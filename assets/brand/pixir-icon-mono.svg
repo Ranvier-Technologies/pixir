@@ -1,0 +1,34 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 256 256"
+  role="img"
+  aria-labelledby="pixir-icon-mono-title pixir-icon-mono-desc"
+>
+  <title id="pixir-icon-mono-title">Pixir icon monochrome</title>
+  <desc id="pixir-icon-mono-desc">
+    A monochrome Pixir icon with a rounded P-shaped BEAM constellation mark.
+  </desc>
+
+  <g
+    id="pixir-mark"
+    fill="none"
+    stroke="currentColor"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path d="M72 50v168" stroke-width="15" />
+    <path d="M72 50h72c36 0 60 21 60 54s-24 54-60 54H98" stroke-width="15" />
+    <path d="M72 114l49-2" stroke-width="8" />
+    <path d="M121 112l34-34" stroke-width="8" />
+    <path d="M121 112l49 14" stroke-width="8" />
+  </g>
+
+  <g id="pixir-nodes" fill="currentColor">
+    <circle cx="72" cy="50" r="11" />
+    <circle cx="72" cy="114" r="11" />
+    <circle cx="72" cy="218" r="7" />
+    <circle cx="121" cy="112" r="14" />
+    <circle cx="155" cy="78" r="12" />
+    <circle cx="170" cy="126" r="12" />
+  </g>
+</svg>

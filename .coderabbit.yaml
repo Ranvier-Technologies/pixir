@@ -1,0 +1,139 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+# CodeRabbit config for Pixir. This file takes precedence over any App-UI settings
+# for this repo. Export current UI settings first with `@coderabbitai configuration`
+# in any PR if you want to merge something from there before this lands.
+
+language: en-US
+# Max 250 chars (schema limit). Longer guidance lives in path_instructions.
+tone_instructions: >-
+  Be direct and terse. Cite the relevant ADR (docs/adr/) by number when a
+  finding touches a documented decision. Prefer concrete, actionable findings;
+  skip praise. Use CONTEXT.md vocabulary; AGENTS.md is the canonical guide.
+
+reviews:
+  # Polish phase pre-open-source: we act on nitpicks today. Switch to "chill"
+  # if the noise outgrows its value once external contributors arrive.
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary: true
+  changed_files_summary: false
+  sequence_diagrams: false
+  poem: false
+  related_issues: true
+  related_prs: true
+  assess_linked_issues: true
+  suggested_labels: false
+  auto_apply_labels: false
+  suggested_reviewers: false
+
+  # Keep reviews focused on source, tests, docs, and CI. Session logs, generated
+  # outputs, and research scratch never need review.
+  path_filters:
+    - "!.pixir/**"
+    - "!outputs/**"
+    - "!.docs/**"
+    - "!deps/**"
+    - "!_build/**"
+    - "!**/*.ndjson"
+
+  path_instructions:
+    - path: "lib/**/*.ex"
+      instructions: |
+        Core invariants (AGENTS.md, CONTEXT.md, docs/adr/) - flag violations:
+        - The append-only Log is the source of truth (ADR 0003). Turn state must
+          be re-derived from the Log each iteration, never threaded in memory
+          expecting it to persist across iterations.
+        - Only canonical event types are logged with a monotonic seq (ADR 0004);
+          deltas/status are ephemeral and bus-only. Adding a canonical event
+          type is a Log schema change and requires an ADR.
+        - Event `data` payloads are string-keyed maps (must round-trip through
+          NDJSON identically); envelope keys are atoms.
+        - Never decode Log/NDJSON input via String.to_existing_atom - that
+          crashed cold resumes once. Decode against Event.canonical_types/0.
+        - Bus access goes through Pixir.Events, never Registry directly.
+        - Errors are structured: a machine-readable "kind" plus details map.
+          A terminal Turn status is done | error | interrupted - all three.
+    - path: "lib/pixir/delegate/**"
+      instructions: |
+        The delegate CLI envelope (schema pixir.delegate.envelope.v1) is a
+        versioned public contract for machine callers. Exit codes are contract
+        (2 invalid_spec, 3 write_policy_denied, 6 indeterminate). Human-facing
+        labels are 1-based ("steps[1]" is the first step) while machine location
+        fields (json_pointer, path, step_index) are 0-based - both must stay
+        consistent. In write_policy_denied details, step-location keys are
+        prefixed (step_field, step_json_pointer, step_path); bare field /
+        json_pointer / path are reserved for WritePolicy's own context. Flag
+        any change to envelope keys, exit codes, or these conventions that is
+        not accompanied by a contract_version bump and test updates in
+        test/pixir/delegate/.
+    - path: "test/**/*.exs"
+      instructions: |
+        Tests must never hit the network: they drive injectable seams
+        (transport:, oauth:, provider: stubs). Assert structured errors by
+        "kind", never by message text. Every new tool must be registered in
+        test/support/tool_contract.ex (ADR 0005 contract). Cold read paths
+        (resume/fold) must be exercised from raw NDJSON fixtures, not by first
+        building events via constructors. Prefer async: true unless the test
+        touches shared global state (Session/Conversation).
+    - path: "docs/adr/**/*.md"
+      instructions: |
+        ADRs are immutable decision records. Check internal coherence
+        (Status/Context/Decision/Consequences) and that the ADR does not
+        silently contradict an existing accepted ADR - superseding must be
+        explicit. Review prose for clarity, not for style nitpicks.
+    - path: ".github/workflows/**"
+      instructions: |
+        CI failures should print file names and line numbers so review context
+        stays actionable (mix format --check-formatted and
+        mix compile --warnings-as-errors already do). Flag steps that swallow
+        output or collapse failures into a bare exit code.
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+
+  # Codex implements, Fable audits, CodeRabbit reviews. Stacked PRs generated
+  # by CodeRabbit (docstrings/unit tests) would fight that division of labor.
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+
+  tools:
+    # No Elixir linter exists in CodeRabbit's catalog (no Credo) - the LLM
+    # review plus the path instructions above carry the Elixir weight, and CI
+    # already enforces format + warnings-as-errors.
+    shellcheck:
+      enabled: true # bin/ scripts
+    actionlint:
+      enabled: true # .github/workflows
+    yamllint:
+      enabled: true
+    markdownlint:
+      enabled: false # ADR/docs prose; style linting is noise here
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  opt_out: false
+  web_search:
+    enabled: true
+  # Feed the same instruction files agents use, so CodeRabbit reviews against
+  # the project's own rules and vocabulary.
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "AGENTS.md"
+      - "CONTEXT.md"
+      - "CLAUDE.md"
+      - "**/CLAUDE.md"
+      - "docs/adr/*.md"
+  learnings:
+    scope: auto
+  issues:
+    scope: auto
+  pull_requests:
+    scope: auto

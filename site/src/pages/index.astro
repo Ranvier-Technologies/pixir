@@ -1,0 +1,238 @@
+---
+import Footer from "../components/Footer.astro";
+import Header from "../components/Header.astro";
+import Hero from "../components/Hero.astro";
+import PresenterBoundary from "../components/PresenterBoundary.astro";
+import BaseLayout from "../layouts/BaseLayout.astro";
+---
+
+<BaseLayout>
+  <div class="page">
+    <Header />
+
+    <main id="top">
+      <Hero />
+
+      <section class="section" id="runtime">
+        <div class="section-inner">
+          <p class="section-kicker">Why Pixir</p>
+          <h2>Use any UI. Keep one supervised runtime.</h2>
+          <p class="section-lead">
+            Pixir sits below the operator and the interface. Codex can plan and audit;
+            Zed, T3Code, or another ACP client can present the work; Pixir runs the
+            supervised local Sessions when tasks need subagents, workflows, lifecycle
+            state, replay, and auditable evidence.
+          </p>
+
+          <div class="proof-grid">
+            <article class="proof">
+              <code>spawn_agent</code>
+              <h3>Subagents are Sessions</h3>
+              <p>Every delegated worker has lifecycle, status, logs, and supervision.</p>
+            </article>
+            <article class="proof">
+              <code>run_workflow</code>
+              <h3>Workflows are runtime graphs</h3>
+              <p>Dependencies, concurrency, cancellation, failed steps, timeouts, and partial completion are tracked structurally.</p>
+            </article>
+            <article class="proof">
+              <code>pixir acp</code>
+              <h3>Presenters are replaceable</h3>
+              <p>Zed, T3Code, CLI, and other ACP clients can request work while Pixir owns the runtime.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section alt">
+        <div class="section-inner split">
+          <div>
+            <p class="section-kicker">Runtime Model</p>
+            <h2>Small spine. Supervised consequences.</h2>
+            <p class="section-lead">
+              Pixir keeps the runtime model legible: Session to Turn to Provider to
+              Tools. OTP supervision keeps Sessions, Turns, Subagents, and Workflows
+              as runtime concerns instead of prompt conventions.
+            </p>
+          </div>
+          <div class="timeline" role="list" aria-label="Runtime event timeline">
+            <div class="event" role="listitem">
+              <code>01</code>
+              <div>
+                <strong>Start a Session</strong>
+                <p>The workspace gets local runtime state, a session id, and append-only evidence.</p>
+              </div>
+            </div>
+            <div class="event" role="listitem">
+              <code>02</code>
+              <div>
+                <strong>Run a Turn</strong>
+                <p>Provider calls and tool results flow through one inspectable loop.</p>
+              </div>
+            </div>
+            <div class="event" role="listitem">
+              <code>03</code>
+              <div>
+                <strong>Delegate safely</strong>
+                <p>Subagents and Workflow steps can complete, fail, time out, detach, or resume.</p>
+              </div>
+            </div>
+            <div class="event" role="listitem">
+              <code>04</code>
+              <div>
+                <strong>Audit before trust</strong>
+                <p>Summaries are not evidence. Logs, artifacts, and status records are.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="operators">
+        <div class="section-inner">
+          <p class="section-kicker">Operator Primitives</p>
+          <h2>Commands for operating agent work, not just chatting with it.</h2>
+          <p class="section-lead">
+            Pixir's first public surface is intentionally narrow: CLI and ACP. The
+            primitives are built around diagnostics, continuation, supervision, and
+            local evidence.
+          </p>
+
+          <div class="command-grid">
+            <article class="command">
+              <code>pixir doctor --json</code>
+              <p>Check runtime, auth, config, workspace, and ACP readiness from a scriptable diagnostic gate.</p>
+            </article>
+            <article class="command">
+              <code>pixir resume &lt;session-id&gt;</code>
+              <p>Continue from a durable Session instead of starting over from a transcript pasted into chat.</p>
+            </article>
+            <article class="command">
+              <code>pixir tree &lt;session-id&gt; --json</code>
+              <p>Project the Session and Subagent hierarchy from local Logs without calling the model.</p>
+            </article>
+            <article class="command">
+              <code>pixir compact &lt;session-id&gt; --dry-run --json</code>
+              <p>Preview history checkpoints before appending a durable compaction boundary.</p>
+            </article>
+            <article class="command">
+              <code>pixir fork &lt;session-id&gt;</code>
+              <p>Branch exploration while preserving the original Session as evidence.</p>
+            </article>
+            <article class="command">
+              <code>pixir acp</code>
+              <p>Run Pixir behind ACP clients while keeping JSON-RPC stdout clean and diagnostics separate.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <PresenterBoundary />
+
+      <section class="section evidence-section" id="evidence">
+        <div class="section-inner">
+          <div class="evidence-header">
+            <div>
+              <p class="section-kicker">Evidence Layer</p>
+              <h2>Agent work should leave evidence you control.</h2>
+              <p class="section-lead">
+                Log as truth matters because supervised work needs a durable record.
+                Every run can be inspected, replayed, resumed, forked, compacted, or
+                audited from local artifacts instead of a hidden chat store.
+              </p>
+            </div>
+
+            <div class="evidence-terminal" role="group" aria-label="Example Pixir event log">
+              <div class="evidence-terminal-head">
+                <code>.pixir/sessions/01HQ...ndjson</code>
+                <span>append-only</span>
+              </div>
+              <pre><span class="log-muted">&#123;"ts":"+0.000","event":"session.start","id":"01HQ...","log":"append-only"&#125;</span>
+<span class="log-muted">&#123;"ts":"+1.204","event":"provider_usage","tokens":1843,"cached_tokens":1190&#125;</span>
+<span class="log-muted">&#123;"ts":"+1.880","event":"subagent.spawned","parent":"01HQ...","id":"01HR..."&#125;</span>
+<span class="log-warn">&#123;"ts":"+4.512","event":"workflow.step.failed","step":"build","retry":true&#125;</span>
+<span class="log-ok">&#123;"ts":"+6.090","event":"workflow.step.ok","step":"build","attempt":2&#125;</span>
+<span class="log-muted">&#123;"ts":"+7.331","event":"compaction.boundary","kept":42,"dropped":260&#125;</span>
+<span class="prompt">$</span> <span class="cursor" aria-hidden="true"></span></pre>
+            </div>
+          </div>
+
+          <div class="evidence-grid">
+            <article class="evidence-card">
+              <code>.pixir/sessions/*.ndjson</code>
+              <h3>The Log is truth</h3>
+              <p>Sessions persist as append-only local evidence for replay, repair, inspection, and audit.</p>
+            </article>
+            <article class="evidence-card">
+              <code>provider_usage</code>
+              <h3>Cache-aware work is measurable</h3>
+              <p>WebSocket continuation, stable prompt prefixes, and minimal per-turn payloads keep Subagent-heavy work cache-friendly; cached tokens are recorded when the Provider reports them.</p>
+            </article>
+            <article class="evidence-card">
+              <code>pixir tree</code>
+              <h3>Hierarchy is inspectable</h3>
+              <p>Parent agents can query Session and Subagent status instead of blocking blindly.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="boundary">
+        <div class="section-inner">
+          <p class="section-kicker">Developer Preview</p>
+          <h2>Preview scope.</h2>
+          <p class="section-lead">
+            Pixir is public enough to install and operate, but the contract is narrow
+            on purpose. The site says this plainly.
+          </p>
+          <div class="boundary">
+            <article class="boundary-item">
+              <code>scope.terminal</code>
+              <strong>Not a Pi TUI replacement</strong>
+              <p>Pixir can be daily-driven through ACP, but it is not a finished standalone terminal app.</p>
+            </article>
+            <article class="boundary-item">
+              <code>scope.adapter</code>
+              <strong>Not a packaged T3 provider</strong>
+              <p>T3 Code pairing is dogfood through a local adapter, not a public install path.</p>
+            </article>
+            <article class="boundary-item">
+              <code>scope.api</code>
+              <strong>Not a stable Elixir API</strong>
+              <p>Hex installs the CLI/ACP runtime; internal modules are documented for transparency.</p>
+            </article>
+            <article class="boundary-item">
+              <code>scope.sla</code>
+              <strong>Not production SLA software</strong>
+              <p>No hosted service promises, telemetry, self-update, or enterprise support contract.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="final">
+        <div class="final-inner">
+          <div>
+            <p class="section-kicker">Get Started</p>
+            <h2>Install the runtime. Run the diagnostic. Keep the evidence.</h2>
+            <p class="section-lead">
+              Start with Hex when you want the published daily-driver binary. Use a source
+              checkout when you are working on Pixir itself.
+            </p>
+            <div class="hero-actions">
+              <a class="button primary" href="https://hex.pm/packages/pixir">Hex package</a>
+              <a class="button secondary" href="https://pixir.hexdocs.pm/readme.html">HexDocs</a>
+            </div>
+          </div>
+          <div class="install-card" role="group" aria-label="Install Pixir command transcript">
+            <pre><span class="prompt">$</span> mix escript.install hex pixir
+<span class="prompt">$</span> pixir doctor --json
+<span class="prompt">$</span> pixir acp</pre>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <Footer />
+  </div>
+</BaseLayout>

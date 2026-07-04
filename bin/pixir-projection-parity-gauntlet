@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+"""Join Pixir runtime-truth output with Presenter projection evidence.
+
+This adapter is intentionally lightweight: it does not drive T3 Code, Zed, or
+networked providers. It turns deterministic runtime-truth gauntlet JSON and
+optional human/client evidence packets into a repeatable projection-parity
+summary for Registry-readiness review.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+
+SCENARIOS: dict[str, dict[str, Any]] = {
+    "P0": {
+        "name": "simple_prompt",
+        "summary": "Clean assistant answer is visible only when Pixir has clean canonical evidence.",
+        "runtime_truth": ["T0"],
+        "presenters": ["CLI", "ACP", "T3 Code", "Zed"],
+        "registry_impact": "blocker",
+    },
+    "P1": {
+        "name": "file_read_or_tool_use",
+        "summary": "File/tool activity projects paired tool_call/tool_result evidence.",
+        "runtime_truth": ["T3"],
+        "presenters": ["CLI", "ACP", "T3 Code", "Zed"],
+        "registry_impact": "blocker",
+    },
+    "P2": {
+        "name": "partial_or_failed_turn",
+        "summary": "Partial or failed Turn evidence is never projected as clean success.",
+        "runtime_truth": ["T1", "T2", "T6", "T9"],
+        "presenters": ["CLI", "ACP", "T3 Code", "Zed"],
+        "registry_impact": "blocker",
+    },
+    "P3": {
+        "name": "subagent_timeout_or_completion",
+        "summary": "Subagent terminal state is explicit, attributable, and not hidden behind parent success.",
+        "runtime_truth": ["T4", "T10"],
+        "presenters": ["CLI", "ACP", "T3 Code", "Zed"],
+        "registry_impact": "blocker_if_opaque",
+    },
+    "P4": {
+        "name": "workflow_partial_or_diagnostic_outcome",
+        "summary": "Workflow partial, held, failed, and completed states stay diagnosable from Log evidence.",
+        "runtime_truth": ["T5", "T11"],
+        "presenters": ["CLI", "ACP", "T3 Code"],
+        "registry_impact": "blocker_if_collapsed",
+    },
+    "P5": {
+        "name": "acp_replay_or_load",
+        "summary": "ACP load/replay does not promote audit-only partial/failure evidence into clean History.",
+        "runtime_truth": ["T6", "T7"],
+        "presenters": ["ACP", "T3 Code", "Zed"],
+        "registry_impact": "blocker",
+    },
+}
+
+PACKET_REQUIRED_FILES = [
+    "INDEX.md",
+    "scenario-id.txt",
+    "session-id.txt",
+    "pixir-diagnose.json",
+    "classification.md",
+]
+VISIBLE_NOTES_NAMES = [
+    "presenter-visible-notes.md",
+    "zed-or-t3-visible-notes.md",
+    "cli-visible-notes.md",
+    "acp-visible-notes.md",
+]
+PACKET_CLASSIFICATIONS = {"pass", "warn", "fail"}
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    if args.list_scenarios:
+        result = scenario_matrix_result()
+    elif args.dry_run:
+        result = dry_run_result(args)
+    else:
+        result = run_gauntlet(args)
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print_human(result)
+
+    if result.get("status") == "tool_error":
+        return 2
+    if args.fail_on_blocker and result.get("registry_readiness") == "blocked":
+        return 1
+    return 0
+
+
+def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate Pixir projection parity from runtime-truth gauntlet JSON and "
+            "optional Presenter evidence packets."
+        )
+    )
+    parser.add_argument(
+        "--runtime-truth-result",
+        help="JSON output from bin/pixir-runtime-trust-gauntlet.",
+    )
+    parser.add_argument(
+        "--evidence-dir",
+        help=(
+            "Directory containing one Presenter evidence packet, or immediate child "
+            "directories containing packets."
+        ),
+    )
+    parser.add_argument(
+        "--list-scenarios",
+        action="store_true",
+        help="Print the projection parity scenario matrix without evaluating evidence.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report planned inputs and required evidence without reading files.",
+    )
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    parser.add_argument(
+        "--fail-on-blocker",
+        action="store_true",
+        help="Exit 1 if projection or Registry readiness is blocked.",
+    )
+    return parser.parse_args(argv)
+
+
+def scenario_matrix_result() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "status": "ready",
+        "classification": "projection_parity_scenario_matrix",
+        "scenarios": scenario_rows(),
+        "pass_fail_warning_rubric": rubric(),
+        "next_actions": [
+            "run bin/pixir-runtime-trust-gauntlet and pass its JSON via --runtime-truth-result",
+            "add --evidence-dir when T3/Zed/ACP/CLI Presenter packets are available",
+        ],
+    }
+
+
+def dry_run_result(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "status": "ready",
+        "classification": "projection_parity_dry_run",
+        "planned_inputs": {
+            "runtime_truth_result": redact_path(args.runtime_truth_result),
+            "evidence_dir": redact_path(args.evidence_dir),
+        },
+        "scenarios": scenario_rows(),
+        "required_packet_files": PACKET_REQUIRED_FILES,
+        "visible_notes_file_options": VISIBLE_NOTES_NAMES,
+        "next_actions": ["remove --dry-run to evaluate supplied evidence"],
+    }
+
+
+def run_gauntlet(args: argparse.Namespace) -> dict[str, Any]:
+    runtime_truth = load_runtime_truth(args.runtime_truth_result)
+    if runtime_truth.get("status") == "tool_error":
+        return runtime_truth
+
+    presenter_evidence = collect_presenter_evidence(args.evidence_dir)
+    if presenter_evidence.get("status") == "tool_error":
+        return presenter_evidence
+
+    summary = summarize(runtime_truth, presenter_evidence)
+    readiness = registry_readiness_for(summary)
+
+    return {
+        "ok": readiness != "blocked",
+        "status": "ready_with_warnings" if readiness == "warning" else "ready",
+        "classification": "projection_parity_gauntlet",
+        "registry_readiness": readiness,
+        "summary": summary,
+        "scenarios": scenario_rows(),
+        "runtime_truth": runtime_truth,
+        "presenter_evidence": presenter_evidence,
+        "next_actions": next_actions_for(summary, readiness),
+    }
+
+
+def load_runtime_truth(path_value: str | None) -> dict[str, Any]:
+    if not path_value:
+        return {
+            "status": "missing",
+            "readiness": "warning",
+            "message": "No runtime-truth gauntlet JSON was provided.",
+        }
+
+    path = Path(path_value).expanduser()
+    payload = read_json_file(path, "runtime_truth_result")
+    if payload.get("status") == "tool_error":
+        return payload
+    if not isinstance(payload.get("json"), dict):
+        return tool_error(
+            "runtime_truth_invalid_shape",
+            "Runtime-truth result must be a JSON object.",
+            {"path": redact_path(path), "json_type": type(payload.get("json")).__name__},
+            ["rerun bin/pixir-runtime-trust-gauntlet with --json"],
+        )
+
+    result = payload["json"]
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    blockers = summary.get("backend_blockers") or summary.get("registry_blockers") or []
+    readiness = "blocked" if result.get("backend_readiness") == "blocked" or blockers else "not_blocked"
+    covered = summary.get("covered_scenarios") if isinstance(summary.get("covered_scenarios"), list) else []
+    missing = summary.get("missing_scenarios") if isinstance(summary.get("missing_scenarios"), list) else []
+
+    return {
+        "status": "provided",
+        "readiness": readiness,
+        "path": redact_path(path),
+        "classification": result.get("classification"),
+        "coverage_status": summary.get("coverage_status"),
+        "covered_scenarios": covered,
+        "missing_scenarios": missing,
+        "blockers": blockers,
+        "counts": {
+            "total": summary.get("total"),
+            "pass": summary.get("pass"),
+            "warn": summary.get("warn"),
+            "fail": summary.get("fail"),
+        },
+    }
+
+
+def collect_presenter_evidence(path_value: str | None) -> dict[str, Any]:
+    if not path_value:
+        return {
+            "status": "not_provided",
+            "readiness": "warning",
+            "packets": [],
+            "message": "No Presenter evidence directory was provided.",
+        }
+
+    root = Path(path_value).expanduser()
+    if not root.exists():
+        return tool_error(
+            "evidence_dir_missing",
+            "Presenter evidence directory was not found.",
+            {"path": redact_path(root)},
+            ["check --evidence-dir", "or omit --evidence-dir until manual Presenter evidence exists"],
+        )
+    if not root.is_dir():
+        return tool_error(
+            "evidence_dir_not_directory",
+            "Presenter evidence path must be a directory.",
+            {"path": redact_path(root)},
+            ["point --evidence-dir at a packet directory or a directory containing packets"],
+        )
+
+    packet_roots = discover_packet_roots(root)
+    packets = [validate_packet(packet_root) for packet_root in packet_roots]
+    blocking_packets = [packet for packet in packets if packet["status"] == "fail"]
+    warning_packets = [packet for packet in packets if packet["status"] == "warn"]
+
+    if blocking_packets:
+        readiness = "blocked"
+    elif warning_packets or not packets:
+        readiness = "warning"
+    else:
+        readiness = "not_blocked"
+
+    return {
+        "status": "provided",
+        "readiness": readiness,
+        "root": redact_path(root),
+        "packet_count": len(packets),
+        "packets": packets,
+    }
+
+
+def discover_packet_roots(root: Path) -> list[Path]:
+    if any((root / name).exists() for name in PACKET_REQUIRED_FILES):
+        return [root]
+
+    packet_roots = [
+        child
+        for child in sorted(root.iterdir())
+        if child.is_dir() and any((child / name).exists() for name in PACKET_REQUIRED_FILES)
+    ]
+    return packet_roots
+
+
+def validate_packet(root: Path) -> dict[str, Any]:
+    missing = [name for name in PACKET_REQUIRED_FILES if not (root / name).is_file()]
+    visible_notes = [name for name in VISIBLE_NOTES_NAMES if (root / name).is_file()]
+    warnings = []
+    scenario_id = None
+    classification = None
+    classification_owner = None
+    classification_reason = None
+
+    scenario_path = root / "scenario-id.txt"
+    if scenario_path.is_file():
+        try:
+            scenario_id = scenario_path.read_text(encoding="utf-8").strip().upper()
+        except OSError:
+            missing.append("readable scenario-id.txt")
+        else:
+            if scenario_id not in SCENARIOS:
+                missing.append("valid scenario-id.txt")
+
+    diagnose_path = root / "pixir-diagnose.json"
+    if diagnose_path.is_file():
+        payload = read_json_file(diagnose_path, "pixir_diagnose")
+        if payload.get("status") == "tool_error":
+            missing.append("valid pixir-diagnose.json")
+    if not visible_notes:
+        missing.append("presenter-visible-notes.md or accepted alias")
+
+    classification_path = root / "classification.md"
+    if classification_path.is_file():
+        packet_classification = read_packet_classification(classification_path)
+        if packet_classification.get("status") == "tool_error":
+            missing.append("readable classification.md")
+        else:
+            classification = packet_classification.get("classification")
+            classification_owner = packet_classification.get("owner")
+            classification_reason = packet_classification.get("reason")
+            if classification not in PACKET_CLASSIFICATIONS:
+                missing.append("valid classification.md")
+            elif classification == "warn":
+                warnings.append(
+                    {
+                        "kind": "packet_classification_warn",
+                        "message": "classification.md marks this Presenter packet as warn.",
+                    }
+                )
+
+    if missing:
+        status = "fail"
+    elif classification == "fail":
+        status = "fail"
+    elif classification == "warn" or warnings:
+        status = "warn"
+    elif classification == "pass":
+        status = "pass"
+    else:
+        status = "pass"
+
+    return {
+        "path": redact_path(root),
+        "status": status,
+        "scenario_id": scenario_id,
+        "classification": classification,
+        "classification_owner": classification_owner,
+        "classification_reason": classification_reason,
+        "missing_required_files": missing,
+        "warnings": warnings,
+        "visible_notes": visible_notes,
+    }
+
+
+def read_packet_classification(path: Path) -> dict[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return tool_error(
+            "classification_unreadable",
+            "Presenter packet classification.md could not be read.",
+            {"path": redact_path(path), "io_error": str(exc)},
+            ["check file permissions", "regenerate the Presenter packet"],
+        )
+
+    fields: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().lower().replace("-", "_")
+        if key in {"classification", "owner", "reason"}:
+            fields[key] = value.strip()
+
+    classification = fields.get("classification", "").lower()
+    return {
+        "classification": classification if classification in PACKET_CLASSIFICATIONS else None,
+        "owner": fields.get("owner"),
+        "reason": fields.get("reason"),
+    }
+
+
+def summarize(runtime_truth: dict[str, Any], presenter_evidence: dict[str, Any]) -> dict[str, Any]:
+    blockers = []
+    warnings = []
+
+    if runtime_truth.get("readiness") == "blocked":
+        blockers.append(
+            {
+                "kind": "runtime_truth_blocked",
+                "message": "Runtime-truth gauntlet has backend or Registry blockers.",
+                "details": {"blockers": runtime_truth.get("blockers", [])},
+            }
+        )
+    elif runtime_truth.get("readiness") == "warning":
+        warnings.append(
+            {
+                "kind": "runtime_truth_missing",
+                "message": "Runtime-truth gauntlet JSON was not provided.",
+            }
+        )
+
+    if presenter_evidence.get("readiness") == "blocked":
+        blockers.append(
+            {
+                "kind": "presenter_evidence_invalid",
+                "message": "At least one Presenter evidence packet is incomplete or invalid.",
+                "details": {"packets": presenter_evidence.get("packets", [])},
+            }
+        )
+    elif presenter_evidence.get("readiness") == "warning":
+        warning_packets = [
+            packet
+            for packet in presenter_evidence.get("packets", [])
+            if packet.get("status") == "warn"
+        ]
+        if warning_packets:
+            warnings.append(
+                {
+                    "kind": "presenter_evidence_warning",
+                    "message": "At least one Presenter evidence packet is explicitly classified as warn.",
+                    "details": {"packets": warning_packets},
+                }
+            )
+        else:
+            warnings.append(
+                {
+                    "kind": "presenter_evidence_pending",
+                    "message": "T3/Zed/ACP/CLI Presenter evidence is pending or only partially packetized.",
+                }
+            )
+
+    covered_runtime = set(runtime_truth.get("covered_scenarios") or [])
+    presenter_packets = presenter_evidence.get("packets") or []
+    scenario_statuses = []
+    for scenario_id, scenario in SCENARIOS.items():
+        required_runtime = set(scenario["runtime_truth"])
+        missing_runtime = sorted(required_runtime - covered_runtime)
+        matching_packets = [
+            packet for packet in presenter_packets if packet.get("scenario_id") == scenario_id
+        ]
+
+        if runtime_truth.get("status") == "missing":
+            runtime_status = "warn"
+        elif missing_runtime:
+            runtime_status = "warn"
+        elif runtime_truth.get("readiness") == "blocked":
+            runtime_status = "fail"
+        else:
+            runtime_status = "pass"
+
+        if not matching_packets:
+            presenter_status = "missing"
+            presenter_effective_status = "warn"
+        elif any(packet["status"] == "fail" for packet in matching_packets):
+            presenter_status = "fail"
+            presenter_effective_status = "fail"
+        elif any(packet["status"] == "warn" for packet in matching_packets):
+            presenter_status = "warn"
+            presenter_effective_status = "warn"
+        else:
+            presenter_status = "pass"
+            presenter_effective_status = "pass"
+
+        status = combine_status(runtime_status, presenter_effective_status)
+
+        scenario_statuses.append(
+            {
+                "id": scenario_id,
+                "name": scenario["name"],
+                "status": status,
+                "missing_runtime_truth": missing_runtime,
+                "presenter_evidence_status": presenter_status,
+                "presenter_packets": [packet["path"] for packet in matching_packets],
+            }
+        )
+
+    return {
+        "blocker_count": len(blockers),
+        "warning_count": len(warnings),
+        "blockers": blockers,
+        "warnings": warnings,
+        "runtime_truth_readiness": runtime_truth.get("readiness"),
+        "presenter_evidence_readiness": presenter_evidence.get("readiness"),
+        "scenario_statuses": scenario_statuses,
+    }
+
+
+def registry_readiness_for(summary: dict[str, Any]) -> str:
+    if summary["blocker_count"]:
+        return "blocked"
+    if summary["warning_count"] or any(item["status"] == "warn" for item in summary["scenario_statuses"]):
+        return "warning"
+    return "not_blocked"
+
+
+def combine_status(*statuses: str) -> str:
+    if "fail" in statuses:
+        return "fail"
+    if "warn" in statuses:
+        return "warn"
+    return "pass"
+
+
+def next_actions_for(summary: dict[str, Any], readiness: str) -> list[str]:
+    if readiness == "blocked":
+        return [
+            "inspect summary.blockers",
+            "fix or replace the blocked runtime-truth or Presenter evidence",
+            "rerun with --fail-on-blocker before using this for #52",
+        ]
+
+    actions = []
+    if summary["runtime_truth_readiness"] == "warning":
+        actions.append("run bin/pixir-runtime-trust-gauntlet with --json and pass --runtime-truth-result")
+    if summary["presenter_evidence_readiness"] == "warning":
+        if any(item["presenter_evidence_status"] == "warn" for item in summary["scenario_statuses"]):
+            actions.append("inspect Presenter packets classified as warn and decide whether they are acceptable for #52")
+        else:
+            actions.append("record at least one T3 Code and one Zed Presenter packet when live dogfood is convenient")
+    if any(item["presenter_evidence_status"] == "missing" for item in summary["scenario_statuses"]):
+        actions.append("record Presenter packets for scenarios with missing presenter evidence")
+    if readiness == "warning":
+        actions.append("treat #52 Registry readiness as not blocked by backend evidence but awaiting client packet refresh")
+    if actions:
+        return actions
+    return ["use this projection parity summary as #60/#52 evidence"]
+
+
+def read_json_file(path: Path, label: str) -> dict[str, Any]:
+    if not path.exists():
+        return tool_error(
+            f"{label}_missing",
+            "A required JSON input was not found.",
+            {"path": redact_path(path)},
+            ["check the path", "rerun the producer command with --json"],
+        )
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return {"json": json.load(handle)}
+    except json.JSONDecodeError as exc:
+        return tool_error(
+            f"{label}_invalid_json",
+            "A JSON input could not be decoded.",
+            {"path": redact_path(path), "json_error": str(exc)},
+            ["regenerate the JSON input", "verify the producer command used --json"],
+        )
+    except OSError as exc:
+        return tool_error(
+            f"{label}_unreadable",
+            "A JSON input could not be read.",
+            {"path": redact_path(path), "io_error": str(exc)},
+            ["check file permissions"],
+        )
+
+
+def scenario_rows() -> list[dict[str, Any]]:
+    return [{"id": key, **value} for key, value in SCENARIOS.items()]
+
+
+def rubric() -> dict[str, str]:
+    return {
+        "pass": "Pixir canonical diagnostics and Presenter-visible state agree for the scenario.",
+        "warn": "Evidence is honest but incomplete, manual Presenter packets are pending, or an actionable partial state is visible.",
+        "fail": "A Presenter reports clean completion without matching clean Pixir evidence, or partial/failure evidence is projected as success.",
+    }
+
+
+def structured_error(kind: str, message: str, details: dict[str, Any], next_actions: list[str]) -> dict[str, Any]:
+    return {"kind": kind, "message": message, "details": details, "next_actions": next_actions}
+
+
+def tool_error(kind: str, message: str, details: dict[str, Any], next_actions: list[str]) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "tool_error",
+        "classification": "projection_parity_gauntlet_unavailable",
+        "error": structured_error(kind, message, details, next_actions),
+        "next_actions": next_actions,
+    }
+
+
+def redact_path(path: str | Path | None) -> str | None:
+    if path is None:
+        return None
+    value = str(path)
+    home = str(Path.home())
+    if value.startswith(home):
+        return "~" + value[len(home) :]
+    return value
+
+
+def print_human(result: dict[str, Any]) -> None:
+    print(f"classification: {result.get('classification')}")
+    if result.get("status") == "tool_error":
+        error = result.get("error") if isinstance(result.get("error"), dict) else {}
+        print(f"error.kind: {error.get('kind')}")
+        print(f"error.message: {error.get('message')}")
+    if "registry_readiness" in result:
+        print(f"registry_readiness: {result['registry_readiness']}")
+    if "summary" in result:
+        summary = result["summary"]
+        print(
+            "summary: "
+            f"blockers={summary['blocker_count']} "
+            f"warnings={summary['warning_count']}"
+        )
+    for action in result.get("next_actions", []):
+        print(f"- {action}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

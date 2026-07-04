@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+"""Run the Pixir backend gauntlet v2 join gate.
+
+This command composes two existing no-network gates:
+
+* runtime truth fixture checks for Turn/Event/replay/presenter semantics
+* fanout correctness checks for direct CLI and parent-led Subagent outcomes
+
+It exists as a join gate for GitHub issue #93. It does not test T3/Zed UI
+projection and it does not make performance claims.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+SCENARIO_FIXTURES: dict[str, dict[str, Any]] = {
+    "T0": {
+        "scenario": "T0",
+        "pixir": {"clean_assistant_messages": 1},
+        "presenter": {"clean_final_answer": True, "completed": True},
+        "evidence": {"session_id": "fixture-clean-one-turn-answer"},
+    },
+    "T1": {
+        "scenario": "T1",
+        "pixir": {"partial_assistant_messages": 1},
+        "presenter": {
+            "clean_final_answer": False,
+            "completed": False,
+            "partial_marked": True,
+        },
+        "evidence": {"session_id": "fixture-partial-provider-error"},
+    },
+    "T2": {
+        "scenario": "T2",
+        "pixir": {"turn_failed_count": 1},
+        "presenter": {"clean_final_answer": False, "stale_historical_answer": False},
+        "evidence": {"session_id": "fixture-provider-error-before-text"},
+    },
+    "T3": {
+        "scenario": "T3",
+        "pixir": {"tool_pairing_ok": True, "clean_assistant_messages": 1},
+        "presenter": {"clean_final_answer": True},
+        "evidence": {"session_id": "fixture-tool-call-final-answer"},
+    },
+    "T4": {
+        "scenario": "T4",
+        "pixir": {
+            "subagent_timeouts": [
+                {
+                    "subagent_id": "sub_timeout",
+                    "child_session_id": "fixture-child-timeout",
+                    "agent": "explorer",
+                    "status": "timed_out",
+                    "reason": "timeout",
+                    "timeout_ms": 30000,
+                    "elapsed_ms": 30050,
+                    "next_actions": ["retry with a narrower task"],
+                    "missing_fields": [],
+                }
+            ]
+        },
+        "presenter": {"completed": False},
+        "evidence": {"session_id": "fixture-parent-timeout"},
+    },
+    "T5": {
+        "scenario": "T5",
+        "pixir": {
+            "workflow_status": "partial",
+            "checkpoint_statuses": ["checkpoint_ready", "failed"],
+        },
+        "presenter": {"completed": False},
+        "evidence": {"session_id": "fixture-workflow-partial"},
+    },
+    "T6": {
+        "scenario": "T6",
+        "acp": {"partial_loaded_as_clean": False, "turn_failed_loaded_as_clean": False},
+        "evidence": {"session_id": "fixture-acp-load-partial-guard"},
+    },
+    "T7": {
+        "scenario": "T7",
+        "replay": {
+            "failure_events_in_provider_input": False,
+            "provider_prefix_changed_by_failure_evidence": False,
+        },
+        "evidence": {"session_id": "fixture-replay-cache-failure-exclusion"},
+    },
+    "T8": {
+        "scenario": "T8",
+        "pixir": {"diagnostics_status": "warn"},
+        "presenter": {"visible": True, "agrees_with_pixir": True},
+        "evidence": {"session_id": "fixture-client-parity"},
+    },
+    "T9": {
+        "scenario": "T9",
+        "pixir": {
+            "terminal_status": "timed_out",
+            "turn_failed_count": 1,
+            "error_kind": "timeout",
+        },
+        "presenter": {"clean_final_answer": False, "completed": False},
+        "evidence": {"session_id": "fixture-turn-timeout"},
+    },
+    "T10": {
+        "scenario": "T10",
+        "pixir": {
+            "subagent_terminal_states": [
+                {
+                    "subagent_id": "sub_completed",
+                    "child_session_id": "fixture-child-completed",
+                    "status": "completed",
+                    "elapsed_ms": 250,
+                    "summary": "completed read-only audit",
+                }
+            ]
+        },
+        "evidence": {"session_id": "fixture-parent-completed"},
+    },
+    "T11": {
+        "scenario": "T11",
+        "pixir": {
+            "workflow_status": "completed",
+            "checkpoint_statuses": ["checkpoint_ready", "checkpoint_ready"],
+        },
+        "presenter": {"completed": True},
+        "evidence": {"session_id": "fixture-workflow-completed"},
+    },
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    repo_root = Path(__file__).resolve().parents[1]
+    output_dir = Path(args.output or default_output_dir()).expanduser()
+
+    if args.dry_run:
+        result = dry_run(args, repo_root, output_dir)
+        emit(result, args.json)
+        return 0
+
+    if output_dir.exists() and any(output_dir.iterdir()) and not args.force:
+        result = tool_error(
+            "output_exists",
+            "Output directory already exists and is not empty.",
+            {"output_dir": str(output_dir)},
+            ["choose a fresh --output path", "or pass --force to overwrite the directory"],
+        )
+        emit(result, args.json)
+        return 2
+
+    if args.force:
+        shutil.rmtree(output_dir, ignore_errors=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    result = run(args, repo_root, output_dir)
+    emit(result, args.json)
+    return 0 if result["ok"] else 1
+
+
+def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the Pixir backend gauntlet v2 join gate. The default mode runs "
+            "runtime-truth fixtures plus the no-network fanout gauntlet."
+        )
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["all", "runtime-truth", "fanout"],
+        default="all",
+        help="Gauntlet component to run. Default: all.",
+    )
+    parser.add_argument(
+        "--output",
+        help="Artifact directory. Default: .pixir/benchmarks/backend-gauntlet-v2/<timestamp>.",
+    )
+    parser.add_argument("--pixir-bin", default="./pixir", help="Pixir binary for fanout direct mode.")
+    parser.add_argument("--direct-n", type=int, default=3, help="Direct CLI fanout count.")
+    parser.add_argument("--parent-n", type=int, default=4, help="Parent-led Subagent fanout count.")
+    parser.add_argument("--timeout-ms", type=int, default=500, help="Intentional timeout fixture limit.")
+    parser.add_argument("--mix-bin", default="mix", help="Mix executable for the fanout child command. Default: mix.")
+    parser.add_argument(
+        "--child-timeout-seconds",
+        type=float,
+        default=120.0,
+        help="Maximum wall time for each child gauntlet subprocess. Default: 120.",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Print planned actions without writing artifacts.")
+    parser.add_argument("--force", action="store_true", help="Overwrite an existing output directory.")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    return parser.parse_args(argv)
+
+
+def default_output_dir() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f".pixir/benchmarks/backend-gauntlet-v2/{stamp}"
+
+
+def dry_run(args: argparse.Namespace, repo_root: Path, output_dir: Path) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "status": "dry_run",
+        "classification": "backend_gauntlet_v2_plan",
+        "mode": args.mode,
+        "repo_root": str(repo_root),
+        "would_write": planned_artifacts(output_dir, args.mode),
+        "would_run": planned_commands(args, repo_root, output_dir),
+        "scenario_ids": list(SCENARIO_FIXTURES.keys()),
+        "network_required": False,
+        "ui_required": False,
+        "next_actions": ["remove --dry-run to execute the gauntlet"],
+    }
+
+
+def run(args: argparse.Namespace, repo_root: Path, output_dir: Path) -> dict[str, Any]:
+    started_at = now_iso()
+    components: dict[str, Any] = {}
+    component_ok = True
+
+    if args.mode in {"all", "runtime-truth"}:
+        runtime = run_runtime_truth(args, repo_root, output_dir)
+        components["runtime_truth"] = runtime
+        component_ok = component_ok and runtime["ok"]
+
+    if args.mode in {"all", "fanout"}:
+        fanout = run_fanout(args, repo_root, output_dir)
+        components["fanout"] = fanout
+        component_ok = component_ok and fanout["ok"]
+
+    audit = completion_audit(args, output_dir, components)
+    result = {
+        "ok": component_ok and audit["status"] == "completion_ready",
+        "status": "completed" if component_ok else "failed",
+        "classification": "backend_gauntlet_v2",
+        "mode": args.mode,
+        "started_at": started_at,
+        "finished_at": now_iso(),
+        "output_dir": str(output_dir.resolve()),
+        "report": str((output_dir / "report.md").resolve()),
+        "completion_audit": audit,
+        "components": components,
+        "next_actions": next_actions(audit, component_ok),
+    }
+
+    write_json(output_dir / "summary.json", result)
+    write_json(output_dir / "completion_audit.json", audit)
+    (output_dir / "report.md").write_text(render_report(result), encoding="utf-8")
+    return result
+
+
+def run_runtime_truth(args: argparse.Namespace, repo_root: Path, output_dir: Path) -> dict[str, Any]:
+    fixture_dir = output_dir / "runtime-truth-fixtures"
+    fixture_dir.mkdir(parents=True, exist_ok=True)
+
+    for scenario_id, fixture in SCENARIO_FIXTURES.items():
+        write_json(fixture_dir / f"{scenario_id.lower()}-{fixture_slug(fixture)}.json", fixture)
+
+    command = python_command(repo_root / "bin" / "pixir-runtime-trust-gauntlet") + [
+        "--fixture-dir",
+        str(fixture_dir),
+        "--json",
+        "--fail-on-blocker",
+        "--require-all-scenarios",
+    ]
+    process = run_command(command, repo_root, timeout=args.child_timeout_seconds)
+    result = child_result(process)
+    write_text(output_dir / "runtime-truth-stdout.txt", process["stdout"])
+    write_text(output_dir / "runtime-truth-stderr.txt", process["stderr"])
+    write_json(output_dir / "runtime-truth-result.json", result)
+
+    ok = process["exit_code"] == 0 and result.get("backend_readiness") == "not_blocked"
+    return {
+        "ok": ok,
+        "command": display_command(command),
+        "exit_code": process["exit_code"],
+        "fixture_dir": str(fixture_dir.resolve()),
+        "result_path": str((output_dir / "runtime-truth-result.json").resolve()),
+        "scenario_count": len(SCENARIO_FIXTURES),
+        "coverage_status": result.get("summary", {}).get("coverage_status"),
+        "backend_readiness": result.get("backend_readiness"),
+        "warning_count": result.get("summary", {}).get("warn"),
+        "failure_count": result.get("summary", {}).get("fail"),
+        "diagnostic_verdict": "not_blocked" if ok else "blocked",
+    }
+
+
+def run_fanout(args: argparse.Namespace, repo_root: Path, output_dir: Path) -> dict[str, Any]:
+    fanout_dir = output_dir / "fanout"
+    command = [
+        args.mix_bin,
+        "pixir.bench.fanout_gauntlet",
+        "--json",
+        "--output",
+        str(fanout_dir),
+        "--pixir-bin",
+        args.pixir_bin,
+        "--direct-n",
+        str(args.direct_n),
+        "--parent-n",
+        str(args.parent_n),
+        "--timeout-ms",
+        str(args.timeout_ms),
+    ]
+    process = run_command(command, repo_root, timeout=args.child_timeout_seconds)
+    result = child_result(process)
+    write_text(output_dir / "fanout-stdout.txt", process["stdout"])
+    write_text(output_dir / "fanout-stderr.txt", process["stderr"])
+    write_json(output_dir / "fanout-result.json", result)
+
+    audit = result.get("completion_audit", {})
+    summary = result.get("summary", {})
+    parent_records = read_jsonl(fanout_dir / "parent_runs.jsonl")
+    parent_record = parent_records[0] if parent_records else {}
+    ok = process["exit_code"] == 0 and audit.get("status") == "completion_ready"
+
+    return {
+        "ok": ok,
+        "command": display_command(command),
+        "exit_code": process["exit_code"],
+        "output_dir": str(fanout_dir.resolve()),
+        "result_path": str((output_dir / "fanout-result.json").resolve()),
+        "report": result.get("report"),
+        "completion_status": audit.get("status"),
+        "terminal_outcomes": terminal_outcomes(summary, parent_record),
+        "session_ids": session_ids(parent_record),
+        "diagnostic_verdict": "completion_ready" if ok else "incomplete",
+    }
+
+
+def completion_audit(args: argparse.Namespace, output_dir: Path, components: dict[str, Any]) -> dict[str, Any]:
+    runtime_required = args.mode in {"all", "runtime-truth"}
+    fanout_required = args.mode in {"all", "fanout"}
+    requirements = [
+        maybe_requirement(runtime_required, "runtime_truth_all_scenarios_covered", components.get("runtime_truth", {}).get("coverage_status") == "complete", components.get("runtime_truth", {})),
+        maybe_requirement(runtime_required, "runtime_truth_not_blocked", components.get("runtime_truth", {}).get("backend_readiness") == "not_blocked", components.get("runtime_truth", {})),
+        maybe_requirement(fanout_required, "fanout_completion_ready", components.get("fanout", {}).get("completion_status") == "completion_ready", components.get("fanout", {})),
+        maybe_requirement(fanout_required, "fanout_artifacts_present", artifact_exists(components.get("fanout", {}).get("output_dir"), "completion_audit.json"), components.get("fanout", {})),
+        requirement("local_no_ui_required", True, {"ui_required": False}),
+        requirement("no_performance_claims", True, {"resource_pressure_sampled": False}),
+        requirement("report_written", True, {"report": str((output_dir / "report.md").resolve())}),
+    ]
+    requirements = [item for item in requirements if item is not None]
+    status = "completion_ready" if all(item["status"] == "proved" for item in requirements) else "incomplete"
+    return {"schema_version": 1, "status": status, "requirements": requirements}
+
+
+def planned_artifacts(output_dir: Path, mode: str) -> list[str]:
+    artifacts = [output_dir / "summary.json", output_dir / "completion_audit.json", output_dir / "report.md"]
+    if mode in {"all", "runtime-truth"}:
+        artifacts.extend([
+            output_dir / "runtime-truth-fixtures",
+            output_dir / "runtime-truth-result.json",
+            output_dir / "runtime-truth-stdout.txt",
+            output_dir / "runtime-truth-stderr.txt",
+        ])
+    if mode in {"all", "fanout"}:
+        artifacts.extend([output_dir / "fanout", output_dir / "fanout-result.json", output_dir / "fanout-stdout.txt", output_dir / "fanout-stderr.txt"])
+    return [str(path) for path in artifacts]
+
+
+def planned_commands(args: argparse.Namespace, repo_root: Path, output_dir: Path) -> list[dict[str, Any]]:
+    commands = []
+    if args.mode in {"all", "runtime-truth"}:
+        commands.append({
+            "component": "runtime_truth",
+            "timeout_seconds": args.child_timeout_seconds,
+            "command": display_command(
+                python_command(repo_root / "bin" / "pixir-runtime-trust-gauntlet")
+                + ["--fixture-dir", str(output_dir / "runtime-truth-fixtures"), "--json", "--fail-on-blocker", "--require-all-scenarios"]
+            ),
+        })
+    if args.mode in {"all", "fanout"}:
+        commands.append({
+            "component": "fanout",
+            "timeout_seconds": args.child_timeout_seconds,
+            "command": display_command([
+                args.mix_bin,
+                "pixir.bench.fanout_gauntlet",
+                "--json",
+                "--output",
+                str(output_dir / "fanout"),
+                "--pixir-bin",
+                args.pixir_bin,
+                "--direct-n",
+                str(args.direct_n),
+                "--parent-n",
+                str(args.parent_n),
+                "--timeout-ms",
+                str(args.timeout_ms),
+            ]),
+        })
+    return commands
+
+
+def requirement(name: str, proved: bool, evidence: dict[str, Any]) -> dict[str, Any]:
+    return {"name": name, "status": "proved" if proved else "missing", "evidence": evidence}
+
+
+def maybe_requirement(enabled: bool, name: str, proved: bool, evidence: dict[str, Any]) -> dict[str, Any] | None:
+    if not enabled:
+        return None
+    return requirement(name, proved, evidence)
+
+
+def run_command(command: list[str], cwd: Path, timeout: float | None = None) -> dict[str, Any]:
+    try:
+        process = subprocess.run(
+            command,
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "exit_code": 124,
+            "stdout": text_or_empty(exc.stdout),
+            "stderr": append_timeout_message(exc.stderr, timeout),
+        }
+    except FileNotFoundError as exc:
+        return {
+            "exit_code": 127,
+            "stdout": "",
+            "stderr": f"[gauntlet] child command not found: {exc.filename}\n",
+        }
+
+    return {"exit_code": process.returncode, "stdout": process.stdout, "stderr": process.stderr}
+
+
+def text_or_empty(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def append_timeout_message(stderr: str | bytes | None, timeout: float | None) -> str:
+    current = text_or_empty(stderr)
+    suffix = f"[gauntlet] child command timed out after {timeout}s"
+    return f"{current.rstrip()}\n{suffix}\n" if current else f"{suffix}\n"
+
+
+def python_command(script: Path) -> list[str]:
+    uv = shutil.which("uv")
+    if uv:
+        return [uv, "run", "python", str(script)]
+    python = shutil.which("python3") or shutil.which("python")
+    if python:
+        return [python, str(script)]
+    return ["python3", str(script)]
+
+
+def parse_child_json(stdout: str) -> dict[str, Any]:
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        return {
+            "ok": False,
+            "status": "tool_error",
+            "error": {
+                "kind": "child_json_parse_failed",
+                "message": "A child gauntlet did not emit parseable JSON.",
+                "details": {"json_error": str(exc), "stdout_preview": stdout[:1000]},
+                "next_actions": ["inspect the child stdout/stderr artifact", "rerun the child command directly"],
+            },
+        }
+
+
+def child_result(process: dict[str, Any]) -> dict[str, Any]:
+    if process["exit_code"] == 124:
+        return child_process_error(
+            "child_timeout",
+            "A child gauntlet command timed out before emitting completion evidence.",
+            process,
+            ["inspect the child stdout/stderr artifact", "increase --child-timeout-seconds"],
+        )
+
+    if process["exit_code"] == 127:
+        return child_process_error(
+            "child_command_not_found",
+            "A child gauntlet command could not be started.",
+            process,
+            ["verify the child command is installed", "override the command path when supported"],
+        )
+
+    return parse_child_json(process["stdout"])
+
+
+def child_process_error(kind: str, message: str, process: dict[str, Any], next_actions: list[str]) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "tool_error",
+        "error": {
+            "kind": kind,
+            "message": message,
+            "details": {
+                "exit_code": process["exit_code"],
+                "stdout_preview": process["stdout"][:1000],
+                "stderr_preview": process["stderr"][:1000],
+            },
+            "next_actions": next_actions,
+        },
+    }
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    return rows
+
+
+def terminal_outcomes(summary: dict[str, Any], parent_record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "overall_status": summary.get("status"),
+        "direct_runs": summary.get("functional", {}).get("direct_runs"),
+        "parent_outcome": parent_record.get("parent_outcome", {}),
+        "child_outcomes": parent_record.get("child_outcomes", []),
+    }
+
+
+def session_ids(parent_record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "parent_session_id": parent_record.get("parent_session_id"),
+        "child_session_ids": [
+            child.get("child_session_id")
+            for child in parent_record.get("child_outcomes", [])
+            if child.get("child_session_id")
+        ],
+    }
+
+
+def artifact_exists(output_dir: str | None, filename: str) -> bool:
+    if not output_dir:
+        return False
+    return (Path(output_dir) / filename).exists()
+
+
+def render_report(result: dict[str, Any]) -> str:
+    audit = result["completion_audit"]
+    runtime = result["components"].get("runtime_truth", {})
+    fanout = result["components"].get("fanout", {})
+    return f"""# Backend Gauntlet V2
+
+This is a backend runtime join gate for Pixir issue #93. It composes runtime
+truth fixtures and no-network fanout checks. It does not automate T3/Zed and it
+does not make performance claims.
+
+- Status: `{result["status"]}`
+- Completion audit: `{audit["status"]}`
+- Output: `{result["output_dir"]}`
+
+## Components
+
+| Component | Status | Verdict | Artifact |
+| --- | --- | --- | --- |
+| Runtime truth | `{runtime.get("ok")}` | `{runtime.get("diagnostic_verdict")}` | `{runtime.get("result_path")}` |
+| Fanout | `{fanout.get("ok")}` | `{fanout.get("diagnostic_verdict")}` | `{fanout.get("result_path")}` |
+
+## Evidence
+
+- Runtime scenarios covered: `{runtime.get("scenario_count")}`
+- Runtime coverage: `{runtime.get("coverage_status")}`
+- Runtime warnings: `{runtime.get("warning_count")}`
+- Runtime failures: `{runtime.get("failure_count")}`
+- Fanout terminal outcomes: `{json.dumps(fanout.get("terminal_outcomes", {}), ensure_ascii=False, sort_keys=True)}`
+- Fanout session ids: `{json.dumps(fanout.get("session_ids", {}), ensure_ascii=False, sort_keys=True)}`
+
+## Completion Requirements
+
+{render_requirements(audit)}
+
+## Interpretation
+
+Use this output as backend evidence only. UI projection parity, live network model
+quality, and resource pressure belong to separate gauntlets.
+"""
+
+
+def render_requirements(audit: dict[str, Any]) -> str:
+    lines = []
+    for item in audit["requirements"]:
+        lines.append(f"- `{item['name']}`: `{item['status']}`")
+    return "\n".join(lines)
+
+
+def next_actions(audit: dict[str, Any], component_ok: bool) -> list[str]:
+    if component_ok and audit["status"] == "completion_ready":
+        return ["attach report.md and completion_audit.json as #93 evidence"]
+    return [
+        "inspect component stdout/stderr artifacts",
+        "fix missing or failed requirements",
+        "rerun the full backend gauntlet v2",
+    ]
+
+
+def fixture_slug(fixture: dict[str, Any]) -> str:
+    return str(fixture.get("evidence", {}).get("session_id", "fixture")).replace("_", "-")
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def write_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value, encoding="utf-8")
+
+
+def emit(result: dict[str, Any], json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    elif result["ok"]:
+        print(f"backend gauntlet v2 {result['status']}: {result.get('output_dir', '')}")
+    else:
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), file=sys.stderr)
+
+
+def display_command(command: list[str]) -> str:
+    return " ".join(command)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def tool_error(kind: str, message: str, details: dict[str, Any], next_actions: list[str]) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "tool_error",
+        "classification": "backend_gauntlet_v2_unavailable",
+        "error": {
+            "kind": kind,
+            "message": message,
+            "details": details,
+            "next_actions": next_actions,
+        },
+        "next_actions": next_actions,
+    }
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

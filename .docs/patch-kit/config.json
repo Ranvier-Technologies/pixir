@@ -1,0 +1,81 @@
+{
+  "adapter": {
+    "ci_provider": null,
+    "package_manager": "unknown",
+    "task_runner": "uv",
+    "test_command": null
+  },
+  "artifactRoot": ".docs/patches",
+  "branches": {
+    "default_target": null,
+    "donor_remote": null
+  },
+  "capabilities": {
+    "patch:accept": true,
+    "patch:artifacts:prune": true,
+    "patch:classify": true,
+    "patch:diff:snapshot": true,
+    "patch:drift:analyze": true,
+    "patch:proof:playwright": true,
+    "patch:proof:runtime": true,
+    "patch:review:coderabbit": true,
+    "patch:status": true,
+    "patch:truth:check": true,
+    "patch:worktree:init": true
+  },
+  "capabilityNames": [
+    "patch:accept",
+    "patch:artifacts:prune",
+    "patch:classify",
+    "patch:diff:snapshot",
+    "patch:drift:analyze",
+    "patch:proof:playwright",
+    "patch:proof:runtime",
+    "patch:review:coderabbit",
+    "patch:status",
+    "patch:truth:check",
+    "patch:worktree:init"
+  ],
+  "commandRunner": "unknown",
+  "defaultAcceptanceCommands": [],
+  "defaults": {
+    "artifact_root": ".docs/patches",
+    "dry_run_first": true,
+    "machine_output": "stdout",
+    "template_path": ".docs/templates/patch.template.md"
+  },
+  "externalTools": {
+    "coderabbit": {
+      "canonical": true,
+      "dependency": false,
+      "invoke": "coderabbit"
+    }
+  },
+  "kitName": "patch-operator-kit",
+  "kitVersion": "0.3.4-alpha.1",
+  "packageScripts": {
+    "patch:accept": "uv run scripts/patch_cli.py accept",
+    "patch:artifacts:prune": "uv run scripts/patch_cli.py artifacts-prune",
+    "patch:classify": "uv run scripts/patch_cli.py classify",
+    "patch:diff:snapshot": "uv run scripts/patch_cli.py diff-snapshot",
+    "patch:drift:analyze": "uv run scripts/patch_cli.py drift-analyze",
+    "patch:proof:playwright": "uv run scripts/patch_cli.py proof-playwright",
+    "patch:proof:runtime": "uv run scripts/patch_cli.py proof-runtime",
+    "patch:review:coderabbit": "uv run scripts/patch_cli.py review-coderabbit",
+    "patch:status": "uv run scripts/patch_cli.py status",
+    "patch:truth:check": "uv run scripts/patch_cli.py truth-check",
+    "patch:worktree:init": "uv run scripts/patch_cli.py worktree-init"
+  },
+  "playwrightProofCommands": [],
+  "profile": "review-proof",
+  "repoLawFile": "AGENTS.md",
+  "repo_law": "AGENTS.md",
+  "reviewProvider": "coderabbit",
+  "runtimeProofCommands": [],
+  "schemaVersion": 1,
+  "schemaVersions": {
+    "classification": 1,
+    "patchSpec": 1
+  },
+  "templatePath": ".docs/templates/patch.template.md"
+}

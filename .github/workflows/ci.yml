@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  elixir:
+    name: Elixir checks
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - name: Set up Erlang/OTP and Elixir
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93
+        with:
+          otp-version: "29"
+          elixir-version: "1.20.2"
+
+      - name: Install Hex and Rebar
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+
+      - name: Fetch dependencies
+        run: mix deps.get
+
+      - name: Check formatting
+        run: mix format --check-formatted
+
+      - name: Compile with warnings as errors
+        run: mix compile --warnings-as-errors
+
+      - name: Run tests with warnings as errors
+        env:
+          MIX_ENV: test
+        run: mix do compile --warnings-as-errors + test --warnings-as-errors
+
+      - name: Build Pixir escript
+        run: mix escript.build
+
+      - name: Run Pixir doctor
+        run: ./pixir doctor --json
+
+      - name: Run workflow smoke
+        run: mix pixir.smoke.workflows --dry-run --json
+
+      - name: Run prompt-cache smoke
+        run: mix pixir.smoke.prompt_cache --dry-run --json
+
+      - name: Run WebSocket smoke
+        run: mix pixir.smoke.websocket --dry-run --json
+
+      - name: Build docs with warnings as errors
+        run: mix docs --warnings-as-errors

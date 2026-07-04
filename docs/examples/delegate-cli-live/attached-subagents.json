@@ -1,0 +1,19 @@
+{
+  "contract_version": 1,
+  "strategy": "subagents",
+  "mode": "read_only",
+  "workspace_mode": "shared",
+  "subagents": {
+    "role": "explorer",
+    "max_threads": 2,
+    "max_depth": 1
+  },
+  "tasks": [
+    "Read README.md only. Return exactly 2 bullets explaining what Pixir is. Do not edit files.",
+    "Read CONTEXT.md only. Return exactly 2 bullets explaining what the Log is and why summaries are not evidence. Do not edit files."
+  ],
+  "limits": {
+    "timeout_ms": 120000
+  }
+}
+

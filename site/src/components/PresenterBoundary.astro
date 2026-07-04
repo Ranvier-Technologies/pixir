@@ -1,0 +1,88 @@
+<section class="section alt architecture-section" id="architecture" aria-labelledby="architecture-title">
+  <div class="section-inner">
+    <p class="section-kicker">Runtime Architecture</p>
+    <h2 id="architecture-title">Presenters drive Pixir. Pixir owns the runtime.</h2>
+    <p class="section-lead">
+      Different tools, same boundary. Operators and presenters request work;
+      Pixir executes, supervises, and keeps the evidence.
+    </p>
+
+    <div class="architecture-map" role="group" aria-label="Presenter and Pixir runtime boundary">
+      <div class="architecture-label">Operators &amp; Presenters</div>
+      <div class="actor-band" role="list" aria-label="Operators and presenters">
+        <div class="actor" role="listitem">
+          <img src="/logos/openai/openai-symbol-2025.svg" width="20" height="20" alt="" />
+          <strong>Codex</strong>
+          <span>meta-orchestrator</span>
+        </div>
+        <div class="actor" role="listitem">
+          <img src="/logos/lucide/square-terminal.svg" width="24" height="24" alt="" />
+          <strong>CLI</strong>
+          <span>presenter</span>
+        </div>
+        <div class="actor" role="listitem">
+          <img src="/logos/simple-icons/zedindustries.svg" width="24" height="24" alt="" />
+          <strong>Zed</strong>
+          <span>ACP client</span>
+        </div>
+        <div class="actor" role="listitem">
+          <img src="/logos/svgl/t3-stack-dark.svg" width="258" height="199" alt="" />
+          <strong>T3Code</strong>
+          <span>ACP client</span>
+        </div>
+        <div class="actor" role="listitem">
+          <img src="/logos/lucide/panel-top.svg" width="24" height="24" alt="" />
+          <strong>Custom UI</strong>
+          <span>ACP client</span>
+        </div>
+      </div>
+
+      <div class="request-rail" aria-hidden="true">
+        <span>request work</span>
+        <code>ACP / CLI</code>
+      </div>
+
+      <div class="architecture-label architecture-label-owner">
+        <img src="/brand/pixir-icon.svg" width="256" height="256" alt="" />
+        <span>Pixir Runtime</span>
+      </div>
+      <div class="runtime-band" role="list" aria-label="Pixir runtime primitives">
+        <div class="runtime-primitive" role="listitem">
+          <img src="/logos/lucide/user-round.svg" width="24" height="24" alt="" />
+          <strong>Session</strong>
+          <span>conversation process</span>
+        </div>
+        <div class="runtime-primitive" role="listitem">
+          <img src="/logos/lucide/refresh-cw.svg" width="24" height="24" alt="" />
+          <strong>Turn</strong>
+          <span>provider/tool loop</span>
+        </div>
+        <div class="runtime-primitive" role="listitem">
+          <img src="/logos/lucide/network.svg" width="24" height="24" alt="" />
+          <strong>Subagents</strong>
+          <span>child Sessions</span>
+        </div>
+        <div class="runtime-primitive" role="listitem">
+          <img src="/logos/lucide/workflow.svg" width="24" height="24" alt="" />
+          <strong>Workflows</strong>
+          <span>structured outcomes</span>
+        </div>
+        <div class="runtime-primitive" role="listitem">
+          <img src="/logos/lucide/puzzle.svg" width="24" height="24" alt="" />
+          <strong>Provider/Tools</strong>
+          <span>permissioned loop</span>
+        </div>
+        <div class="runtime-primitive evidence" role="listitem">
+          <img src="/logos/lucide/file-check.svg" width="24" height="24" alt="" />
+          <strong>Evidence Log</strong>
+          <span>logs and artifacts</span>
+        </div>
+      </div>
+    </div>
+
+    <p class="logo-disclaimer">
+      Logos identify example operators or presenters. They do not imply bundled
+      integrations, endorsement, or production support.
+    </p>
+  </div>
+</section>

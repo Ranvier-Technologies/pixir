@@ -1,0 +1,50 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 256 256"
+  role="img"
+  aria-labelledby="pixir-logo-mono-title pixir-logo-mono-desc"
+>
+  <title id="pixir-logo-mono-title">Pixir logo monochrome</title>
+  <desc id="pixir-logo-mono-desc">
+    A monochrome Pixir wordmark using a rounded P-shaped BEAM constellation as
+    the first letter.
+  </desc>
+
+  <g
+    id="pixir-mark"
+    fill="none"
+    stroke="currentColor"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path d="M72 50v168" stroke-width="15" />
+    <path d="M72 50h72c36 0 60 21 60 54s-24 54-60 54H98" stroke-width="15" />
+    <path d="M72 114l49-2" stroke-width="8" />
+    <path d="M121 112l34-34" stroke-width="8" />
+    <path d="M121 112l49 14" stroke-width="8" />
+  </g>
+
+  <g id="pixir-nodes" fill="currentColor">
+    <circle cx="72" cy="50" r="11" />
+    <circle cx="72" cy="114" r="11" />
+    <circle cx="72" cy="218" r="7" />
+    <circle cx="121" cy="112" r="14" />
+    <circle cx="155" cy="78" r="12" />
+    <circle cx="170" cy="126" r="12" />
+  </g>
+
+  <g id="pixir-wordmark" fill="currentColor">
+    <rect x="103" y="181" width="9" height="34" rx="1.5" />
+    <rect x="103" y="168" width="9" height="9" rx="1.5" />
+
+    <polygon points="119,181 130,181 150,215 139,215" />
+    <polygon points="139,181 150,181 130,215 119,215" />
+
+    <rect x="158" y="181" width="9" height="34" rx="1.5" />
+    <rect x="158" y="168" width="9" height="9" rx="1.5" />
+
+    <rect x="176" y="181" width="9" height="34" rx="1.5" />
+    <rect x="176" y="181" width="30" height="9" rx="1.5" />
+    <rect x="197" y="181" width="9" height="15" rx="1.5" />
+  </g>
+</svg>

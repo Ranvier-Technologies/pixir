@@ -1,0 +1,34 @@
+---
+import RuntimeSpine from "./RuntimeSpine.astro";
+import TerminalProof from "./TerminalProof.astro";
+---
+
+<section class="hero" aria-labelledby="hero-title">
+  <div class="hero-inner">
+    <div class="hero-copy">
+      <div class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Developer Preview · supervised runtime</div>
+      <div class="hero-title-row">
+        <h1 id="hero-title">Supervised subagents and workflows for coding agents.</h1>
+        <div class="hero-mark" aria-hidden="true">
+          <img src="/brand/pixir-icon.svg" width="256" height="256" alt="" />
+        </div>
+      </div>
+      <p class="lead">
+        Pixir is an Elixir/OTP harness for running agent work as supervised local
+        sessions. Drive it from the CLI or ACP clients; Pixir owns subagent
+        lifecycle, workflow outcomes, failures, timeouts, and replayable evidence
+        without making the presenter the runtime.
+      </p>
+      <div class="hero-actions">
+        <a class="button primary" href="https://hex.pm/packages/pixir">Install from Hex</a>
+        <a class="button secondary" href="https://pixir.hexdocs.pm/readme.html">Read HexDocs</a>
+        <a class="button secondary" href="https://github.com/Ranvier-Technologies/pixir-harness">View source</a>
+      </div>
+    </div>
+
+    <div class="hero-proof" role="group" aria-label="Pixir proof artifacts">
+      <TerminalProof />
+      <RuntimeSpine />
+    </div>
+  </div>
+</section>

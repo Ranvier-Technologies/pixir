@@ -1,0 +1,64 @@
+{
+  "id": "parallel_review",
+  "version": 1,
+  "name": "Parallel read-only review",
+  "description": "Two read-only explorer steps followed by one synthesis step.",
+  "parameters": {
+    "topic": {
+      "type": "string",
+      "required": true,
+      "description": "The subject to review."
+    },
+    "focus_a": {
+      "type": "string",
+      "required": true,
+      "description": "The first independent review focus."
+    },
+    "focus_b": {
+      "type": "string",
+      "required": true,
+      "description": "The second independent review focus."
+    }
+  },
+  "workflow": {
+    "id": "readonly_review",
+    "name": "Read-only review: {{topic}}",
+    "max_concurrency": 2,
+    "steps": [
+      {
+        "id": "inspect_a",
+        "agent": "explorer",
+        "permission_mode": "read_only",
+        "workspace_mode": "shared",
+        "read_set": [
+          "**/*"
+        ],
+        "task": "Review {{topic}} with focus on {{focus_a}}. Return concise evidence and note limitations."
+      },
+      {
+        "id": "inspect_b",
+        "agent": "explorer",
+        "permission_mode": "read_only",
+        "workspace_mode": "shared",
+        "read_set": [
+          "**/*"
+        ],
+        "task": "Review {{topic}} with focus on {{focus_b}}. Return concise evidence and note limitations."
+      },
+      {
+        "id": "synthesize",
+        "agent": "explorer",
+        "permission_mode": "read_only",
+        "workspace_mode": "shared",
+        "read_set": [
+          "**/*"
+        ],
+        "depends_on": [
+          "inspect_a",
+          "inspect_b"
+        ],
+        "task": "Synthesize the two read-only reviews for {{topic}}. Report agreement, disagreement, limitations, and safe next actions."
+      }
+    ]
+  }
+}

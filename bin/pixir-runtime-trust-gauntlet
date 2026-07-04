@@ -1,0 +1,653 @@
+#!/usr/bin/env python3
+"""Run fixture-backed Pixir runtime trust projection checks.
+
+This repo-local diagnostic adapter evaluates whether a Pixir run has coherent
+runtime truth across canonical Log evidence, replay/cache expectations, and
+presenter projection. It is intentionally fixture-friendly so agents can verify
+the contract without live T3 Code, Zed, network, or model calls.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+
+SCENARIOS: dict[str, dict[str, Any]] = {
+    "T0": {
+        "name": "clean_one_turn_answer",
+        "summary": "Clean one-turn answer, no tools.",
+        "registry_impact": "blocker",
+    },
+    "T1": {
+        "name": "partial_answer_then_provider_error",
+        "summary": "Provider emits useful text deltas, then errors.",
+        "registry_impact": "blocker",
+    },
+    "T2": {
+        "name": "provider_error_before_text",
+        "summary": "Provider errors before useful assistant text.",
+        "registry_impact": "blocker",
+    },
+    "T3": {
+        "name": "tool_call_plus_final_answer",
+        "summary": "Tool call plus final assistant answer.",
+        "registry_impact": "blocker",
+    },
+    "T4": {
+        "name": "subagent_timeout",
+        "summary": "Subagent timeout is explicit and actionable.",
+        "registry_impact": "blocker_if_opaque",
+    },
+    "T5": {
+        "name": "workflow_partial_outcome",
+        "summary": "Workflow partial outcome is not collapsed into success.",
+        "registry_impact": "blocker_if_collapsed",
+    },
+    "T6": {
+        "name": "acp_load_after_partial_assistant",
+        "summary": "ACP load never projects partial assistant evidence as clean final.",
+        "registry_impact": "blocker",
+    },
+    "T7": {
+        "name": "replay_cache_after_failure_evidence",
+        "summary": "Audit-only failure evidence does not alter Provider replay prefix.",
+        "registry_impact": "warning_or_blocker",
+    },
+    "T8": {
+        "name": "client_dogfood_parity",
+        "summary": "T3 Code and Zed visible state agrees with Pixir Log diagnostics.",
+        "registry_impact": "blocker",
+    },
+    "T9": {
+        "name": "turn_timeout_or_interrupted",
+        "summary": "Interrupted or timed-out Turn leaves explicit terminal evidence.",
+        "registry_impact": "blocker",
+    },
+    "T10": {
+        "name": "subagent_completion",
+        "summary": "Subagent completion is explicit, durable, and attributable.",
+        "registry_impact": "blocker",
+    },
+    "T11": {
+        "name": "workflow_full_completion",
+        "summary": "Workflow full completion has durable checkpoint-ready evidence.",
+        "registry_impact": "blocker",
+    },
+}
+
+STATUS_ORDER = {"pass": 0, "warn": 1, "fail": 2}
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    if args.list_scenarios:
+        result = matrix_result()
+    elif args.dry_run:
+        result = dry_run_result(args)
+    else:
+        fixtures = collect_fixtures(args)
+        if isinstance(fixtures, dict) and fixtures.get("status") == "tool_error":
+            result = fixtures
+        else:
+            result = run_gauntlet(fixtures, require_all_scenarios=args.require_all_scenarios)
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print_human(result)
+
+    if result.get("status") == "tool_error":
+        return 2
+    if args.fail_on_blocker and result.get("backend_readiness", result.get("registry_readiness")) == "blocked":
+        return 1
+    return 0
+
+
+def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate Pixir runtime trust scenarios from sanitized fixtures. "
+            "Use this to compare canonical evidence against presenter projection "
+            "without relying on screenshots alone."
+        )
+    )
+    parser.add_argument(
+        "--fixture",
+        action="append",
+        default=[],
+        help="Fixture JSON file to evaluate. May be passed more than once.",
+    )
+    parser.add_argument(
+        "--fixture-dir",
+        help="Directory containing *.json fixtures to evaluate in sorted order.",
+    )
+    parser.add_argument(
+        "--list-scenarios",
+        action="store_true",
+        help="Print the built-in scenario matrix without running fixtures.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show which fixtures would run and the scenario matrix, without evaluating them.",
+    )
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    parser.add_argument(
+        "--fail-on-blocker",
+        action="store_true",
+        help="Exit 1 if any scenario blocks backend readiness.",
+    )
+    parser.add_argument(
+        "--require-all-scenarios",
+        action="store_true",
+        help="Treat missing scenario coverage as a backend readiness blocker.",
+    )
+    return parser.parse_args(argv)
+
+
+def matrix_result() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "status": "ready",
+        "classification": "scenario_matrix",
+        "scenarios": scenario_rows(),
+        "next_actions": [
+            "run with --fixture or --fixture-dir to evaluate evidence",
+            "use --json for machine-readable output",
+        ],
+    }
+
+
+def dry_run_result(args: argparse.Namespace) -> dict[str, Any]:
+    fixture_paths = planned_fixture_paths(args)
+    return {
+        "ok": True,
+        "status": "ready",
+        "classification": "dry_run",
+        "planned_fixtures": [redact_path(path) for path in fixture_paths],
+        "scenarios": scenario_rows(),
+        "next_actions": ["remove --dry-run to evaluate fixtures"],
+    }
+
+
+def collect_fixtures(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any]:
+    paths = planned_fixture_paths(args)
+
+    if not paths:
+        return tool_error(
+            "no_fixtures",
+            "No runtime trust fixtures were provided.",
+            {},
+            ["pass --fixture <file.json>", "pass --fixture-dir <directory>", "or use --list-scenarios"],
+        )
+
+    fixtures = []
+    for path in paths:
+        if not path.exists():
+            return tool_error(
+                "fixture_missing",
+                "A runtime trust fixture was not found.",
+                {"path": redact_path(path)},
+                ["check the fixture path", "use --dry-run to inspect planned fixtures"],
+            )
+
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                fixture = json.load(handle)
+        except json.JSONDecodeError as exc:
+            return tool_error(
+                "fixture_invalid_json",
+                "A runtime trust fixture is not valid JSON.",
+                {"path": redact_path(path), "json_error": str(exc)},
+                ["fix the JSON fixture", "rerun with --json for structured output"],
+            )
+        except OSError as exc:
+            return tool_error(
+                "fixture_unreadable",
+                "A runtime trust fixture could not be read.",
+                {"path": redact_path(path), "io_error": str(exc)},
+                ["check file permissions", "check that the fixture path is a readable JSON file"],
+            )
+
+        if not isinstance(fixture, dict):
+            return tool_error(
+                "fixture_invalid_shape",
+                "A runtime trust fixture must be a JSON object.",
+                {"path": redact_path(path), "json_type": type(fixture).__name__},
+                ["wrap fixture fields in a JSON object", "include a scenario key such as T0"],
+            )
+
+        fixture["_fixture_path"] = redact_path(path)
+        fixtures.append(fixture)
+
+    return fixtures
+
+
+def planned_fixture_paths(args: argparse.Namespace) -> list[Path]:
+    paths = [Path(value).expanduser() for value in args.fixture]
+    if args.fixture_dir:
+        root = Path(args.fixture_dir).expanduser()
+        if root.exists():
+            paths.extend(sorted(root.glob("*.json")))
+        else:
+            paths.append(root)
+    return paths
+
+
+def run_gauntlet(fixtures: list[dict[str, Any]], *, require_all_scenarios: bool = False) -> dict[str, Any]:
+    results = [evaluate_fixture(fixture) for fixture in fixtures]
+    summary = summarize(results, require_all_scenarios=require_all_scenarios)
+    backend_readiness = "blocked" if summary["backend_blockers"] else "not_blocked"
+
+    return {
+        "ok": backend_readiness != "blocked",
+        "status": "ready",
+        "classification": "runtime_trust_gauntlet",
+        "backend_readiness": backend_readiness,
+        "registry_readiness": backend_readiness,
+        "summary": summary,
+        "results": results,
+        "next_actions": next_actions_for(summary, backend_readiness),
+    }
+
+
+def evaluate_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
+    scenario_id = str(fixture.get("scenario") or "").upper()
+    scenario = SCENARIOS.get(scenario_id)
+
+    if not scenario:
+        return result(
+            fixture,
+            scenario_id or "__missing__",
+            "fail",
+            "unknown_scenario",
+            ["fixture scenario must be one of " + ", ".join(SCENARIOS.keys())],
+        )
+
+    checks = {
+        "T0": check_t0,
+        "T1": check_t1,
+        "T2": check_t2,
+        "T3": check_t3,
+        "T4": check_t4,
+        "T5": check_t5,
+        "T6": check_t6,
+        "T7": check_t7,
+        "T8": check_t8,
+        "T9": check_t9,
+        "T10": check_t10,
+        "T11": check_t11,
+    }
+    status, classification, findings = checks[scenario_id](fixture)
+    return result(fixture, scenario_id, status, classification, findings)
+
+
+def check_t0(fixture: dict[str, Any]) -> tuple[str, str, list[str]]:
+    pixir = fixture_layer(fixture, "pixir")
+    presenter = fixture_layer(fixture, "presenter")
+
+    findings = []
+    if pixir.get("clean_assistant_messages", 0) < 1:
+        findings.append("Pixir lacks a clean assistant_message.")
+    if presenter.get("clean_final_answer") is not True:
+        findings.append("Presenter did not show a clean final answer.")
+    if presenter.get("completed") is not True:
+        findings.append("Presenter did not mark the turn completed.")
+
+    return status_for_findings(findings), "clean_answer_parity", findings
+
+
+def check_t1(fixture: dict[str, Any]) -> tuple[str, str, list[str]]:
+    pixir = fixture_layer(fixture, "pixir")
+    presenter = fixture_layer(fixture, "presenter")
+
+    findings = []
+    if pixir.get("partial_assistant_messages", 0) < 1:
+        findings.append("Pixir did not preserve partial assistant evidence.")
+    if presenter.get("clean_final_answer") is True:
+        findings.append("Presenter projected partial assistant evidence as a clean final answer.")
+    if presenter.get("completed") is True:
+        findings.append("Presenter marked a provider-error partial answer as completed.")
+    if presenter.get("partial_marked") is not True:
+        findings.append("Presenter did not mark the visible text as partial or error evidence.")
+
+    return status_for_findings(findings), "partial_answer_projection", findings
+
+
+def check_t2(fixture: dict[str, Any]) -> tuple[str, str, list[str]]:
+    pixir = fixture_layer(fixture, "pixir")
+    presenter = fixture_layer(fixture, "presenter")
+
+    findings = []
+    if pixir.get("turn_failed_count", 0) < 1:
+        findings.append("Pixir lacks turn_failed evidence for a no-text provider error.")
+    if presenter.get("clean_final_answer") is True:
+        findings.append("Presenter showed a clean final answer after no-text provider error.")
+    if presenter.get("stale_historical_answer") is True:
+        findings.append("Presenter replayed stale historical assistant text.")
+
+    return status_for_findings(findings), "no_text_provider_error", findings
+
+
+def check_t3(fixture: dict[str, Any]) -> tuple[str, str, list[str]]:
+    pixir = fixture_layer(fixture, "pixir")
+    presenter = fixture_layer(fixture, "presenter")
+
+    findings = []
+    if pixir.get("tool_pairing_ok") is not True:
+        findings.append("Pixir tool_call/tool_result evidence is not paired.")
+    if pixir.get("clean_assistant_messages", 0) < 1:
+        findings.append("Pixir lacks a final assistant_message after tool use.")
+    if presenter.get("clean_final_answer") is not True:
+        findings.append("Presenter did not show a clean final answer after tool use.")
+
+    return status_for_findings(findings), "tool_answer_parity", findings
+
+
+def check_t4(fixture: dict[str, Any]) -> tuple[str, str, list[str]]:
+    pixir = fixture_layer(fixture, "pixir")
+    timeouts = pixir.get("subagent_timeouts") or []
+
+    findings = []
+    if not timeouts:
+        findings.append("Fixture lacks Subagent timeout evidence.")
+    for timeout in timeouts:
+        missing = timeout.get("missing_fields") or []
+        if missing:
+            findings.append("Subagent timeout evidence is missing fields: " + ", ".join(missing))
+
+    if findings:
+        return "fail", "subagent_timeout_opaque", findings
+    return "warn", "subagent_timeout_actionable", ["Timeout is explicit and actionable."]
+
+
+def check_t5(fixture: dict[str, Any]) -> tuple[str, str, list[str]]:
+    pixir = fixture_layer(fixture, "pixir")
+    presenter = fixture_layer(fixture, "presenter")
+
+    outcome = pixir.get("workflow_outcome") or pixir.get("workflow_status")
+    checkpoint_statuses = pixir.get("checkpoint_statuses") or []
+    findings = []
+    if outcome not in {"partial", "failed", "timed_out"}:
+        findings.append("Workflow outcome is not partial, failed, or timed_out.")
+    if checkpoint_statuses and not any(status in {"partial", "failed", "timed_out", "held"} for status in checkpoint_statuses):
+        findings.append("Workflow checkpoint evidence does not contain partial, failed, timed_out, or held state.")
+    if presenter.get("completed") is True:
+        findings.append("Presenter collapsed a partial Workflow outcome into completed.")
+
+    return status_for_findings(findings), "workflow_partial_outcome", findings
+
+
+def check_t6(fixture: dict[str, Any]) -> tuple[str, str, list[str]]:
+    acp = fixture_layer(fixture, "acp")
+    findings = []
+    if acp.get("partial_loaded_as_clean") is True:
+        findings.append("ACP load projected partial assistant evidence as clean final.")
+    if acp.get("turn_failed_loaded_as_clean") is True:
+        findings.append("ACP load projected turn_failed evidence as clean final.")
+
+    return status_for_findings(findings), "acp_replay_partial_guard", findings
+
+
+def check_t7(fixture: dict[str, Any]) -> tuple[str, str, list[str]]:
+    replay = fixture_layer(fixture, "replay")
+    findings = []
+    if replay.get("failure_events_in_provider_input") is True:
+        findings.append("Audit-only failure events appeared in Provider replay input.")
+    if replay.get("provider_prefix_changed_by_failure_evidence") is True:
+        findings.append("Provider prefix changed due to audit-only failure evidence.")
+
+    return status_for_findings(findings), "replay_cache_failure_impact", findings
+
+
+def check_t8(fixture: dict[str, Any]) -> tuple[str, str, list[str]]:
+    pixir = fixture_layer(fixture, "pixir")
+    presenter = fixture_layer(fixture, "presenter")
+
+    findings = []
+    if presenter.get("visible") is not True:
+        findings.append("Presenter-visible result is missing or unconfirmed.")
+    if presenter.get("agrees_with_pixir") is not True:
+        findings.append("Presenter projection does not agree with Pixir canonical evidence.")
+    if pixir.get("diagnostics_status") not in {"pass", "warn"}:
+        findings.append("Pixir diagnostics status is not acceptable for dogfood parity.")
+
+    return status_for_findings(findings), "client_dogfood_parity", findings
+
+
+def check_t9(fixture: dict[str, Any]) -> tuple[str, str, list[str]]:
+    pixir = fixture_layer(fixture, "pixir")
+    presenter = fixture_layer(fixture, "presenter")
+
+    terminal_status = pixir.get("terminal_status")
+    turn_failed_count = non_negative_int(pixir.get("turn_failed_count"))
+    findings = []
+    if terminal_status not in {"timed_out", "interrupted"}:
+        findings.append("Turn terminal_status is not timed_out or interrupted.")
+    if turn_failed_count < 1:
+        findings.append("Pixir lacks durable turn_failed evidence for the terminal Turn.")
+    if not pixir.get("error_kind"):
+        findings.append("Turn failure evidence lacks error_kind.")
+    if presenter.get("clean_final_answer") is True:
+        findings.append("Presenter showed a clean final answer after terminal Turn failure.")
+    if presenter.get("completed") is True:
+        findings.append("Presenter marked a timed-out or interrupted Turn as completed.")
+
+    return status_for_findings(findings), "turn_terminal_failure", findings
+
+
+def check_t10(fixture: dict[str, Any]) -> tuple[str, str, list[str]]:
+    pixir = fixture_layer(fixture, "pixir")
+    raw_terminal_states = pixir.get("subagent_terminal_states") or []
+
+    findings = []
+    if not isinstance(raw_terminal_states, list):
+        findings.append("subagent_terminal_states is not a list.")
+        terminal_states = []
+    else:
+        terminal_states = []
+        invalid_count = 0
+        for state in raw_terminal_states:
+            if isinstance(state, dict):
+                terminal_states.append(state)
+            else:
+                invalid_count += 1
+        if invalid_count:
+            findings.append(f"subagent_terminal_states contains {invalid_count} non-object entries.")
+
+    completed = [state for state in terminal_states if state.get("status") == "completed"]
+    if not completed:
+        findings.append("Fixture lacks completed Subagent terminal evidence.")
+    for state in completed:
+        missing = [
+            field
+            for field in ["subagent_id", "child_session_id", "status", "elapsed_ms"]
+            if state.get(field) in {None, ""}
+        ]
+        if not (state.get("summary") or state.get("result") or state.get("checkpoint")):
+            missing.append("summary_or_result")
+        if missing:
+            findings.append("Subagent completion evidence is missing fields: " + ", ".join(missing))
+
+    return status_for_findings(findings), "subagent_completion_evidence", findings
+
+
+def check_t11(fixture: dict[str, Any]) -> tuple[str, str, list[str]]:
+    pixir = fixture_layer(fixture, "pixir")
+    presenter = fixture_layer(fixture, "presenter")
+
+    workflow_status = pixir.get("workflow_status") or pixir.get("workflow_outcome")
+    checkpoint_statuses = pixir.get("checkpoint_statuses") or []
+    findings = []
+    if workflow_status not in {"completed", "completion_ready"}:
+        findings.append("Workflow status is not completed or completion_ready.")
+    if not checkpoint_statuses:
+        findings.append("Workflow completion lacks checkpoint status evidence.")
+    if checkpoint_statuses and any(status != "checkpoint_ready" for status in checkpoint_statuses):
+        findings.append("Workflow completion contains a non-checkpoint_ready checkpoint.")
+    if presenter and presenter.get("completed") is False:
+        findings.append("Presenter contradicted full Workflow completion evidence.")
+
+    return status_for_findings(findings), "workflow_completion_evidence", findings
+
+
+def status_for_findings(findings: list[str]) -> str:
+    return "fail" if findings else "pass"
+
+
+def result(
+    fixture: dict[str, Any],
+    scenario_id: str,
+    status: str,
+    classification: str,
+    findings: list[str],
+) -> dict[str, Any]:
+    scenario = SCENARIOS.get(scenario_id, {})
+    registry_blocker = status == "fail" and scenario.get("registry_impact", "blocker") != "warning"
+    return {
+        "fixture": fixture.get("_fixture_path"),
+        "scenario": scenario_id,
+        "scenario_name": scenario.get("name"),
+        "status": status,
+        "classification": classification,
+        "registry_blocker": registry_blocker,
+        "findings": findings,
+        "evidence": fixture.get("evidence", {}),
+    }
+
+
+def summarize(results: list[dict[str, Any]], *, require_all_scenarios: bool = False) -> dict[str, Any]:
+    counts = {"pass": 0, "warn": 0, "fail": 0}
+    for item in results:
+        counts[item["status"]] += 1
+
+    covered = {item["scenario"] for item in results if item["scenario"] in SCENARIOS}
+    missing_scenarios = sorted(set(SCENARIOS) - covered)
+
+    blockers = [
+        {
+            "scenario": item["scenario"],
+            "classification": item["classification"],
+            "fixture": item["fixture"],
+        }
+        for item in results
+        if item["registry_blocker"]
+    ]
+    if require_all_scenarios:
+        blockers.extend(
+            {
+                "scenario": scenario_id,
+                "classification": "missing_required_scenario",
+                "fixture": None,
+            }
+            for scenario_id in missing_scenarios
+        )
+
+    return {
+        "total": len(results),
+        "pass": counts["pass"],
+        "warn": counts["warn"],
+        "fail": counts["fail"],
+        "coverage_status": "complete" if not missing_scenarios else "incomplete",
+        "covered_scenarios": sorted(covered),
+        "missing_scenarios": missing_scenarios,
+        "require_all_scenarios": require_all_scenarios,
+        "backend_blockers": blockers,
+        "registry_blockers": blockers,
+    }
+
+
+def next_actions_for(summary: dict[str, Any], backend_readiness: str) -> list[str]:
+    if summary["total"] == 0:
+        return ["provide at least one fixture"]
+    actions = []
+    if summary.get("require_all_scenarios") and summary.get("missing_scenarios"):
+        actions.extend([
+            "add fixtures for every missing scenario",
+            "rerun with --require-all-scenarios --fail-on-blocker",
+            "use the complete output as #84 backend join-gate evidence",
+        ])
+    if backend_readiness == "blocked":
+        actions.extend([
+            "inspect each backend_blocker",
+            "fix the underlying runtime or projection issue",
+            "rerun affected scenarios, then rerun the full gauntlet",
+        ])
+    if actions:
+        return list(dict.fromkeys(actions))
+    if summary["warn"]:
+        return ["review warning scenarios before using this as release or registry confidence evidence"]
+    return ["use this gauntlet output as deterministic evidence for #84"]
+
+
+def fixture_layer(fixture: dict[str, Any], key: str) -> dict[str, Any]:
+    value = fixture.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def non_negative_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int) and value >= 0:
+        return value
+    return 0
+
+
+def scenario_rows() -> list[dict[str, Any]]:
+    return [{"id": key, **value} for key, value in SCENARIOS.items()]
+
+
+def structured_error(kind: str, message: str, details: dict[str, Any], next_actions: list[str]) -> dict[str, Any]:
+    return {"kind": kind, "message": message, "details": details, "next_actions": next_actions}
+
+
+def tool_error(kind: str, message: str, details: dict[str, Any], next_actions: list[str]) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "tool_error",
+        "classification": "runtime_trust_gauntlet_unavailable",
+        "error": structured_error(kind, message, details, next_actions),
+        "next_actions": next_actions,
+    }
+
+
+def redact_path(path: str | Path | None) -> str | None:
+    if path is None:
+        return None
+    value = str(path)
+    home = str(Path.home())
+    if value.startswith(home):
+        return "~" + value[len(home) :]
+    return value
+
+
+def print_human(result: dict[str, Any]) -> None:
+    print(f"classification: {result.get('classification')}")
+    if "backend_readiness" in result:
+        print(f"backend_readiness: {result['backend_readiness']}")
+    if "registry_readiness" in result:
+        print(f"registry_readiness: {result['registry_readiness']}")
+    if "summary" in result:
+        summary = result["summary"]
+        print(
+            "summary: "
+            f"total={summary['total']} pass={summary['pass']} "
+            f"warn={summary['warn']} fail={summary['fail']}"
+        )
+        if "coverage_status" in summary:
+            print(
+                "coverage: "
+                f"{summary['coverage_status']} "
+                f"missing={','.join(summary.get('missing_scenarios', [])) or 'none'}"
+            )
+    for action in result.get("next_actions", []):
+        print(f"- {action}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,113 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="1100"
+  height="650"
+  viewBox="0 0 1100 650"
+  role="img"
+  aria-label="Example operators and presenters request work through CLI or ACP, while Pixir owns Sessions, Turns, Subagents, Workflows, Provider and Tools, and Evidence Logs."
+>
+  <rect width="1100" height="650" rx="18" fill="#ffffff" />
+  <rect x="1" y="1" width="1098" height="648" rx="17" fill="none" stroke="#e5e7eb" stroke-width="2" />
+
+  <text x="64" y="62" fill="#64748b" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="700" letter-spacing="1.2">RUNTIME BOUNDARY</text>
+  <text x="64" y="101" fill="#111827" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="25" font-weight="800">Presenters drive Pixir. Pixir owns the runtime.</text>
+  <text x="64" y="136" fill="#64748b" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="18" font-weight="500">Different tools, same boundary: request work through CLI or ACP; keep runtime state and evidence in Pixir.</text>
+
+  <text x="64" y="196" fill="#0369a1" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="800" letter-spacing="1.2">OPERATORS &amp; PRESENTERS</text>
+
+  <g transform="translate(64 218)">
+    <rect x="0" y="0" width="972" height="150" rx="10" fill="#ffffff" stroke="#d8e0ea" stroke-width="2" />
+    <line x1="194.4" y1="0" x2="194.4" y2="150" stroke="#d8e0ea" stroke-width="1.5" />
+    <line x1="388.8" y1="0" x2="388.8" y2="150" stroke="#d8e0ea" stroke-width="1.5" />
+    <line x1="583.2" y1="0" x2="583.2" y2="150" stroke="#d8e0ea" stroke-width="1.5" />
+    <line x1="777.6" y1="0" x2="777.6" y2="150" stroke="#d8e0ea" stroke-width="1.5" />
+
+    <g transform="translate(97.2 30)">
+      <g transform="translate(-18 0) scale(1.8)" fill="#111827">
+        <path d="M11.248 18.25q-.825 0-1.568-.314a4.3 4.3 0 0 1-1.32-.874 4 4 0 0 1-1.304.214 4 4 0 0 1-2.046-.544 4.27 4.27 0 0 1-1.518-1.485 4 4 0 0 1-.56-2.095q0-.48.131-1.04A4.4 4.4 0 0 1 2.04 10.71a4.07 4.07 0 0 1 .017-3.4 4.2 4.2 0 0 1 1.056-1.418 3.8 3.8 0 0 1 1.6-.842 3.9 3.9 0 0 1 .76-1.683q.593-.759 1.451-1.188a4.04 4.04 0 0 1 1.832-.429q.825 0 1.567.313.742.314 1.32.875a4 4 0 0 1 1.304-.215q1.106 0 2.046.545a4.14 4.14 0 0 1 1.501 1.485q.578.941.578 2.095 0 .48-.132 1.04.66.61 1.023 1.419.363.792.363 1.666 0 .892-.38 1.717a4.3 4.3 0 0 1-1.072 1.435 3.8 3.8 0 0 1-1.584.825 3.8 3.8 0 0 1-.775 1.683 4.06 4.06 0 0 1-1.436 1.188 4.04 4.04 0 0 1-1.832.429m-4.076-2.062q.825 0 1.435-.347l3.103-1.782a.36.36 0 0 0 .164-.313v-1.42L7.881 14.62a.67.67 0 0 1-.726 0l-3.118-1.798a.5.5 0 0 1-.017.115v.198q0 .841.396 1.551.413.693 1.139 1.089a3.2 3.2 0 0 0 1.617.412m.165-2.69a.4.4 0 0 0 .181.05q.083 0 .165-.05l1.238-.71-3.977-2.31a.7.7 0 0 1-.363-.643v-3.58q-.825.362-1.32 1.122a2.9 2.9 0 0 0-.495 1.65q0 .809.413 1.55.412.743 1.072 1.123zm3.91 3.663q.875 0 1.585-.396a2.96 2.96 0 0 0 1.534-2.64v-3.564a.32.32 0 0 0-.165-.297l-1.254-.726v4.604a.7.7 0 0 1-.363.643l-3.119 1.799a3 3 0 0 0 1.783.577m.627-6.039V8.878L10.01 7.822 8.129 8.878v2.244l1.881 1.056zM7.057 5.859a.7.7 0 0 1 .363-.644l3.119-1.798a3 3 0 0 0-1.782-.578q-.874 0-1.584.396A2.96 2.96 0 0 0 6.05 4.324a3.07 3.07 0 0 0-.396 1.551v3.547q0 .199.165.314l1.237.726zm8.383 7.887q.825-.364 1.303-1.123.495-.758.495-1.65a3.15 3.15 0 0 0-.412-1.55q-.413-.743-1.073-1.123l-3.086-1.782q-.099-.065-.181-.049a.3.3 0 0 0-.165.05l-1.238.692 3.993 2.327a.6.6 0 0 1 .264.264.64.64 0 0 1 .1.363zm-3.317-8.382a.63.63 0 0 1 .726 0l3.135 1.831v-.297q0-.792-.396-1.501a2.86 2.86 0 0 0-1.105-1.155q-.71-.43-1.65-.43-.825 0-1.436.347L8.294 5.941a.36.36 0 0 0-.165.314v1.418z" />
+      </g>
+      <text x="0" y="78" text-anchor="middle" fill="#111827" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="20" font-weight="800">Codex</text>
+      <text x="0" y="112" text-anchor="middle" fill="#64748b" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="15" font-weight="500">meta-orchestrator</text>
+    </g>
+
+    <g transform="translate(291.6 31)">
+      <rect x="-24" y="0" width="48" height="48" rx="6" fill="#111827" />
+      <rect x="-18" y="6" width="36" height="36" rx="3" fill="#ffffff" />
+      <path d="M-10 15l10 9-10 9-5-5 5-4-5-4z" fill="#111827" />
+      <rect x="3" y="31" width="14" height="5" rx="2.5" fill="#111827" />
+      <text x="0" y="77" text-anchor="middle" fill="#111827" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="20" font-weight="800">CLI</text>
+      <text x="0" y="112" text-anchor="middle" fill="#64748b" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="15" font-weight="500">presenter</text>
+    </g>
+
+    <g transform="translate(486 29)">
+      <g transform="translate(-20 0) scale(1.7)" fill="#111827">
+        <path d="M2.25 1.5a.75.75 0 0 0-.75.75v16.5H0V2.25A2.25 2.25 0 0 1 2.25 0h20.095c1.002 0 1.504 1.212.795 1.92L10.764 14.298h3.486V12.75h1.5v1.922a1.125 1.125 0 0 1-1.125 1.125H9.264l-2.578 2.578h11.689V9h1.5v9.375a1.5 1.5 0 0 1-1.5 1.5H5.185L2.562 22.5H21.75a.75.75 0 0 0 .75-.75V5.25H24v16.5A2.25 2.25 0 0 1 21.75 24H1.655C.653 24 .151 22.788.86 22.08L13.19 9.75H9.75v1.5h-1.5V9.375A1.125 1.125 0 0 1 9.375 8.25h5.314l2.625-2.625H5.625V15h-1.5V5.625a1.5 1.5 0 0 1 1.5-1.5h13.19L21.438 1.5z" />
+      </g>
+      <text x="0" y="79" text-anchor="middle" fill="#111827" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="20" font-weight="800">Zed</text>
+      <text x="0" y="112" text-anchor="middle" fill="#64748b" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="15" font-weight="500">ACP client</text>
+    </g>
+
+    <g transform="translate(680.4 28)">
+      <g transform="translate(-28 0) scale(.22)" fill="#111827">
+        <path fill-rule="evenodd" clip-rule="evenodd" d="M165.735 25.0701L188.947 0.972412H0.465994V25.0701H165.735Z" />
+        <path d="M163.981 96.3239L254.022 3.68314L221.206 3.68295L145.617 80.7609L163.981 96.3239Z" />
+        <path d="M233.658 131.418C233.658 155.075 214.48 174.254 190.823 174.254C171.715 174.254 155.513 161.738 150 144.439L146.625 133.848L127.329 153.143L129.092 157.336C139.215 181.421 163.034 198.354 190.823 198.354C227.791 198.354 257.759 168.386 257.759 131.418C257.759 106.937 244.399 85.7396 224.956 74.0905L220.395 71.3582L202.727 89.2528L210.788 93.5083C224.403 100.696 233.658 114.981 233.658 131.418Z" />
+        <path fill-rule="evenodd" clip-rule="evenodd" d="M88.2625 192.669L88.2626 45.6459H64.1648L64.1648 192.669H88.2625Z" />
+      </g>
+      <text x="0" y="80" text-anchor="middle" fill="#111827" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="20" font-weight="800">T3Code</text>
+      <text x="0" y="112" text-anchor="middle" fill="#64748b" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="15" font-weight="500">ACP client</text>
+    </g>
+
+    <g transform="translate(874.8 31)">
+      <rect x="-24" y="0" width="48" height="4" fill="#111827" />
+      <rect x="-24" y="36" width="48" height="4" fill="#111827" />
+      <rect x="-24" y="0" width="4" height="40" fill="#111827" />
+      <rect x="20" y="0" width="4" height="40" fill="#111827" />
+      <rect x="-24" y="13" width="48" height="4" fill="#111827" />
+      <text x="0" y="77" text-anchor="middle" fill="#111827" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="20" font-weight="800">Custom UI</text>
+      <text x="0" y="112" text-anchor="middle" fill="#64748b" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="15" font-weight="500">ACP client</text>
+    </g>
+  </g>
+
+  <g transform="translate(64 410)">
+    <line x1="0" y1="0" x2="972" y2="0" stroke="#38bdf8" stroke-width="2" stroke-dasharray="5 7" />
+    <rect x="397" y="-19" width="178" height="38" rx="19" fill="#ffffff" stroke="#bae6fd" stroke-width="1.5" />
+    <text x="486" y="5" text-anchor="middle" fill="#0369a1" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="800">request work</text>
+    <text x="486" y="43" text-anchor="middle" fill="#0369a1" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="800">CLI / ACP</text>
+  </g>
+
+  <text x="64" y="500" fill="#0369a1" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="800" letter-spacing="1.2">PIXIR RUNTIME</text>
+
+  <g transform="translate(64 522)">
+    <rect x="0" y="0" width="972" height="96" rx="10" fill="#f0faff" stroke="#bae6fd" stroke-width="2" />
+    <line x1="162" y1="0" x2="162" y2="96" stroke="#d8e0ea" stroke-width="1.5" />
+    <line x1="324" y1="0" x2="324" y2="96" stroke="#d8e0ea" stroke-width="1.5" />
+    <line x1="486" y1="0" x2="486" y2="96" stroke="#d8e0ea" stroke-width="1.5" />
+    <line x1="648" y1="0" x2="648" y2="96" stroke="#d8e0ea" stroke-width="1.5" />
+    <rect x="810" y="0" width="162" height="96" rx="10" fill="#ecfdf5" stroke="#a7f3d0" stroke-width="2" />
+    <line x1="810" y1="0" x2="810" y2="96" stroke="#d8e0ea" stroke-width="1.5" />
+
+    <text x="81" y="36" text-anchor="middle" fill="#111827" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="18" font-weight="800">Session</text>
+    <text x="81" y="67" text-anchor="middle" fill="#64748b" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="500">conversation</text>
+
+    <text x="243" y="36" text-anchor="middle" fill="#111827" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="18" font-weight="800">Turn</text>
+    <text x="243" y="67" text-anchor="middle" fill="#64748b" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="500">provider loop</text>
+
+    <text x="405" y="36" text-anchor="middle" fill="#111827" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="18" font-weight="800">Subagents</text>
+    <text x="405" y="67" text-anchor="middle" fill="#64748b" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="500">child Sessions</text>
+
+    <text x="567" y="36" text-anchor="middle" fill="#111827" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="18" font-weight="800">Workflows</text>
+    <text x="567" y="62" text-anchor="middle" fill="#64748b" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="500">structured</text>
+    <text x="567" y="80" text-anchor="middle" fill="#64748b" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="500">outcomes</text>
+
+    <text x="729" y="34" text-anchor="middle" fill="#111827" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="17" font-weight="800">Provider</text>
+    <text x="729" y="56" text-anchor="middle" fill="#111827" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="17" font-weight="800">/ Tools</text>
+    <text x="729" y="80" text-anchor="middle" fill="#64748b" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="500">permissioned loop</text>
+
+    <text x="891" y="34" text-anchor="middle" fill="#111827" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="17" font-weight="800">Evidence</text>
+    <text x="891" y="56" text-anchor="middle" fill="#111827" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="17" font-weight="800">Log</text>
+    <text x="891" y="80" text-anchor="middle" fill="#047857" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="500">logs and artifacts</text>
+  </g>
+
+  <text x="64" y="636" fill="#64748b" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" font-weight="500">Logos identify example operators or presenters. They do not imply bundled integrations, endorsement, or production support.</text>
+</svg>

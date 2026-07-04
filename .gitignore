@@ -1,0 +1,69 @@
+# The directory Mix will write compiled artifacts to.
+/_build/
+
+# If you run "mix test --cover", coverage assets end up here.
+/cover/
+
+# The directory Mix downloads your dependencies sources to.
+/deps/
+
+# Where third-party dependencies like ExDoc output generated docs.
+/doc/
+
+# Temporary files, for example, from tests.
+/tmp/
+
+# If the VM crashes, it generates a dump, let's ignore it too.
+erl_crash.dump
+
+# Local OS/editor noise.
+.DS_Store
+
+# Local agent execution state.
+/.codex/
+
+# Local environment files; commit explicit examples only.
+.env
+.env.*
+!.env.example
+
+# Also ignore archive artifacts (built via "mix archive.build").
+*.ez
+
+# Ignore package tarball (built via "mix hex.build").
+pixir-*.tar
+
+# Built escript binary (mix escript.build).
+/pixir
+
+# Local JavaScript dependencies for optional docs/media packages.
+node_modules/
+
+# Local generated media experiments and render outputs.
+/docs/media/
+
+# Local landing experiments. Keep these out of commits until the public landing
+# direction is chosen.
+/docs/landing/
+
+# Per-project Pixir state: Session Logs are the source of truth but are
+# machine-local and not version-controlled (ADR 0003).
+/.pixir/sessions/
+/.pixir/benchmarks/
+/.pixir/subagents/
+/.pixir/smoke/
+/.pixir/audited-runs/
+/.pixir/session_leases/
+
+# Local dogfood/research outputs — machine-local evidence, not project source.
+/outputs/
+/.docs/research/
+
+# Local tooling scratch (machine-local agent configs and HTML-render proof
+# screenshots, scheduler/workflow state) — not project source.
+/.devin/
+/.evidence/
+# Interop dogfood binaries (PNGs, wire logs) — text ledger only in pixir-harness
+.docs/patches/**/evidence/
+/.claude/
+.orchestrator/

@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""Diagnose Pixir/T3 projection parity from local evidence.
+
+This is intentionally a repo-local diagnostic adapter rather than a Pixir public
+CLI command. It compares Pixir's canonical Session Log with T3's provider log
+and projection database so operator/debugging work can separate runtime truth
+from presenter projection failures.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+
+SESSION_ID_RE = re.compile(r"20\d{6}T\d{6}-[a-z0-9]+")
+UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    if args.fixture:
+        loaded = load_fixture(args.fixture)
+        result = diagnose_from_fixture(args, loaded)
+    else:
+        result = diagnose_live(args)
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print_human(result)
+
+    if result["status"] == "tool_error":
+        return 2
+    if args.fail_on_parity_failure and result["classification"] != "healthy_projection":
+        return 1
+    return 0
+
+
+def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compare Pixir Session Log truth with T3 provider/projection evidence "
+            "for a Pixir-backed T3 thread."
+        )
+    )
+    parser.add_argument("--thread-id", help="T3 thread id to inspect.")
+    parser.add_argument(
+        "--workspace",
+        help="Workspace that may contain .pixir/sessions/<session-id>.ndjson.",
+    )
+    parser.add_argument(
+        "--t3-userdata",
+        default="~/.t3-pixir/userdata",
+        help="T3 user data directory containing state.sqlite and logs/provider/.",
+    )
+    parser.add_argument("--state-db", help="Override T3 projection SQLite database path.")
+    parser.add_argument("--provider-log", help="Override T3 provider log path.")
+    parser.add_argument("--pixir-log", help="Override Pixir Session NDJSON log path.")
+    parser.add_argument(
+        "--ui-visible",
+        choices=["yes", "no", "unknown"],
+        default="unknown",
+        help="Optional human/UI visibility observation. Default: unknown.",
+    )
+    parser.add_argument(
+        "--fixture",
+        help="Read a sanitized JSON fixture instead of live local T3/Pixir files.",
+    )
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    parser.add_argument(
+        "--fail-on-parity-failure",
+        action="store_true",
+        help="Exit 1 when classification is not healthy_projection.",
+    )
+    return parser.parse_args(argv)
+
+
+def diagnose_live(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.thread_id or not UUID_RE.match(args.thread_id):
+        return tool_error(
+            "invalid_thread_id",
+            "--thread-id must be a T3 UUID thread id.",
+            {"thread_id": args.thread_id},
+            ["pass --thread-id <uuid>"],
+        )
+
+    t3_userdata = Path(args.t3_userdata).expanduser()
+    provider_log_path = (
+        Path(args.provider_log).expanduser()
+        if args.provider_log
+        else t3_userdata / "logs" / "provider" / f"{args.thread_id}.log"
+    )
+    state_db_path = Path(args.state_db).expanduser() if args.state_db else t3_userdata / "state.sqlite"
+
+    provider = read_provider_log(provider_log_path)
+    if provider["status"] == "error":
+        return result_from_layers(
+            args,
+            pixir={},
+            provider=provider,
+            projection={},
+            session_id=None,
+            evidence_paths={"provider_log": redact_path(provider_log_path), "state_db": redact_path(state_db_path)},
+        )
+
+    session_id = provider.get("session_id")
+    provider_workspace = provider.get("workspace")
+    pixir_log_path = resolve_pixir_log(args, session_id, provider_workspace)
+    pixir = read_pixir_log(pixir_log_path) if pixir_log_path else missing_pixir_log(session_id)
+    projection = read_projection_db(state_db_path, args.thread_id)
+    provider_output = dict(provider)
+    provider_output["workspace"] = redact_path(provider_workspace)
+
+    return result_from_layers(
+        args,
+        pixir=pixir,
+        provider=provider_output,
+        projection=projection,
+        session_id=session_id,
+        evidence_paths={
+            "provider_log": redact_path(provider_log_path),
+            "state_db": redact_path(state_db_path),
+            "pixir_log": redact_path(pixir_log_path) if pixir_log_path else None,
+        },
+    )
+
+
+def diagnose_from_fixture(args: argparse.Namespace, loaded: dict[str, Any]) -> dict[str, Any]:
+    provider = loaded.get("provider_log", {})
+    pixir = loaded.get("pixir_log", {})
+    projection = loaded.get("t3_projection", {})
+    session_id = loaded.get("session_id") or provider.get("session_id")
+    return result_from_layers(
+        args,
+        pixir=pixir,
+        provider=provider,
+        projection=projection,
+        session_id=session_id,
+        evidence_paths=loaded.get("evidence_paths", {}),
+    )
+
+
+def load_fixture(path: str) -> dict[str, Any]:
+    with Path(path).expanduser().open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def read_provider_log(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "status": "error",
+            "error": structured_error(
+                "provider_log_missing",
+                "T3 provider log was not found.",
+                {"path": redact_path(path)},
+                ["pass --provider-log or verify --t3-userdata"],
+            ),
+        }
+
+    text = path.read_text(encoding="utf-8", errors="replace")
+    session_ids = SESSION_ID_RE.findall(text)
+    cwd = first_regex(text, [r'"cwd":"([^"]+)"', r'\\"cwd\\":\\"([^"\\]+)\\"'])
+    return {
+        "status": "readable",
+        "session_id": session_ids[0] if session_ids else None,
+        "workspace": cwd,
+        "agent_message_chunks": count_any(
+            text,
+            ['"sessionUpdate":"agent_message_chunk"', '\\"sessionUpdate\\":\\"agent_message_chunk\\"'],
+        ),
+        "turn_completed_events": count_any(text, ['"type":"turn.completed"', '\\"type\\":\\"turn.completed\\"']),
+        "end_turn_results": count_any(text, ['"stopReason":"end_turn"', '\\"stopReason\\":\\"end_turn\\"']),
+        "assistant_item_completed": count_any(
+            text,
+            ['"itemType":"assistant_message"', '\\"itemType\\":\\"assistant_message\\"'],
+        ),
+        "line_count": text.count("\n") + (1 if text else 0),
+    }
+
+
+def read_pixir_log(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return missing_pixir_log(None, path)
+
+    counts: Counter[str] = Counter()
+    assistant_messages: list[dict[str, Any]] = []
+    tool_calls: dict[str, int] = {}
+    tool_results: dict[str, int] = {}
+    invalid_json = 0
+    total = 0
+
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            total += 1
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                invalid_json += 1
+                continue
+
+            event_type = event.get("type")
+            event_type_key = (
+                event_type if isinstance(event_type, str) and event_type else "__missing_type__"
+            )
+            counts[event_type_key] += 1
+            data = event.get("data") or {}
+
+            if event_type == "assistant_message":
+                text = str(data.get("text") or "")
+                assistant_messages.append(
+                    {
+                        "seq": event.get("seq"),
+                        "text_length": len(text),
+                        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                        "text_prefix": text[:120],
+                    }
+                )
+            elif event_type == "tool_call":
+                call_id = data.get("call_id")
+                if call_id:
+                    tool_calls[call_id] = event.get("seq")
+            elif event_type == "tool_result":
+                call_id = data.get("call_id")
+                if call_id:
+                    tool_results[call_id] = event.get("seq")
+
+    missing_results = sorted(set(tool_calls) - set(tool_results))
+    extra_results = sorted(set(tool_results) - set(tool_calls))
+
+    return {
+        "status": "readable",
+        "event_count": total,
+        "invalid_json_lines": invalid_json,
+        "counts_by_type": dict(counts),
+        "assistant_messages": assistant_messages,
+        "assistant_message_count": len(assistant_messages),
+        "tool_calls": len(tool_calls),
+        "tool_results": len(tool_results),
+        "tool_pairing_ok": not missing_results and not extra_results,
+        "missing_tool_results": missing_results[:20],
+        "extra_tool_results": extra_results[:20],
+    }
+
+
+def missing_pixir_log(session_id: str | None, path: Path | None = None) -> dict[str, Any]:
+    return {
+        "status": "missing",
+        "session_id": session_id,
+        "assistant_message_count": 0,
+        "error": structured_error(
+            "pixir_log_missing",
+            "Pixir Session Log was not found.",
+            {"session_id": session_id, "path": redact_path(path) if path else None},
+            ["pass --workspace or --pixir-log", "verify the T3 provider log contains a Pixir session id"],
+        ),
+    }
+
+
+def read_projection_db(path: Path, thread_id: str) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "status": "error",
+            "error": structured_error(
+                "projection_db_missing",
+                "T3 projection database was not found.",
+                {"path": redact_path(path)},
+                ["pass --state-db or verify --t3-userdata"],
+            ),
+        }
+
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error as exc:
+        return {
+            "status": "error",
+            "error": structured_error(
+                "projection_db_open_failed",
+                "T3 projection database could not be opened read-only.",
+                {"path": redact_path(path), "sqlite_error": str(exc)},
+                ["close T3 if the database is locked", "pass a copied --state-db fixture"],
+            ),
+        }
+
+    try:
+        message_rows = query_all(
+            conn,
+            """
+            select message_id, turn_id, role, text, is_streaming, created_at, updated_at
+            from projection_thread_messages
+            where thread_id = ?
+            order by created_at
+            """,
+            [thread_id],
+        )
+        turn_rows = query_all(
+            conn,
+            """
+            select row_id, turn_id, assistant_message_id, state, requested_at, completed_at
+            from projection_turns
+            where thread_id = ?
+            order by requested_at
+            """,
+            [thread_id],
+        )
+    except sqlite3.Error as exc:
+        return {
+            "status": "error",
+            "error": structured_error(
+                "projection_query_failed",
+                "T3 projection tables could not be queried.",
+                {"sqlite_error": str(exc)},
+                ["verify the database is from a compatible T3 Code build"],
+            ),
+        }
+    finally:
+        conn.close()
+
+    assistant_rows = [row for row in message_rows if row["role"] == "assistant"]
+    user_rows = [row for row in message_rows if row["role"] == "user"]
+    return {
+        "status": "readable",
+        "message_count": len(message_rows),
+        "assistant_rows": [
+            {
+                "message_id": row["message_id"],
+                "turn_id": row["turn_id"],
+                "text_length": len(row["text"] or ""),
+                "text_sha256": hashlib.sha256((row["text"] or "").encode("utf-8")).hexdigest(),
+                "text_prefix": (row["text"] or "")[:120],
+                "created_at": row["created_at"],
+            }
+            for row in assistant_rows
+        ],
+        "assistant_row_count": len(assistant_rows),
+        "user_row_count": len(user_rows),
+        "turns": [dict(row) for row in turn_rows],
+        "completed_turn_count": len([row for row in turn_rows if row["state"] == "completed"]),
+    }
+
+
+def query_all(conn: sqlite3.Connection, sql: str, params: list[Any]) -> list[sqlite3.Row]:
+    return list(conn.execute(sql, params))
+
+
+def result_from_layers(
+    args: argparse.Namespace,
+    *,
+    pixir: dict[str, Any],
+    provider: dict[str, Any],
+    projection: dict[str, Any],
+    session_id: str | None,
+    evidence_paths: dict[str, Any],
+) -> dict[str, Any]:
+    classification = classify(args, pixir, provider, projection)
+    return {
+        "ok": classification == "healthy_projection",
+        "status": "ready" if classification != "insufficient_evidence" else "warning",
+        "classification": classification,
+        "thread_id": args.thread_id,
+        "session_id": session_id,
+        "layers": {
+            "pixir_log": pixir,
+            "t3_provider_log": provider,
+            "t3_projection": projection,
+            "ui": {"visible": args.ui_visible},
+        },
+        "evidence_paths": evidence_paths,
+        "next_actions": next_actions_for(classification),
+    }
+
+
+def classify(
+    args: argparse.Namespace,
+    pixir: dict[str, Any],
+    provider: dict[str, Any],
+    projection: dict[str, Any],
+) -> str:
+    if provider.get("status") == "error" or projection.get("status") == "error" or pixir.get("status") == "missing":
+        return "insufficient_evidence"
+
+    if pixir.get("assistant_message_count", 0) == 0 and projection_has_only_stream_exit_assistant(projection):
+        return "provider_stream_exit_projected_without_canonical_assistant"
+
+    if pixir.get("assistant_message_count", 0) == 0:
+        return "pixir_core_missing_assistant"
+
+    if provider.get("agent_message_chunks", 0) == 0:
+        return "acp_emission_gap"
+
+    if projection.get("assistant_row_count", 0) == 0:
+        return "t3_projection_gap"
+
+    if args.ui_visible == "no":
+        return "t3_ui_visibility_gap"
+
+    return "healthy_projection"
+
+
+def next_actions_for(classification: str) -> list[str]:
+    return {
+        "healthy_projection": [
+            "No projection action required for this thread.",
+            "Use this as the passing baseline fixture.",
+        ],
+        "pixir_core_missing_assistant": [
+            "Run pixir diagnose session for the session id.",
+            "Inspect Pixir Turn completion and provider replay before blaming T3.",
+        ],
+        "provider_stream_exit_projected_without_canonical_assistant": [
+            "Treat the visible T3 assistant row as a technical failure marker, not a model answer.",
+            "Inspect Pixir Turn provider-error handling and partial assistant canonicalization.",
+            "Rerun with a source Pixir binary that preserves useful text deltas or records an explicit failure.",
+        ],
+        "acp_emission_gap": [
+            "Inspect Pixir ACP server final assistant_message fallback emission.",
+            "Add a regression test for a tool-heavy turn that records assistant_message but emits no agent_message_chunk.",
+        ],
+        "t3_projection_gap": [
+            "Inspect T3 provider adapter projection from agent_message_chunk to projection_thread_messages.",
+            "Check projection_turns assistant_message_id and message insertion logic.",
+        ],
+        "t3_ui_visibility_gap": [
+            "Inspect T3 UI message rendering and thread ordering state.",
+            "Compare projection_thread_messages rows with visible chat DOM/state.",
+        ],
+        "insufficient_evidence": [
+            "Provide --workspace, --provider-log, --state-db, or --pixir-log.",
+            "Verify the T3 thread id belongs to the configured T3 userdata directory.",
+        ],
+    }[classification]
+
+
+def projection_has_only_stream_exit_assistant(projection: dict[str, Any]) -> bool:
+    rows = projection.get("assistant_rows") or []
+    if not rows:
+        return False
+    return all(is_provider_stream_exit_text(row.get("text_prefix", "")) for row in rows)
+
+
+def is_provider_stream_exit_text(text: str) -> bool:
+    normalized = " ".join(str(text).strip().lower().split())
+    return normalized in {
+        "provider stream process exited.",
+        "the provider stream exited before pixir received a final answer.",
+    }
+
+
+def resolve_pixir_log(args: argparse.Namespace, session_id: str | None, provider_workspace: str | None) -> Path | None:
+    if args.pixir_log:
+        return Path(args.pixir_log).expanduser()
+    if not session_id:
+        return None
+
+    candidates: list[Path] = []
+    for value in [args.workspace, provider_workspace, os.getcwd()]:
+        if value:
+            root = Path(value).expanduser()
+            if root not in candidates:
+                candidates.append(root)
+
+    for root in candidates:
+        candidate = root / ".pixir" / "sessions" / f"{session_id}.ndjson"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def structured_error(kind: str, message: str, details: dict[str, Any], next_actions: list[str]) -> dict[str, Any]:
+    return {"kind": kind, "message": message, "details": details, "next_actions": next_actions}
+
+
+def tool_error(kind: str, message: str, details: dict[str, Any], next_actions: list[str]) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "tool_error",
+        "classification": "insufficient_evidence",
+        "error": structured_error(kind, message, details, next_actions),
+        "next_actions": next_actions,
+    }
+
+
+def first_regex(text: str, patterns: list[str]) -> str | None:
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return None
+
+
+def count_any(text: str, needles: list[str]) -> int:
+    return sum(text.count(needle) for needle in needles)
+
+
+def redact_path(path: str | Path | None) -> str | None:
+    if path is None:
+        return None
+    value = str(path)
+    home = str(Path.home())
+    if value.startswith(home):
+        return "~" + value[len(home) :]
+    return value
+
+
+def print_human(result: dict[str, Any]) -> None:
+    print(f"classification: {result.get('classification')}")
+    print(f"ok: {str(result.get('ok')).lower()}")
+    if result.get("thread_id"):
+        print(f"thread_id: {result['thread_id']}")
+    if result.get("session_id"):
+        print(f"session_id: {result['session_id']}")
+    for action in result.get("next_actions", []):
+        print(f"- {action}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

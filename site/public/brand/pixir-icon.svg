@@ -1,0 +1,35 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 256 256"
+  role="img"
+  aria-labelledby="pixir-icon-title pixir-icon-desc"
+>
+  <title id="pixir-icon-title">Pixir icon</title>
+  <desc id="pixir-icon-desc">
+    A rounded P-shaped BEAM constellation mark with a supervisor node and child
+    process nodes.
+  </desc>
+
+  <g
+    id="pixir-mark"
+    fill="none"
+    stroke="#111827"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path d="M72 50v168" stroke-width="15" />
+    <path d="M72 50h72c36 0 60 21 60 54s-24 54-60 54H98" stroke-width="15" />
+    <path d="M72 114l49-2" stroke-width="8" />
+    <path d="M121 112l34-34" stroke-width="8" />
+    <path d="M121 112l49 14" stroke-width="8" />
+  </g>
+
+  <g id="pixir-nodes">
+    <circle cx="72" cy="50" r="11" fill="#111827" />
+    <circle cx="72" cy="114" r="11" fill="#111827" />
+    <circle cx="72" cy="218" r="7" fill="#111827" />
+    <circle cx="121" cy="112" r="14" fill="#111827" />
+    <circle cx="155" cy="78" r="12" fill="#14b8ff" />
+    <circle cx="170" cy="126" r="12" fill="#10b981" />
+  </g>
+</svg>

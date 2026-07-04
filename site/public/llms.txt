@@ -1,0 +1,35 @@
+# Pixir
+
+Pixir is an Elixir/OTP harness for supervised coding-agent sessions, subagents,
+workflows, lifecycle state, and replayable local evidence behind any presenter.
+
+## Canonical Site
+
+- https://pixir.dev/
+
+## Install
+
+```bash
+mix escript.install hex pixir
+pixir doctor --json
+pixir acp
+```
+
+## Product Boundary
+
+- Supported public surface: CLI and ACP runtime.
+- Daily-driver path: ACP clients, including local T3 Code dogfood.
+- Positioning: Codex is an operator/meta-orchestrator and auditor; Zed, T3Code,
+  and other ACP clients are UI/client/presenters; Pixir is the supervised local
+  runtime for bounded agent work.
+- Cache stance: Pixir treats WebSocket continuation, stable prompt prefixes, and
+  minimal per-turn payloads as cache-friendly runtime choices, but cache hits must be
+  proven by Provider usage evidence such as cached token counts.
+- Not yet: finished Pi-style TUI replacement, packaged T3 provider, MCP server,
+  stable public Elixir API, hosted SLA software, or multi-provider marketplace.
+
+## Primary Links
+
+- Hex package: https://hex.pm/packages/pixir
+- HexDocs: https://pixir.hexdocs.pm/readme.html
+- Source: https://github.com/Ranvier-Technologies/pixir-harness
