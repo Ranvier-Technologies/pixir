@@ -4,7 +4,7 @@ import Header from "../components/Header.astro";
 import BaseLayout from "../layouts/BaseLayout.astro";
 
 const envelopeLine = `{"ok":true,"status":"completed","work_complete":true,"children":[…64…]}`;
-const statusLine = `[{"completed":64}]   # 202 s wall · 441 MB peak · 1 BEAM process`;
+const statusLine = `[{"completed":64}]   # 202 s wall · 441 MB peak · one BEAM VM (single OS process)`;
 const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_sse",
   "transport_preference":"websocket","fallback_reason":"websocket_handshake_failed",
   "usage_available":true, …}}`;
@@ -56,7 +56,7 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
             <article class="proof">
               <code>441 MB vs 11,981 MB</code>
               <h3>27× memory at N=64</h3>
-              <p>Peak RSS on real work: one BEAM process against 91 OS processes — 1.4% versus 37% of a 32 GB machine.</p>
+              <p>Peak RSS on real work: one BEAM VM — a single OS process — against 91 processes — 1.4% versus 37% of a 32 GB machine.</p>
             </article>
             <article class="proof">
               <code>64/64 · both runtimes</code>
@@ -192,8 +192,8 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
             The <code>auto</code> transport policy — WebSocket preferred, SSE as a
             pre-output-safe fallback — earned its existence exactly where it should:
             under real pressure it degraded 31 calls and lost none. The pressure
-            threshold (between 32 and 64 connections) is documented as evidence in the
-            issue tracker.
+            threshold (between 32 and 64 connections) is recorded in our issue
+            backlog with the session evidence.
           </p>
         </div>
       </section>
@@ -239,8 +239,8 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
           <h2>Method, limits, and how to reproduce</h2>
           <p class="section-lead">
             Parity: same model and the same ChatGPT OAuth quota on both sides; isolated
-            homes (auth via symlink) to exclude MCP servers and personal config from
-            the comparison. RSS figures are sampled process-tree peaks (1 s poll), not
+            configuration homes on the same authorized account, excluding MCP servers
+            and personal config from the comparison. RSS figures are sampled process-tree peaks (1 s poll), not
             OS-exact accounting. The synthetic ladder ran 3 repetitions; the 16/32/64
             scale points ran once each — directional, stated as such. Delegate fan-outs
             require <code>subagents.max_threads: N</code> in the spec or children queue
@@ -249,10 +249,13 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
           <p class="section-lead">
             Pixir is a developer preview. These are dogfood scale notes from one
             machine (macOS, 32 GB), published with their caveats attached. Primary
-            evidence lives in append-only session logs (<code>provider_usage</code>
-            events carry per-call token and transport data) and in the benchmark
-            harness artifacts in the repository — reproduce it, or better,
-            <a href="https://github.com/Ranvier-Technologies/pixir-harness">try to break it and file what doesn't hold</a>.
+            evidence is machine-local by design — Pixir's evidence model keeps
+            append-only session logs (with per-call <code>provider_usage</code> token
+            and transport data) on the machine that ran them, so the numbers above
+            are our runs, not a public dataset; publishing a redacted evidence
+            bundle is tracked work. The runtime ships everything needed to generate
+            your own evidence:
+            <a href="https://github.com/Ranvier-Technologies/pixir">try to break it and file what doesn't hold</a>.
           </p>
         </div>
       </section>

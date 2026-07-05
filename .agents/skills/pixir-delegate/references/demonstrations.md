@@ -3,8 +3,10 @@
 Real annotated traces — not invented examples. Three agent classes followed
 this skill blind (no prior context, the skill as their only manual) on
 2026-07-04/05, each exercising surfaces the others could not. Session ids
-reference append-only logs under `.pixir/sessions/` in the repository where
-the runs happened; treat them as the primary evidence.
+reference append-only logs under `.pixir/sessions/` on the machines where the
+runs happened — Pixir evidence is machine-local by design, so those logs are
+not in this repository. Read these as annotated accounts by the people holding
+the logs, then generate your own primary evidence by following the skill.
 
 The four vicarious modes these demonstrate: watching someone **build** a
 delegation, **exercise it under pressure**, **tune it after failures**, and

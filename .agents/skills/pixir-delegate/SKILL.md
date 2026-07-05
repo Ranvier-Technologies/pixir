@@ -18,8 +18,9 @@ the `source_install_binary` check.
 Pixir speaks a machine contract directly: JSON envelopes on stdout, documented
 exit codes, resumable session ids. The CLI is self-describing by design —
 discover contracts from it at runtime instead of trusting any transcript of
-them (including this one). Requirements: `pixir` on PATH, `jq`, signed in via
-`pixir login`; verify with `pixir doctor --json`.
+them (including this one). Requirements: `pixir` on PATH, `jq`, authenticated
+(a stored `pixir login` credential or `OPENAI_API_KEY`); verify with
+`pixir doctor --json`.
 
 ## Pick the right shape
 

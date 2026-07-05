@@ -48,12 +48,7 @@ node_modules/
 
 # Per-project Pixir state: Session Logs are the source of truth but are
 # machine-local and not version-controlled (ADR 0003).
-/.pixir/sessions/
-/.pixir/benchmarks/
-/.pixir/subagents/
-/.pixir/smoke/
-/.pixir/audited-runs/
-/.pixir/session_leases/
+/.pixir/
 
 # Local dogfood/research outputs — machine-local evidence, not project source.
 /outputs/

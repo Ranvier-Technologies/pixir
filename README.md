@@ -50,6 +50,10 @@ mix escript.build
 ./pixir doctor --json
 ```
 
+Requires Elixir `~> 1.20`. From a source checkout, every `pixir ...` command
+below works as `./pixir ...` from the repo root — or put it on your PATH first
+with `mix escript.install --force`.
+
 ## Authenticate
 
 Use ChatGPT subscription login:

@@ -33,8 +33,8 @@ and report the Pixir binary you will drive:
    check, and readiness classification for the closure report.
 
 Doctor status and the `source_install_binary` check are part of the runtime
-contract (`lib/pixir/doctor.ex:22-31`, `lib/pixir/doctor.ex:81-105`,
-`lib/pixir/doctor.ex:251-257`).
+contract (`lib/pixir/doctor.ex`; verify current shapes with
+`pixir doctor --json` rather than line numbers).
 
 ## Codex command posture
 
