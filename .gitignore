@@ -65,5 +65,6 @@ node_modules/
 /.evidence/
 # Interop dogfood binaries (PNGs, wire logs) — text ledger only in pixir-harness
 .docs/patches/**/evidence/
-/.claude/
+/.claude/*
+!/.claude/skills/
 .orchestrator/

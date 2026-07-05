@@ -42,6 +42,7 @@ defmodule Pixir.CLI do
     RecoveryCommands,
     Renderer,
     SessionDiagnostics,
+    SessionSupervisor,
     SessionTree
   }
 
@@ -1353,8 +1354,52 @@ defmodule Pixir.CLI do
     true
   end
 
-  defp halt(:ok), do: System.halt(0)
-  defp halt({:error, code}), do: System.halt(code)
+  defp halt(:ok), do: halt_with_cleanup(0)
+  defp halt({:error, code}), do: halt_with_cleanup(code)
+
+  defp halt_with_cleanup(code) do
+    case stop_sessions_before_halt() do
+      {:ok, _summary} ->
+        :ok
+
+      {:error, error} ->
+        IO.puts(:stderr, "warning: Session cleanup before exit failed: #{inspect(error)}")
+    end
+
+    cli_halt_fun().(code)
+  end
+
+  defp stop_sessions_before_halt do
+    try do
+      SessionSupervisor.stop_all_sessions()
+    rescue
+      exception ->
+        {:error,
+         %{
+           ok: false,
+           error: %{
+             kind: :session_shutdown_failed,
+             message: "Session cleanup before exit raised",
+             details: %{exception: Exception.message(exception)}
+           }
+         }}
+    catch
+      kind, reason ->
+        {:error,
+         %{
+           ok: false,
+           error: %{
+             kind: :session_shutdown_failed,
+             message: "Session cleanup before exit exited",
+             details: %{kind: kind, reason: inspect(reason)}
+           }
+         }}
+    end
+  end
+
+  defp cli_halt_fun do
+    Application.get_env(:pixir, :cli_halt_fun, &System.halt/1)
+  end
 
   # ── help text ─────────────────────────────────────────────────────────────
 

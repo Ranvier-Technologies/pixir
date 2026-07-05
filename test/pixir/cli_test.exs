@@ -19,6 +19,19 @@ defmodule Pixir.CLITest do
             Process.sleep(ms)
             nested
 
+          {:interrupt_after, ms} ->
+            session_id = Keyword.fetch!(opts, :session_id)
+
+            spawn(fn ->
+              Process.sleep(ms)
+              _ = Pixir.Conversation.interrupt(session_id)
+            end)
+
+            Process.sleep(ms + 1_000)
+
+            {:ok,
+             %{text: "should not arrive", reasoning: "", function_calls: [], finish_reason: :stop}}
+
           other ->
             other
         end
@@ -131,6 +144,22 @@ defmodule Pixir.CLITest do
     )
   end
 
+  defp with_cli_halt(fun) do
+    previous = Application.get_env(:pixir, :cli_halt_fun, :unset)
+
+    Application.put_env(:pixir, :cli_halt_fun, fn code -> throw({:pixir_cli_halt, code}) end)
+
+    try do
+      fun.()
+    after
+      if previous == :unset do
+        Application.delete_env(:pixir, :cli_halt_fun)
+      else
+        Application.put_env(:pixir, :cli_halt_fun, previous)
+      end
+    end
+  end
+
   defp in_tmp_workspace(prefix, fun) do
     ws = Path.join(System.tmp_dir!(), "#{prefix}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(ws)
@@ -163,6 +192,9 @@ defmodule Pixir.CLITest do
     [path] = Path.wildcard(Path.join([ws, ".pixir", "sessions", "*.ndjson"]))
     path |> Path.basename() |> String.replace_suffix(".ndjson", "")
   end
+
+  defp session_lease_files(ws),
+    do: Path.wildcard(Path.join([ws, ".pixir", "session_leases", "*.json"]))
 
   test "no args prints usage and succeeds" do
     out = capture_io(fn -> assert :ok = CLI.route([]) end)
@@ -846,6 +878,51 @@ defmodule Pixir.CLITest do
         assert diagnose_command == "pixir diagnose session #{session_id} --json"
         assert File.exists?(log_path)
         assert String.ends_with?(log_path, "/.pixir/sessions/#{session_id}.ndjson")
+      end)
+    end)
+  end
+
+  test "main releases attached delegate parent and child writer leases before halting" do
+    with_cli_halt(fn ->
+      with_cli_provider([stop("child one"), stop("child two")], fn ->
+        in_tmp_workspace("pixir-main-delegate-lease-cleanup", fn ws ->
+          spec =
+            Jason.encode!(%{
+              "contract_version" => 1,
+              "strategy" => "subagents",
+              "task" => "answer from fake provider",
+              "mode" => "read_only",
+              "subagents" => %{"role" => "explorer", "count" => 2},
+              "limits" => %{
+                "timeout_ms" => 7_000,
+                "delegate_timeout_ms" => 6_000,
+                "child_timeout_ms" => 3_000,
+                "wait_horizon_ms" => 5_000
+              }
+            })
+
+          stderr =
+            capture_io(:stderr, fn ->
+              stdout =
+                capture_io(spec, fn ->
+                  assert {:pixir_cli_halt, 0} =
+                           catch_throw(CLI.main(["delegate", "--spec", "-", "--json"]))
+                end)
+
+              send(self(), {:delegate_stdout, stdout})
+            end)
+
+          assert stderr == ""
+          assert_received {:delegate_stdout, stdout}
+
+          assert %{"ok" => true, "status" => "completed", "children" => children} =
+                   Jason.decode!(stdout)
+
+          assert length(children) == 2
+
+          assert [] = session_lease_files(ws)
+          assert 3 = Path.wildcard(Path.join([ws, ".pixir", "sessions", "*.ndjson"])) |> length()
+        end)
       end)
     end)
   end
@@ -2104,6 +2181,78 @@ defmodule Pixir.CLITest do
     end)
   end
 
+  test "main releases resume writer lease before halting on clean completion" do
+    with_cli_halt(fn ->
+      with_cli_provider([stop("resumed answer")], fn ->
+        in_tmp_workspace("pixir-main-resume-lease-cleanup", fn ws ->
+          sid = "cli-main-resume-clean"
+          old = Event.user_message(sid, "old") |> Event.with_seq(0)
+          assert {:ok, ^old} = Log.append(old, workspace: ws)
+
+          stderr =
+            capture_io(:stderr, fn ->
+              stdout =
+                capture_io(fn ->
+                  assert {:pixir_cli_halt, 0} =
+                           catch_throw(CLI.main(["resume", sid, "continue"]))
+                end)
+
+              send(self(), {:stdout, stdout})
+            end)
+
+          assert_received {:stdout, stdout}
+          assert String.trim(stdout) == "resumed answer"
+          assert stderr =~ "session #{sid}"
+          assert [] = session_lease_files(ws)
+        end)
+      end)
+    end)
+  end
+
+  test "main leaves stale writer lease fail-closed when resume is refused" do
+    with_cli_halt(fn ->
+      with_cli_provider([stop("should not run")], fn ->
+        in_tmp_workspace("pixir-main-resume-stale-lease", fn _ws ->
+          workspace = File.cwd!()
+          sid = "cli-main-stale-writer"
+          old = Event.user_message(sid, "old") |> Event.with_seq(0)
+          assert {:ok, ^old} = Log.append(old, workspace: workspace)
+
+          lease_path = Paths.session_lease(sid, workspace)
+          Paths.ensure_session_leases_dir(workspace)
+
+          File.write!(
+            lease_path,
+            Jason.encode!(%{
+              "version" => 1,
+              "purpose" => "session_writer",
+              "session_id" => sid,
+              "workspace" => workspace,
+              "lease_path" => lease_path,
+              "holder_id" => "stale_cli_holder",
+              "heartbeat_at_ms" => System.system_time(:millisecond) - 60_000,
+              "heartbeat_at" => "2026-01-01T00:00:00Z",
+              "stale_after_ms" => 1
+            })
+          )
+
+          stdout =
+            capture_io(fn ->
+              assert {:pixir_cli_halt, 5} =
+                       catch_throw(CLI.main(["--json", "resume", sid, "continue"]))
+            end)
+
+          assert %{"ok" => false, "error" => %{"kind" => "session_writer_stale"}} =
+                   Jason.decode!(stdout)
+
+          assert File.exists?(lease_path)
+          assert [_lease] = session_lease_files(workspace)
+          refute stdout =~ "should not run"
+        end)
+      end)
+    end)
+  end
+
   test "one-shot returns ok only when the turn completes cleanly" do
     with_cli_provider([stop("clean answer")], fn ->
       in_tmp_workspace("pixir-cli-success", fn _ws ->
@@ -2117,6 +2266,29 @@ defmodule Pixir.CLITest do
         assert String.trim(out) == "clean answer"
         assert err =~ "session"
         assert err =~ "resume with"
+      end)
+    end)
+  end
+
+  test "main releases one-shot writer lease before halting on clean completion" do
+    with_cli_halt(fn ->
+      with_cli_provider([stop("clean answer")], fn ->
+        in_tmp_workspace("pixir-main-oneshot-lease-cleanup", fn ws ->
+          stderr =
+            capture_io(:stderr, fn ->
+              stdout =
+                capture_io(fn ->
+                  assert {:pixir_cli_halt, 0} = catch_throw(CLI.main(["hello"]))
+                end)
+
+              send(self(), {:stdout, stdout})
+            end)
+
+          assert_received {:stdout, stdout}
+          assert String.trim(stdout) == "clean answer"
+          assert stderr =~ "resume with"
+          assert [] = session_lease_files(ws)
+        end)
       end)
     end)
   end
@@ -2480,6 +2652,66 @@ defmodule Pixir.CLITest do
       end,
       idle_timeout: 50
     )
+  end
+
+  test "main releases writer lease on handled idle timeout before halting" do
+    with_cli_halt(fn ->
+      with_cli_provider(
+        [{:sleep, 300, stop("late answer")}],
+        fn ->
+          in_tmp_workspace("pixir-main-oneshot-timeout-lease-cleanup", fn ws ->
+            stderr =
+              capture_io(:stderr, fn ->
+                stdout =
+                  capture_io(fn ->
+                    assert {:pixir_cli_halt, 124} = catch_throw(CLI.main(["hello"]))
+                  end)
+
+                send(self(), {:stdout, stdout})
+              end)
+
+            assert_received {:stdout, stdout}
+            assert String.trim(stdout) == ""
+            assert stderr =~ "[timed out waiting for the model]"
+
+            sid = only_session_id!(ws)
+            assert stderr =~ "resume with: pixir resume #{sid}"
+            assert [] = session_lease_files(ws)
+          end)
+        end,
+        idle_timeout: 50
+      )
+    end)
+  end
+
+  test "main releases writer lease on handled SIGINT interrupt before halting" do
+    with_cli_halt(fn ->
+      with_cli_provider(
+        [{:interrupt_after, 25}],
+        fn ->
+          in_tmp_workspace("pixir-main-oneshot-sigint-lease-cleanup", fn ws ->
+            stderr =
+              capture_io(:stderr, fn ->
+                stdout =
+                  capture_io(fn ->
+                    assert {:pixir_cli_halt, 130} = catch_throw(CLI.main(["hello"]))
+                  end)
+
+                send(self(), {:stdout, stdout})
+              end)
+
+            assert_received {:stdout, stdout}
+            assert String.trim(stdout) == ""
+            assert stderr =~ "[interrupted]"
+
+            sid = only_session_id!(ws)
+            assert stderr =~ "resume with: pixir resume #{sid}"
+            assert [] = session_lease_files(ws)
+          end)
+        end,
+        idle_timeout: 2_000
+      )
+    end)
   end
 
   test "one-shot --json idle timeout includes deterministic recovery guidance" do

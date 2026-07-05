@@ -170,6 +170,8 @@ defmodule Pixir.Session do
 
   @impl true
   def terminate(_reason, state) do
+    terminate_active_turn(Map.get(state, :turn))
+
     if Map.get(state, :writer_lease_timer_ref),
       do: Process.cancel_timer(state.writer_lease_timer_ref)
 
@@ -376,4 +378,11 @@ defmodule Pixir.Session do
       "last_error" => state.writer_lease_error
     }
   end
+
+  defp terminate_active_turn(%{pid: pid}) when is_pid(pid) do
+    _ = Task.Supervisor.terminate_child(@turn_supervisor, pid)
+    :ok
+  end
+
+  defp terminate_active_turn(_turn), do: :ok
 end
