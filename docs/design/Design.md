@@ -173,7 +173,7 @@ Example terminal transcript:
 
 ```text
 $ pixir doctor --json
-{"ok":true,"status":"ready","version":"0.1.1"}
+{"ok":true,"status":"ready","version":"0.1.5"}
 
 $ pixir tree <session-id> --json
 {"session":"...","children":[...],"log":"append-only"}

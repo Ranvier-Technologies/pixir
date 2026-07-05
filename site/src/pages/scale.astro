@@ -1,0 +1,367 @@
+---
+import Footer from "../components/Footer.astro";
+import Header from "../components/Header.astro";
+import BaseLayout from "../layouts/BaseLayout.astro";
+
+const envelopeLine = `{"ok":true,"status":"completed","work_complete":true,"children":[…64…]}`;
+const statusLine = `[{"completed":64}]   # 202 s wall · 441 MB peak · 1 BEAM process`;
+const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_sse",
+  "transport_preference":"websocket","fallback_reason":"websocket_handshake_failed",
+  "usage_available":true, …}}`;
+---
+
+<BaseLayout
+  title="Pixir - Scale notes: 64 concurrent workers"
+  description="Measured evidence for running up to 64 concurrent supervised subagent workers in one BEAM runtime versus one OS process per worker, on the same OpenAI quota. Memory, wall clock, transport pressure, and an honest caveat."
+  canonical="https://pixir.dev/scale"
+>
+  <div class="page">
+    <Header />
+
+    <main id="top">
+      <section class="section" id="scale">
+        <div class="section-inner">
+          <p class="section-kicker">Evidence · Scale notes</p>
+          <h2>One runtime vs. a herd of processes</h2>
+          <p class="section-lead">
+            The same question at three scales: what does it cost to run N coding-agent
+            workers in parallel over one OpenAI quota? Pixir <code>delegate</code> — N
+            supervised Subagent Sessions inside one BEAM runtime — against the common
+            pattern today: one OS process per worker via <code>codex exec</code>.
+            Measured, not projected, up to <strong>64 concurrent workers</strong>;
+            synthetic load first, then real work. Pixir does not manufacture extra
+            quota or capacity — it reduces process, token, and reconciliation overhead
+            for the same account. The runtime speaks the OpenAI Responses dialect — the
+            same wire contract the <a href="https://www.openresponses.org/specification">Open
+            Responses</a> standard now formalizes. Today it binds to OpenAI's backends;
+            conformance with open implementations is tracked direction, not a shipped
+            feature.
+          </p>
+
+          <div class="terminal" role="group" aria-label="Terminal transcript of the 64-worker run">
+            <div class="terminal-head">
+              <span class="window-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+              <span>pixir · 64-worker fan-out · real run</span>
+            </div>
+            <div class="terminal-body">
+              <div><span class="prompt">$</span> pixir delegate --spec audit64-spec.json --json --timeout-ms 480000</div>
+              <div class="json">{envelopeLine}</div>
+              <br />
+              <div><span class="prompt">$</span> jq '[.children[].status] | group_by(.) | map(&#123;(.[0]): length&#125;)' envelope.json</div>
+              <div class="ok">{statusLine}</div>
+            </div>
+          </div>
+
+          <div class="proof-grid" role="group" aria-label="Headline results at 64 workers">
+            <article class="proof">
+              <code>441 MB vs 11,981 MB</code>
+              <h3>27× memory at N=64</h3>
+              <p>Peak RSS on real work: one BEAM process against 91 OS processes — 1.4% versus 37% of a 32 GB machine.</p>
+            </article>
+            <article class="proof">
+              <code>64/64 · both runtimes</code>
+              <h3>Full completion, valid contracts</h3>
+              <p>Every worker returned schema-valid strict JSON on both sides, with mutually consistent findings — cross-validation, not just throughput.</p>
+            </article>
+            <article class="proof">
+              <code>31/673 calls</code>
+              <h3>WebSocket pressure, zero losses</h3>
+              <p>First systematic WS fallback appeared at 64 connections (4.6%; zero through 32). Every affected call degraded safely to SSE.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section alt">
+        <div class="section-inner">
+          <p class="section-kicker">scale.memory</p>
+          <h2>Marginal cost per worker is the story</h2>
+          <p class="section-lead">
+            Synthetic ladder N=1→8, three repetitions, bootstrap CI95 with zero overlap:
+            <strong>5.1–10.0 MB</strong> per additional child for <code>delegate</code>
+            versus <strong>94.6–97.5 MB</strong> per additional process. Everything
+            solid below is measured; the projection exists only to size the wall and is
+            drawn as one.
+          </p>
+
+          <div class="meter-panel" role="group" aria-label="Measured peak memory by scale">
+            <div class="meter-grp">
+              <p class="meter-l">N=32 · synthetic load</p>
+              <div class="mrow"><span class="mn">pixir</span><div class="mtrack"><div class="mbar px" style="width:2.6%"></div></div><span class="mv">315 MB · 6 procs</span></div>
+              <div class="mrow"><span class="mn">per-proc</span><div class="mtrack"><div class="mbar cx" style="width:35.6%"></div></div><span class="mv">4,265 MB · 309 procs</span></div>
+            </div>
+            <div class="meter-grp">
+              <p class="meter-l">N=64 · real work — a 64-module documentation audit</p>
+              <div class="mrow"><span class="mn">pixir</span><div class="mtrack"><div class="mbar px" style="width:3.7%"></div></div><span class="mv">441 MB · 1 VM</span></div>
+              <div class="mrow"><span class="mn">per-proc</span><div class="mtrack"><div class="mbar cx" style="width:100%"></div></div><span class="mv">11,981 MB · 91 procs</span></div>
+            </div>
+            <div class="meter-grp">
+              <p class="meter-l">Projection · N=150 on this 32 GB machine — not measured</p>
+              <div class="mrow"><span class="mn">pixir</span><div class="mtrack"><div class="mbar px proj" style="width:6%"></div></div><span class="mv">~0.9 GB proj.</span></div>
+              <div class="mrow"><span class="mn">per-proc</span><div class="mtrack"><div class="mbar cx proj" style="width:100%"></div></div><span class="mv">≳28 GB → swap proj.</span></div>
+            </div>
+            <p class="meter-f">
+              The projection extrapolates the measured marginal cost: on 32 GB, the
+              process-per-worker pattern exhausts RAM around N≈150 while the shared
+              runtime stays in single digits. "Hundreds of agents" remains unmeasured —
+              which is why the public claim is <strong>measured up to 64 concurrent
+              workers</strong>, and nothing more.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-inner">
+          <p class="section-kicker">scale.wall</p>
+          <h2>The crossover appeared on synthetic load — and reversed on real work</h2>
+          <p class="section-lead">
+            Two workloads that must not be compared to each other: a synthetic ladder
+            (trivial one-answer children) and the real audit (children reading whole
+            modules in several passes). Read each group on its own.
+          </p>
+
+          <div class="meter-panel" role="group" aria-label="Wall clock by scale">
+            <div class="meter-grp">
+              <p class="meter-l">synthetic · N=16</p>
+              <div class="mrow"><span class="mn">pixir</span><div class="mtrack"><div class="mbar px" style="width:14.3%"></div></div><span class="mv">28.9 s</span></div>
+              <div class="mrow"><span class="mn">per-proc</span><div class="mtrack"><div class="mbar cx" style="width:10.6%"></div></div><span class="mv">21.4 s</span></div>
+            </div>
+            <div class="meter-grp">
+              <p class="meter-l">synthetic · N=32 — crossover toward the shared runtime</p>
+              <div class="mrow"><span class="mn">pixir</span><div class="mtrack"><div class="mbar px" style="width:12.4%"></div></div><span class="mv">25.0 s</span></div>
+              <div class="mrow"><span class="mn">per-proc</span><div class="mtrack"><div class="mbar cx" style="width:18.9%"></div></div><span class="mv">38.2 s</span></div>
+            </div>
+            <div class="meter-grp">
+              <p class="meter-l">real work · N=64 — it reverses</p>
+              <div class="mrow"><span class="mn">pixir</span><div class="mtrack"><div class="mbar px" style="width:100%"></div></div><span class="mv">202 s</span></div>
+              <div class="mrow"><span class="mn">per-proc</span><div class="mtrack"><div class="mbar cx" style="width:47.5%"></div></div><span class="mv">~96 s †</span></div>
+            </div>
+            <p class="meter-f">
+              † max child; per-process timings are clean — the harness's total clock was
+              contaminated by an orchestrator-side bug (ours, not the baseline's). Why
+              the reversal? Pixir children worked deeper — 673 provider calls, ~10.5 per
+              child, 65% more output than the baseline — and absorbed WebSocket pressure
+              with retries. Raw speed was never the claim; the number is reported anyway.
+            </p>
+          </div>
+
+          <div class="honesty-note" role="note">
+            <p class="honesty-tag">honesty.rule</p>
+            <p>
+              The N=32 wall-clock crossover did not generalize to real work at N=64. Any
+              public scale claim carries that nuance or is not made. Pixir's stable
+              advantages are memory, process footprint, durable evidence, and
+              backpressure — not raw per-run speed.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section alt">
+        <div class="section-inner">
+          <p class="section-kicker">scale.transport</p>
+          <h2>WebSocket yields at 64; the design expected it</h2>
+
+          <div class="data-wrap">
+            <table class="data">
+              <thead>
+                <tr><th scope="col">ws concurrency</th><th scope="col">calls</th><th scope="col">fallbacks to sse</th><th scope="col">causes</th><th scope="col">children lost</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>N=8 · synthetic</td><td>16</td><td>1 (one rep)</td><td>transient websocket_closed</td><td class="hl">0</td></tr>
+                <tr><td>N=16</td><td>32</td><td>0</td><td>—</td><td class="hl">0</td></tr>
+                <tr><td>N=32</td><td>68</td><td>0</td><td>—</td><td class="hl">0</td></tr>
+                <tr><td><strong>N=64 · real</strong></td><td>673</td><td><strong>31 · 4.6%</strong></td><td>handshake_failed 17 · degraded 13 · closed 1</td><td class="hl">0</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="terminal" role="group" aria-label="Provider usage log excerpt showing a safe transport fallback">
+            <div class="terminal-head">
+              <span class="window-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+              <span>provider_usage · append-only log · bounded excerpt</span>
+            </div>
+            <div class="terminal-body">
+              <div class="dim"># real evidence of one safe fallback under 64-connection pressure</div>
+              <div class="json">{fallbackJson}</div>
+            </div>
+          </div>
+
+          <p class="section-lead" style="margin-top: 18px;">
+            The <code>auto</code> transport policy — WebSocket preferred, SSE as a
+            pre-output-safe fallback — earned its existence exactly where it should:
+            under real pressure it degraded 31 calls and lost none. The pressure
+            threshold (between 32 and 64 connections) is documented as evidence in the
+            issue tracker.
+          </p>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-inner">
+          <p class="section-kicker">scale.evidence</p>
+          <h2>The 64 runs produced real work, not benchmark theater</h2>
+          <p class="section-lead">
+            The N=64 workload was a documentation audit of this repository's 64 largest
+            modules — the exact chore a freshly opened project needs. Each module was
+            audited independently by both runtimes under the same strict JSON contract.
+          </p>
+
+          <div class="data-wrap">
+            <table class="data">
+              <thead>
+                <tr><th scope="col">audit result</th><th scope="col">pixir · 64 workers</th><th scope="col">per-proc · 64 processes</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>schema-valid JSON contracts</td><td class="hl">64/64</td><td>64/64</td></tr>
+                <tr><td>modules with major doc drift</td><td>7</td><td>8</td></tr>
+                <tr><td>minor / clean</td><td>32 / 25</td><td>36 / 20</td></tr>
+                <tr><td>consensus majors (both agree)</td><td colspan="2"><strong>4</strong> — independently double-evidenced findings</td></tr>
+                <tr><td>uncached input tokens</td><td>1.47M</td><td>1.81M</td></tr>
+                <tr><td>output produced</td><td>121k tok · ≈10.5 calls/child</td><td>73k tok · 1 turn/process</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p class="section-lead" style="margin-top: 18px;">
+            Severity agreement between two mutually blind runtimes turns the four
+            consensus findings into high-confidence, actionable results —
+            parallelization as a <strong>verification method</strong>, not just
+            throughput.
+          </p>
+        </div>
+      </section>
+
+      <section class="section alt">
+        <div class="section-inner">
+          <p class="section-kicker">method.reproduction</p>
+          <h2>Method, limits, and how to reproduce</h2>
+          <p class="section-lead">
+            Parity: same model and the same ChatGPT OAuth quota on both sides; isolated
+            homes (auth via symlink) to exclude MCP servers and personal config from
+            the comparison. RSS figures are sampled process-tree peaks (1 s poll), not
+            OS-exact accounting. The synthetic ladder ran 3 repetitions; the 16/32/64
+            scale points ran once each — directional, stated as such. Delegate fan-outs
+            require <code>subagents.max_threads: N</code> in the spec or children queue
+            at the default.
+          </p>
+          <p class="section-lead">
+            Pixir is a developer preview. These are dogfood scale notes from one
+            machine (macOS, 32 GB), published with their caveats attached. Primary
+            evidence lives in append-only session logs (<code>provider_usage</code>
+            events carry per-call token and transport data) and in the benchmark
+            harness artifacts in the repository — reproduce it, or better,
+            <a href="https://github.com/Ranvier-Technologies/pixir-harness">try to break it and file what doesn't hold</a>.
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <Footer />
+  </div>
+</BaseLayout>
+
+<style>
+  .meter-panel {
+    margin-top: 26px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--canvas);
+    padding: 20px 22px 8px;
+  }
+  .meter-grp { padding: 10px 0 8px; }
+  .meter-grp + .meter-grp { border-top: 1px solid var(--line); }
+  .meter-l {
+    margin: 0 0 6px;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .mrow {
+    display: grid;
+    grid-template-columns: 92px 1fr 168px;
+    align-items: center;
+    gap: 14px;
+    padding: 3px 0;
+  }
+  @media (max-width: 560px) {
+    .mrow { grid-template-columns: 68px 1fr 126px; gap: 8px; }
+  }
+  .mn { font-family: var(--mono); font-size: 13px; color: var(--muted); }
+  .mv {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    white-space: nowrap;
+  }
+  .mtrack { height: 12px; display: flex; align-items: center; }
+  .mbar { height: 12px; border-radius: 0 3px 3px 0; min-width: 3px; }
+  .mbar.px { background: var(--beam-cyan); }
+  .mbar.cx { background: var(--subtle); }
+  .mbar.proj {
+    opacity: 0.45;
+    background-image: repeating-linear-gradient(
+      45deg, transparent 0 5px, rgba(255, 255, 255, 0.55) 5px 8px);
+  }
+  .meter-f {
+    margin: 14px 0 10px;
+    max-width: 640px;
+    font-size: 14px;
+    line-height: 1.55;
+    color: var(--subtle);
+  }
+
+  .honesty-note {
+    margin-top: 24px;
+    max-width: 720px;
+    border: 1px solid #f3d9a4;
+    border-radius: 8px;
+    background: #fffbeb;
+    padding: 16px 20px;
+  }
+  .honesty-tag {
+    margin: 0 0 6px;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: #b45309;
+  }
+  .honesty-note p:last-child {
+    margin: 0;
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--muted);
+  }
+
+  .data-wrap {
+    margin-top: 22px;
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+  table.data {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+    background: var(--canvas);
+  }
+  table.data th {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 400;
+    color: var(--subtle);
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  table.data td {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--line);
+    font-variant-numeric: tabular-nums;
+  }
+  table.data tr:last-child td { border-bottom: 0; }
+  table.data td.hl { color: #0284c7; font-weight: 620; }
+
+  .terminal { margin-top: 26px; }
+</style>

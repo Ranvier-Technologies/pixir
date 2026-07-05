@@ -302,6 +302,40 @@ defmodule Pixir.SubagentsTest do
     assert Enum.all?(polled, &(&1["status"] == "completed"))
   end
 
+  test "a late timeout for an already-dead child does not crash the Manager", %{
+    sid: sid,
+    ws: ws
+  } do
+    {:ok, agent} =
+      Subagents.spawn_agent(
+        sid,
+        %{"task" => "block", "timeout_ms" => 600_000},
+        workspace: ws,
+        provider: BlockingProvider,
+        permission_mode: :auto
+      )
+
+    manager = Process.whereis(Pixir.Subagents.Manager)
+    assert is_pid(manager)
+
+    # Kill the child Session out from under the Manager, simulating a child
+    # whose test/app tore down before its timeout fired (the CI race).
+    [{child_pid, _}] = Registry.lookup(Pixir.Sessions.Registry, agent["child_session_id"])
+    ref = Process.monitor(child_pid)
+    Process.exit(child_pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^child_pid, :killed}
+
+    # Fire the timeout by hand; before the guard this crashed the Manager with
+    # a :noproc exit from Session.interrupt/1.
+    send(manager, {:subagent_timeout, sid, agent["id"]})
+
+    # The Manager must survive and record honest timeout evidence.
+    assert {:ok, [outcome]} = Subagents.wait(sid, [agent["id"]], 0, workspace: ws)
+    assert outcome["status"] == "timed_out"
+    assert Process.alive?(manager)
+    assert Process.whereis(Pixir.Subagents.Manager) == manager
+  end
+
   test "isolated snapshots skip generated directories recursively and expose metadata", %{
     sid: sid,
     ws: ws

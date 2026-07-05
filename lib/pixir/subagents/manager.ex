@@ -278,7 +278,7 @@ defmodule Pixir.Subagents.Manager do
   def handle_info({:subagent_timeout, parent_sid, id}, state) do
     case fetch_agent(state, parent_sid, id) do
       {:ok, %{status: "running"} = agent} ->
-        _ = Session.interrupt(agent.child_session_id)
+        _ = safe_interrupt(agent.child_session_id)
         elapsed_ms = elapsed_ms(agent)
         next_actions = timeout_next_actions(agent)
 
@@ -782,8 +782,18 @@ defmodule Pixir.Subagents.Manager do
   defp ensure_closeable(%{status: "detached"}), do: {:error, :detached}
   defp ensure_closeable(_agent), do: :ok
 
+  # A late timeout or cancel can race a child Session that already terminated
+  # (its test/app tore down, or it finished between deadline firing and handling).
+  # Interrupting a dead child must not crash the Manager: the timeout/cancel
+  # evidence below is still the honest record either way.
+  defp safe_interrupt(session_id) do
+    Session.interrupt(session_id)
+  catch
+    :exit, _ -> :ok
+  end
+
   defp close_or_cancel_agent(%{status: "running"} = agent) do
-    _ = Session.interrupt(agent.child_session_id)
+    _ = safe_interrupt(agent.child_session_id)
 
     {%{
        agent
