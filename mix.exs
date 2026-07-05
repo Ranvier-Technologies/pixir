@@ -2,7 +2,7 @@ defmodule Pixir.MixProject do
   use Mix.Project
 
   @version "0.1.5"
-  @source_url "https://github.com/Ranvier-Technologies/pixir-harness"
+  @source_url "https://github.com/Ranvier-Technologies/pixir"
 
   def project do
     [

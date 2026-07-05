@@ -42,8 +42,8 @@ pixir doctor --json
 From source:
 
 ```bash
-git clone https://github.com/Ranvier-Technologies/pixir-harness.git
-cd pixir-harness
+git clone https://github.com/Ranvier-Technologies/pixir.git
+cd pixir
 
 mix deps.get
 mix escript.build

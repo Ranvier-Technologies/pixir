@@ -7,7 +7,23 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [0.1.5]
 
+### Fixed
+- Clean CLI exits now release Session writer leases across one-shot, `resume`,
+  and attached delegate (parent and children); stale leases from crashed runs
+  remain fail-closed behind `--force-release-writer-lease`. Headless
+  orchestrators no longer need the force flag on the happy path.
+- `Subagents.Manager` survives late timeouts or cancels racing an
+  already-terminated child Session; the recorded timeout/cancel evidence is the
+  honest record either way.
+
 ### Added
+- `pixir-delegate` skill family for orchestrating agents
+  (`.agents/skills/pixir-delegate*`): a host-neutral delegation judgment core,
+  real blind-run demonstrations, deterministic `fanout.sh`/`steer.sh` scripts,
+  and variants for Claude Code, Codex root agents, and Pixir-native
+  orchestration. Discoverable by Claude Code via `.claude/skills/`.
+- Site route `/scale` with measured scale evidence (up to 64 concurrent
+  workers) and bounded public claims.
 - Delegate CLI contract documentation for expensive orchestrators
   (`docs/examples/delegate-cli-live/README.md`): a per-subcommand exit-code table,
   the read/scope vs write-policy denial distinction (`outside_workspace` vs
