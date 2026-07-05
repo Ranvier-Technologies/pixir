@@ -2,7 +2,9 @@
 
 Date: 2026-06-04
 Status: Accepted
-Implementation status: Initial repo integration
+Implementation status: Initial repo integration. PATCHMD is a maintainer
+practice: the UV-backed PATCH kit CLI (`scripts/patch_cli.py`) referenced
+below is not distributed with this repository.
 
 ## Context
 

@@ -5,6 +5,9 @@ description: Maintain a customized Pixir repository against canonical upstream u
 
 # Pixir Customization Operator
 
+> Maintainer practice: the UV-backed PATCH kit CLI (`scripts/patch_cli.py`)
+> that this skill drives is not distributed with this repository.
+
 Use this Skill when Pixir itself is the target repository and the task is to keep local
 customizations aligned with canonical upstream without losing installed practices.
 

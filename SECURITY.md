@@ -25,6 +25,9 @@ Use GitHub's private vulnerability reporting: go to the repository's **Security*
 tab and choose **"Report a vulnerability"**. This opens a private advisory visible
 only to you and the maintainers.
 
+If private vulnerability reporting is unavailable to you, email
+<opensource@ranvier-technologies.com> with the same details.
+
 When you report, please include:
 
 - the Pixir version (`pixir --version`) and how it was installed (source checkout

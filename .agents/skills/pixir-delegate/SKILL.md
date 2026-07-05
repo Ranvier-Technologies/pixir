@@ -111,10 +111,12 @@ current one.
 
 ## When something fails
 
-- One-shot and resume abnormal exits print the **exact resume command on
-  stderr** — run that instead of reconstructing one. Delegate partials print
-  nothing there: the resume targets live only in the envelope's `children[]`.
-  Error envelopes carry `next_actions` — follow them.
+- Recovery guidance for one-shot and resume abnormal exits depends on mode:
+  in `--json` mode it arrives **in the envelope** (`.resume_command`; timeouts
+  also carry `.recovery`) and stderr stays silent; without `--json`, the exact
+  resume command prints on stderr. Delegate partials put resume targets only
+  in the envelope's `children[]`. Error envelopes carry `next_actions` —
+  follow them.
 - A stale writer lease fails closed **on purpose** (crashed runs leave
   evidence). Inspect first: `pixir diagnose session <sid> --json`. Force-release
   is a deliberate operator action, never a default.

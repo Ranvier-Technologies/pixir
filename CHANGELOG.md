@@ -1,6 +1,8 @@
 # Changelog
 
-All notable changes to Pixir are recorded here. Pixir is a developer preview;
+All notable changes to Pixir are recorded here. Issue and PR references
+(`#N`) point to the private development repository; this public mirror
+carries curated history, so those references may not resolve here. Pixir is a developer preview;
 the CLI/ACP runtime is the public surface, and there is no stable Elixir library
 API yet. Versions follow [Semantic Versioning](https://semver.org/) with the
 caveat that pre-1.0 minor versions may still change behavior.

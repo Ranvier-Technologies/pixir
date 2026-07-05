@@ -5,6 +5,9 @@ description: "Run bounded patch work in this repository using the installed Patc
 
 # Patch Operator
 
+> Maintainer practice: the UV-backed PATCH kit CLI (`scripts/patch_cli.py`)
+> that this skill drives is not distributed with this repository.
+
 Operate one bounded patch at a time, with a written charter, Skill-led classification, local
 acceptance, and a handoff that never confuses local proof with CI or external review. This skill
 is installed by the Patch Operator Kit; it reads the repo's `patch:*` commands, `.docs/`

@@ -44,7 +44,7 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
               <span>pixir · 64-worker fan-out · real run</span>
             </div>
             <div class="terminal-body">
-              <div><span class="prompt">$</span> pixir delegate --spec audit64-spec.json --json --timeout-ms 480000</div>
+              <div><span class="prompt">$</span> pixir delegate --spec docs/benchmarks/scale/audit64-spec.json --json --timeout-ms 480000</div>
               <div class="json">{envelopeLine}</div>
               <br />
               <div><span class="prompt">$</span> jq '[.children[].status] | group_by(.) | map(&#123;(.[0]): length&#125;)' envelope.json</div>
@@ -192,8 +192,9 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
             The <code>auto</code> transport policy — WebSocket preferred, SSE as a
             pre-output-safe fallback — earned its existence exactly where it should:
             under real pressure it degraded 31 calls and lost none. The pressure
-            threshold (between 32 and 64 connections) is recorded in our issue
-            backlog with the session evidence.
+            threshold (between 32 and 64 connections) is tracked publicly in
+            <a href="https://github.com/Ranvier-Technologies/pixir/issues/1">the
+            scale-evidence bundle issue</a>.
           </p>
         </div>
       </section>
