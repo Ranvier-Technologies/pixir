@@ -1,0 +1,482 @@
+{
+  "claim": "Pixir WebSocket transport under concurrency: N=16 (32/32 calls) and N=32 (68/68 calls) were all-websocket, zero fallbacks. The N=1..8 ladder had one transient WS->SSE fallback in a single N=8 rep; the other two N=8 reps were all-websocket. First systematic pressure appeared at N=64 real work: 31 of 673 calls fell back WS->SSE (4.6%), zero losses: every fallback call completed over http_sse.",
+  "synthetic_ladder_and_scale_runs": [
+    {
+      "arm": "codex-exec",
+      "workload": "fanout",
+      "n": 1,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 1
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "fanout",
+      "n": 2,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 2
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "fanout",
+      "n": 4,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 4
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "fanout",
+      "n": 8,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 8
+    },
+    {
+      "arm": "pixir-delegate",
+      "workload": "fanout",
+      "n": 1,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 2
+    },
+    {
+      "arm": "pixir-delegate",
+      "workload": "fanout",
+      "n": 2,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 4
+    },
+    {
+      "arm": "pixir-delegate",
+      "workload": "fanout",
+      "n": 4,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 8
+    },
+    {
+      "arm": "pixir-delegate",
+      "workload": "fanout",
+      "n": 8,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 19
+    },
+    {
+      "arm": "pixir-oneshot",
+      "workload": "fanout",
+      "n": 1,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 2
+    },
+    {
+      "arm": "pixir-oneshot",
+      "workload": "fanout",
+      "n": 2,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 4
+    },
+    {
+      "arm": "pixir-oneshot",
+      "workload": "fanout",
+      "n": 4,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 8
+    },
+    {
+      "arm": "pixir-oneshot",
+      "workload": "fanout",
+      "n": 8,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 16
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "fanout",
+      "n": 1,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 1
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "fanout",
+      "n": 2,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 2
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "fanout",
+      "n": 4,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 4
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "fanout",
+      "n": 8,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 8
+    },
+    {
+      "arm": "pixir-delegate",
+      "workload": "fanout",
+      "n": 1,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 2
+    },
+    {
+      "arm": "pixir-delegate",
+      "workload": "fanout",
+      "n": 2,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 4
+    },
+    {
+      "arm": "pixir-delegate",
+      "workload": "fanout",
+      "n": 4,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 8
+    },
+    {
+      "arm": "pixir-delegate",
+      "workload": "fanout",
+      "n": 8,
+      "rep": 1,
+      "transports": [
+        "http_sse",
+        "websocket"
+      ],
+      "provider_calls": 21
+    },
+    {
+      "arm": "pixir-oneshot",
+      "workload": "fanout",
+      "n": 1,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 2
+    },
+    {
+      "arm": "pixir-oneshot",
+      "workload": "fanout",
+      "n": 2,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 4
+    },
+    {
+      "arm": "pixir-oneshot",
+      "workload": "fanout",
+      "n": 4,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 8
+    },
+    {
+      "arm": "pixir-oneshot",
+      "workload": "fanout",
+      "n": 8,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 16
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "fanout",
+      "n": 1,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 1
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "fanout",
+      "n": 2,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 2
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "fanout",
+      "n": 4,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 4
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "fanout",
+      "n": 8,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 8
+    },
+    {
+      "arm": "pixir-delegate",
+      "workload": "fanout",
+      "n": 1,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 2
+    },
+    {
+      "arm": "pixir-delegate",
+      "workload": "fanout",
+      "n": 2,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 4
+    },
+    {
+      "arm": "pixir-delegate",
+      "workload": "fanout",
+      "n": 4,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 11
+    },
+    {
+      "arm": "pixir-delegate",
+      "workload": "fanout",
+      "n": 8,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 16
+    },
+    {
+      "arm": "pixir-oneshot",
+      "workload": "fanout",
+      "n": 1,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 2
+    },
+    {
+      "arm": "pixir-oneshot",
+      "workload": "fanout",
+      "n": 2,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 4
+    },
+    {
+      "arm": "pixir-oneshot",
+      "workload": "fanout",
+      "n": 4,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 8
+    },
+    {
+      "arm": "pixir-oneshot",
+      "workload": "fanout",
+      "n": 8,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 16
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "resume",
+      "n": 5,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 5
+    },
+    {
+      "arm": "pixir-oneshot",
+      "workload": "resume",
+      "n": 5,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 9
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "resume",
+      "n": 5,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 5
+    },
+    {
+      "arm": "pixir-oneshot",
+      "workload": "resume",
+      "n": 5,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 9
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "resume",
+      "n": 5,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 5
+    },
+    {
+      "arm": "pixir-oneshot",
+      "workload": "resume",
+      "n": 5,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 9
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "fanout",
+      "n": 16,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 16
+    },
+    {
+      "arm": "pixir-delegate",
+      "workload": "fanout",
+      "n": 16,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 32
+    },
+    {
+      "arm": "codex-exec",
+      "workload": "fanout",
+      "n": 32,
+      "rep": 1,
+      "transports": [
+        "http_sse"
+      ],
+      "provider_calls": 32
+    },
+    {
+      "arm": "pixir-delegate",
+      "workload": "fanout",
+      "n": 32,
+      "rep": 1,
+      "transports": [
+        "websocket"
+      ],
+      "provider_calls": 68
+    }
+  ],
+  "audit64_realwork": {
+    "provider_calls": 673,
+    "transports": {
+      "websocket": 642,
+      "http_sse": 31
+    },
+    "fallback_rate": 0.0461,
+    "fallback_reasons": {
+      "websocket_closed": 1,
+      "websocket_handshake_failed": 17,
+      "websocket_degraded": 13
+    },
+    "losses": 0,
+    "losses_definition": "children that failed to produce a valid contract due to transport: none; 64/64 completed"
+  },
+  "provenance": "provider_usage events in append-only session logs (ADR 0019)"
+}

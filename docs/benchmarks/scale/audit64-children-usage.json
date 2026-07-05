@@ -1,0 +1,860 @@
+{
+  "run": "audit64-realwork (2026-07-05, 64-task module doc-audit, read-only)",
+  "children": [
+    {
+      "child_session_id": "20260705T015916-4c3a54",
+      "status": "completed",
+      "provider_calls": 24,
+      "input_tokens": 677023,
+      "cached_tokens": 604672,
+      "uncached_input_tokens": 72351,
+      "output_tokens": 3700,
+      "reasoning_tokens": 2505,
+      "transports": {
+        "websocket": 24
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-4c123e",
+      "status": "completed",
+      "provider_calls": 21,
+      "input_tokens": 289906,
+      "cached_tokens": 242688,
+      "uncached_input_tokens": 47218,
+      "output_tokens": 2852,
+      "reasoning_tokens": 2039,
+      "transports": {
+        "websocket": 21
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-3d16be",
+      "status": "completed",
+      "provider_calls": 23,
+      "input_tokens": 316993,
+      "cached_tokens": 269824,
+      "uncached_input_tokens": 47169,
+      "output_tokens": 2627,
+      "reasoning_tokens": 1680,
+      "transports": {
+        "websocket": 23
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-315072",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 48228,
+      "cached_tokens": 32256,
+      "uncached_input_tokens": 15972,
+      "output_tokens": 1380,
+      "reasoning_tokens": 1085,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-6239c6",
+      "status": "completed",
+      "provider_calls": 10,
+      "input_tokens": 104078,
+      "cached_tokens": 78336,
+      "uncached_input_tokens": 25742,
+      "output_tokens": 3763,
+      "reasoning_tokens": 3390,
+      "transports": {
+        "websocket": 10
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-e1f60f",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 61444,
+      "cached_tokens": 45056,
+      "uncached_input_tokens": 16388,
+      "output_tokens": 989,
+      "reasoning_tokens": 693,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-afdd85",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 55477,
+      "cached_tokens": 38912,
+      "uncached_input_tokens": 16565,
+      "output_tokens": 1620,
+      "reasoning_tokens": 1390,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-da4472",
+      "status": "completed",
+      "provider_calls": 22,
+      "input_tokens": 376003,
+      "cached_tokens": 316416,
+      "uncached_input_tokens": 59587,
+      "output_tokens": 2212,
+      "reasoning_tokens": 1328,
+      "transports": {
+        "websocket": 22
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-349258",
+      "status": "completed",
+      "provider_calls": 30,
+      "input_tokens": 644414,
+      "cached_tokens": 548352,
+      "uncached_input_tokens": 96062,
+      "output_tokens": 3306,
+      "reasoning_tokens": 2163,
+      "transports": {
+        "websocket": 29,
+        "http_sse": 1
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-15ec97",
+      "status": "completed",
+      "provider_calls": 8,
+      "input_tokens": 59303,
+      "cached_tokens": 41984,
+      "uncached_input_tokens": 17319,
+      "output_tokens": 1352,
+      "reasoning_tokens": 1075,
+      "transports": {
+        "websocket": 8
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-856ddc",
+      "status": "completed",
+      "provider_calls": 22,
+      "input_tokens": 290947,
+      "cached_tokens": 253952,
+      "uncached_input_tokens": 36995,
+      "output_tokens": 3079,
+      "reasoning_tokens": 2233,
+      "transports": {
+        "websocket": 22
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-416230",
+      "status": "completed",
+      "provider_calls": 23,
+      "input_tokens": 432793,
+      "cached_tokens": 384512,
+      "uncached_input_tokens": 48281,
+      "output_tokens": 3647,
+      "reasoning_tokens": 2745,
+      "transports": {
+        "websocket": 23
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-b32d62",
+      "status": "completed",
+      "provider_calls": 19,
+      "input_tokens": 203641,
+      "cached_tokens": 173568,
+      "uncached_input_tokens": 30073,
+      "output_tokens": 2552,
+      "reasoning_tokens": 1862,
+      "transports": {
+        "websocket": 19
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-5b1ec2",
+      "status": "completed",
+      "provider_calls": 9,
+      "input_tokens": 72104,
+      "cached_tokens": 53248,
+      "uncached_input_tokens": 18856,
+      "output_tokens": 1216,
+      "reasoning_tokens": 873,
+      "transports": {
+        "websocket": 9
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-49317c",
+      "status": "completed",
+      "provider_calls": 8,
+      "input_tokens": 71577,
+      "cached_tokens": 53248,
+      "uncached_input_tokens": 18329,
+      "output_tokens": 2375,
+      "reasoning_tokens": 1986,
+      "transports": {
+        "websocket": 8
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-3640ec",
+      "status": "completed",
+      "provider_calls": 17,
+      "input_tokens": 294060,
+      "cached_tokens": 236032,
+      "uncached_input_tokens": 58028,
+      "output_tokens": 2770,
+      "reasoning_tokens": 2173,
+      "transports": {
+        "websocket": 17
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-cdeba3",
+      "status": "completed",
+      "provider_calls": 24,
+      "input_tokens": 279009,
+      "cached_tokens": 246272,
+      "uncached_input_tokens": 32737,
+      "output_tokens": 2210,
+      "reasoning_tokens": 1335,
+      "transports": {
+        "websocket": 24
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-5e47e7",
+      "status": "completed",
+      "provider_calls": 39,
+      "input_tokens": 673017,
+      "cached_tokens": 619520,
+      "uncached_input_tokens": 53497,
+      "output_tokens": 3675,
+      "reasoning_tokens": 1801,
+      "transports": {
+        "websocket": 39
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-6a7d15",
+      "status": "completed",
+      "provider_calls": 20,
+      "input_tokens": 253270,
+      "cached_tokens": 203776,
+      "uncached_input_tokens": 49494,
+      "output_tokens": 2447,
+      "reasoning_tokens": 1635,
+      "transports": {
+        "websocket": 20
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-9abe25",
+      "status": "completed",
+      "provider_calls": 18,
+      "input_tokens": 201548,
+      "cached_tokens": 173056,
+      "uncached_input_tokens": 28492,
+      "output_tokens": 2072,
+      "reasoning_tokens": 1278,
+      "transports": {
+        "websocket": 18
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-c405fe",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 51504,
+      "cached_tokens": 38400,
+      "uncached_input_tokens": 13104,
+      "output_tokens": 3729,
+      "reasoning_tokens": 3435,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-d5ee28",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 62870,
+      "cached_tokens": 46592,
+      "uncached_input_tokens": 16278,
+      "output_tokens": 1544,
+      "reasoning_tokens": 1329,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-f15195",
+      "status": "completed",
+      "provider_calls": 8,
+      "input_tokens": 64923,
+      "cached_tokens": 50176,
+      "uncached_input_tokens": 14747,
+      "output_tokens": 1568,
+      "reasoning_tokens": 1324,
+      "transports": {
+        "websocket": 8
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-6dc066",
+      "status": "completed",
+      "provider_calls": 8,
+      "input_tokens": 63573,
+      "cached_tokens": 46592,
+      "uncached_input_tokens": 16981,
+      "output_tokens": 1320,
+      "reasoning_tokens": 1069,
+      "transports": {
+        "websocket": 8
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-8c97d4",
+      "status": "completed",
+      "provider_calls": 6,
+      "input_tokens": 48182,
+      "cached_tokens": 32256,
+      "uncached_input_tokens": 15926,
+      "output_tokens": 1101,
+      "reasoning_tokens": 891,
+      "transports": {
+        "websocket": 6
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-013f08",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 60731,
+      "cached_tokens": 41984,
+      "uncached_input_tokens": 18747,
+      "output_tokens": 2018,
+      "reasoning_tokens": 1757,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-7b384f",
+      "status": "completed",
+      "provider_calls": 6,
+      "input_tokens": 48371,
+      "cached_tokens": 35328,
+      "uncached_input_tokens": 13043,
+      "output_tokens": 1204,
+      "reasoning_tokens": 995,
+      "transports": {
+        "websocket": 6
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-0d6924",
+      "status": "completed",
+      "provider_calls": 15,
+      "input_tokens": 189793,
+      "cached_tokens": 145408,
+      "uncached_input_tokens": 44385,
+      "output_tokens": 2900,
+      "reasoning_tokens": 2330,
+      "transports": {
+        "websocket": 15
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-e5c75b",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 56932,
+      "cached_tokens": 39936,
+      "uncached_input_tokens": 16996,
+      "output_tokens": 1179,
+      "reasoning_tokens": 799,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-3a6377",
+      "status": "completed",
+      "provider_calls": 9,
+      "input_tokens": 73126,
+      "cached_tokens": 48128,
+      "uncached_input_tokens": 24998,
+      "output_tokens": 2536,
+      "reasoning_tokens": 2134,
+      "transports": {
+        "websocket": 9
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-274509",
+      "status": "completed",
+      "provider_calls": 5,
+      "input_tokens": 32942,
+      "cached_tokens": 24576,
+      "uncached_input_tokens": 8366,
+      "output_tokens": 738,
+      "reasoning_tokens": 568,
+      "transports": {
+        "websocket": 5
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-7a3cde",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 47930,
+      "cached_tokens": 32256,
+      "uncached_input_tokens": 15674,
+      "output_tokens": 1405,
+      "reasoning_tokens": 1086,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-4ee23f",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 47450,
+      "cached_tokens": 34816,
+      "uncached_input_tokens": 12634,
+      "output_tokens": 708,
+      "reasoning_tokens": 463,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-0042ad",
+      "status": "completed",
+      "provider_calls": 6,
+      "input_tokens": 39865,
+      "cached_tokens": 31232,
+      "uncached_input_tokens": 8633,
+      "output_tokens": 513,
+      "reasoning_tokens": 330,
+      "transports": {
+        "websocket": 6
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-e24909",
+      "status": "completed",
+      "provider_calls": 8,
+      "input_tokens": 55583,
+      "cached_tokens": 39424,
+      "uncached_input_tokens": 16159,
+      "output_tokens": 853,
+      "reasoning_tokens": 575,
+      "transports": {
+        "websocket": 8
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-da25b4",
+      "status": "completed",
+      "provider_calls": 9,
+      "input_tokens": 80137,
+      "cached_tokens": 60416,
+      "uncached_input_tokens": 19721,
+      "output_tokens": 2872,
+      "reasoning_tokens": 2502,
+      "transports": {
+        "websocket": 9
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-ad4a9a",
+      "status": "completed",
+      "provider_calls": 5,
+      "input_tokens": 32198,
+      "cached_tokens": 25088,
+      "uncached_input_tokens": 7110,
+      "output_tokens": 773,
+      "reasoning_tokens": 586,
+      "transports": {
+        "websocket": 5
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-22cee4",
+      "status": "completed",
+      "provider_calls": 8,
+      "input_tokens": 55775,
+      "cached_tokens": 39936,
+      "uncached_input_tokens": 15839,
+      "output_tokens": 1874,
+      "reasoning_tokens": 1515,
+      "transports": {
+        "websocket": 8
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-21bdff",
+      "status": "completed",
+      "provider_calls": 6,
+      "input_tokens": 46874,
+      "cached_tokens": 31232,
+      "uncached_input_tokens": 15642,
+      "output_tokens": 1494,
+      "reasoning_tokens": 1155,
+      "transports": {
+        "websocket": 6
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-b9e1b9",
+      "status": "completed",
+      "provider_calls": 5,
+      "input_tokens": 32727,
+      "cached_tokens": 18432,
+      "uncached_input_tokens": 14295,
+      "output_tokens": 1905,
+      "reasoning_tokens": 1616,
+      "transports": {
+        "websocket": 5
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-fc4298",
+      "status": "completed",
+      "provider_calls": 9,
+      "input_tokens": 66107,
+      "cached_tokens": 39936,
+      "uncached_input_tokens": 26171,
+      "output_tokens": 2552,
+      "reasoning_tokens": 2137,
+      "transports": {
+        "http_sse": 7,
+        "websocket": 2
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-2d576b",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 46515,
+      "cached_tokens": 31744,
+      "uncached_input_tokens": 14771,
+      "output_tokens": 2982,
+      "reasoning_tokens": 2642,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-f0e925",
+      "status": "completed",
+      "provider_calls": 5,
+      "input_tokens": 32031,
+      "cached_tokens": 24576,
+      "uncached_input_tokens": 7455,
+      "output_tokens": 3416,
+      "reasoning_tokens": 3163,
+      "transports": {
+        "websocket": 5
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-1efe8d",
+      "status": "completed",
+      "provider_calls": 5,
+      "input_tokens": 31324,
+      "cached_tokens": 25088,
+      "uncached_input_tokens": 6236,
+      "output_tokens": 3933,
+      "reasoning_tokens": 3699,
+      "transports": {
+        "websocket": 5
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-66f6f0",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 46166,
+      "cached_tokens": 38912,
+      "uncached_input_tokens": 7254,
+      "output_tokens": 684,
+      "reasoning_tokens": 417,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-bf3651",
+      "status": "completed",
+      "provider_calls": 6,
+      "input_tokens": 44753,
+      "cached_tokens": 25088,
+      "uncached_input_tokens": 19665,
+      "output_tokens": 2224,
+      "reasoning_tokens": 1944,
+      "transports": {
+        "websocket": 6
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-eb92f2",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 46282,
+      "cached_tokens": 35328,
+      "uncached_input_tokens": 10954,
+      "output_tokens": 504,
+      "reasoning_tokens": 292,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-6e13ef",
+      "status": "completed",
+      "provider_calls": 6,
+      "input_tokens": 44497,
+      "cached_tokens": 27136,
+      "uncached_input_tokens": 17361,
+      "output_tokens": 981,
+      "reasoning_tokens": 779,
+      "transports": {
+        "http_sse": 4,
+        "websocket": 2
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-7a2bfa",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 46195,
+      "cached_tokens": 35840,
+      "uncached_input_tokens": 10355,
+      "output_tokens": 1337,
+      "reasoning_tokens": 1098,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-619851",
+      "status": "completed",
+      "provider_calls": 5,
+      "input_tokens": 31007,
+      "cached_tokens": 24576,
+      "uncached_input_tokens": 6431,
+      "output_tokens": 548,
+      "reasoning_tokens": 383,
+      "transports": {
+        "websocket": 5
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-ad186b",
+      "status": "completed",
+      "provider_calls": 6,
+      "input_tokens": 38603,
+      "cached_tokens": 25088,
+      "uncached_input_tokens": 13515,
+      "output_tokens": 1095,
+      "reasoning_tokens": 913,
+      "transports": {
+        "websocket": 6
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-8a4d76",
+      "status": "completed",
+      "provider_calls": 5,
+      "input_tokens": 30995,
+      "cached_tokens": 21504,
+      "uncached_input_tokens": 9491,
+      "output_tokens": 1989,
+      "reasoning_tokens": 1798,
+      "transports": {
+        "websocket": 5
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-9b043f",
+      "status": "completed",
+      "provider_calls": 5,
+      "input_tokens": 30935,
+      "cached_tokens": 25088,
+      "uncached_input_tokens": 5847,
+      "output_tokens": 531,
+      "reasoning_tokens": 364,
+      "transports": {
+        "websocket": 5
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-a8814f",
+      "status": "completed",
+      "provider_calls": 6,
+      "input_tokens": 38537,
+      "cached_tokens": 28160,
+      "uncached_input_tokens": 10377,
+      "output_tokens": 1204,
+      "reasoning_tokens": 1013,
+      "transports": {
+        "websocket": 6
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-743c51",
+      "status": "completed",
+      "provider_calls": 9,
+      "input_tokens": 68358,
+      "cached_tokens": 52224,
+      "uncached_input_tokens": 16134,
+      "output_tokens": 4056,
+      "reasoning_tokens": 3551,
+      "transports": {
+        "websocket": 9
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-1aa5bd",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 45861,
+      "cached_tokens": 31744,
+      "uncached_input_tokens": 14117,
+      "output_tokens": 548,
+      "reasoning_tokens": 321,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-4269af",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 48718,
+      "cached_tokens": 36864,
+      "uncached_input_tokens": 11854,
+      "output_tokens": 1504,
+      "reasoning_tokens": 1197,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-761f6f",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 46198,
+      "cached_tokens": 35328,
+      "uncached_input_tokens": 10870,
+      "output_tokens": 487,
+      "reasoning_tokens": 272,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-9e6250",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 45947,
+      "cached_tokens": 35840,
+      "uncached_input_tokens": 10107,
+      "output_tokens": 2352,
+      "reasoning_tokens": 2140,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-6f2929",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 45528,
+      "cached_tokens": 35840,
+      "uncached_input_tokens": 9688,
+      "output_tokens": 493,
+      "reasoning_tokens": 278,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-04b826",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 45587,
+      "cached_tokens": 32256,
+      "uncached_input_tokens": 13331,
+      "output_tokens": 2118,
+      "reasoning_tokens": 1904,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-9aa2f3",
+      "status": "completed",
+      "provider_calls": 7,
+      "input_tokens": 45748,
+      "cached_tokens": 32256,
+      "uncached_input_tokens": 13492,
+      "output_tokens": 588,
+      "reasoning_tokens": 366,
+      "transports": {
+        "websocket": 7
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-b7ad06",
+      "status": "completed",
+      "provider_calls": 17,
+      "input_tokens": 212381,
+      "cached_tokens": 144896,
+      "uncached_input_tokens": 67485,
+      "output_tokens": 1893,
+      "reasoning_tokens": 1239,
+      "transports": {
+        "http_sse": 11,
+        "websocket": 6
+      }
+    },
+    {
+      "child_session_id": "20260705T015916-bc3b95",
+      "status": "completed",
+      "provider_calls": 8,
+      "input_tokens": 54046,
+      "cached_tokens": 35328,
+      "uncached_input_tokens": 18718,
+      "output_tokens": 548,
+      "reasoning_tokens": 309,
+      "transports": {
+        "http_sse": 8
+      }
+    }
+  ],
+  "totals": {
+    "children": 64,
+    "completed": 64,
+    "provider_calls": 673,
+    "input_tokens": 7828640,
+    "cached_tokens": 6358528,
+    "uncached_input_tokens": 1470112,
+    "output_tokens": 120645,
+    "reasoning_tokens": 93947,
+    "transports": {
+      "websocket": 642,
+      "http_sse": 31
+    },
+    "fallback_reasons": {
+      "websocket_closed": 1,
+      "websocket_handshake_failed": 17,
+      "websocket_degraded": 13
+    }
+  }
+}

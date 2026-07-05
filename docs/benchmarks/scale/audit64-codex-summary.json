@@ -1,0 +1,655 @@
+{
+  "run": "codex-exec x64 arm of the same 64-task doc-audit; per-task usage aggregated from each process's turn.completed events. Raw event streams are not published: they carry provider correlation ids.",
+  "tasks": [
+    {
+      "task": 1,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 331027,
+      "cached_input_tokens": 230912,
+      "uncached_input_tokens": 100115,
+      "output_tokens": 2803,
+      "reasoning_output_tokens": 1093
+    },
+    {
+      "task": 2,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 223205,
+      "cached_input_tokens": 157056,
+      "uncached_input_tokens": 66149,
+      "output_tokens": 1532,
+      "reasoning_output_tokens": 705
+    },
+    {
+      "task": 3,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 208898,
+      "cached_input_tokens": 110336,
+      "uncached_input_tokens": 98562,
+      "output_tokens": 2195,
+      "reasoning_output_tokens": 829
+    },
+    {
+      "task": 4,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 170619,
+      "cached_input_tokens": 107392,
+      "uncached_input_tokens": 63227,
+      "output_tokens": 2310,
+      "reasoning_output_tokens": 1590
+    },
+    {
+      "task": 5,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 94782,
+      "cached_input_tokens": 67200,
+      "uncached_input_tokens": 27582,
+      "output_tokens": 992,
+      "reasoning_output_tokens": 580
+    },
+    {
+      "task": 6,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 150809,
+      "cached_input_tokens": 102912,
+      "uncached_input_tokens": 47897,
+      "output_tokens": 1219,
+      "reasoning_output_tokens": 479
+    },
+    {
+      "task": 7,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 139526,
+      "cached_input_tokens": 93696,
+      "uncached_input_tokens": 45830,
+      "output_tokens": 1817,
+      "reasoning_output_tokens": 958
+    },
+    {
+      "task": 8,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 296481,
+      "cached_input_tokens": 249088,
+      "uncached_input_tokens": 47393,
+      "output_tokens": 1964,
+      "reasoning_output_tokens": 859
+    },
+    {
+      "task": 9,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 274814,
+      "cached_input_tokens": 210432,
+      "uncached_input_tokens": 64382,
+      "output_tokens": 3655,
+      "reasoning_output_tokens": 2027
+    },
+    {
+      "task": 10,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 288579,
+      "cached_input_tokens": 221056,
+      "uncached_input_tokens": 67523,
+      "output_tokens": 2320,
+      "reasoning_output_tokens": 1315
+    },
+    {
+      "task": 11,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 287713,
+      "cached_input_tokens": 211584,
+      "uncached_input_tokens": 76129,
+      "output_tokens": 2550,
+      "reasoning_output_tokens": 1264
+    },
+    {
+      "task": 12,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 154874,
+      "cached_input_tokens": 130816,
+      "uncached_input_tokens": 24058,
+      "output_tokens": 1113,
+      "reasoning_output_tokens": 556
+    },
+    {
+      "task": 13,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 241827,
+      "cached_input_tokens": 199168,
+      "uncached_input_tokens": 42659,
+      "output_tokens": 1163,
+      "reasoning_output_tokens": 544
+    },
+    {
+      "task": 14,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 49908,
+      "cached_input_tokens": 23808,
+      "uncached_input_tokens": 26100,
+      "output_tokens": 483,
+      "reasoning_output_tokens": 348
+    },
+    {
+      "task": 15,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 112111,
+      "cached_input_tokens": 83968,
+      "uncached_input_tokens": 28143,
+      "output_tokens": 1192,
+      "reasoning_output_tokens": 705
+    },
+    {
+      "task": 16,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 70142,
+      "cached_input_tokens": 43136,
+      "uncached_input_tokens": 27006,
+      "output_tokens": 831,
+      "reasoning_output_tokens": 547
+    },
+    {
+      "task": 17,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 46231,
+      "cached_input_tokens": 22784,
+      "uncached_input_tokens": 23447,
+      "output_tokens": 701,
+      "reasoning_output_tokens": 533
+    },
+    {
+      "task": 18,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 120571,
+      "cached_input_tokens": 108416,
+      "uncached_input_tokens": 12155,
+      "output_tokens": 1263,
+      "reasoning_output_tokens": 778
+    },
+    {
+      "task": 19,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 48353,
+      "cached_input_tokens": 23808,
+      "uncached_input_tokens": 24545,
+      "output_tokens": 799,
+      "reasoning_output_tokens": 533
+    },
+    {
+      "task": 20,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 47350,
+      "cached_input_tokens": 23808,
+      "uncached_input_tokens": 23542,
+      "output_tokens": 1364,
+      "reasoning_output_tokens": 1078
+    },
+    {
+      "task": 21,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 152805,
+      "cached_input_tokens": 103168,
+      "uncached_input_tokens": 49637,
+      "output_tokens": 1405,
+      "reasoning_output_tokens": 888
+    },
+    {
+      "task": 22,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 46578,
+      "cached_input_tokens": 38656,
+      "uncached_input_tokens": 7922,
+      "output_tokens": 1138,
+      "reasoning_output_tokens": 984
+    },
+    {
+      "task": 23,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 46142,
+      "cached_input_tokens": 38656,
+      "uncached_input_tokens": 7486,
+      "output_tokens": 697,
+      "reasoning_output_tokens": 567
+    },
+    {
+      "task": 24,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 45634,
+      "cached_input_tokens": 23808,
+      "uncached_input_tokens": 21826,
+      "output_tokens": 641,
+      "reasoning_output_tokens": 498
+    },
+    {
+      "task": 25,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 142340,
+      "cached_input_tokens": 127232,
+      "uncached_input_tokens": 15108,
+      "output_tokens": 967,
+      "reasoning_output_tokens": 483
+    },
+    {
+      "task": 26,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 113715,
+      "cached_input_tokens": 65536,
+      "uncached_input_tokens": 48179,
+      "output_tokens": 1876,
+      "reasoning_output_tokens": 1383
+    },
+    {
+      "task": 27,
+      "turns_completed": 1,
+      "transport_errors_retried": 4,
+      "input_tokens": 115784,
+      "cached_input_tokens": 107904,
+      "uncached_input_tokens": 7880,
+      "output_tokens": 1247,
+      "reasoning_output_tokens": 883
+    },
+    {
+      "task": 28,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 46358,
+      "cached_input_tokens": 23808,
+      "uncached_input_tokens": 22550,
+      "output_tokens": 706,
+      "reasoning_output_tokens": 536
+    },
+    {
+      "task": 29,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 68989,
+      "cached_input_tokens": 50816,
+      "uncached_input_tokens": 18173,
+      "output_tokens": 1066,
+      "reasoning_output_tokens": 536
+    },
+    {
+      "task": 30,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 93495,
+      "cached_input_tokens": 52224,
+      "uncached_input_tokens": 41271,
+      "output_tokens": 1655,
+      "reasoning_output_tokens": 655
+    },
+    {
+      "task": 31,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 71617,
+      "cached_input_tokens": 60544,
+      "uncached_input_tokens": 11073,
+      "output_tokens": 929,
+      "reasoning_output_tokens": 469
+    },
+    {
+      "task": 32,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 44544,
+      "cached_input_tokens": 8960,
+      "uncached_input_tokens": 35584,
+      "output_tokens": 802,
+      "reasoning_output_tokens": 556
+    },
+    {
+      "task": 33,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 44191,
+      "cached_input_tokens": 23808,
+      "uncached_input_tokens": 20383,
+      "output_tokens": 607,
+      "reasoning_output_tokens": 421
+    },
+    {
+      "task": 34,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 43990,
+      "cached_input_tokens": 23808,
+      "uncached_input_tokens": 20182,
+      "output_tokens": 497,
+      "reasoning_output_tokens": 338
+    },
+    {
+      "task": 35,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 43718,
+      "cached_input_tokens": 23808,
+      "uncached_input_tokens": 19910,
+      "output_tokens": 622,
+      "reasoning_output_tokens": 462
+    },
+    {
+      "task": 36,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 104667,
+      "cached_input_tokens": 76800,
+      "uncached_input_tokens": 27867,
+      "output_tokens": 2530,
+      "reasoning_output_tokens": 2044
+    },
+    {
+      "task": 37,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 43694,
+      "cached_input_tokens": 23808,
+      "uncached_input_tokens": 19886,
+      "output_tokens": 566,
+      "reasoning_output_tokens": 382
+    },
+    {
+      "task": 38,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 43547,
+      "cached_input_tokens": 8960,
+      "uncached_input_tokens": 34587,
+      "output_tokens": 675,
+      "reasoning_output_tokens": 429
+    },
+    {
+      "task": 39,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 43746,
+      "cached_input_tokens": 8960,
+      "uncached_input_tokens": 34786,
+      "output_tokens": 778,
+      "reasoning_output_tokens": 569
+    },
+    {
+      "task": 40,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 42043,
+      "cached_input_tokens": 8960,
+      "uncached_input_tokens": 33083,
+      "output_tokens": 826,
+      "reasoning_output_tokens": 548
+    },
+    {
+      "task": 41,
+      "turns_completed": 1,
+      "transport_errors_retried": 4,
+      "input_tokens": 43689,
+      "cached_input_tokens": 38656,
+      "uncached_input_tokens": 5033,
+      "output_tokens": 841,
+      "reasoning_output_tokens": 581
+    },
+    {
+      "task": 42,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 42906,
+      "cached_input_tokens": 38656,
+      "uncached_input_tokens": 4250,
+      "output_tokens": 784,
+      "reasoning_output_tokens": 543
+    },
+    {
+      "task": 43,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 43341,
+      "cached_input_tokens": 38656,
+      "uncached_input_tokens": 4685,
+      "output_tokens": 1716,
+      "reasoning_output_tokens": 1567
+    },
+    {
+      "task": 44,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 40483,
+      "cached_input_tokens": 8960,
+      "uncached_input_tokens": 31523,
+      "output_tokens": 503,
+      "reasoning_output_tokens": 346
+    },
+    {
+      "task": 45,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 42410,
+      "cached_input_tokens": 38656,
+      "uncached_input_tokens": 3754,
+      "output_tokens": 829,
+      "reasoning_output_tokens": 553
+    },
+    {
+      "task": 46,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 40413,
+      "cached_input_tokens": 36608,
+      "uncached_input_tokens": 3805,
+      "output_tokens": 779,
+      "reasoning_output_tokens": 566
+    },
+    {
+      "task": 47,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 42375,
+      "cached_input_tokens": 38656,
+      "uncached_input_tokens": 3719,
+      "output_tokens": 716,
+      "reasoning_output_tokens": 585
+    },
+    {
+      "task": 48,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 40628,
+      "cached_input_tokens": 22784,
+      "uncached_input_tokens": 17844,
+      "output_tokens": 644,
+      "reasoning_output_tokens": 479
+    },
+    {
+      "task": 49,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 42222,
+      "cached_input_tokens": 8960,
+      "uncached_input_tokens": 33262,
+      "output_tokens": 775,
+      "reasoning_output_tokens": 565
+    },
+    {
+      "task": 50,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 42125,
+      "cached_input_tokens": 38656,
+      "uncached_input_tokens": 3469,
+      "output_tokens": 668,
+      "reasoning_output_tokens": 506
+    },
+    {
+      "task": 51,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 42271,
+      "cached_input_tokens": 38656,
+      "uncached_input_tokens": 3615,
+      "output_tokens": 884,
+      "reasoning_output_tokens": 551
+    },
+    {
+      "task": 52,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 65494,
+      "cached_input_tokens": 61056,
+      "uncached_input_tokens": 4438,
+      "output_tokens": 923,
+      "reasoning_output_tokens": 572
+    },
+    {
+      "task": 53,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 65913,
+      "cached_input_tokens": 45184,
+      "uncached_input_tokens": 20729,
+      "output_tokens": 1108,
+      "reasoning_output_tokens": 869
+    },
+    {
+      "task": 54,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 68796,
+      "cached_input_tokens": 29312,
+      "uncached_input_tokens": 39484,
+      "output_tokens": 800,
+      "reasoning_output_tokens": 529
+    },
+    {
+      "task": 55,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 42044,
+      "cached_input_tokens": 23808,
+      "uncached_input_tokens": 18236,
+      "output_tokens": 603,
+      "reasoning_output_tokens": 299
+    },
+    {
+      "task": 56,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 41695,
+      "cached_input_tokens": 23808,
+      "uncached_input_tokens": 17887,
+      "output_tokens": 330,
+      "reasoning_output_tokens": 157
+    },
+    {
+      "task": 57,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 114942,
+      "cached_input_tokens": 81408,
+      "uncached_input_tokens": 33534,
+      "output_tokens": 1220,
+      "reasoning_output_tokens": 835
+    },
+    {
+      "task": 58,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 131834,
+      "cached_input_tokens": 100736,
+      "uncached_input_tokens": 31098,
+      "output_tokens": 1589,
+      "reasoning_output_tokens": 943
+    },
+    {
+      "task": 59,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 41688,
+      "cached_input_tokens": 28416,
+      "uncached_input_tokens": 13272,
+      "output_tokens": 760,
+      "reasoning_output_tokens": 579
+    },
+    {
+      "task": 60,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 41268,
+      "cached_input_tokens": 38656,
+      "uncached_input_tokens": 2612,
+      "output_tokens": 330,
+      "reasoning_output_tokens": 190
+    },
+    {
+      "task": 61,
+      "turns_completed": 1,
+      "transport_errors_retried": 4,
+      "input_tokens": 183187,
+      "cached_input_tokens": 145152,
+      "uncached_input_tokens": 38035,
+      "output_tokens": 2027,
+      "reasoning_output_tokens": 939
+    },
+    {
+      "task": 62,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 65051,
+      "cached_input_tokens": 30336,
+      "uncached_input_tokens": 34715,
+      "output_tokens": 971,
+      "reasoning_output_tokens": 604
+    },
+    {
+      "task": 63,
+      "turns_completed": 1,
+      "transport_errors_retried": 0,
+      "input_tokens": 61687,
+      "cached_input_tokens": 54912,
+      "uncached_input_tokens": 6775,
+      "output_tokens": 502,
+      "reasoning_output_tokens": 187
+    },
+    {
+      "task": 64,
+      "turns_completed": 1,
+      "transport_errors_retried": 4,
+      "input_tokens": 41202,
+      "cached_input_tokens": 38656,
+      "uncached_input_tokens": 2546,
+      "output_tokens": 634,
+      "reasoning_output_tokens": 467
+    }
+  ],
+  "totals": {
+    "tasks": 64,
+    "tasks_with_completed_turn": 64,
+    "input_tokens": 6183081,
+    "cached_input_tokens": 4370944,
+    "uncached_input_tokens": 1812137,
+    "output_tokens": 73432,
+    "reasoning_output_tokens": 44964,
+    "transport_errors_retried": 16
+  }
+}

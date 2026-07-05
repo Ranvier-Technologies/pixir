@@ -66,7 +66,7 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
             <article class="proof">
               <code>31/673 calls</code>
               <h3>WebSocket pressure, zero losses</h3>
-              <p>First systematic WS fallback appeared at 64 connections (4.6%; zero through 32). Every affected call degraded safely to SSE.</p>
+              <p>First systematic WS fallback appeared at 64 connections (4.6%). N=16 and N=32 ran clean; one N=8 ladder rep saw a single transient fallback. Every affected call degraded safely to SSE.</p>
             </article>
           </div>
         </div>
@@ -78,8 +78,9 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
           <h2>Marginal cost per worker is the story</h2>
           <p class="section-lead">
             Synthetic ladder N=1→8, three repetitions, bootstrap CI95 with zero overlap:
-            <strong>5.1–10.0 MB</strong> per additional child for <code>delegate</code>
-            versus <strong>94.6–97.5 MB</strong> per additional process. Everything
+            <strong>6.5 MB</strong> (CI95 4.9–7.7) per additional child for <code>delegate</code>
+            versus <strong>96.8 MB</strong> (CI95 95.9–97.5) per additional process, seeded and
+            recomputable from the published evidence bundle. Everything
             solid below is measured; the projection exists only to size the wall and is
             drawn as one.
           </p>
@@ -97,13 +98,15 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
             </div>
             <div class="meter-grp">
               <p class="meter-l">Projection · N=150 on this 32 GB machine — not measured</p>
-              <div class="mrow"><span class="mn">pixir</span><div class="mtrack"><div class="mbar px proj" style="width:6%"></div></div><span class="mv">~0.9 GB proj.</span></div>
+              <div class="mrow"><span class="mn">pixir</span><div class="mtrack"><div class="mbar px proj" style="width:6%"></div></div><span class="mv">~1 GB proj.</span></div>
               <div class="mrow"><span class="mn">per-proc</span><div class="mtrack"><div class="mbar cx proj" style="width:100%"></div></div><span class="mv">≳28 GB → swap proj.</span></div>
             </div>
             <p class="meter-f">
-              The projection extrapolates the measured marginal cost: on 32 GB, the
-              process-per-worker pattern exhausts RAM around N≈150 while the shared
-              runtime stays in single digits. "Hundreds of agents" remains unmeasured —
+              The projection scales the measured real-work footprint at N=64
+              (11,981 MB across 64 processes ≈ 187 MB each; 441 MB for the shared
+              VM) linearly to N=150: on 32 GB, the process-per-worker pattern is
+              deep into swap around N≈150 while the shared runtime stays near a
+              gigabyte. "Hundreds of agents" remains unmeasured —
               which is why the public claim is <strong>measured up to 64 concurrent
               workers</strong>, and nothing more.
             </p>
@@ -191,10 +194,11 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
           <p class="section-lead" style="margin-top: 18px;">
             The <code>auto</code> transport policy — WebSocket preferred, SSE as a
             pre-output-safe fallback — earned its existence exactly where it should:
-            under real pressure it degraded 31 calls and lost none. The pressure
-            threshold (between 32 and 64 connections) is tracked publicly in
-            <a href="https://github.com/Ranvier-Technologies/pixir/issues/1">the
-            scale-evidence bundle issue</a>.
+            under real pressure it degraded 31 calls and lost none. The transport
+            evidence behind this, per-child transport counts and fallback-reason
+            tallies, ships in
+            <a href="https://github.com/Ranvier-Technologies/pixir/tree/main/docs/benchmarks/scale">the
+            published scale-evidence bundle</a>.
           </p>
         </div>
       </section>
@@ -241,7 +245,8 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
           <p class="section-lead">
             Parity: same model and the same ChatGPT OAuth quota on both sides; isolated
             configuration homes on the same authorized account, excluding MCP servers
-            and personal config from the comparison. RSS figures are sampled process-tree peaks (1 s poll), not
+            and personal config from the comparison. RSS figures are sampled process-tree peaks (500 ms poll
+            for the ladder, ~1 s for the N=64 samples), not
             OS-exact accounting. The synthetic ladder ran 3 repetitions; the 16/32/64
             scale points ran once each — directional, stated as such. Delegate fan-outs
             require <code>subagents.max_threads: N</code> in the spec or children queue
@@ -253,9 +258,11 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
             evidence is machine-local by design — Pixir's evidence model keeps
             append-only session logs (with per-call <code>provider_usage</code> token
             and transport data) on the machine that ran them, so the numbers above
-            are our runs, not a public dataset; publishing a redacted evidence
-            bundle is tracked work. The runtime ships everything needed to generate
-            your own evidence:
+            are our runs, not a public dataset. A redacted evidence bundle ships
+            in-repo at <a href="https://github.com/Ranvier-Technologies/pixir/tree/main/docs/benchmarks/scale">docs/benchmarks/scale/</a>:
+            envelopes, per-child usage, ladder aggregates, CI95s, transport
+            evidence, and the cross-validated audit findings. The runtime ships
+            everything needed to generate your own evidence:
             <a href="https://github.com/Ranvier-Technologies/pixir">try to break it and file what doesn't hold</a>.
           </p>
         </div>

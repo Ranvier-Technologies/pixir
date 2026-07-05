@@ -1,0 +1,26 @@
+{
+  "codex-exec": {
+    "point_estimate_mb_per_child": 96.8,
+    "ci95_mb_per_child": [
+      95.9,
+      97.5
+    ],
+    "method": "least-squares slope of sampled process-tree peak RSS vs N (fanout, N=1..8, 3 reps); bootstrap over reps, 10k resamples, seed 20260705"
+  },
+  "pixir-delegate": {
+    "point_estimate_mb_per_child": 6.5,
+    "ci95_mb_per_child": [
+      4.9,
+      7.7
+    ],
+    "method": "least-squares slope of sampled process-tree peak RSS vs N (fanout, N=1..8, 3 reps); bootstrap over reps, 10k resamples, seed 20260705"
+  },
+  "pixir-oneshot": {
+    "point_estimate_mb_per_child": 134.2,
+    "ci95_mb_per_child": [
+      132.7,
+      135.7
+    ],
+    "method": "least-squares slope of sampled process-tree peak RSS vs N (fanout, N=1..8, 3 reps); bootstrap over reps, 10k resamples, seed 20260705"
+  }
+}
