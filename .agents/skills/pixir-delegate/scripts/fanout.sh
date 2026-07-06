@@ -69,15 +69,21 @@ if ! jq -e . "$out_dir/envelope.json" >/dev/null 2>&1; then
   exit 2
 fi
 
-jq -r '.children[] | "\(.status)\t\(.child_session_id)\t\(.reason_code // "-")"' \
+jq -r '.children[] | "\(.status)\t\(.child_session_id)\t\(.reason_code // "-")\tretries:\(.retry_attempts // 0)"' \
   "$out_dir/envelope.json"
 
 if [[ "$(jq -r '.work_complete' "$out_dir/envelope.json")" == "true" ]]; then
   exit 0
 fi
 
+# The runtime may already have auto-retried eligible children (retry_history
+# on the child is the confession): disposition what remains; never re-retry
+# what the runtime retried, never re-run the spec. resume_command is the
+# envelope's ready-made recovery; steer.sh wraps the same move with a custom
+# prompt and lease discipline.
+steer="$(dirname -- "${BASH_SOURCE[0]}")/steer.sh"
 echo "partial: disposition each non-completed child (do NOT re-run the spec):" >&2
-jq -r '.children[] | select(.status != "completed")
-  | "  \(.status) \(.child_session_id) → steer.sh \(.child_session_id) \"...\"  (log: \(.child_log_path))"' \
+jq -r --arg steer "$steer" '.children[] | select(.status != "completed")
+  | "  \(.status) \(.child_session_id) (runtime retries: \(.retry_attempts // 0))\n    resume:   \(.resume_command // "\($steer) \(.child_session_id) \"...\"")\n    diagnose: \(.diagnose_command // "pixir diagnose session \(.child_session_id) --json")\n    log:      \(.child_log_path)"' \
   "$out_dir/envelope.json" >&2
 exit 3

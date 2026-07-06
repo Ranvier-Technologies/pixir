@@ -9,6 +9,22 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [Unreleased]
 
+### Fixed
+- `pixir delegate --help` (and the main help) now document `--timeout-ms` on
+  the attached form; the flag was always accepted there but only listed under
+  `delegate start`, so contract-of-record readers concluded it was invalid
+  (#204).
+
+### Added
+- Subagents-strategy delegate result envelopes now give every non-completed
+  child the same ready-made recovery commands the one-shot contract ships:
+  conditional `children[].resume_command` and `children[].diagnose_command`,
+  including children reported `running` at the collection horizon (their
+  writer lease fails closed if anything is genuinely alive). Start/lifecycle
+  snapshots stay terminal-only, and workflow-strategy children keep their
+  step-based evidence without these commands. Without `--json`, per-child
+  resume hints print on stderr, matching the one-shot mode contract (#204).
+
 ### Changed
 - A `bash` call denied because the bounded write policy disables the shell now
   surfaces as `kind: "bash_disabled"` ("shell is disabled by the bounded write

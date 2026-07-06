@@ -39,6 +39,12 @@ you its current contract. Do not memorize contracts; ask the runtime to
 reveal them at the moment of use. Know exactly WHICH binary/runtime version
 you are driving before delegating through it.
 
+Acceptance is not validation of every knob: surfaces may ignore unknown
+fields silently, so a typo or an invented setting can pass rehearsal while
+doing nothing. Before trusting that rehearsal exercised an intent-bearing
+knob, confirm the knob exists in the surface's revealed contract (help,
+plan echo, or documented spec), not merely that no error mentioned it.
+
 Readiness classification (doctor or equivalent): `ready` proceeds;
 `ready_with_warnings` means read the non-passed checks and judge — a missing
 local build is non-blocking, failed auth is not; an error status never
@@ -76,6 +82,12 @@ non-completed child dispositioned — resumed, retried, or reported. Partial
 failure recovers per child; never re-run the whole batch. If the surface's
 output fails to parse, the run failed — read the error channel, do not
 scrape fragments.
+
+Runtimes absorb recovery over time: eligible children may already have been
+auto-retried before you see the result. Reconcile whatever retry confession
+the surface offers as part of the record, never re-retry what the runtime
+already retried, and distrust a successful retry when the task was not
+idempotent (verify its effects, not its status).
 
 ## Evidence
 

@@ -1,16 +1,18 @@
 # Demonstrations of the practice
 
-Real annotated traces — not invented examples. Three agent classes followed
-this skill blind (no prior context, the skill as their only manual) on
-2026-07-04/05, each exercising surfaces the others could not. Session ids
-reference append-only logs under `.pixir/sessions/` on the machines where the
-runs happened — Pixir evidence is machine-local by design, so those logs are
-not in this repository. Read these as annotated accounts by the people holding
+Real annotated traces — not invented examples. Demos 1-3: three agent classes
+followed this skill blind (no prior context, the skill as their only manual)
+on 2026-07-04/05, each exercising surfaces the others could not. Demo 4 is a
+later, deliberately non-blind trace: a practiced orchestrator staking a real
+merge decision on the practice (2026-07-06). Session ids reference
+append-only logs under `.pixir/sessions/` on the machines where the runs
+happened — Pixir evidence is machine-local by design, so those logs are not
+in this repository. Read these as annotated accounts by the people holding
 the logs, then generate your own primary evidence by following the skill.
 
-The four vicarious modes these demonstrate: watching someone **build** a
-delegation, **exercise it under pressure**, **tune it after failures**, and
-**decide not to use it**.
+The vicarious modes these demonstrate: watching someone **build** a
+delegation, **exercise it under pressure**, **tune it after failures**,
+**decide not to use it**, and **use it in production as a gate**.
 
 ## Demo 1 — Claude (Opus 4.8): building a fan-out, first try
 
@@ -71,6 +73,30 @@ consciously open.
   rehearsal degraded to schema validation; and `skill_view` hit an
   `orphan_tool_call` replay error on first call. Both filed as runtime
   findings, not skill patches — the skill cannot paper over its host.
+
+## Demo 4 — Claude (Fable 5): the practice in production, as a pre-merge gate
+
+Mission (2026-07-06, not a blind run: a practiced orchestrator using the
+skill in anger): adversarially review a real PR before merge, four
+independent lenses (correctness, security, contract honesty, test adequacy),
+each a read-only child with a strict JSON verdict contract.
+
+- Parent envelope reconciled 4/4 completed, zero retries; sids
+  `20260706T171044-{d745a1,d137ea,66e8b7,ace82a}`. All four `summary` fields
+  parsed against the declared verdict schema on arrival.
+- The judgment moment: 17 findings came back and the orchestrator's job
+  became adjudication. Two lenses independently converged on the same real
+  bug (accepted, fixed), while a "major" severity was rejected as overclaimed
+  after checking the claim against the actual threat model. The fan-out
+  produces claims; the practice is deciding which survive.
+- Rehearsal caught nothing it should have: the spec carried invented
+  `model`/`reasoning_effort` knobs and dry-run accepted them silently. The
+  honest workaround (isolated `PIXIR_HOME` with its own `config.json`,
+  doctor-verified before spending quota) became skill text, and the
+  validation gap became a runtime finding, the same split as Demo 3:
+  runtime defects get filed, not papered over.
+- What it proves: the closure discipline scales from "did my workers finish"
+  to "can I stake a merge decision on this envelope".
 
 ## How to read these as a learner
 

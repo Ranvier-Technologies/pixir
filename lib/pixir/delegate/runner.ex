@@ -25,7 +25,7 @@ defmodule Pixir.Delegate.Runner do
   `pixir delegate --spec` pretend to be a detached daemon.
   """
 
-  alias Pixir.{Conversation, Log, Subagents, Workflows}
+  alias Pixir.{Conversation, Log, RecoveryCommands, Subagents, Workflows}
   alias Pixir.Delegate.{Evidence, Handle, Owner}
   alias Pixir.Permissions.WritePolicy
   alias Pixir.Tools.Workspace
@@ -47,7 +47,7 @@ defmodule Pixir.Delegate.Runner do
         {:ok, agents} ->
           refresh_lifecycle_evidence(parent_session_id, runtime, agents)
 
-          with {:ok, outcome} <- wait_for_agents(parent_session_id, runtime, agents) do
+          with {:ok, outcome} <- wait_for_agents(parent_session_id, runtime, agents, opts) do
             {:ok,
              result_payload(parent_session_id, runtime, agents, outcome)
              |> refresh_evidence_payload()}
@@ -57,7 +57,7 @@ defmodule Pixir.Delegate.Runner do
           refresh_lifecycle_evidence(parent_session_id, runtime, agents)
 
           {:ok,
-           partial_spawn_payload(parent_session_id, runtime, agents, spawn_error)
+           partial_spawn_payload(parent_session_id, runtime, agents, spawn_error, opts)
            |> refresh_evidence_payload()}
 
         {:error, error} ->
@@ -671,8 +671,10 @@ defmodule Pixir.Delegate.Runner do
     end
   end
 
-  defp wait_for_agents(parent_session_id, runtime, agents) do
-    Subagents.wait_outcome(
+  defp wait_for_agents(parent_session_id, runtime, agents, opts) do
+    wait_outcome = Keyword.get(opts, :wait_outcome, &Subagents.wait_outcome/4)
+
+    wait_outcome.(
       parent_session_id,
       Enum.map(agents, & &1["id"]),
       runtime.wait_horizon_ms,
@@ -694,9 +696,9 @@ defmodule Pixir.Delegate.Runner do
     workflow_runner.(parent_session_id, runtime.workflow_spec, workflow_opts)
   end
 
-  defp partial_spawn_payload(parent_session_id, runtime, agents, spawn_error) do
+  defp partial_spawn_payload(parent_session_id, runtime, agents, spawn_error, opts) do
     outcome =
-      case wait_for_agents(parent_session_id, runtime, agents) do
+      case wait_for_agents(parent_session_id, runtime, agents, opts) do
         {:ok, outcome} ->
           outcome
 
@@ -750,7 +752,7 @@ defmodule Pixir.Delegate.Runner do
   defp result_payload(parent_session_id, runtime, agents, outcome) do
     {:ok, handle} = Handle.build(parent_session_id)
     status = delegate_status(outcome)
-    children = Enum.map(outcome["subagents"] || agents, &child_result/1)
+    children = Enum.map(outcome["subagents"] || agents, &child_result(&1, :delegate_result))
     timeout_diagnostics = timeout_diagnostics(runtime, outcome, children)
 
     %{
@@ -1301,11 +1303,45 @@ defmodule Pixir.Delegate.Runner do
     end
   end
 
-  defp child_result(agent) do
+  defp child_result(agent, context \\ :snapshot) do
     agent
     |> child_result_base()
     |> maybe_put_child_retry_lineage(agent)
+    |> maybe_put_child_recovery(context)
   end
+
+  # Parity with one-shot envelopes: a non-completed child ships the same
+  # ready-made recovery commands the one-shot contract puts at .resume_command,
+  # so orchestrators recover per child without composing commands from parts.
+  # Conditional presence, like the retry confession: completed children omit them.
+  #
+  # Context matters for "running": in the FINAL delegate_result envelope a child
+  # still reported running was cut off at the collection horizon; the reader holds
+  # a durable log, and if anything is genuinely alive the writer lease fails
+  # closed, so diagnose-then-resume is the documented recovery either way.
+  # Start/lifecycle snapshots keep the terminal-only rule: their running children
+  # are owned and mid-flight, not recovery targets.
+  @recoverable_child_statuses ~w(failed timed_out cancelled)
+
+  defp maybe_put_child_recovery(
+         %{"status" => status, "child_session_id" => sid} = result,
+         context
+       )
+       when is_binary(sid) and sid != "" and
+              (status in @recoverable_child_statuses or
+                 (context == :delegate_result and status != "completed")) do
+    case RecoveryCommands.commands(sid) do
+      {:ok, commands} ->
+        result
+        |> Map.put("resume_command", commands["resume_command"])
+        |> Map.put("diagnose_command", commands["diagnose_command"])
+
+      {:error, _details} ->
+        result
+    end
+  end
+
+  defp maybe_put_child_recovery(result, _context), do: result
 
   defp child_result_base(agent) do
     %{
