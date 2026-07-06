@@ -1,13 +1,15 @@
 ---
 name: pixir-delegate
-description: Use Pixir as a headless subagent runtime from an orchestrating agent (Claude Code, Codex, or any shell-capable harness) — one-shot workers (`pixir --json`), parallel fan-out to N children (`pixir delegate --spec`), resumable steering (`pixir resume`), evidence drill-down. Use when the user wants to fan out subagents or parallel workers, delegate analysis or bounded coding tasks to GPT/OpenAI models, run cheap background workers, or steer and retry a worker across turns.
+description: Use Pixir as a headless subagent runtime from Claude Code or any harness with skill `!` preprocessing (Codex roots and other no-hydration hosts use pixir-delegate-codex instead) — one-shot workers (`pixir --json`), parallel fan-out to N children (`pixir delegate --spec`), resumable steering (`pixir resume`), evidence drill-down. Use when the user wants to fan out subagents or parallel workers, delegate analysis or bounded coding tasks to GPT/OpenAI models, run cheap background workers, or steer and retry a worker across turns.
 allowed-tools: Bash(pixir:*), Bash(jq:*)
 ---
 
 # Pixir Delegate — subagents without a wrapper agent
 
-Runtime state, hydrated at invocation on harnesses that support `!` command
-preprocessing (others see the raw placeholder — run it yourself):
+Runtime state, hydrated by the harness at invocation. Preprocessing is this
+variant's contract: if the line below reads as a raw placeholder, you are on
+the wrong variant; use `pixir-delegate-codex` (explicit preflight, no
+hydration) instead of working around it here.
 pixir on PATH: !`echo "$(command -v pixir || echo 'not on PATH') · v$(pixir --version 2>/dev/null || echo '?') · $(pixir doctor --json 2>/dev/null | jq -r .status 2>/dev/null || echo 'doctor unavailable')"`
 
 Know WHICH binary you are driving before delegating: if the workspace has a
@@ -33,8 +35,12 @@ them (including this one). Requirements: `pixir` on PATH, `jq`, authenticated
 
 Do NOT spawn N independent one-shot processes for fan-out — each boots its own
 VM. `delegate` exists so N children share one runtime. Prefer `resume` over
-fresh sessions for follow-ups: resumed turns reuse the session's prompt-cache
-family even from a new OS process.
+fresh sessions for follow-ups: a resumed turn reuses the session's history and
+prompt-cache key, but do NOT budget on guaranteed cache hits (a blind-run
+measured 0% cached on a resume minutes after the fan-out; hits depend on
+provider cache state). Session ids look global but `resume` resolves them
+against `$PWD/.pixir/sessions/` only — run it from the workspace root, not
+from a scratchpad.
 
 **When not to delegate:** a child starts blind — if writing the self-contained
 prompt costs more than doing the work, do it yourself. Sequentially dependent
@@ -102,29 +108,48 @@ current one.
 - **Size `--timeout-ms` for waves**: with tasks > max_threads, children run in
   ceil(N / max_threads) waves; the timeout must cover all of them. Read-only
   analysis children typically finish in a few minutes each — budget generously;
-  a timeout yields an honest partial envelope, not a crash. (`--timeout-ms` is
-  valid on the attached form even though current help text lists it only under
-  `delegate start` — known help gap.)
+  a timeout yields an honest partial envelope, not a crash.
 - `role: "explorer"` is read-only; write-capable fan-out needs a spec-level
   mode and write policy — a dry run of your draft spec walks you through the
   exact fields.
+- **Dry-run acceptance is not knob validation**: unknown spec fields are
+  silently ignored today, so a typo or an invented knob (`model`,
+  `reasoning_effort`) passes rehearsal without doing anything. Confirm an
+  intent knob exists in the revealed contract before trusting it.
+- **Model/effort per delegation**: the spec has no model or reasoning-effort
+  fields; the Provider resolves them from config. To pin them for one
+  delegation without touching global state, run against an isolated home:
+  `dir=$(mktemp -d)` (outside the workspace, so the credential can never
+  land in a commit or a child snapshot), copy `~/.pixir/auth.json` there
+  with its 600 mode, write a `config.json`
+  (`{"model": "...", "reasoning": {"effort": "..."}}`), then
+  `PIXIR_HOME=$dir pixir delegate ...`. Verify with
+  `PIXIR_HOME=$dir pixir doctor --json` before spending quota; never echo or
+  log the auth file. Delete the scratch home as soon as the delegation
+  closes; a copied credential must not outlive its purpose. Delete this
+  whole workaround when the spec grows real fields.
 
 ## When something fails
 
-- Recovery guidance for one-shot and resume abnormal exits depends on mode:
-  in `--json` mode it arrives **in the envelope** (`.resume_command`; timeouts
-  also carry `.recovery`) and stderr stays silent; without `--json`, the exact
-  resume command prints on stderr. Delegate partials put resume targets only
-  in the envelope's `children[]`. Error envelopes carry `next_actions` —
-  follow them.
+- Recovery guidance follows the mode contract: in `--json` mode it arrives
+  **in the envelope** (one-shot/resume: `.resume_command`, timeouts also
+  `.recovery`; subagents-strategy delegate partials: ready-made
+  `children[].resume_command` and `children[].diagnose_command` on each
+  non-completed child) and stderr stays silent; without `--json`, a terse
+  resume hint prints on stderr per child (the diagnose command and richer
+  recovery data live only in the envelope). Workflow-strategy children carry
+  step buckets and evidence instead of these commands; recover those via
+  diagnostics. Error envelopes carry `next_actions`; follow them.
 - A stale writer lease fails closed **on purpose** (crashed runs leave
   evidence). Inspect first: `pixir diagnose session <sid> --json`. Force-release
   is a deliberate operator action, never a default.
 - Delegate partial failure (`work_complete: false`): the runtime may already
   have auto-retried eligible read-only children (transient transport and
-  retryable provider errors) — check `children[].retry_history` first. For
-  children still not completed, recover per child: read its `child_log_path`,
-  then `pixir resume <child_session_id>`. Do not re-run the whole spec.
+  retryable provider errors) — check `children[].retry_history` first and do
+  not re-retry what the runtime already retried. For children still not
+  completed, recover per child: read its `child_log_path`, then run the
+  child's own `resume_command` from the envelope. Do not re-run the whole
+  spec.
 - If stdout fails to parse as JSON in `--json` mode, treat the run as failed
   and read stderr; do not scrape partial stdout.
 
@@ -132,8 +157,17 @@ A delegation does not close when the process exits — it closes when the
 envelope is reconciled: every child status read, every `summary` parsed against
 its contract, every failure dispositioned (resumed, retried, or reported).
 The fields you reconcile: top-level `ok`/`status`/`work_complete`, and per
-child `status`, `reason_code`, `child_session_id`, `child_log_path`, `summary`.
-Never report fan-out success on exit code alone.
+child `status`, `reason_code`, `child_session_id`, `child_log_path`, `summary`,
+plus the conditional confessions when present: `retry_attempts`/`retry_history`
+(a child that arrived on a second attempt is part of the record; distrust a
+successful retry when the task was not idempotent) and `resume_command` on
+non-completed children. Two mapping caveats: nothing in the envelope promises
+that `children[]` order matches `tasks[]` order (`children[].index` is
+currently unpopulated), so with homogeneous tasks make each contract
+self-identifying (include the task's subject in the child's JSON); and there
+is no aggregate cost field anywhere — per-delegation totals are computed by
+summing `provider_usage` events across the child logs. Never report fan-out
+success on exit code alone.
 
 ## Evidence
 
@@ -147,11 +181,12 @@ estimates.
 
 - `references/delegation-core.md` — the host-neutral judgment core shared by
   every variant; canonical text for routing, refusal, rehearsal, closure.
-- `references/demonstrations.md` — three real blind-run traces (build,
-  pressure/failure, cross-surface transfer), annotated as practice, with
-  session ids.
+- `references/demonstrations.md` — four real traces (build, pressure/failure,
+  cross-surface transfer, and a production pre-merge review gate), annotated
+  as practice, with session ids.
 - `scripts/fanout.sh` and `scripts/steer.sh` — deterministic invocation:
   rehearsal-gated fan-out with disposition targets on partial (exit 3), and
   single-child steering that never force-releases a lease.
 - Sibling variants: `pixir-delegate-native` (orchestrating from inside a
-  Pixir session) and `pixir-delegate-codex` (Codex root agent; draft).
+  Pixir session) and `pixir-delegate-codex` (Codex root agent; explicit
+  preflight instead of hydration).

@@ -498,6 +498,200 @@ defmodule Pixir.Delegate.RunnerTest do
       refute Map.has_key?(child, "retry_max_attempts")
       refute Map.has_key?(child, "current_attempt_index")
       refute Map.has_key?(child, "retry_history")
+      refute Map.has_key?(child, "resume_command")
+      refute Map.has_key?(child, "diagnose_command")
+    end)
+  end
+
+  test "non-completed terminal children carry ready-made recovery commands" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-child-recovery")
+
+      spec = %{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "tasks" => ["times out", "fails", "completes", "still running"]
+      }
+
+      spec_meta = %{"strategy" => "subagents", "planned_child_count" => 4}
+
+      agents = %{
+        "times out" => %{
+          "id" => "subagent_1",
+          "agent" => "worker",
+          "status" => "timed_out",
+          "summary" => "",
+          "child_session_id" => "20260706T000000-timeout"
+        },
+        "fails" => %{
+          "id" => "subagent_2",
+          "agent" => "worker",
+          "status" => "failed",
+          "summary" => "",
+          "child_session_id" => "20260706T000000-failed"
+        },
+        "completes" => %{
+          "id" => "subagent_3",
+          "agent" => "worker",
+          "status" => "completed",
+          "summary" => "done",
+          "child_session_id" => "20260706T000000-done"
+        },
+        "still running" => %{
+          "id" => "subagent_4",
+          "agent" => "worker",
+          "status" => "running",
+          "summary" => "",
+          "child_session_id" => "20260706T000000-running"
+        }
+      }
+
+      spawn_agent = fn _parent_session_id, args, _opts ->
+        {:ok, Map.fetch!(agents, args["task"])}
+      end
+
+      assert {:ok, payload} =
+               Runner.start(%{workspace: ws}, spec, spec_meta, spawn_agent: spawn_agent)
+
+      children = payload.payload["children"]
+      by_sid = Map.new(children, &{&1["child_session_id"], &1})
+
+      timed_out = by_sid["20260706T000000-timeout"]
+
+      assert timed_out["resume_command"] ==
+               ~s(pixir resume 20260706T000000-timeout ) <>
+                 ~s("Continue from the latest incomplete turn. Inspect the Log first, ) <>
+                 ~s(avoid duplicating completed writes, and report what you resumed.")
+
+      assert timed_out["diagnose_command"] ==
+               "pixir diagnose session 20260706T000000-timeout --json"
+
+      failed = by_sid["20260706T000000-failed"]
+
+      assert failed["resume_command"] ==
+               ~s(pixir resume 20260706T000000-failed ) <>
+                 ~s("Continue from the latest incomplete turn. Inspect the Log first, ) <>
+                 ~s(avoid duplicating completed writes, and report what you resumed.")
+
+      assert failed["diagnose_command"] ==
+               "pixir diagnose session 20260706T000000-failed --json"
+
+      # This is a start snapshot (kind delegate_start): a running child here is
+      # alive and owned, so it must NOT carry recovery commands. The final
+      # delegate_result envelope is where running-at-collection-horizon children
+      # gain them (functional coverage: the forced-partial dogfood run).
+      running = by_sid["20260706T000000-running"]
+      refute Map.has_key?(running, "resume_command")
+      refute Map.has_key?(running, "diagnose_command")
+
+      completed = by_sid["20260706T000000-done"]
+      refute Map.has_key?(completed, "resume_command")
+      refute Map.has_key?(completed, "diagnose_command")
+    end)
+  end
+
+  @safe_resume_prompt "Continue from the latest incomplete turn. Inspect the Log first, " <>
+                        "avoid duplicating completed writes, and report what you resumed."
+
+  test "final delegate_result gives recovery commands to children cut off at the horizon" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-horizon-recovery")
+
+      spec = %{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "tasks" => ["keeps running", "gets cancelled", "completes"]
+      }
+
+      spec_meta = %{"strategy" => "subagents", "planned_child_count" => 3}
+
+      running_with_retry = %{
+        "id" => "subagent_1",
+        "agent" => "worker",
+        "status" => "running",
+        "summary" => "",
+        "child_session_id" => "20260706T000001-running",
+        "retry_attempts" => 1,
+        "retry_max_attempts" => 1,
+        "current_attempt_index" => 1,
+        "retry_history" => [
+          %{"attempt_index" => 0, "error_kind" => "websocket_read_failed"}
+        ]
+      }
+
+      cancelled = %{
+        "id" => "subagent_2",
+        "agent" => "worker",
+        "status" => "cancelled",
+        "summary" => "",
+        "child_session_id" => "20260706T000001-cancelled"
+      }
+
+      completed = %{
+        "id" => "subagent_3",
+        "agent" => "worker",
+        "status" => "completed",
+        "summary" => "done",
+        "child_session_id" => "20260706T000001-done"
+      }
+
+      agents = %{
+        "keeps running" => running_with_retry,
+        "gets cancelled" => cancelled,
+        "completes" => completed
+      }
+
+      spawn_agent = fn _parent_session_id, args, _opts ->
+        {:ok, Map.fetch!(agents, args["task"])}
+      end
+
+      wait_outcome = fn _parent_session_id, _ids, _timeout_ms, _opts ->
+        {:ok,
+         %{
+           "status" => "incomplete",
+           "summary" => "horizon reached",
+           "counts" => %{"completed" => 1, "cancelled" => 1},
+           "subagents" => [running_with_retry, cancelled, completed]
+         }}
+      end
+
+      assert {:ok, payload} =
+               Runner.run(%{workspace: ws}, spec, spec_meta,
+                 spawn_agent: spawn_agent,
+                 wait_outcome: wait_outcome
+               )
+
+      # work_complete is stamped later by CLIContract; at Runner level the
+      # incomplete outcome shows as status timed_out with ok false.
+      assert payload["kind"] == "delegate_result"
+      assert payload["ok"] == false
+      assert payload["status"] == "timed_out"
+
+      by_sid = Map.new(payload["children"], &{&1["child_session_id"], &1})
+
+      running = by_sid["20260706T000001-running"]
+
+      assert running["resume_command"] ==
+               ~s(pixir resume 20260706T000001-running "#{@safe_resume_prompt}")
+
+      assert running["diagnose_command"] ==
+               "pixir diagnose session 20260706T000001-running --json"
+
+      # Retry lineage and recovery commands coexist on the same child.
+      assert running["retry_attempts"] == 1
+      assert [%{"error_kind" => "websocket_read_failed"}] = running["retry_history"]
+
+      cancelled_child = by_sid["20260706T000001-cancelled"]
+
+      assert cancelled_child["resume_command"] ==
+               ~s(pixir resume 20260706T000001-cancelled "#{@safe_resume_prompt}")
+
+      assert cancelled_child["diagnose_command"] ==
+               "pixir diagnose session 20260706T000001-cancelled --json"
+
+      completed_child = by_sid["20260706T000001-done"]
+      refute Map.has_key?(completed_child, "resume_command")
+      refute Map.has_key?(completed_child, "diagnose_command")
     end)
   end
 

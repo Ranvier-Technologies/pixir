@@ -763,6 +763,7 @@ defmodule Pixir.CLI do
       IO.puts(Jason.encode!(result.payload))
     else
       render_delegate_text(status, result)
+      print_delegate_recovery_hints(result.payload)
     end
 
     if after_render = Map.get(result, :after_render) do
@@ -777,6 +778,20 @@ defmodule Pixir.CLI do
 
   defp render_delegate_text(:ok, result), do: IO.puts(result.text)
   defp render_delegate_text(:error, result), do: print_error_msg(result.text)
+
+  # Same mode contract as one-shot recovery: in --json mode guidance lives in the
+  # envelope (children[].resume_command) and stderr stays silent; without --json,
+  # each non-completed child prints its ready-made resume command on stderr.
+  defp print_delegate_recovery_hints(%{"children" => children}) when is_list(children) do
+    Enum.each(children, fn child ->
+      with %{"resume_command" => cmd, "child_session_id" => sid, "status" => child_status}
+           when is_binary(cmd) <- child do
+        IO.puts(:stderr, "child #{sid} #{child_status}  (resume with: #{cmd})")
+      end
+    end)
+  end
+
+  defp print_delegate_recovery_hints(_payload), do: :ok
 
   defp one_shot(_mode, {:error, error}, runtime) do
     print_runtime_error(error, runtime.json?)
@@ -1424,7 +1439,7 @@ defmodule Pixir.CLI do
       pixir compact <id>        Record a durable History compaction checkpoint
       pixir fork <id>           Create a child Session from a parent History prefix
       pixir inspect-replay <id> Inspect Provider replay input without network
-      pixir delegate --spec <path|-> --dry-run [--json]
+      pixir delegate --spec <path|-> [--dry-run] [--json] [--contract-version 1] [--timeout-ms N]
       pixir delegate start --spec <path|-> [--json] [--contract-version 1] [--timeout-ms N]
       pixir delegate status <delegate_id|parent_session_id> [--json] [--contract-version 1]
       pixir delegate attach <delegate_id|parent_session_id> [--json] [--contract-version 1] [--progress=stderr-jsonl] [--wait-horizon-ms N]
@@ -1541,7 +1556,7 @@ defmodule Pixir.CLI do
 
   defp delegate_help do
     IO.puts("""
-    pixir delegate --spec <path|-> [--dry-run] [--json] [--contract-version 1]
+    pixir delegate --spec <path|-> [--dry-run] [--json] [--contract-version 1] [--timeout-ms N]
     pixir delegate start --spec <path|-> [--json] [--contract-version 1] [--timeout-ms N]
     pixir delegate status <delegate_id|parent_session_id> [--json] [--contract-version 1]
     pixir delegate attach <delegate_id|parent_session_id> [--json] [--contract-version 1] [--progress=stderr-jsonl] [--wait-horizon-ms N]

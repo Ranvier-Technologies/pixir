@@ -66,9 +66,15 @@ reviews:
         json_pointer / path are reserved for WritePolicy's own context.
         The spec-level transport knob (subagents.transport / transport:
         auto|websocket|http_sse, validated at dry-run, surfaced as
-        limits.transport) and the conditional children[] retry-confession
+        limits.transport), the conditional children[] retry-confession
         fields (retry_attempts, retry_max_attempts, current_attempt_index,
-        retry_history - present only when a retry happened) are contract. Flag
+        retry_history - present only when a retry happened), and the
+        conditional children[] recovery commands (resume_command,
+        diagnose_command - on non-completed children of the final
+        SUBAGENTS-strategy delegate_result envelope, including
+        running-at-collection-horizon; terminal-only on start/lifecycle
+        snapshots; workflow-strategy children never carry them) are
+        contract. Flag
         any change to envelope keys, exit codes, or these conventions that is
         not accompanied by a contract_version bump and test updates in
         test/pixir/delegate/.

@@ -491,6 +491,10 @@ defmodule Pixir.CLITest do
     assert out =~ "Delegate CLI I/O Contract v1"
     assert out =~ "--dry-run"
     assert out =~ "--json"
+
+    assert out =~
+             "pixir delegate --spec <path|-> [--dry-run] [--json] [--contract-version 1] [--timeout-ms N]"
+
     assert out =~ "strategy=\"subagents\""
     assert out =~ "structured unsupported runtime result"
     assert out =~ "--progress=stderr-jsonl"
@@ -716,6 +720,113 @@ defmodule Pixir.CLITest do
       assert payload["ok"] == true
       assert payload["write_policy"]["id"] == "delegate-test"
       assert payload["beam_coordination"]["delegate_mode"] == "bounded_write"
+    end)
+  end
+
+  defp put_delegate_runtime_seams(agent, outcome) do
+    previous = Application.fetch_env(:pixir, :cli_turn_opts)
+
+    Application.put_env(:pixir, :cli_turn_opts,
+      spawn_agent: fn _parent_session_id, _args, _opts -> {:ok, agent} end,
+      wait_outcome: fn _parent_session_id, _ids, _timeout_ms, _opts -> {:ok, outcome} end
+    )
+
+    on_exit(fn ->
+      case previous do
+        {:ok, prior} -> Application.put_env(:pixir, :cli_turn_opts, prior)
+        :error -> Application.delete_env(:pixir, :cli_turn_opts)
+      end
+    end)
+  end
+
+  defp horizon_cut_agent do
+    %{
+      "id" => "subagent_1",
+      "agent" => "worker",
+      "status" => "running",
+      "summary" => "",
+      "child_session_id" => "20260706T000002-cutoff"
+    }
+  end
+
+  defp horizon_cut_outcome(agent) do
+    %{
+      "status" => "incomplete",
+      "summary" => "horizon reached",
+      "counts" => %{"completed" => 0},
+      "subagents" => [agent]
+    }
+  end
+
+  test "delegate partial without --json prints per-child resume hints on stderr" do
+    in_tmp_workspace("pixir-cli-delegate-hints", fn ws ->
+      agent = horizon_cut_agent()
+      put_delegate_runtime_seams(agent, horizon_cut_outcome(agent))
+
+      spec_path = Path.join(ws, "delegate.json")
+
+      File.write!(
+        spec_path,
+        Jason.encode!(%{
+          "contract_version" => 1,
+          "strategy" => "subagents",
+          "task" => "cut off at horizon"
+        })
+      )
+
+      stderr =
+        capture_io(:stderr, fn ->
+          stdout =
+            capture_io(fn ->
+              assert {:error, 6} = CLI.route(["delegate", "--spec", spec_path])
+            end)
+
+          send(self(), {:delegate_stdout, stdout})
+        end)
+
+      assert stderr =~ "child 20260706T000002-cutoff running"
+
+      assert stderr =~
+               ~s{(resume with: pixir resume 20260706T000002-cutoff "Continue from the latest incomplete turn.}
+
+      assert_received {:delegate_stdout, stdout}
+      refute stdout =~ "resume with:"
+    end)
+  end
+
+  test "delegate partial with --json keeps stderr silent; guidance lives in the envelope" do
+    in_tmp_workspace("pixir-cli-delegate-hints-json", fn ws ->
+      agent = horizon_cut_agent()
+      put_delegate_runtime_seams(agent, horizon_cut_outcome(agent))
+
+      spec_path = Path.join(ws, "delegate.json")
+
+      File.write!(
+        spec_path,
+        Jason.encode!(%{
+          "contract_version" => 1,
+          "strategy" => "subagents",
+          "task" => "cut off at horizon"
+        })
+      )
+
+      stderr =
+        capture_io(:stderr, fn ->
+          stdout =
+            capture_io(fn ->
+              assert {:error, 6} = CLI.route(["delegate", "--spec", spec_path, "--json"])
+            end)
+
+          send(self(), {:delegate_stdout, stdout})
+        end)
+
+      assert stderr == ""
+      assert_received {:delegate_stdout, stdout}
+
+      assert {:ok, payload} = Jason.decode(stdout)
+      assert [child] = payload["children"]
+      assert child["resume_command"] =~ "pixir resume 20260706T000002-cutoff"
+      assert child["diagnose_command"] == "pixir diagnose session 20260706T000002-cutoff --json"
     end)
   end
 

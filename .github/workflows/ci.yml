@@ -13,7 +13,12 @@ concurrency:
 jobs:
   elixir:
     name: Elixir checks
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # This file is synced verbatim to the public mirror (Ranvier-Technologies/pixir),
+    # where Blacksmith is not installed. The condition names ONLY the public repo
+    # (the sync verifier rejects private-name mentions): the mirror gets free
+    # GitHub-hosted runners, everywhere else (the development repo) keeps
+    # Blacksmith. Rename the mirror -> update this.
+    runs-on: ${{ github.repository == 'Ranvier-Technologies/pixir' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}
     timeout-minutes: 15
 
     steps:

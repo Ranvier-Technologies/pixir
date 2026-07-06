@@ -1973,7 +1973,7 @@ defmodule Pixir.Delegate.CLIContract do
   end
 
   defp usage do
-    "pixir delegate --spec <path|-> [--dry-run] [--json] [--contract-version 1]\n" <>
+    "pixir delegate --spec <path|-> [--dry-run] [--json] [--contract-version 1] [--timeout-ms N]\n" <>
       "pixir delegate start --spec <path|-> [--json] [--contract-version 1] [--timeout-ms N]\n" <>
       "pixir delegate status <delegate_id|parent_session_id> [--json] [--contract-version 1]\n" <>
       "pixir delegate attach <delegate_id|parent_session_id> [--json] [--contract-version 1] [--progress=stderr-jsonl] [--wait-horizon-ms N]\n" <>
