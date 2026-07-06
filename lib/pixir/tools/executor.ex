@@ -366,8 +366,9 @@ defmodule Pixir.Tools.Executor do
   end
 
   # Consult the bounded write policy before permission mode. This is a headless
-  # executor guard, not an interactive approval flow: denial is structured,
-  # auditable, and terminal for the Turn loop.
+  # executor guard, not an interactive approval flow: denial is structured and
+  # auditable. Write-allowlist denials are terminal for the Turn loop; a
+  # bash_disabled denial is not (the model adapts with native tools, #218).
   defp authorize_write_policy(name, args, call_id, context) do
     policy = get_in(context, [:permission, :policy])
 

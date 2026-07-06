@@ -134,12 +134,7 @@ defmodule Pixir.Permissions.WritePolicy do
         if bounded_safe_command?(command) do
           :allow
         else
-          {:deny,
-           denial(policy, "bash", "bash_disabled", %{
-             "requested_command" => command,
-             "normalized_path" => nil,
-             "matched_rule" => "bash_disabled"
-           })}
+          {:deny, bash_disabled_denial(policy, command)}
         end
     end
   end
@@ -271,6 +266,27 @@ defmodule Pixir.Permissions.WritePolicy do
         "rule" => rule,
         "next_actions" => ["request_policy_expansion", "write_within_allowed_globs"]
       })
+    )
+  end
+
+  # The shell being disabled is a property of the bounded-write mode, not a write
+  # allowlist violation: the denial must not read as "write denied" when the command
+  # was a read (#218). Distinct kind, honest message, shell-free next_actions.
+  defp bash_disabled_denial(policy, command) do
+    Tool.error(
+      :bash_disabled,
+      "shell is disabled by the bounded write policy",
+      %{
+        "tool" => "bash",
+        "requested_command" => command,
+        "normalized_path" => nil,
+        "policy_id" => policy["id"],
+        "policy_hash" => policy["hash"],
+        "policy_version" => policy["version"],
+        "rule" => "bash_disabled",
+        "matched_rule" => "bash_disabled",
+        "next_actions" => ["use_native_read_tools", "use_edit_or_write_within_allowed_globs"]
+      }
     )
   end
 

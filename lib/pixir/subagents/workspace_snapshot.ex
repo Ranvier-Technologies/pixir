@@ -11,10 +11,23 @@ defmodule Pixir.Subagents.WorkspaceSnapshot do
   The first policy is intentionally conservative. It skips common dependency, build,
   cache, and Pixir runtime-state directories by basename at any depth, enforces copy
   limits, and returns string-keyed metadata/errors suitable for Tool results and Events.
+
+  The exclusion denylist is a policy carried in copier state: the built-in defaults
+  are always in effect, and callers may only extend them, never remove them, via
+  `config :pixir, :subagents, snapshot_excluded_dir_names: [...]` or the
+  `:excluded_dir_names` copy option (project-specific bulk like a benchmark `outputs/`
+  directory is the motivating case, #221). Names are directory basenames matched
+  byte-exactly at any depth: a regular file with an excluded name is still copied, and
+  on case-insensitive or normalization-insensitive filesystems a case or Unicode
+  variant of an excluded name is not matched (the failure mode is copying more, never
+  escaping the workspace). The effective list is confessed in the snapshot metadata;
+  when policy validation itself fails, no effective list is claimed. Symlinks are
+  lstat-skipped before the policy is consulted, so custom exclusions never introduce
+  traversal that follows them.
   """
 
   @policy "recursive_denylist_v1"
-  @excluded_dir_names ~w(.git .pixir _build deps node_modules dist .astro .vercel .next .turbo coverage .cache)
+  @default_excluded_dir_names ~w(.git .pixir _build deps node_modules dist .astro .vercel .next .turbo coverage .cache)
   @copy_chunk_bytes 64 * 1024
   @default_limits %{
     max_files: 20_000,
@@ -39,8 +52,9 @@ defmodule Pixir.Subagents.WorkspaceSnapshot do
   def copy(src, dest, opts) when is_binary(src) and is_binary(dest) do
     started_at = monotonic_ms()
 
-    with {:ok, limits} <- limits(opts) do
-      state = new_state(src, dest, limits)
+    with {:ok, limits} <- limits(opts),
+         {:ok, excluded_dir_names} <- excluded_dir_names(opts) do
+      state = new_state(src, dest, limits, excluded_dir_names)
 
       with :ok <- ensure_directory(src, "source"),
            :ok <- ensure_directory(dest, "destination"),
@@ -60,7 +74,10 @@ defmodule Pixir.Subagents.WorkspaceSnapshot do
       end
     else
       {:error, details} when is_map(details) ->
-        state = new_state(src, dest, @default_limits)
+        # Policy validation failed before an effective policy existed: report
+        # default limits but claim no effective exclusion list (nil is omitted
+        # from the finalized error rather than confessing a policy that never ran).
+        state = new_state(src, dest, @default_limits, nil)
         {:error, finalize_error(details, state, started_at)}
     end
   end
@@ -75,7 +92,7 @@ defmodule Pixir.Subagents.WorkspaceSnapshot do
      }}
   end
 
-  defp new_state(src, dest, limits) do
+  defp new_state(src, dest, limits, excluded_dir_names) do
     %{
       root: Path.expand(src),
       dest_root: Path.expand(dest),
@@ -85,7 +102,8 @@ defmodule Pixir.Subagents.WorkspaceSnapshot do
       special_entries_skipped: 0,
       bytes_copied: 0,
       skipped_dirs_by_name: %{},
-      limits: limits
+      limits: limits,
+      excluded_dir_names: excluded_dir_names
     }
   end
 
@@ -150,22 +168,22 @@ defmodule Pixir.Subagents.WorkspaceSnapshot do
     end
   end
 
-  defp copy_directory(entry, _src_path, _dest_path, state) when entry in @excluded_dir_names do
-    {:ok, skip_directory(state, entry)}
-  end
+  defp copy_directory(entry, src_path, dest_path, state) do
+    if MapSet.member?(state.excluded_dir_names, entry) do
+      {:ok, skip_directory(state, entry)}
+    else
+      case File.mkdir_p(dest_path) do
+        :ok ->
+          copy_dir(src_path, dest_path, state)
 
-  defp copy_directory(_entry, src_path, dest_path, state) do
-    case File.mkdir_p(dest_path) do
-      :ok ->
-        copy_dir(src_path, dest_path, state)
-
-      {:error, reason} ->
-        {:error,
-         %{
-           "reason" => "snapshot_mkdir_failed",
-           "path" => relative(dest_path, state.root),
-           "filesystem_reason" => inspect(reason)
-         }}
+        {:error, reason} ->
+          {:error,
+           %{
+             "reason" => "snapshot_mkdir_failed",
+             "path" => relative(dest_path, state.root),
+             "filesystem_reason" => inspect(reason)
+           }}
+      end
     end
   end
 
@@ -374,12 +392,8 @@ defmodule Pixir.Subagents.WorkspaceSnapshot do
   end
 
   defp limits(opts) when is_list(opts) do
-    app_limits =
-      :pixir
-      |> Application.get_env(:subagents, [])
-      |> Keyword.get(:snapshot_limits, [])
-
-    with {:ok, app_limits} <- normalize_limits(app_limits),
+    with {:ok, env} <- subagents_env(),
+         {:ok, app_limits} <- env |> Keyword.get(:snapshot_limits, []) |> normalize_limits(),
          {:ok, opts_limits} <- opts |> Keyword.get(:limits, []) |> normalize_limits() do
       {:ok,
        @default_limits
@@ -437,6 +451,66 @@ defmodule Pixir.Subagents.WorkspaceSnapshot do
      }}
   end
 
+  defp default_excluded_dir_names, do: MapSet.new(@default_excluded_dir_names)
+
+  defp excluded_dir_names(opts) do
+    with {:ok, env} <- subagents_env(),
+         {:ok, app_names} <-
+           env |> Keyword.get(:snapshot_excluded_dir_names, []) |> normalize_excluded_dir_names(),
+         {:ok, opts_names} <-
+           opts |> Keyword.get(:excluded_dir_names, []) |> normalize_excluded_dir_names() do
+      {:ok,
+       default_excluded_dir_names()
+       |> MapSet.union(app_names)
+       |> MapSet.union(opts_names)}
+    end
+  end
+
+  defp subagents_env do
+    env = Application.get_env(:pixir, :subagents, [])
+
+    if Keyword.keyword?(env) do
+      {:ok, env}
+    else
+      {:error,
+       %{
+         "reason" => "snapshot_invalid_subagents_env",
+         "message" => "config :pixir, :subagents must be a keyword list",
+         "value" => inspect(env),
+         "next_actions" => ["use_a_keyword_list_for_the_pixir_subagents_application_env"]
+       }}
+    end
+  end
+
+  defp normalize_excluded_dir_names(names) when is_list(names) do
+    Enum.reduce_while(names, {:ok, MapSet.new()}, fn name, {:ok, acc} ->
+      if excluded_dir_name?(name) do
+        {:cont, {:ok, MapSet.put(acc, name)}}
+      else
+        {:halt, {:error, invalid_excluded_dir_names_error(inspect(name))}}
+      end
+    end)
+  end
+
+  defp normalize_excluded_dir_names(names),
+    do: {:error, invalid_excluded_dir_names_error(inspect(names))}
+
+  defp excluded_dir_name?(name) do
+    is_binary(name) and name != "" and name not in [".", ".."] and
+      not String.contains?(name, ["/", "\0"])
+  end
+
+  defp invalid_excluded_dir_names_error(value) do
+    %{
+      "reason" => "snapshot_invalid_excluded_dir_names",
+      "message" =>
+        "workspace snapshot excluded directory names must be a list of non-empty " <>
+          "basenames without path separators",
+      "value" => value,
+      "next_actions" => ["use_basename_only_snapshot_excluded_dir_names"]
+    }
+  end
+
   defp normalize_limit(key, value) when key in [:max_files, :max_bytes, :max_file_bytes],
     do: normalize_known_limit(key, value)
 
@@ -464,6 +538,7 @@ defmodule Pixir.Subagents.WorkspaceSnapshot do
     |> Map.put_new("message", "subagent workspace snapshot failed")
     |> Map.put("snapshot_policy", @policy)
     |> Map.put("limits", public_limits(state.limits))
+    |> maybe_put_excluded_dir_names(state.excluded_dir_names)
     |> Map.put("files_copied", state.files_copied)
     |> Map.put("dirs_skipped", state.dirs_skipped)
     |> Map.put("bytes_copied", state.bytes_copied)
@@ -479,11 +554,20 @@ defmodule Pixir.Subagents.WorkspaceSnapshot do
       "bytes_copied" => state.bytes_copied,
       "elapsed_ms" => elapsed_ms,
       "limits" => public_limits(state.limits),
+      "excluded_dir_names" => public_excluded_dir_names(state.excluded_dir_names),
       "skipped_dirs_by_name" => state.skipped_dirs_by_name,
       "symlinks_skipped" => state.symlinks_skipped,
       "special_entries_skipped" => state.special_entries_skipped
     }
   end
+
+  defp maybe_put_excluded_dir_names(details, nil), do: details
+
+  defp maybe_put_excluded_dir_names(details, excluded_dir_names),
+    do: Map.put(details, "excluded_dir_names", public_excluded_dir_names(excluded_dir_names))
+
+  defp public_excluded_dir_names(excluded_dir_names),
+    do: excluded_dir_names |> MapSet.to_list() |> Enum.sort()
 
   defp public_limits(limits) do
     %{

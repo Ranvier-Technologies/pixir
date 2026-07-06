@@ -67,10 +67,11 @@ defmodule Pixir.Permissions.WritePolicyTest do
 
     assert details["matched_rule"] == ".pixir/**"
 
-    assert {:deny, %{error: %{kind: :write_policy_denied, details: details}}} =
+    assert {:deny, %{error: %{kind: :bash_disabled, details: details}}} =
              WritePolicy.authorize_tool(policy, "bash", %{"command" => "rm -rf src"}, ws)
 
     assert details["matched_rule"] == "bash_disabled"
+    assert "use_native_read_tools" in details["next_actions"]
   end
 
   test "denies case variants of protected paths under broad allow", %{ws: ws} do
@@ -106,7 +107,7 @@ defmodule Pixir.Permissions.WritePolicyTest do
           "ls src & rm -rf src",
           "cat src/file.txt > src/copy.txt"
         ] do
-      assert {:deny, %{error: %{kind: :write_policy_denied, details: details}}} =
+      assert {:deny, %{error: %{kind: :bash_disabled, details: details}}} =
                WritePolicy.authorize_tool(policy, "bash", %{"command" => command}, ws)
 
       assert details["matched_rule"] == "bash_disabled"

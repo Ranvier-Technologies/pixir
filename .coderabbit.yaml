@@ -57,7 +57,8 @@ reviews:
       instructions: |
         The delegate CLI envelope (schema pixir.delegate.envelope.v1) is a
         versioned public contract for machine callers. Exit codes are contract
-        (2 invalid_spec, 3 write_policy_denied, 6 indeterminate). Human-facing
+        (2 invalid_spec, 3 policy denials: write_policy_denied, outside_workspace,
+        permission_denied, bash_disabled, 6 indeterminate). Human-facing
         labels are 1-based ("steps[1]" is the first step) while machine location
         fields (json_pointer, path, step_index) are 0-based - both must stay
         consistent. In write_policy_denied details, step-location keys are

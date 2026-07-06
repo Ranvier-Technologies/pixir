@@ -66,7 +66,8 @@ defmodule Pixir.Tool do
     * **tools / executor** — `:invalid_args`, `:unknown_tool`, `:outside_workspace`,
       `:protected_path`, `:not_found`, `:resource_missing`, `:no_match`, `:not_unique`,
       `:read_failed`, `:write_failed`, `:command_failed`, `:timeout`,
-      `:permission_denied`, `:write_policy_denied`, `:detached`, `:backpressure`
+      `:permission_denied`, `:write_policy_denied`, `:bash_disabled`, `:detached`,
+      `:backpressure`
     * **turn loop** — `:iteration_cap`, `:tool_result_record_failed`,
       `:session_record_unavailable`
     * **log / writer lease** — `:corrupt_log_line`, `:ephemeral_not_loggable`,
@@ -99,6 +100,7 @@ defmodule Pixir.Tool do
           | :timeout
           | :permission_denied
           | :write_policy_denied
+          | :bash_disabled
           | :detached
           | :backpressure
           | :iteration_cap

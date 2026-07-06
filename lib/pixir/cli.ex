@@ -1141,6 +1141,7 @@ defmodule Pixir.CLI do
       %{"error_kind" => "write_policy_denied"} -> 3
       %{"error_kind" => "permission_denied"} -> 3
       %{"error_kind" => "outside_workspace"} -> 3
+      %{"error_kind" => "bash_disabled"} -> 3
       _ -> 1
     end
   end
@@ -1326,7 +1327,7 @@ defmodule Pixir.CLI do
     do: {:error, 2}
 
   defp error_exit(%{error: %{kind: kind}})
-       when kind in [:permission_denied, :write_policy_denied, :outside_workspace],
+       when kind in [:permission_denied, :write_policy_denied, :outside_workspace, :bash_disabled],
        do: {:error, 3}
 
   defp error_exit(%{error: %{kind: kind}})

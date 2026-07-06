@@ -9,6 +9,16 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [Unreleased]
 
+### Changed
+- A `bash` call denied because the bounded write policy disables the shell now
+  surfaces as `kind: "bash_disabled"` ("shell is disabled by the bounded write
+  policy") instead of the misleading `write_policy_denied` ("write denied"),
+  with shell-free `next_actions` (`use_native_read_tools`,
+  `use_edit_or_write_within_allowed_globs`). The denial keeps exit code 3 but
+  is no longer terminal for the child's Turn: the model can adapt with native
+  tools instead of dying on a read-only command. Write-allowlist denials keep
+  `write_policy_denied` and remain terminal (#218).
+
 ### Added
 - Delegate spec transport knob: `subagents.transport` (or top-level
   `transport`) accepts `auto` | `websocket` | `http_sse`; invalid values fail
@@ -22,6 +32,15 @@ caveat that pre-1.0 minor versions may still change behavior.
   when a retry happened) (#205).
 - `usage_summary.model` is now populated on provider usage events, and
   subagent session ids are aliased in `pixir tree` projections (#216).
+- Isolated subagent workspace snapshots accept extra exclusion directory names
+  (directory basenames, byte-exact, matched at any depth) via
+  `config :pixir, :subagents, snapshot_excluded_dir_names: [...]` or the
+  `:excluded_dir_names` snapshot option; built-in defaults (`.git`, `.pixir`,
+  `_build`, ...) always stay in effect, invalid names and a non-keyword
+  `:subagents` application env fail closed with structured errors, and the
+  effective list is confessed as `excluded_dir_names` in snapshot metadata and
+  runtime failure envelopes (never on validation failures, where no effective
+  policy ran) (#221).
 
 ## [0.1.5]
 
