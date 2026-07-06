@@ -328,6 +328,60 @@ defmodule Pixir.Delegate.RunnerTest do
     end)
   end
 
+  test "subagents transport is accepted and surfaced in runtime limits" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-transport")
+      test_pid = self()
+
+      spec = %{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "inspect transport",
+        "subagents" => %{"transport" => "websocket"}
+      }
+
+      spec_meta = %{"strategy" => "subagents", "planned_child_count" => 1}
+
+      spawn_agent = fn parent_session_id, args, opts ->
+        send(test_pid, {:spawn_agent_called, parent_session_id, args, opts})
+
+        {:ok,
+         %{
+           "id" => "subagent_1",
+           "agent" => args["agent"] || args[:agent],
+           "status" => "queued",
+           "summary" => "queued"
+         }}
+      end
+
+      assert {:ok, payload} =
+               Runner.start(%{workspace: ws}, spec, spec_meta, spawn_agent: spawn_agent)
+
+      assert payload.runtime.provider_transport == "websocket"
+      assert get_in(payload.payload, ["limits", "transport"]) == "websocket"
+      assert_received {:spawn_agent_called, _parent_session_id, _args, opts}
+      assert Keyword.fetch!(opts, :provider_transport) == "websocket"
+    end)
+  end
+
+  test "subagents transport rejects unsupported values" do
+    ws = tmp_workspace("pixir-delegate-runner-bad-transport")
+
+    spec = %{
+      "contract_version" => 1,
+      "strategy" => "subagents",
+      "task" => "inspect transport",
+      "subagents" => %{"transport" => "stdio"}
+    }
+
+    spec_meta = %{"strategy" => "subagents", "planned_child_count" => 1}
+
+    assert {:error, error} = Runner.start(%{workspace: ws}, spec, spec_meta)
+    assert error["kind"] == "invalid_spec"
+    assert error["details"]["field"] == "subagents.transport"
+    assert error["details"]["accepted_values"] == ["auto", "websocket", "http_sse"]
+  end
+
   test "bounded_write workflow does not infer observed writes from corrupt child log" do
     with_pixir_home("pixir-delegate-runner-home", fn ->
       ws = tmp_workspace("pixir-delegate-runner-corrupt-child-log")
@@ -411,6 +465,73 @@ defmodule Pixir.Delegate.RunnerTest do
 
       refute Map.has_key?(payload["write_destination"], "observed_applied_writes")
       refute Map.has_key?(hd(payload["children"]), "observed_applied_writes")
+    end)
+  end
+
+  test "subagent children without retries keep retry lineage keys omitted" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-no-retry-lineage")
+
+      spec = %{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "no retry child"
+      }
+
+      spec_meta = %{"strategy" => "subagents", "planned_child_count" => 1}
+
+      agent = %{
+        "id" => "subagent_1",
+        "agent" => "worker",
+        "status" => "completed",
+        "summary" => "done",
+        "child_session_id" => "20260706T000000-child"
+      }
+
+      spawn_agent = fn _parent_session_id, _args, _opts -> {:ok, agent} end
+
+      assert {:ok, payload} =
+               Runner.start(%{workspace: ws}, spec, spec_meta, spawn_agent: spawn_agent)
+
+      assert [child] = payload.payload["children"]
+      refute Map.has_key?(child, "retry_attempts")
+      refute Map.has_key?(child, "retry_max_attempts")
+      refute Map.has_key?(child, "current_attempt_index")
+      refute Map.has_key?(child, "retry_history")
+    end)
+  end
+
+  test "subagents transport is nil when absent" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-no-transport")
+      test_pid = self()
+
+      spec = %{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "inspect default transport"
+      }
+
+      spec_meta = %{"strategy" => "subagents", "planned_child_count" => 1}
+
+      spawn_agent = fn parent_session_id, args, opts ->
+        send(test_pid, {:spawn_agent_called, parent_session_id, args, opts})
+
+        {:ok,
+         %{
+           "id" => "subagent_1",
+           "agent" => args["agent"] || args[:agent],
+           "status" => "queued",
+           "summary" => "queued"
+         }}
+      end
+
+      assert {:ok, payload} =
+               Runner.start(%{workspace: ws}, spec, spec_meta, spawn_agent: spawn_agent)
+
+      assert get_in(payload, ["limits", "transport"]) == nil
+      assert_received {:spawn_agent_called, _parent_session_id, _args, opts}
+      refute Keyword.has_key?(opts, :provider_transport)
     end)
   end
 end

@@ -120,9 +120,11 @@ current one.
 - A stale writer lease fails closed **on purpose** (crashed runs leave
   evidence). Inspect first: `pixir diagnose session <sid> --json`. Force-release
   is a deliberate operator action, never a default.
-- Delegate partial failure (`work_complete: false`): recover per child — read
-  its `child_log_path`, then `pixir resume <child_session_id>`. Do not re-run
-  the whole spec.
+- Delegate partial failure (`work_complete: false`): the runtime may already
+  have auto-retried eligible read-only children (transient transport and
+  retryable provider errors) — check `children[].retry_history` first. For
+  children still not completed, recover per child: read its `child_log_path`,
+  then `pixir resume <child_session_id>`. Do not re-run the whole spec.
 - If stdout fails to parse as JSON in `--json` mode, treat the run as failed
   and read stderr; do not scrape partial stdout.
 

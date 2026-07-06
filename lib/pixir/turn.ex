@@ -843,7 +843,7 @@ defmodule Pixir.Turn do
         "call_index" => iteration,
         "usage_available" => not is_nil(result[:usage]),
         "usage" => stringify(result[:usage] || %{}),
-        "usage_summary" => stringify(summary)
+        "usage_summary" => summary |> stringify() |> Map.put_new("model", state.model)
       }
       |> Map.merge(cache_metadata)
       |> Map.merge(stringify(result[:provider_metadata] || %{}))

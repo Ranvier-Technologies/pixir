@@ -116,8 +116,13 @@ defmodule Pixir.SubagentsTest do
     {:ok, sid, pid} = SessionSupervisor.start_session(workspace: ws, role: :build)
 
     on_exit(fn ->
-      if Process.alive?(pid), do: DynamicSupervisor.terminate_child(SessionSupervisor, pid)
-      File.rm_rf!(ws)
+      try do
+        if Process.alive?(pid), do: DynamicSupervisor.terminate_child(SessionSupervisor, pid)
+      catch
+        :exit, _ -> :ok
+      end
+
+      File.rm_rf(ws)
     end)
 
     %{ws: ws, sid: sid}

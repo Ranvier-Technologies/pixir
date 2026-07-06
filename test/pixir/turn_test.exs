@@ -130,6 +130,8 @@ defmodule Pixir.TurnTest do
 
     assert {:ok, "Hi there!"} = run_with(ctx, "hello", [stop("Hi there!")])
 
+    model = Pixir.Provider.default_model()
+
     assert_receive {:pixir_event, %{type: :user_message}}
     assert_receive {:pixir_event, %{type: :text_delta, data: %{"chunk" => "Hi there!"}}}
     assert_receive {:pixir_event, %{type: :assistant_message, data: %{"text" => "Hi there!"}}}
@@ -137,6 +139,8 @@ defmodule Pixir.TurnTest do
     assert {:ok, history} = Log.fold(sid, workspace: ws)
     assert Enum.map(history, & &1.type) == [:user_message, :provider_usage, :assistant_message]
     usage = Enum.find(history, &(&1.type == :provider_usage))
+    assert usage.data["model"] == model
+    assert usage.data["usage_summary"]["model"] == model
     assert usage.data["usage_summary"]["cached_tokens"] == 0
     refute usage.data["prompt_cache_key"] =~ ws
     refute usage.data["prompt_cache_key"] =~ "hello"

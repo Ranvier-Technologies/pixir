@@ -3,6 +3,11 @@
 Date: 2026-06-02
 Status: Accepted
 
+Implementation status: supervised child Sessions, lifecycle tools, delegation
+context, and timeout rearming shipped with the original decision; the bounded
+read-only auto-retry described below was added as a later implementation slice
+on 2026-07-06 (#205).
+
 ## Context
 
 Codex subagents use explicit fan-out: a parent agent spawns specialized workers, those
@@ -38,6 +43,16 @@ subscribes to filtered child lifecycle Events, monitors lifecycle, enforces
 capacity frees. Timeout supervision records durable `timeout_ms` and `deadline_at`
 metadata in the parent Log so a restarted Manager can rearm the child timeout instead of
 depending on in-memory timers.
+
+The Manager also owns bounded auto-retry for explicitly read-only children that die
+terminally from transient provider failures (the websocket transport family and
+provider-declared-retryable server errors): bounded attempts (`retry_attempts`,
+default 1) with capped jitter re-enter the normal queue behind waiting children,
+never synchronously inside the failure handler. Each retry emits an observable
+`retrying` lifecycle event and preserves lineage (`retry_history` with the failed
+attempt's session id and error kind) on the agent and in delegate envelopes; failed
+attempt Logs are referenced, never overwritten. Write-capable children never
+auto-retry.
 
 Each child receives an isolated workspace snapshot under the parent workspace's ignored
 `.pixir/subagents/<id>/workspace` directory by default. This keeps file writes from
@@ -96,6 +111,11 @@ unless their agent config narrows it to read-only.
   wholesale.
 - Resume/fork can reconstruct Subagent relationships and terminal outcomes from the
   parent Log.
+- Explicitly read-only children can recover from retryable provider failures without
+  parent intervention; retries stay bounded, observable, queued behind waiting
+  children, and prohibited for write-capable children.
+- Failed retry attempts remain auditable: the failed attempt's Log is referenced by
+  `retry_history`, never overwritten by the successful attempt.
 - Child Turns receive their own delegation identity and limits without changing the
   stable Prompt Contract prefix for every Session.
 - Manager restart can reattach still-running child Sessions and rearm their timeout from

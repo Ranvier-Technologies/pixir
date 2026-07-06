@@ -221,6 +221,7 @@ defmodule Pixir.SessionTree do
         updated =
           current
           |> Map.merge(Map.take(data, subagent_fields()))
+          |> alias_subagent_session_id()
           |> Map.put("events", append_event(current["events"], data["event"]))
           |> Map.put("first_seq", min_seq(current["first_seq"], event.seq))
           |> Map.put("last_seq", max_seq(current["last_seq"], event.seq))
@@ -233,6 +234,17 @@ defmodule Pixir.SessionTree do
     |> Map.values()
     |> Enum.sort_by(&{seq_sort_key(&1["first_seq"]), &1["subagent_id"]})
   end
+
+  defp alias_subagent_session_id(%{"child_session_id" => child_session_id} = record)
+       when not is_nil(child_session_id) do
+    if is_nil(Map.get(record, "session_id")) do
+      Map.put(record, "session_id", child_session_id)
+    else
+      record
+    end
+  end
+
+  defp alias_subagent_session_id(record), do: record
 
   defp base_node(session_id, workspace, log_path, log_exists?) do
     %{

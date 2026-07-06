@@ -7,6 +7,22 @@ the CLI/ACP runtime is the public surface, and there is no stable Elixir library
 API yet. Versions follow [Semantic Versioning](https://semver.org/) with the
 caveat that pre-1.0 minor versions may still change behavior.
 
+## [Unreleased]
+
+### Added
+- Delegate spec transport knob: `subagents.transport` (or top-level
+  `transport`) accepts `auto` | `websocket` | `http_sse`; invalid values fail
+  `--dry-run` with a structured error and the effective value is surfaced as
+  `limits.transport` (#205).
+- Manager-level bounded auto-retry for read-only subagent children killed by
+  mid-stream websocket drops or provider-declared-retryable server errors,
+  with jittered re-queueing, an observable `retrying` lifecycle event, and a
+  retry confession on delegate envelopes (`children[].retry_attempts`,
+  `retry_max_attempts`, `current_attempt_index`, `retry_history`; present only
+  when a retry happened) (#205).
+- `usage_summary.model` is now populated on provider usage events, and
+  subagent session ids are aliased in `pixir tree` projections (#216).
+
 ## [0.1.5]
 
 ### Fixed

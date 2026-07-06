@@ -62,7 +62,12 @@ reviews:
         fields (json_pointer, path, step_index) are 0-based - both must stay
         consistent. In write_policy_denied details, step-location keys are
         prefixed (step_field, step_json_pointer, step_path); bare field /
-        json_pointer / path are reserved for WritePolicy's own context. Flag
+        json_pointer / path are reserved for WritePolicy's own context.
+        The spec-level transport knob (subagents.transport / transport:
+        auto|websocket|http_sse, validated at dry-run, surfaced as
+        limits.transport) and the conditional children[] retry-confession
+        fields (retry_attempts, retry_max_attempts, current_attempt_index,
+        retry_history - present only when a retry happened) are contract. Flag
         any change to envelope keys, exit codes, or these conventions that is
         not accompanied by a contract_version bump and test updates in
         test/pixir/delegate/.

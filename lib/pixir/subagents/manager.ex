@@ -24,6 +24,11 @@ defmodule Pixir.Subagents.Manager do
 
   @server __MODULE__
   @manager_child_event_types ~w(assistant_message status turn_failed)a
+  @retry_jitter_ceiling_ms 60_000
+  # Erlang timers reject delays above 2^32 - 1 ms (~49.7 days); clamp every
+  # Process.send_after delay so an oversized accepted value degrades to the
+  # ceiling instead of a badarg crash after durable evidence was recorded.
+  @erlang_timer_max_ms 4_294_967_295
 
   # TODO(service-lifetime): Delegate service mode needs an owner process that can keep
   # live child handles across CLI invocations. Today the Manager can restore durable
@@ -53,6 +58,8 @@ defmodule Pixir.Subagents.Manager do
   end
 
   def wait(parent_session_id, ids, timeout_ms, opts \\ []) do
+    timeout_ms = clamp_timer_ms(timeout_ms, @erlang_timer_max_ms - 1_000)
+
     GenServer.call(@server, {:wait, parent_session_id, ids, timeout_ms, opts}, timeout_ms + 1_000)
   catch
     :exit, {:timeout, _} ->
@@ -60,6 +67,8 @@ defmodule Pixir.Subagents.Manager do
   end
 
   def wait_outcome(parent_session_id, ids, timeout_ms, opts \\ []) do
+    timeout_ms = clamp_timer_ms(timeout_ms, @erlang_timer_max_ms - 1_000)
+
     GenServer.call(
       @server,
       {:wait_outcome, parent_session_id, ids, timeout_ms, opts},
@@ -169,7 +178,7 @@ defmodule Pixir.Subagents.Manager do
 
       true ->
         waiter_id = make_ref()
-        timer = Process.send_after(self(), {:wait_timeout, waiter_id}, timeout_ms)
+        timer = Process.send_after(self(), {:wait_timeout, waiter_id}, clamp_timer_ms(timeout_ms))
 
         waiters =
           Map.put(state.waiters, waiter_id, %{
@@ -207,7 +216,7 @@ defmodule Pixir.Subagents.Manager do
 
       true ->
         waiter_id = make_ref()
-        timer = Process.send_after(self(), {:wait_timeout, waiter_id}, timeout_ms)
+        timer = Process.send_after(self(), {:wait_timeout, waiter_id}, clamp_timer_ms(timeout_ms))
 
         waiters =
           Map.put(state.waiters, waiter_id, %{
@@ -266,9 +275,12 @@ defmodule Pixir.Subagents.Manager do
   def handle_info({:pixir_event, %{session_id: child_sid} = event}, state) do
     case Map.fetch(state.child_to_agent, child_sid) do
       {:ok, {parent_sid, id}} ->
-        state
-        |> remember_child_event(parent_sid, id, event)
-        |> then(&handle_child_event(parent_sid, id, event, &1))
+        state = remember_child_event(state, parent_sid, id, event)
+
+        case maybe_retry_transport_failure(parent_sid, id, event, state) do
+          {:retrying, state} -> {:noreply, state}
+          :no_retry -> handle_child_event(parent_sid, id, event, state)
+        end
 
       :error ->
         {:noreply, state}
@@ -311,6 +323,16 @@ defmodule Pixir.Subagents.Manager do
     end
   end
 
+  def handle_info({:subagent_retry, parent_sid, id}, state) do
+    case fetch_agent(state, parent_sid, id) do
+      {:ok, %{status: "queued"}} ->
+        {:noreply, maybe_start_queued(state, parent_sid)}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:wait_timeout, waiter_id}, state) do
     case Map.pop(state.waiters, waiter_id) do
       {nil, _waiters} ->
@@ -321,6 +343,97 @@ defmodule Pixir.Subagents.Manager do
         GenServer.reply(waiter.from, waiter_reply(waiter, agents))
         {:noreply, %{state | waiters: waiters}}
     end
+  end
+
+  # ── retry handling ───────────────────────────────────────────────────────
+
+  defp maybe_retry_transport_failure(parent_sid, id, event, state) do
+    with {:ok, agent} <- fetch_agent(state, parent_sid, id),
+         true <- transport_retry_event?(event),
+         true <- retry_attempt_index(agent) < retry_max_attempts(agent),
+         true <- not write_capable?(agent) do
+      old_agent = agent
+
+      retry_entry = %{
+        "attempt_index" => retry_attempt_index(agent),
+        "failed_child_session_id" => agent.child_session_id,
+        "error_kind" => event.data["error_kind"],
+        "timestamp" => now()
+      }
+
+      agent =
+        agent
+        |> Map.merge(%{
+          status: "queued",
+          child_pid: nil,
+          timer_ref: nil,
+          retry_attempt_index: retry_attempt_index(agent) + 1,
+          retry_history: Map.get(agent, :retry_history, []) ++ [retry_entry],
+          updated_at: now()
+        })
+
+      state =
+        state
+        |> cancel_timer(old_agent)
+        |> put_agent(agent)
+        |> remove_child_mapping(retry_entry["failed_child_session_id"])
+        |> record_parent_event(agent, "retrying", "queued", %{
+          "retry_attempts" => retry_attempt_index(agent),
+          "retry_max_attempts" => retry_max_attempts(agent),
+          "failed_child_session_id" => retry_entry["failed_child_session_id"],
+          "error_kind" => retry_entry["error_kind"]
+        })
+
+      Process.send_after(
+        self(),
+        {:subagent_retry, parent_sid, id},
+        retry_jitter(Map.get(agent, :retry_jitter_ms, 0))
+      )
+
+      {:retrying, state}
+    else
+      _ -> :no_retry
+    end
+  end
+
+  defp transport_retry_event?(%{type: :turn_failed, data: data}) when is_map(data) do
+    data["terminal_status"] == "provider_error" and
+      (data["error_kind"] in websocket_transport_error_kinds() or
+         retryable_provider_http_error?(data))
+  end
+
+  defp transport_retry_event?(_event), do: false
+
+  defp websocket_transport_error_kinds do
+    ~w(websocket_read_failed websocket_failed websocket_closed websocket_timeout)
+  end
+
+  defp retryable_provider_http_error?(%{"error_kind" => "provider_http_error"} = data) do
+    get_in(data, ["details", "type"]) == "server_error"
+  end
+
+  defp retryable_provider_http_error?(_data), do: false
+
+  defp write_capable?(%{permission_mode: :read_only}), do: false
+  defp write_capable?(%{permission_mode: "read_only"}), do: false
+  defp write_capable?(_agent), do: true
+
+  defp clamp_timer_ms(ms, ceiling \\ @erlang_timer_max_ms)
+
+  defp clamp_timer_ms(ms, ceiling) when is_integer(ms) and ms >= 0,
+    do: min(ms, ceiling)
+
+  defp clamp_timer_ms(_ms, _ceiling), do: 0
+
+  defp retry_jitter(ms) when is_integer(ms) and ms > 0,
+    do: :rand.uniform(clamp_timer_ms(ms, @retry_jitter_ceiling_ms) + 1) - 1
+
+  defp retry_jitter(_ms), do: 0
+
+  defp remove_child_mapping(state, nil), do: state
+
+  defp remove_child_mapping(state, child_sid) do
+    %{state | child_to_agent: Map.delete(state.child_to_agent, child_sid)}
   end
 
   # ── build/start ──────────────────────────────────────────────────────────
@@ -336,6 +449,8 @@ defmodule Pixir.Subagents.Manager do
       max_threads = Map.get(args, "max_threads", limits.max_threads)
       max_depth = Map.get(args, "max_depth", limits.max_depth)
       timeout_ms = Map.get(args, "timeout_ms", limits.timeout_ms)
+      retry_max_attempts = Map.get(args, "retry_attempts", limits.retry_attempts)
+      retry_jitter_ms = Map.get(args, "retry_jitter_ms", limits.retry_jitter_ms)
       workspace_mode = Map.get(args, "workspace_mode", "isolated")
       id = Map.get(args, "id") || gen_id()
 
@@ -343,6 +458,8 @@ defmodule Pixir.Subagents.Manager do
            :ok <- validate_positive_integer("max_threads", max_threads),
            :ok <- validate_non_negative_integer("max_depth", max_depth),
            :ok <- validate_positive_integer("timeout_ms", timeout_ms),
+           :ok <- validate_non_negative_integer("retry_attempts", retry_max_attempts),
+           :ok <- validate_non_negative_integer("retry_jitter_ms", retry_jitter_ms),
            {:ok, workspace_mode} <-
              WorkspaceStrategy.normalize_runtime_mode(workspace_mode, "subagent") do
         {:ok,
@@ -361,6 +478,10 @@ defmodule Pixir.Subagents.Manager do
            max_threads: max_threads,
            max_depth: max_depth,
            timeout_ms: timeout_ms,
+           retry_max_attempts: retry_max_attempts,
+           retry_jitter_ms: retry_jitter_ms,
+           retry_attempt_index: 0,
+           retry_history: [],
            parent_log_path: Log.path(parent_sid, workspace: workspace),
            child_log_path: nil,
            workspace: workspace,
@@ -478,7 +599,7 @@ defmodule Pixir.Subagents.Manager do
           Process.send_after(
             self(),
             {:subagent_timeout, agent.parent_session_id, agent.id},
-            agent.timeout_ms
+            clamp_timer_ms(agent.timeout_ms)
           )
 
         started = %{
@@ -528,7 +649,7 @@ defmodule Pixir.Subagents.Manager do
           Process.send_after(
             self(),
             {:subagent_timeout, agent.parent_session_id, agent.id},
-            agent.timeout_ms
+            clamp_timer_ms(agent.timeout_ms)
           )
 
         updated = %{
@@ -915,6 +1036,10 @@ defmodule Pixir.Subagents.Manager do
       workspace_snapshot: data["workspace_snapshot"],
       workspace_snapshot_opts: [],
       delegation_context: data["delegation_context"] || %{},
+      retry_attempt_index: data["retry_attempts"] || 0,
+      retry_max_attempts: data["retry_max_attempts"] || Subagents.default_limits().retry_attempts,
+      retry_jitter_ms: Subagents.default_limits().retry_jitter_ms,
+      retry_history: data["retry_history"] || [],
       provider: nil,
       provider_opts: [],
       permission_mode: nil,
@@ -1072,7 +1197,7 @@ defmodule Pixir.Subagents.Manager do
       Process.send_after(
         self(),
         {:subagent_timeout, agent.parent_session_id, agent.id},
-        remaining_ms
+        clamp_timer_ms(remaining_ms)
       )
 
     started_at_ms = monotonic_ms() - max(timeout_ms - remaining_ms, 0)
@@ -1525,7 +1650,28 @@ defmodule Pixir.Subagents.Manager do
     |> Enum.map_join("; ", fn {bucket, count} -> "#{count} #{bucket}" end)
   end
 
+  defp retry_attempt_index(agent), do: Map.get(agent, :retry_attempt_index, 0)
+
+  defp retry_max_attempts(agent), do: Map.get(agent, :retry_max_attempts, 0)
+
+  defp maybe_put_retry_lineage(map, %{retry_history: history} = agent)
+       when is_list(history) and history != [] do
+    map
+    |> Map.put("retry_attempts", retry_attempt_index(agent))
+    |> Map.put("retry_max_attempts", retry_max_attempts(agent))
+    |> Map.put("current_attempt_index", retry_attempt_index(agent))
+    |> Map.put("retry_history", history)
+  end
+
+  defp maybe_put_retry_lineage(map, _agent), do: map
+
   defp public_agent(agent) do
+    agent
+    |> public_agent_base()
+    |> maybe_put_retry_lineage(agent)
+  end
+
+  defp public_agent_base(agent) do
     %{
       "id" => agent.id,
       "parent_session_id" => agent.parent_session_id,
@@ -1683,6 +1829,12 @@ defmodule Pixir.Subagents.Manager do
   end
 
   defp terminal_event_fields(agent) do
+    agent
+    |> terminal_event_fields_base()
+    |> maybe_put_retry_lineage(agent)
+  end
+
+  defp terminal_event_fields_base(agent) do
     %{
       "reason" => agent.timeout_reason,
       "timeout_ms" => agent.timeout_ms,

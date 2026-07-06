@@ -38,7 +38,9 @@ defmodule Pixir.Subagents do
     %{
       max_threads: Keyword.get(config, :max_threads, 6),
       max_depth: Keyword.get(config, :max_depth, 1),
-      timeout_ms: Keyword.get(config, :timeout_ms, 120_000)
+      timeout_ms: Keyword.get(config, :timeout_ms, 120_000),
+      retry_attempts: Keyword.get(config, :retry_attempts, 1),
+      retry_jitter_ms: Keyword.get(config, :retry_jitter_ms, 250)
     }
   end
 
@@ -162,7 +164,11 @@ defmodule Pixir.Subagents do
       "write_policy",
       "elapsed_ms",
       "reason",
-      "next_actions"
+      "next_actions",
+      "retry_attempts",
+      "retry_max_attempts",
+      "current_attempt_index",
+      "retry_history"
     ]
   end
 end

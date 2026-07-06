@@ -618,7 +618,7 @@ defmodule Pixir.Delegate.Async do
     %{
       "tree_command" => "pixir tree #{session_id} --json",
       "diagnose_command" => "pixir diagnose session #{session_id} --json",
-      "issue" => "https://github.com/Ranvier-Technologies/pixir-harness/issues/133"
+      "issue" => "private-tracker#133 (see docs/adr/README.md on private refs)"
     }
   end
 

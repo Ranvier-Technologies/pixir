@@ -32,4 +32,4 @@ pixir acp
 
 - Hex package: https://hex.pm/packages/pixir
 - HexDocs: https://pixir.hexdocs.pm/readme.html
-- Source: https://github.com/Ranvier-Technologies/pixir-harness
+- Source: https://github.com/Ranvier-Technologies/pixir

@@ -166,6 +166,11 @@ fi
 printf '%s\n' "$result" | jq '{ok,status,delegate_id,parent_session_id,children}'
 ```
 
+Optional transport preference: `subagents.transport` (or top-level
+`transport`) accepts `auto`, `websocket`, or `http_sse`; invalid values fail
+the dry-run with a structured error, and the effective value is surfaced as
+`limits.transport` in plan and envelope.
+
 Useful fields for callers:
 
 - `ok`
@@ -174,6 +179,12 @@ Useful fields for callers:
 - `parent_session_id`
 - `children[].status`
 - `children[].child_session_id`
+- `children[].retry_attempts` / `children[].retry_max_attempts` /
+  `children[].current_attempt_index` / `children[].retry_history` - present
+  only when the runtime auto-retried that child (bounded retry for
+  websocket-family and provider-declared-retryable server errors on
+  read-only children); `retry_history` preserves each failed attempt's
+  session id and error kind
 - `diagnostics.diagnose_command`
 - `diagnostics.tree_command`
 - `host_boundary.external_process_spawns_scope`

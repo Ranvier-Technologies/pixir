@@ -31,6 +31,7 @@ defmodule Pixir.Delegate.Runner do
   alias Pixir.Tools.Workspace
 
   @supported_modes [nil, "read_only", "bounded_write"]
+  @supported_transports ["auto", "websocket", "http_sse"]
   @incomplete_statuses ~w(partial timed_out failed cancelled)
 
   @doc "Run a validated Delegate spec through the attached runtime path."
@@ -138,6 +139,7 @@ defmodule Pixir.Delegate.Runner do
          {:ok, timeouts} <- normalize_timeouts(request, spec),
          {:ok, max_threads} <- normalize_positive_integer(spec, ["subagents", "max_threads"]),
          {:ok, max_depth} <- normalize_non_negative_integer(spec, ["subagents", "max_depth"]),
+         {:ok, provider_transport} <- normalize_provider_transport(spec),
          {:ok, workspace_mode} <- normalize_workspace_mode(spec),
          {:ok, agent} <- normalize_agent(spec),
          :ok <- ensure_child_count(tasks, spec_meta) do
@@ -153,6 +155,7 @@ defmodule Pixir.Delegate.Runner do
          wait_horizon_ms: timeouts.wait_horizon_ms,
          max_threads: max_threads,
          max_depth: max_depth,
+         provider_transport: provider_transport,
          workspace_mode: workspace_mode,
          agent: agent,
          planned_child_count: length(tasks)
@@ -442,6 +445,50 @@ defmodule Pixir.Delegate.Runner do
     })
   end
 
+  defp normalize_provider_transport(spec) do
+    {value, path} = provider_transport_candidate(spec)
+
+    cond do
+      is_nil(value) ->
+        {:ok, nil}
+
+      value in @supported_transports ->
+        {:ok, value}
+
+      true ->
+        {:error, provider_transport_error(path, value)}
+    end
+  end
+
+  defp provider_transport_candidate(spec) do
+    cond do
+      not is_nil(get_in(spec, ["subagents", "transport"])) ->
+        {get_in(spec, ["subagents", "transport"]), ["subagents", "transport"]}
+
+      not is_nil(Map.get(spec, "transport")) ->
+        {Map.get(spec, "transport"), ["transport"]}
+
+      true ->
+        {nil, ["transport"]}
+    end
+  end
+
+  defp provider_transport_error(path, value) do
+    field = Enum.join(path, ".")
+
+    error_payload("invalid_spec", "#{field} must be supported transport", %{
+      "field" => field,
+      "observed" => inspect(value),
+      "accepted_values" => @supported_transports,
+      "next_actions" => ["fix_#{String.replace(field, ".", "_")}"]
+    })
+  end
+
+  defp with_provider_transport(opts, nil), do: opts
+
+  defp with_provider_transport(opts, transport),
+    do: Keyword.put(opts, :provider_transport, transport)
+
   defp normalize_workspace_mode(spec) do
     value =
       Map.get(spec, "workspace_mode") ||
@@ -599,7 +646,11 @@ defmodule Pixir.Delegate.Runner do
         |> Keyword.put(:permission_mode, runtime_permission_mode(runtime))
         |> Keyword.put(:write_policy, runtime.write_policy)
 
-      case spawn_agent.(parent_session_id, args, spawn_opts) do
+      case spawn_agent.(
+             parent_session_id,
+             args,
+             with_provider_transport(spawn_opts, runtime.provider_transport)
+           ) do
         {:ok, agent} ->
           {:cont, {:ok, [agent | agents]}}
 
@@ -724,6 +775,7 @@ defmodule Pixir.Delegate.Runner do
         "wait_horizon_ms" => runtime.wait_horizon_ms,
         "timeout_semantics" => timeout_semantics(),
         "max_threads" => runtime.max_threads,
+        "transport" => runtime.provider_transport,
         "max_depth" => runtime.max_depth,
         "mode" => runtime.mode,
         "workspace_mode" => runtime.workspace_mode,
@@ -1102,6 +1154,7 @@ defmodule Pixir.Delegate.Runner do
         "wait_horizon_ms" => runtime.wait_horizon_ms,
         "timeout_semantics" => timeout_semantics(),
         "max_threads" => runtime.max_threads,
+        "transport" => runtime.provider_transport,
         "max_depth" => runtime.max_depth,
         "mode" => runtime.mode,
         "workspace_mode" => runtime.workspace_mode,
@@ -1224,7 +1277,37 @@ defmodule Pixir.Delegate.Runner do
   defp start_next_actions(_status),
     do: ["inspect_spawn_failure", "check_delegate_status", "inspect_delegate_diagnostics"]
 
+  defp maybe_put_child_retry_lineage(child, agent) do
+    retry_attempts = Map.get(agent, "retry_attempts")
+    retry_history = Map.get(agent, "retry_history", [])
+
+    if retry_attempts in [nil, 0] and retry_history in [nil, []] do
+      child
+    else
+      child
+      |> maybe_copy_child_field(agent, "retry_attempts")
+      |> maybe_copy_child_field(agent, "retry_max_attempts")
+      |> maybe_copy_child_field(agent, "current_attempt_index")
+      |> maybe_copy_child_field(agent, "retry_history")
+    end
+  end
+
+  defp maybe_copy_child_field(child, agent, field) do
+    case Map.fetch(agent, field) do
+      {:ok, nil} -> child
+      {:ok, []} -> child
+      {:ok, value} -> Map.put(child, field, value)
+      :error -> child
+    end
+  end
+
   defp child_result(agent) do
+    agent
+    |> child_result_base()
+    |> maybe_put_child_retry_lineage(agent)
+  end
+
+  defp child_result_base(agent) do
     %{
       "subagent_id" => agent["id"],
       "child_session_id" => agent["child_session_id"],
@@ -1354,14 +1437,14 @@ defmodule Pixir.Delegate.Runner do
       "log_path" => Log.path(parent_session_id, workspace: workspace),
       "tree_command" => "pixir tree #{parent_session_id} --json",
       "diagnose_command" => "pixir diagnose session #{parent_session_id} --json",
-      "issue" => "https://github.com/Ranvier-Technologies/pixir-harness/issues/133"
+      "issue" => "private-tracker#133 (see docs/adr/README.md on private refs)"
     }
   end
 
   defp workflow_diagnostics(parent_session_id, workspace) do
     parent_session_id
     |> diagnostics(workspace)
-    |> Map.put("issue", "https://github.com/Ranvier-Technologies/pixir-harness/issues/150")
+    |> Map.put("issue", "private-tracker#150 (see docs/adr/README.md on private refs)")
   end
 
   defp delegate_next_actions("completed", _outcome), do: []

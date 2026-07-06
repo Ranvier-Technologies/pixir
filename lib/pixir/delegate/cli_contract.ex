@@ -1025,6 +1025,7 @@ defmodule Pixir.Delegate.CLIContract do
          {:ok, mode} <- validate_mode(spec),
          :ok <- validate_strategy_mode(strategy, mode),
          {:ok, write_policy} <- validate_write_policy(spec, mode),
+         {:ok, transport} <- validate_transport(spec),
          {:ok, planned_child_count} <- validate_strategy_shape(strategy, spec),
          {:ok, strategy_meta} <-
            validate_strategy_contract(strategy, spec, workspace, runtime_opts) do
@@ -1034,6 +1035,7 @@ defmodule Pixir.Delegate.CLIContract do
            "strategy" => strategy,
            "mode" => mode || "read_only",
            "write_policy" => write_policy,
+           "transport" => transport,
            "planned_child_count" => planned_child_count,
            "spec_contract_version" => Map.get(spec, "contract_version", @contract_version)
          },
@@ -1070,6 +1072,28 @@ defmodule Pixir.Delegate.CLIContract do
   defp validate_mode(%{"mode" => mode}) when mode in @supported_modes, do: {:ok, mode}
   defp validate_mode(%{"mode" => mode}), do: {:error, unsupported_mode(mode)}
   defp validate_mode(_spec), do: {:ok, nil}
+
+  @supported_transports ["auto", "websocket", "http_sse"]
+
+  defp validate_transport(spec) do
+    value = get_in(spec, ["subagents", "transport"]) || Map.get(spec, "transport")
+
+    cond do
+      is_nil(value) ->
+        {:ok, nil}
+
+      value in @supported_transports ->
+        {:ok, value}
+
+      true ->
+        {:error,
+         invalid_spec("delegate spec transport is unsupported", %{
+           "observed" => inspect(value),
+           "supported_transports" => @supported_transports,
+           "next_actions" => ["use_auto_websocket_or_http_sse", "remove_transport_field"]
+         })}
+    end
+  end
 
   defp validate_strategy_mode("workflow", mode) when mode in [nil, "read_only", "bounded_write"],
     do: :ok
@@ -1562,6 +1586,7 @@ defmodule Pixir.Delegate.CLIContract do
         "next_actions" => dry_run_next_actions(spec_meta)
       }
       |> put_if_present("role_validation", spec_meta["subagent_role_validation"])
+      |> put_if_present("transport", spec_meta["transport"])
 
     {:ok, rendered(payload, request.json?, 0, human_success(payload))}
   end
@@ -1658,7 +1683,7 @@ defmodule Pixir.Delegate.CLIContract do
     %{
       "tree_command" => "available_after_delegate_runner_creates_a_session",
       "diagnose_command" => "available_after_delegate_runner_creates_a_session",
-      "issue" => "https://github.com/Ranvier-Technologies/pixir-harness/issues/133"
+      "issue" => "private-tracker#133 (see docs/adr/README.md on private refs)"
     }
   end
 

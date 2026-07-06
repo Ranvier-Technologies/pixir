@@ -73,6 +73,8 @@ defmodule Pixir.SessionTreeTest do
 
     assert [subagent] = tree["subagents"]
     assert subagent["subagent_id"] == "sub_1"
+    assert subagent["child_session_id"] == child_sid
+    assert subagent["session_id"] == child_sid
     assert subagent["status"] == "completed"
     assert subagent["events"] == ["started", "finished"]
     assert subagent["summary"] == "found one child"
