@@ -335,6 +335,41 @@ defmodule Pixir.TurnTest do
     assert Enum.count(history, &(&1.type == :provider_usage)) == 1
   end
 
+  test "bash_disabled is not terminal: the model adapts after the denial", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    {:ok, policy} =
+      WritePolicy.normalize(%{
+        "version" => 1,
+        "metadata" => %{"id" => "turn-test"},
+        "allow_writes" => ["allowed/**"]
+      })
+
+    script = [
+      tool_calls([
+        %{
+          call_id: "c1",
+          name: "bash",
+          args: %{"command" => "grep -n needle lib/app.ex | head -5"}
+        }
+      ]),
+      stop("adapted with native tools")
+    ]
+
+    assert {:ok, "adapted with native tools"} =
+             run_with(ctx, "search the code", script, write_policy: policy)
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    assert [result] = Enum.filter(history, &(&1.type == :tool_result))
+    assert result.data["error"]["kind"] == "bash_disabled"
+    assert "use_native_read_tools" in result.data["error"]["details"]["next_actions"]
+    refute Enum.any?(history, &(&1.type == :turn_failed))
+    assert List.last(history).type == :assistant_message
+  end
+
   test "records explicit dollar skill activation before the user message", %{
     ctx: ctx,
     sid: sid,

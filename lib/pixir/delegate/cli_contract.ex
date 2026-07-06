@@ -1913,6 +1913,7 @@ defmodule Pixir.Delegate.CLIContract do
   defp exit_code(%{"kind" => "stdin_error"}), do: 2
   defp exit_code(%{"kind" => "not_found"}), do: 2
   defp exit_code(%{"kind" => "write_policy_denied"}), do: 3
+  defp exit_code(%{"kind" => "bash_disabled"}), do: 3
   defp exit_code(%{"kind" => "manager_unavailable"}), do: 5
   defp exit_code(%{"kind" => "timeout"}), do: 5
   defp exit_code(%{"kind" => "daemon_required"}), do: 5
@@ -1929,7 +1930,12 @@ defmodule Pixir.Delegate.CLIContract do
        do: 2
 
   defp runtime_exit_code(%{"kind" => kind}, _request)
-       when kind in ["permission_denied", "outside_workspace", "write_policy_denied"],
+       when kind in [
+              "permission_denied",
+              "outside_workspace",
+              "write_policy_denied",
+              "bash_disabled"
+            ],
        do: 3
 
   defp runtime_exit_code(%{"kind" => kind}, _request)

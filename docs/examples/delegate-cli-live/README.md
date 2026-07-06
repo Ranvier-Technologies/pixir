@@ -30,7 +30,7 @@ command path first, then parse stdout JSON.
 | `pixir delegate --spec ... --dry-run --json` | `2` | Invalid args/spec, unreadable stdin/spec, unsupported mode, or unknown role. | Inspect `kind`, `details`, `field` / `json_pointer`, and `next_actions`; fix the spec before runtime. |
 | `pixir delegate --spec ... --dry-run --json` | `3` | Bounded write policy rejected the planned write scope. | Narrow the child `write_set` or explicitly expand `write_policy.allow_writes`. |
 | attached `pixir delegate --spec ... --json` | `0` | Delegate work reached a clean success state; expect `ok: true` and `status: "completed"`. | Consume `children`, diagnostics commands, artifacts, and summaries as evidence pointers. |
-| attached `pixir delegate --spec ... --json` | `3` | Permission, workspace, read-confinement, or bounded-write policy denial. | Distinguish `kind: "outside_workspace"` from `kind: "write_policy_denied"` before retrying. |
+| attached `pixir delegate --spec ... --json` | `3` | Permission, workspace, read-confinement, disabled-shell, or bounded-write policy denial. | Distinguish `kind: "outside_workspace"`, `kind: "write_policy_denied"`, `kind: "permission_denied"`, and `kind: "bash_disabled"` before retrying. |
 | attached `pixir delegate --spec ... --json` | `4` | Provider/auth/network class failure. | Inspect `kind`, provider diagnostics, and retry or re-auth guidance. |
 | attached `pixir delegate --spec ... --json` | `5` | Runner-level failure before delegated work reached a terminal state: backpressure, unavailable manager, or daemon requirement. | Inspect the error `kind` and details; retry with adjusted budgets or daemon setup. |
 | attached `pixir delegate --spec ... --json` | `6` | Domain work reached an incomplete terminal state such as `partial`, `timed_out`, `failed`, or `cancelled` — attached child timeouts normalize to `status: "timed_out"` and exit here, not `5`. | Parse the envelope; inspect `children[*].status`, workflow buckets, `write_destination`, and diagnostics before deciding whether the result is usable. |
@@ -100,6 +100,14 @@ Do not collapse read/scope denials and write allowlist denials:
   workspace. This is a tripwire, not a full POSIX sandbox.
 - `kind: "write_policy_denied"` means the requested write exceeded the bounded write
   policy.
+- `kind: "permission_denied"` means the permission mode (ADR 0006) rejected the
+  request, independent of any bounded write policy.
+- `kind: "bash_disabled"` means the shell tool itself is disabled by the bounded
+  write policy (v1 always disables it); the command's read/write nature is
+  irrelevant. This denial does not end the child's Turn: the model is expected to
+  adapt via `next_actions` (`use_native_read_tools`,
+  `use_edit_or_write_within_allowed_globs`). Do not respond by widening write
+  globs; they are unrelated.
 
 Illustrative non-golden `outside_workspace` denial:
 

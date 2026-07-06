@@ -535,7 +535,7 @@ defmodule Pixir.Tools.ExecutorTest do
       {:ok, policy} = write_policy(["allowed/**"])
       ctx = Map.put(ctx, :permission, %{mode: :auto, policy: policy})
 
-      assert {:error, %{error: %{kind: :write_policy_denied, details: details}}} =
+      assert {:error, %{error: %{kind: :bash_disabled, details: details}}} =
                Executor.run(
                  %{call_id: "c", name: "bash", args: %{"command" => "touch allowed/out.txt"}},
                  ctx
