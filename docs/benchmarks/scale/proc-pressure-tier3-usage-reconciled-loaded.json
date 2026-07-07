@@ -1,0 +1,481 @@
+{
+  "summary": {
+    "note": "Per-call normalization from durable evidence: pixir child session-log provider_usage, codex per-task turn.completed. Purpose: pixir children make many provider calls per child while codex makes ~1, so normalizing per call shows the per-worker pressure gap is NOT an artifact of pixir doing deeper multi-call work: codex pays MORE kernel pressure per individual provider call. Medians via statistics.median (even rep counts average the middle pair; corrected 2026-07-07, previous revision took the upper value).",
+    "per_n": {
+      "1": {
+        "codex-exec": {
+          "reps": 3,
+          "median_calls_per_child": 1.0,
+          "median_icsw_per_call": 41742,
+          "median_sys_cpu_ms_per_call": 920.0
+        },
+        "pixir-delegate": {
+          "reps": 3,
+          "median_calls_per_child": 7.0,
+          "median_icsw_per_call": 4515,
+          "median_sys_cpu_ms_per_call": 128.6
+        }
+      },
+      "2": {
+        "codex-exec": {
+          "reps": 3,
+          "median_calls_per_child": 1.0,
+          "median_icsw_per_call": 51140,
+          "median_sys_cpu_ms_per_call": 1225.0
+        },
+        "pixir-delegate": {
+          "reps": 3,
+          "median_calls_per_child": 9.0,
+          "median_icsw_per_call": 2573,
+          "median_sys_cpu_ms_per_call": 69.4
+        }
+      },
+      "4": {
+        "codex-exec": {
+          "reps": 3,
+          "median_calls_per_child": 1.0,
+          "median_icsw_per_call": 52854,
+          "median_sys_cpu_ms_per_call": 1365.0
+        },
+        "pixir-delegate": {
+          "reps": 3,
+          "median_calls_per_child": 9.0,
+          "median_icsw_per_call": 2240,
+          "median_sys_cpu_ms_per_call": 55.3
+        }
+      },
+      "8": {
+        "codex-exec": {
+          "reps": 3,
+          "median_calls_per_child": 1.0,
+          "median_icsw_per_call": 53403,
+          "median_sys_cpu_ms_per_call": 1417.5
+        },
+        "pixir-delegate": {
+          "reps": 3,
+          "median_calls_per_child": 11.0,
+          "median_icsw_per_call": 1550,
+          "median_sys_cpu_ms_per_call": 45.3
+        }
+      },
+      "16": {
+        "codex-exec": {
+          "reps": 2,
+          "median_calls_per_child": 1.0,
+          "median_icsw_per_call": 57647.5,
+          "median_sys_cpu_ms_per_call": 1507.2
+        },
+        "pixir-delegate": {
+          "reps": 2,
+          "median_calls_per_child": 9.2,
+          "median_icsw_per_call": 1531.5,
+          "median_sys_cpu_ms_per_call": 44.5
+        }
+      },
+      "32": {
+        "codex-exec": {
+          "reps": 2,
+          "median_calls_per_child": 1.0,
+          "median_icsw_per_call": 60869.5,
+          "median_sys_cpu_ms_per_call": 1934.2
+        },
+        "pixir-delegate": {
+          "reps": 2,
+          "median_calls_per_child": 9.2,
+          "median_icsw_per_call": 1105.5,
+          "median_sys_cpu_ms_per_call": 34.6
+        }
+      },
+      "64": {
+        "codex-exec": {
+          "reps": 1,
+          "median_calls_per_child": 1.0,
+          "median_icsw_per_call": 77020,
+          "median_sys_cpu_ms_per_call": 2923.3
+        },
+        "pixir-delegate": {
+          "reps": 1,
+          "median_calls_per_child": 7.4,
+          "median_icsw_per_call": 1457,
+          "median_sys_cpu_ms_per_call": 35.7
+        }
+      }
+    }
+  },
+  "per_unit": [
+    {
+      "arm": "pixir-delegate",
+      "n": 1,
+      "rep": 1,
+      "provider_calls": 5,
+      "calls_per_child": 5.0,
+      "uncached_input_tokens": 11700,
+      "output_tokens": 743,
+      "icsw_per_call": 7273,
+      "sys_cpu_ms_per_call": 168.0
+    },
+    {
+      "arm": "codex-exec",
+      "n": 1,
+      "rep": 1,
+      "provider_calls": 1,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 57652,
+      "output_tokens": 2163,
+      "icsw_per_call": 44767,
+      "sys_cpu_ms_per_call": 1060.0
+    },
+    {
+      "arm": "codex-exec",
+      "n": 1,
+      "rep": 2,
+      "provider_calls": 1,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 56298,
+      "output_tokens": 970,
+      "icsw_per_call": 41742,
+      "sys_cpu_ms_per_call": 890.0
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 1,
+      "rep": 2,
+      "provider_calls": 7,
+      "calls_per_child": 7.0,
+      "uncached_input_tokens": 13182,
+      "output_tokens": 823,
+      "icsw_per_call": 4515,
+      "sys_cpu_ms_per_call": 128.6
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 1,
+      "rep": 3,
+      "provider_calls": 24,
+      "calls_per_child": 24.0,
+      "uncached_input_tokens": 44117,
+      "output_tokens": 2132,
+      "icsw_per_call": 2281,
+      "sys_cpu_ms_per_call": 64.2
+    },
+    {
+      "arm": "codex-exec",
+      "n": 1,
+      "rep": 3,
+      "provider_calls": 1,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 37826,
+      "output_tokens": 1347,
+      "icsw_per_call": 41550,
+      "sys_cpu_ms_per_call": 920.0
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 2,
+      "rep": 1,
+      "provider_calls": 18,
+      "calls_per_child": 9.0,
+      "uncached_input_tokens": 39796,
+      "output_tokens": 2780,
+      "icsw_per_call": 2573,
+      "sys_cpu_ms_per_call": 69.4
+    },
+    {
+      "arm": "codex-exec",
+      "n": 2,
+      "rep": 1,
+      "provider_calls": 2,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 101005,
+      "output_tokens": 2760,
+      "icsw_per_call": 51140,
+      "sys_cpu_ms_per_call": 1225.0
+    },
+    {
+      "arm": "codex-exec",
+      "n": 2,
+      "rep": 2,
+      "provider_calls": 2,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 81703,
+      "output_tokens": 3261,
+      "icsw_per_call": 48216,
+      "sys_cpu_ms_per_call": 1175.0
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 2,
+      "rep": 2,
+      "provider_calls": 31,
+      "calls_per_child": 15.5,
+      "uncached_input_tokens": 48967,
+      "output_tokens": 3956,
+      "icsw_per_call": 2026,
+      "sys_cpu_ms_per_call": 60.6
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 2,
+      "rep": 3,
+      "provider_calls": 15,
+      "calls_per_child": 7.5,
+      "uncached_input_tokens": 33066,
+      "output_tokens": 2241,
+      "icsw_per_call": 3708,
+      "sys_cpu_ms_per_call": 100.0
+    },
+    {
+      "arm": "codex-exec",
+      "n": 2,
+      "rep": 3,
+      "provider_calls": 2,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 112867,
+      "output_tokens": 3256,
+      "icsw_per_call": 51846,
+      "sys_cpu_ms_per_call": 11980.0
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 4,
+      "rep": 1,
+      "provider_calls": 31,
+      "calls_per_child": 7.8,
+      "uncached_input_tokens": 61310,
+      "output_tokens": 4417,
+      "icsw_per_call": 3041,
+      "sys_cpu_ms_per_call": 67.7
+    },
+    {
+      "arm": "codex-exec",
+      "n": 4,
+      "rep": 1,
+      "provider_calls": 4,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 165469,
+      "output_tokens": 4929,
+      "icsw_per_call": 52854,
+      "sys_cpu_ms_per_call": 1295.0
+    },
+    {
+      "arm": "codex-exec",
+      "n": 4,
+      "rep": 2,
+      "provider_calls": 4,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 162338,
+      "output_tokens": 6599,
+      "icsw_per_call": 59883,
+      "sys_cpu_ms_per_call": 1635.0
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 4,
+      "rep": 2,
+      "provider_calls": 52,
+      "calls_per_child": 13.0,
+      "uncached_input_tokens": 102696,
+      "output_tokens": 5366,
+      "icsw_per_call": 1466,
+      "sys_cpu_ms_per_call": 46.0
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 4,
+      "rep": 3,
+      "provider_calls": 36,
+      "calls_per_child": 9.0,
+      "uncached_input_tokens": 67305,
+      "output_tokens": 4367,
+      "icsw_per_call": 2240,
+      "sys_cpu_ms_per_call": 55.3
+    },
+    {
+      "arm": "codex-exec",
+      "n": 4,
+      "rep": 3,
+      "provider_calls": 4,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 166144,
+      "output_tokens": 5687,
+      "icsw_per_call": 51730,
+      "sys_cpu_ms_per_call": 1365.0
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 8,
+      "rep": 1,
+      "provider_calls": 88,
+      "calls_per_child": 11.0,
+      "uncached_input_tokens": 141733,
+      "output_tokens": 10055,
+      "icsw_per_call": 1550,
+      "sys_cpu_ms_per_call": 45.3
+    },
+    {
+      "arm": "codex-exec",
+      "n": 8,
+      "rep": 1,
+      "provider_calls": 8,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 334501,
+      "output_tokens": 11132,
+      "icsw_per_call": 53403,
+      "sys_cpu_ms_per_call": 1417.5
+    },
+    {
+      "arm": "codex-exec",
+      "n": 8,
+      "rep": 2,
+      "provider_calls": 8,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 276710,
+      "output_tokens": 9747,
+      "icsw_per_call": 50177,
+      "sys_cpu_ms_per_call": 1418.8
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 8,
+      "rep": 2,
+      "provider_calls": 48,
+      "calls_per_child": 6.0,
+      "uncached_input_tokens": 95776,
+      "output_tokens": 5976,
+      "icsw_per_call": 1900,
+      "sys_cpu_ms_per_call": 60.4
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 8,
+      "rep": 3,
+      "provider_calls": 120,
+      "calls_per_child": 15.0,
+      "uncached_input_tokens": 200530,
+      "output_tokens": 11681,
+      "icsw_per_call": 1513,
+      "sys_cpu_ms_per_call": 44.3
+    },
+    {
+      "arm": "codex-exec",
+      "n": 8,
+      "rep": 3,
+      "provider_calls": 8,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 293455,
+      "output_tokens": 10463,
+      "icsw_per_call": 54604,
+      "sys_cpu_ms_per_call": 1412.5
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 16,
+      "rep": 1,
+      "provider_calls": 150,
+      "calls_per_child": 9.4,
+      "uncached_input_tokens": 330602,
+      "output_tokens": 18689,
+      "icsw_per_call": 1417,
+      "sys_cpu_ms_per_call": 44.6
+    },
+    {
+      "arm": "codex-exec",
+      "n": 16,
+      "rep": 1,
+      "provider_calls": 16,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 697519,
+      "output_tokens": 21072,
+      "icsw_per_call": 58404,
+      "sys_cpu_ms_per_call": 1508.8
+    },
+    {
+      "arm": "codex-exec",
+      "n": 16,
+      "rep": 2,
+      "provider_calls": 16,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 575384,
+      "output_tokens": 17925,
+      "icsw_per_call": 56891,
+      "sys_cpu_ms_per_call": 1505.6
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 16,
+      "rep": 2,
+      "provider_calls": 145,
+      "calls_per_child": 9.1,
+      "uncached_input_tokens": 255978,
+      "output_tokens": 17230,
+      "icsw_per_call": 1646,
+      "sys_cpu_ms_per_call": 44.5
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 32,
+      "rep": 1,
+      "provider_calls": 272,
+      "calls_per_child": 8.5,
+      "uncached_input_tokens": 567489,
+      "output_tokens": 34295,
+      "icsw_per_call": 1072,
+      "sys_cpu_ms_per_call": 32.8
+    },
+    {
+      "arm": "codex-exec",
+      "n": 32,
+      "rep": 1,
+      "provider_calls": 32,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 704522,
+      "output_tokens": 31019,
+      "icsw_per_call": 55944,
+      "sys_cpu_ms_per_call": 1517.8
+    },
+    {
+      "arm": "codex-exec",
+      "n": 32,
+      "rep": 2,
+      "provider_calls": 32,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 869015,
+      "output_tokens": 35946,
+      "icsw_per_call": 65795,
+      "sys_cpu_ms_per_call": 2350.6
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 32,
+      "rep": 2,
+      "provider_calls": 314,
+      "calls_per_child": 9.8,
+      "uncached_input_tokens": 623308,
+      "output_tokens": 38603,
+      "icsw_per_call": 1139,
+      "sys_cpu_ms_per_call": 36.4
+    },
+    {
+      "arm": "pixir-delegate",
+      "n": 64,
+      "rep": 1,
+      "provider_calls": 474,
+      "calls_per_child": 7.4,
+      "uncached_input_tokens": 926462,
+      "output_tokens": 60790,
+      "icsw_per_call": 1457,
+      "sys_cpu_ms_per_call": 35.7
+    },
+    {
+      "arm": "codex-exec",
+      "n": 64,
+      "rep": 1,
+      "provider_calls": 64,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 1092347,
+      "output_tokens": 51184,
+      "icsw_per_call": 77020,
+      "sys_cpu_ms_per_call": 2923.3
+    }
+  ]
+}

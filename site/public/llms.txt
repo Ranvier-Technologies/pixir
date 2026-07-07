@@ -1,13 +1,18 @@
 # Pixir
 
-Pixir is an Elixir/OTP harness for supervised coding-agent sessions, subagents,
-workflows, lifecycle state, and replayable local evidence behind any presenter.
+> Pixir is an Elixir/OTP runtime for supervised coding-agent work, with CLI and ACP surfaces, local Session evidence, Subagent lifecycle, Workflow outcomes, permissions, diagnostics, and replayable Logs.
+
+Pixir is a developer preview for operators who want a supervised local runtime beneath coding-agent presenters. It is public enough to install and operate, but the public contract is intentionally narrow.
 
 ## Canonical Site
 
-- https://pixir.dev/
+- [Pixir](https://pixir.dev/): Product overview, runtime boundary, operator primitives, evidence model, and preview scope.
+- [Scale notes](https://pixir.dev/scale): Measured scale notes for supervised Subagent fan-out, including memory, kernel pressure, transport fallback, method, caveats, and public evidence links.
 
 ## Install
+
+- [Hex package](https://hex.pm/packages/pixir): Published package for installing the Pixir CLI and ACP runtime.
+- [HexDocs](https://hexdocs.pm/pixir): Package documentation for the current public developer-preview surface.
 
 ```bash
 mix escript.install hex pixir
@@ -15,21 +20,34 @@ pixir doctor --json
 pixir acp
 ```
 
+## Source And Documentation
+
+- [Source repository](https://github.com/Ranvier-Technologies/pixir): Pixir source, tests, docs, ADRs, benchmarks, and site content.
+- [README](https://github.com/Ranvier-Technologies/pixir/blob/main/README.md): Quickstart, install paths, authentication, first run, runtime boundary, ACP usage, preview scope, and development commands.
+- [Architecture vocabulary](https://github.com/Ranvier-Technologies/pixir/blob/main/CONTEXT.md): Project language for Harness, Session, Agent, Skill, Workflow, Subagent, Event, Log, History, Workspace, Tool, Provider, Credential, and related terms.
+- [Architecture decisions](https://github.com/Ranvier-Technologies/pixir/tree/main/docs/adr/): ADRs for the runtime model, evidence contract, permissions, ACP, Skills, Subagents, Workflows, package scope, and provider behavior.
+- [Scale evidence directory](https://github.com/Ranvier-Technologies/pixir/tree/main/docs/benchmarks/scale/): Benchmark reports and companion evidence for the public scale notes.
+
 ## Product Boundary
 
-- Supported public surface: CLI and ACP runtime.
-- Daily-driver path: ACP clients, including local T3 Code dogfood.
-- Positioning: Codex is an operator/meta-orchestrator and auditor; Zed, T3Code,
-  and other ACP clients are UI/client/presenters; Pixir is the supervised local
-  runtime for bounded agent work.
-- Cache stance: Pixir treats WebSocket continuation, stable prompt prefixes, and
-  minimal per-turn payloads as cache-friendly runtime choices, but cache hits must be
-  proven by Provider usage evidence such as cached token counts.
-- Not yet: finished Pi-style TUI replacement, packaged T3 provider, MCP server,
-  stable public Elixir API, hosted SLA software, or multi-provider marketplace.
+- [CLI and ACP runtime](https://pixir.dev/): Supported public surface: a supervised local runtime usable from the terminal or ACP clients.
+- [Runtime source](https://github.com/Ranvier-Technologies/pixir): Pixir owns Session state, Subagent lifecycle, Workflow outcomes, tool execution, failures, timeouts, and replayable evidence.
+- [Preview scope in README](https://github.com/Ranvier-Technologies/pixir/blob/main/README.md#preview-scope): Not a stable public Elixir API, standalone Pi-style terminal TUI, MCP server, packaged T3Code provider, or production/SLA-backed hosted agent service.
 
-## Primary Links
+## Positioning
 
-- Hex package: https://hex.pm/packages/pixir
-- HexDocs: https://pixir.hexdocs.pm/readme.html
-- Source: https://github.com/Ranvier-Technologies/pixir
+- [Pixir homepage](https://pixir.dev/): Codex can act as operator, meta-orchestrator, or auditor. Zed, T3Code, and other ACP clients are presenters. Pixir is the supervised local runtime for bounded agent work.
+- [README runtime boundary](https://github.com/Ranvier-Technologies/pixir/blob/main/README.md#runtime-boundary): Pixir is not another chat surface. Presenters request work while Pixir executes, supervises, and keeps evidence.
+- [README presenter confidence](https://github.com/Ranvier-Technologies/pixir/blob/main/README.md#presenter-confidence): Local gauntlets support dogfood and operator feedback, not strict UI parity, bundled integrations, or production support.
+
+## Cache And Evidence Stance
+
+- [Homepage evidence layer](https://pixir.dev/): Summaries are not evidence. Local Logs, artifacts, diagnostics, provider usage records, replay, and tree projections are the audit layer.
+- [Provider usage ADRs](https://github.com/Ranvier-Technologies/pixir/tree/main/docs/adr/): Pixir treats WebSocket continuation, stable prompt prefixes, and minimal per-turn payloads as cache-friendly runtime choices, but cache hits must be proven by provider usage evidence such as cached token counts.
+- [Scale notes](https://pixir.dev/scale): Scale claims are measured up to the disclosed bounds and include negative results, transport fallback behavior, and caveats.
+
+## Not Yet
+
+- [Preview scope](https://github.com/Ranvier-Technologies/pixir/blob/main/README.md#preview-scope): No stable public Elixir library API, standalone Pi-style terminal TUI, MCP server, packaged T3Code provider, production SLA, hosted service promises, telemetry, or self-update claim.
+- [Package scope ADRs](https://github.com/Ranvier-Technologies/pixir/tree/main/docs/adr/): Public package scope is the CLI/ACP runtime. Internal modules are documented for transparency, not promised as a stable library contract.
+- [Presenter confidence](https://github.com/Ranvier-Technologies/pixir/blob/main/README.md#presenter-confidence): T3Code integration is local dogfood through a separate adapter/patch workflow, not a primary public install path yet.
