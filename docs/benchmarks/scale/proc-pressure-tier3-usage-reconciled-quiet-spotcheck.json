@@ -1,0 +1,45 @@
+{
+  "summary": {
+    "note": "Per-call normalization from durable evidence: pixir child session-log provider_usage, codex per-task turn.completed. Purpose: pixir children make many provider calls per child while codex makes ~1, so normalizing per call shows the per-worker pressure gap is NOT an artifact of pixir doing deeper multi-call work: codex pays MORE kernel pressure per individual provider call. Medians via statistics.median (even rep counts average the middle pair; corrected 2026-07-07, previous revision took the upper value).",
+    "per_n": {
+      "32": {
+        "codex-exec": {
+          "reps": 1,
+          "median_calls_per_child": 1.0,
+          "median_icsw_per_call": 85511,
+          "median_sys_cpu_ms_per_call": 7127.5
+        },
+        "pixir-delegate": {
+          "reps": 1,
+          "median_calls_per_child": 9.0,
+          "median_icsw_per_call": 984,
+          "median_sys_cpu_ms_per_call": 30.7
+        }
+      }
+    }
+  },
+  "per_unit": [
+    {
+      "arm": "pixir-delegate",
+      "n": 32,
+      "rep": 1,
+      "provider_calls": 289,
+      "calls_per_child": 9.0,
+      "uncached_input_tokens": 536545,
+      "output_tokens": 38462,
+      "icsw_per_call": 984,
+      "sys_cpu_ms_per_call": 30.7
+    },
+    {
+      "arm": "codex-exec",
+      "n": 32,
+      "rep": 1,
+      "provider_calls": 32,
+      "calls_per_child": 1.0,
+      "uncached_input_tokens": 793843,
+      "output_tokens": 32893,
+      "icsw_per_call": 85511,
+      "sys_cpu_ms_per_call": 7127.5
+    }
+  ]
+}

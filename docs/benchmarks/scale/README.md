@@ -10,7 +10,21 @@ bundle is a redacted export of aggregates and envelopes, not a hosted dataset,
 and not the raw logs themselves. "subagent-duel" in file contents is the
 internal name of the benchmark harness that produced these runs.
 
-## Contents
+Two benchmarks live here:
+
+- **audit64** (`audit64-*`, `synthetic-ladder-*`, `scale16-32-*`,
+  `transport-evidence.json`, `marginal-rss-ci95.json`): memory, wall, and
+  transport at up to 64 concurrent workers. Documented in the sections below.
+- **proc-pressure** (`proc-pressure-*`): the macOS kernel cost of
+  process-per-worker fan-out: spawn tax, marginal threads/processes/RSS/kernel
+  CPU/context switches per additional worker under two labeled machine
+  conditions, per-provider-call normalization, and completion audits. Its
+  report, method, honesty notes, redaction decisions, and per-file map ship
+  inside the bundle itself: start at
+  [`proc-pressure-report.md`](proc-pressure-report.md) (see its "Bundle map"
+  section) and [`proc-pressure-design.md`](proc-pressure-design.md).
+
+## Contents (audit64)
 
 | File | What it is |
 |---|---|

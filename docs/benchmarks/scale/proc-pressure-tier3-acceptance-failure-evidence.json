@@ -1,0 +1,23 @@
+{
+ "unit": "acc-pixir-n16-rep2",
+ "child_session_id": "20260706T041253-224740",
+ "turn_failed_event": {
+  "data": {
+   "details": {
+    "code": "server_error",
+    "event_type": "error",
+    "param": null,
+    "status": 200,
+    "type": "server_error"
+   },
+   "error_kind": "provider_http_error",
+   "error_message": "An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID <request-id> in your message.",
+   "terminal_status": "provider_error"
+  },
+  "id": "3928fb27e42a31ef",
+  "type": "turn_failed",
+  "seq": 11,
+  "session_id": "20260706T041253-224740",
+  "ts": "2026-07-06T04:12:59.141971Z"
+ }
+}

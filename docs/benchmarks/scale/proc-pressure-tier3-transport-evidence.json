@@ -1,0 +1,147 @@
+[
+ {
+  "unit": "t3-pixir-delegate-n32-rep1",
+  "child_session_id": "20260706T014704-75a9cc",
+  "turn_failed_event": {
+   "data": {
+    "details": {
+     "partial_text_length": 107,
+     "reason": ":closed"
+    },
+    "error_kind": "websocket_read_failed",
+    "error_message": "Could not read WebSocket frame.",
+    "terminal_status": "provider_error"
+   },
+   "id": "6000f01535e33300",
+   "type": "turn_failed",
+   "seq": 29,
+   "session_id": "20260706T014704-75a9cc",
+   "ts": "2026-07-06T01:47:48.109067Z"
+  },
+  "partial_message_evidence": {
+   "partial": true,
+   "error_kind": "websocket_read_failed",
+   "terminal_status": "provider_error",
+   "partial_text_chars": 107
+  }
+ },
+ {
+  "unit": "t3-pixir-delegate-n32-rep1",
+  "child_session_id": "20260706T014704-1fba6a",
+  "turn_failed_event": {
+   "data": {
+    "details": {
+     "reason": ":closed"
+    },
+    "error_kind": "websocket_read_failed",
+    "error_message": "Could not read WebSocket frame.",
+    "terminal_status": "provider_error"
+   },
+   "id": "1c1cb191989aa025",
+   "type": "turn_failed",
+   "seq": 63,
+   "session_id": "20260706T014704-1fba6a",
+   "ts": "2026-07-06T01:48:01.920446Z"
+  },
+  "partial_message_evidence": null
+ },
+ {
+  "unit": "t3-pixir-delegate-n32-rep2",
+  "child_session_id": "20260706T015140-dce1e5",
+  "turn_failed_event": {
+   "data": {
+    "details": {
+     "partial_text_length": 243,
+     "reason": ":closed"
+    },
+    "error_kind": "websocket_read_failed",
+    "error_message": "Could not read WebSocket frame.",
+    "terminal_status": "provider_error"
+   },
+   "id": "04308fb2f5d48221",
+   "type": "turn_failed",
+   "seq": 40,
+   "session_id": "20260706T015140-dce1e5",
+   "ts": "2026-07-06T01:52:33.908858Z"
+  },
+  "partial_message_evidence": {
+   "partial": true,
+   "error_kind": "websocket_read_failed",
+   "terminal_status": "provider_error",
+   "partial_text_chars": 243
+  }
+ },
+ {
+  "unit": "t3-pixir-delegate-n4-rep3",
+  "child_session_id": "20260706T012756-ea00df",
+  "turn_failed_event": {
+   "data": {
+    "details": {
+     "partial_text_length": 9
+    },
+    "error_kind": "websocket_closed",
+    "error_message": "WebSocket closed before response.completed.",
+    "terminal_status": "provider_error"
+   },
+   "id": "2971b1661b188204",
+   "type": "turn_failed",
+   "seq": 72,
+   "session_id": "20260706T012756-ea00df",
+   "ts": "2026-07-06T01:29:17.153091Z"
+  },
+  "partial_message_evidence": {
+   "partial": true,
+   "error_kind": "websocket_closed",
+   "terminal_status": "provider_error",
+   "partial_text_chars": 9
+  }
+ },
+ {
+  "unit": "t3-pixir-delegate-n8-rep2",
+  "child_session_id": "20260706T013422-b135a6",
+  "turn_failed_event": {
+   "data": {
+    "details": {
+     "code": "server_error",
+     "event_type": "error",
+     "param": null,
+     "status": 200,
+     "type": "server_error"
+    },
+    "error_kind": "provider_http_error",
+    "error_message": "An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID <request-id> in your message.",
+    "terminal_status": "provider_error"
+   },
+   "id": "653ddd87fd4bc9f7",
+   "type": "turn_failed",
+   "seq": 8,
+   "session_id": "20260706T013422-b135a6",
+   "ts": "2026-07-06T01:34:27.424617Z"
+  },
+  "partial_message_evidence": null
+ },
+ {
+  "unit": "t3-pixir-delegate-n8-rep2",
+  "child_session_id": "20260706T013422-f00ba6",
+  "turn_failed_event": {
+   "data": {
+    "details": {
+     "code": "server_error",
+     "event_type": "error",
+     "param": null,
+     "status": 200,
+     "type": "server_error"
+    },
+    "error_kind": "provider_http_error",
+    "error_message": "An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID <request-id> in your message.",
+    "terminal_status": "provider_error"
+   },
+   "id": "d2b92b37c727453e",
+   "type": "turn_failed",
+   "seq": 27,
+   "session_id": "20260706T013422-f00ba6",
+   "ts": "2026-07-06T01:34:44.555885Z"
+  },
+  "partial_message_evidence": null
+ }
+]

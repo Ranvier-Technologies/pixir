@@ -9,6 +9,19 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [Unreleased]
 
+## [0.1.6]
+
+### Added
+- Published the proc-pressure kernel-pressure evidence bundle (23 files,
+  gate-hardened) at `docs/benchmarks/scale/`, and the matching /scale
+  kernel-tax section: marginal threads/processes/RSS/kernel-CPU/involuntary
+  context switches per additional worker under two labeled machine
+  conditions, per-provider-call normalization from durable usage evidence,
+  the spawn-tax microbench, and the completion audits with the negative
+  result (199/205 loaded) published as the headline. The /scale hero line
+  and the N=8 transport-table cause cell were corrected to claims the
+  published bundles can back.
+
 ### Fixed
 - `pixir delegate --help` (and the main help) now document `--timeout-ms` on
   the attached form; the flag was always accepted there but only listed under
