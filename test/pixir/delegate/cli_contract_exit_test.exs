@@ -91,7 +91,7 @@ defmodule Pixir.Delegate.CLIContractExitTest do
                 payload: %{
                   "status" => ^status,
                   "ok" => false,
-                  "schema_version" => 1,
+                  "schema_version" => 2,
                   "command_ok" => true,
                   "work_complete" => false,
                   "outcome" => ^status,
@@ -118,7 +118,7 @@ defmodule Pixir.Delegate.CLIContractExitTest do
               payload: %{
                 "status" => "completed",
                 "ok" => true,
-                "schema_version" => 1,
+                "schema_version" => 2,
                 "command_ok" => true,
                 "work_complete" => true,
                 "outcome" => "completed",

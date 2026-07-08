@@ -84,6 +84,10 @@ defmodule Pixir.Config do
     end
   end
 
+  @doc "Accepted reasoning effort ids."
+  @spec valid_reasoning_efforts() :: [String.t()]
+  def valid_reasoning_efforts, do: @valid_reasoning_efforts
+
   @doc "Resolved permission default (`:auto`, `:ask`, or `:read_only`)."
   @spec permission_default(keyword()) :: Permissions.mode()
   def permission_default(opts \\ []) do

@@ -112,22 +112,18 @@ current one.
 - `role: "explorer"` is read-only; write-capable fan-out needs a spec-level
   mode and write policy — a dry run of your draft spec walks you through the
   exact fields.
-- **Dry-run acceptance is not knob validation**: unknown spec fields are
-  silently ignored today, so a typo or an invented knob (`model`,
-  `reasoning_effort`) passes rehearsal without doing anything. Confirm an
-  intent knob exists in the revealed contract before trusting it.
-- **Model/effort per delegation**: the spec has no model or reasoning-effort
-  fields; the Provider resolves them from config. To pin them for one
-  delegation without touching global state, run against an isolated home:
-  `dir=$(mktemp -d)` (outside the workspace, so the credential can never
-  land in a commit or a child snapshot), copy `~/.pixir/auth.json` there
-  with its 600 mode, write a `config.json`
-  (`{"model": "...", "reasoning": {"effort": "..."}}`), then
-  `PIXIR_HOME=$dir pixir delegate ...`. Verify with
-  `PIXIR_HOME=$dir pixir doctor --json` before spending quota; never echo or
-  log the auth file. Delete the scratch home as soon as the delegation
-  closes; a copied credential must not outlive its purpose. Delete this
-  whole workaround when the spec grows real fields.
+- **Specs validate fail-closed**: an unknown top-level or `subagents` key is
+  rejected as structured `invalid_spec` with a `json_pointer` to the exact
+  field, in dry-run and real runs alike — the rehearsal now catches typos.
+  On binaries at 0.1.6 or older, unknown fields are still silently ignored:
+  there, confirm a knob exists in the revealed contract before trusting it.
+- **Model/effort per delegation**: `subagents.model` and
+  `subagents.reasoning_effort` (`low|medium|high|xhigh`) apply to every child;
+  a spec knob wins over config defaults. They mirror ACP `session/prompt`
+  `_meta` exactly. The effective value is proven by each child's
+  `provider_usage` events, never echoed in the envelope — reconcile from
+  logs. Binaries at 0.1.6 or older ignore these fields silently; verify the
+  evidence before assuming the pin took effect.
 
 ## When something fails
 
@@ -162,12 +158,14 @@ plus the conditional confessions when present: `retry_attempts`/`retry_history`
 (a child that arrived on a second attempt is part of the record; distrust a
 successful retry when the task was not idempotent) and `resume_command` on
 non-completed children. Two mapping caveats: nothing in the envelope promises
-that `children[]` order matches `tasks[]` order (`children[].index` is
-currently unpopulated), so with homogeneous tasks make each contract
-self-identifying (include the task's subject in the child's JSON); and there
-is no aggregate cost field anywhere — per-delegation totals are computed by
-summing `provider_usage` events across the child logs. Never report fan-out
-success on exit code alone.
+that `children[]` order matches `tasks[]` order — join children to tasks by
+`children[].index`, the zero-based `tasks[]` position (spawn-assigned, stable
+across a child's retry lineage; legacy `task`+`count` specs omit it, and
+binaries at 0.1.6 or older leave it null — there, fall back to making each
+contract self-identifying by including the task's subject in the child's
+JSON); and there is no aggregate cost field anywhere — per-delegation totals
+are computed by summing `provider_usage` events across the child logs. Never
+report fan-out success on exit code alone.
 
 ## Evidence
 

@@ -451,7 +451,13 @@ defmodule Pixir.Delegate.Async do
       "child_log_path" => child["child_log_path"] || child[:child_log_path],
       "next_actions" => child["next_actions"] || child[:next_actions] || []
     }
+    |> maybe_put_child_index(child["index"] || child[:index])
   end
+
+  defp maybe_put_child_index(payload, index) when is_integer(index),
+    do: Map.put(payload, "index", index)
+
+  defp maybe_put_child_index(payload, _index), do: payload
 
   defp child_status(child), do: child["status"] || child[:status] || "unknown"
 

@@ -1,7 +1,7 @@
 defmodule Pixir.MixProject do
   use Mix.Project
 
-  @version "0.1.6"
+  @version "0.1.7"
   @source_url "https://github.com/Ranvier-Technologies/pixir"
 
   def project do
@@ -136,7 +136,10 @@ defmodule Pixir.MixProject do
     [
       files: package_files(),
       licenses: ["MIT"],
-      links: %{"GitHub" => @source_url}
+      links: %{
+        "GitHub" => @source_url,
+        "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md"
+      }
     ]
   end
 
@@ -146,6 +149,7 @@ defmodule Pixir.MixProject do
       "assets/brand/pixir-logo.svg",
       "assets/brand/pixir-logo-card.svg",
       "assets/readme/runtime-boundary.svg",
+      "CHANGELOG.md",
       "CONTEXT.md",
       "LICENSE",
       "README.md",

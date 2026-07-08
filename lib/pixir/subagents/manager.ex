@@ -452,9 +452,15 @@ defmodule Pixir.Subagents.Manager do
       retry_max_attempts = Map.get(args, "retry_attempts", limits.retry_attempts)
       retry_jitter_ms = Map.get(args, "retry_jitter_ms", limits.retry_jitter_ms)
       workspace_mode = Map.get(args, "workspace_mode", "isolated")
+      provider_model = Map.get(args, "model") || Keyword.get(opts, :model)
+      reasoning_effort = Map.get(args, "reasoning_effort") || Keyword.get(opts, :reasoning_effort)
+      index = Map.get(args, "index")
       id = Map.get(args, "id") || gen_id()
 
       with :ok <- validate_subagent_id(id),
+           :ok <- validate_optional_non_negative_integer("index", index),
+           :ok <- validate_optional_binary("model", provider_model),
+           :ok <- validate_optional_reasoning_effort(reasoning_effort),
            :ok <- validate_positive_integer("max_threads", max_threads),
            :ok <- validate_non_negative_integer("max_depth", max_depth),
            :ok <- validate_positive_integer("timeout_ms", timeout_ms),
@@ -466,6 +472,7 @@ defmodule Pixir.Subagents.Manager do
          %{
            id: id,
            parent_session_id: parent_sid,
+           index: index,
            child_session_id: nil,
            child_pid: nil,
            task: task,
@@ -487,6 +494,8 @@ defmodule Pixir.Subagents.Manager do
            workspace: workspace,
            child_workspace: nil,
            workspace_mode: workspace_mode,
+           provider_model: provider_model,
+           reasoning_effort: reasoning_effort,
            workspace_snapshot: nil,
            workspace_snapshot_opts: Keyword.get(opts, :workspace_snapshot_opts, []),
            provider: Keyword.get(opts, :provider, Pixir.Provider),
@@ -524,6 +533,39 @@ defmodule Pixir.Subagents.Manager do
        "field" => field,
        "value" => inspect(value)
      })}
+  end
+
+  defp validate_optional_non_negative_integer(_field, nil), do: :ok
+
+  defp validate_optional_non_negative_integer(field, value),
+    do: validate_non_negative_integer(field, value)
+
+  defp validate_optional_binary(_field, nil), do: :ok
+  defp validate_optional_binary(_field, value) when is_binary(value) and value != "", do: :ok
+
+  defp validate_optional_binary(field, value) do
+    {:error,
+     Tool.error(:invalid_args, "#{field} must be a non-empty string", %{
+       "field" => field,
+       "value" => inspect(value)
+     })}
+  end
+
+  defp validate_optional_reasoning_effort(nil), do: :ok
+
+  defp validate_optional_reasoning_effort(value) do
+    accepted = Pixir.Config.valid_reasoning_efforts()
+
+    if value in accepted do
+      :ok
+    else
+      {:error,
+       Tool.error(:invalid_args, "reasoning_effort has an unsupported value", %{
+         "field" => "reasoning_effort",
+         "value" => inspect(value),
+         "accepted_values" => accepted
+       })}
+    end
   end
 
   defp validate_non_negative_integer(_field, value) when is_integer(value) and value >= 0,
@@ -684,10 +726,18 @@ defmodule Pixir.Subagents.Manager do
   defp start_child_turn(agent, child_sid, child_workspace) do
     instructions = agent.agent_config.developer_instructions
 
+    # The Turn reads model/reasoning_effort from provider_opts (same seam ACP
+    # uses for _meta knobs); a spec knob wins over any inherited default.
+    provider_opts =
+      agent.provider_opts
+      |> List.wrap()
+      |> put_provider_knob(:model, Map.get(agent, :provider_model))
+      |> put_provider_knob(:reasoning_effort, Map.get(agent, :reasoning_effort))
+
     Session.start_turn(child_sid, fn ctx ->
       Turn.run(%{ctx | workspace: child_workspace}, agent.prompt,
         provider: agent.provider,
-        provider_opts: agent.provider_opts,
+        provider_opts: provider_opts,
         permission_mode: agent.permission_mode,
         write_policy: agent.write_policy,
         skills_opts: agent.skills_opts,
@@ -698,6 +748,9 @@ defmodule Pixir.Subagents.Manager do
       )
     end)
   end
+
+  defp put_provider_knob(opts, _key, nil), do: opts
+  defp put_provider_knob(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp subscribe_child_events(child_sid),
     do: Events.subscribe(child_sid, only: @manager_child_event_types)
@@ -1007,6 +1060,9 @@ defmodule Pixir.Subagents.Manager do
     %{
       id: data["id"] || data["subagent_id"],
       parent_session_id: parent_sid,
+      index: data["index"],
+      provider_model: data["model"],
+      reasoning_effort: data["reasoning_effort"],
       child_session_id: data["child_session_id"],
       child_pid: nil,
       task: task,
@@ -1356,6 +1412,7 @@ defmodule Pixir.Subagents.Manager do
       "child_indexed" => child_indexed?(state, agent),
       "child_pid_alive" => child_pid_alive?(agent)
     }
+    |> maybe_put_public("index", Map.get(agent, :index))
     |> maybe_put_public("write_policy", WritePolicy.metadata(Map.get(agent, :write_policy)))
   end
 
@@ -1520,6 +1577,9 @@ defmodule Pixir.Subagents.Manager do
         "summary" => agent.summary,
         "parent_log_path" => parent_log_path(agent)
       }
+      |> maybe_put_event("index", Map.get(agent, :index))
+      |> maybe_put_event("model", Map.get(agent, :provider_model))
+      |> maybe_put_event("reasoning_effort", Map.get(agent, :reasoning_effort))
       |> maybe_put_event("deadline_at", agent.deadline_at)
       |> maybe_put_event("child_log_path", child_log_path(agent))
       |> maybe_put_event("workspace_snapshot", agent.workspace_snapshot)
@@ -1688,6 +1748,7 @@ defmodule Pixir.Subagents.Manager do
       "parent_log_path" => parent_log_path(agent)
     }
     |> Map.merge(child_log_fields(agent))
+    |> maybe_put_public("index", Map.get(agent, :index))
     |> maybe_put_public("child_last_event_seq", agent.last_seen_child_event_seq)
     |> maybe_put_public("child_last_event_type", agent.last_seen_child_event_type)
     |> maybe_put_public("child_last_event_ts", agent.last_seen_child_event_ts)

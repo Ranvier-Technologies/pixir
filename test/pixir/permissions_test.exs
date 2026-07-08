@@ -173,5 +173,73 @@ defmodule Pixir.PermissionsTest do
       assert {:ok, nil} = Permissions.outside_workspace_shell_token("cat README.md", ws)
       assert {:ok, nil} = Permissions.outside_workspace_shell_token("ls .", ws)
     end
+
+    test "ignores leading environment assignment RHS before a command", %{ws: ws} do
+      # Accepted residual: `VAR=/outside cmd $VAR` can expand at runtime; bash
+      # confinement is a defense-in-depth tripwire, not a parser or sandbox.
+      assert {:ok, nil} = Permissions.outside_workspace_shell_token("TMPDIR=/tmp mix test", ws)
+    end
+
+    test "ignores leading environment assignment RHS before a relative command", %{ws: ws} do
+      assert {:ok, nil} =
+               Permissions.outside_workspace_shell_token("PREFIX=/usr/local ./configure", ws)
+    end
+
+    test "denies literal absolute path arguments", %{ws: ws} do
+      assert {:ok, "/etc/passwd"} =
+               Permissions.outside_workspace_shell_token("cat /etc/passwd", ws)
+    end
+
+    test "denies invoking an outside-workspace binary by absolute path", %{ws: ws} do
+      # The leading-assignment exemption never extends to the command word
+      # itself: an absolute outside binary is a host-boundary crossing.
+      assert {:ok, "/bin/cat"} =
+               Permissions.outside_workspace_shell_token("/bin/cat README.md", ws)
+    end
+
+    test "denies later literal outside paths after a leading assignment", %{ws: ws} do
+      assert {:ok, "/outside"} =
+               Permissions.outside_workspace_shell_token("FOO=x cat /outside", ws)
+    end
+
+    test "denies non-leading assignment RHS path arguments", %{ws: ws} do
+      assert {:ok, "/outside"} =
+               Permissions.outside_workspace_shell_token("echo ok FOO=/outside", ws)
+    end
+
+    test "resets leading assignment window after semicolon", %{ws: ws} do
+      assert {:ok, nil} =
+               Permissions.outside_workspace_shell_token("echo ok; TMPDIR=/tmp mix test", ws)
+
+      assert {:ok, "/outside"} =
+               Permissions.outside_workspace_shell_token("echo ok; echo FOO=/outside", ws)
+    end
+
+    test "resets leading assignment window after and-if", %{ws: ws} do
+      assert {:ok, nil} =
+               Permissions.outside_workspace_shell_token(
+                 "true && PREFIX=/usr/local ./configure",
+                 ws
+               )
+
+      assert {:ok, "/outside"} =
+               Permissions.outside_workspace_shell_token("true && echo FOO=/outside", ws)
+    end
+
+    test "resets leading assignment window after or-if", %{ws: ws} do
+      assert {:ok, nil} =
+               Permissions.outside_workspace_shell_token("false || TMPDIR=/tmp mix test", ws)
+
+      assert {:ok, "/outside"} =
+               Permissions.outside_workspace_shell_token("false || echo FOO=/outside", ws)
+    end
+
+    test "resets leading assignment window after a pipeline separator", %{ws: ws} do
+      assert {:ok, nil} =
+               Permissions.outside_workspace_shell_token("printf x | TMPDIR=/tmp cat", ws)
+
+      assert {:ok, "/outside"} =
+               Permissions.outside_workspace_shell_token("printf x | cat FOO=/outside", ws)
+    end
   end
 end

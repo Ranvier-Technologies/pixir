@@ -11,7 +11,11 @@ defmodule Pixir.Permissions do
     * `:read_only` — mutating tools are denied; reads and safe commands run.
 
   Workspace confinement is enforced elsewhere (the tools) and is the real floor in every
-  mode — this layer is a convenience gate on top.
+  mode — this layer is a convenience gate on top. Shell-token confinement is a
+  conservative pre-exec tripwire, not a shell parser or sandbox: it checks visible path
+  tokens, while intentionally ignoring RHS values of leading POSIX environment
+  assignments before a simple command, so residual runtime expansion such as
+  `VAR=/outside cmd $VAR` remains out of scope.
   """
 
   @type mode :: :auto | :ask | :read_only
@@ -96,8 +100,11 @@ defmodule Pixir.Permissions do
   This is a conservative workspace-confinement tripwire for shell-shaped commands. It
   catches explicit parent-directory references, absolute paths outside the workspace,
   home/env-home references, and relative paths whose deepest existing prefix resolves
-  outside the workspace. It is not a full shell parser; callers should still keep shell
-  execution behind their normal permission and command-boundary gates.
+  outside the workspace. Leading POSIX environment assignments before a simple command
+  do not contribute their RHS as a path candidate; literal path arguments, redirection
+  targets, and non-leading `NAME=VALUE` arguments are still checked. It is not a full
+  shell parser or sandbox; callers should still keep shell execution behind their normal
+  permission and command-boundary gates.
   """
   @spec outside_workspace_shell_token(term(), String.t()) :: {:ok, String.t() | nil}
   def outside_workspace_shell_token(command, workspace)
@@ -183,8 +190,63 @@ defmodule Pixir.Permissions do
 
   defp shell_path_candidates(command) do
     command
-    |> String.split(~r/[\s<>()|;&>]+/, trim: true)
-    |> Enum.flat_map(&String.split(&1, "=", parts: 2, trim: true))
+    |> shell_tokens()
+    |> Enum.reduce({[], true, false}, fn
+      :reset, {candidates, _leading?, _after_redirection?} ->
+        {candidates, true, false}
+
+      :delimiter, {candidates, leading?, after_redirection?} ->
+        {candidates, leading?, after_redirection?}
+
+      :redirection, {candidates, leading?, _after_redirection?} ->
+        {candidates, leading?, true}
+
+      {:word, token}, {candidates, leading?, true} ->
+        {add_shell_path_candidates(candidates, token), leading?, false}
+
+      {:word, token}, {candidates, true, false} ->
+        if env_assignment?(token) do
+          {candidates, true, false}
+        else
+          {add_shell_path_candidates(candidates, token), false, false}
+        end
+
+      {:word, token}, {candidates, false, false} ->
+        {add_shell_path_candidates(candidates, token), false, false}
+    end)
+    |> elem(0)
+    |> Enum.reverse()
+  end
+
+  defp shell_tokens(command) do
+    ~r/(\r?\n|&&|\|\||;|\||&|\d*>>|\d*>|\d*<|[()\s]+)/
+    |> Regex.split(command, include_captures: true, trim: true)
+    |> Enum.map(&shell_token/1)
+  end
+
+  defp shell_token(token) when token in ["&&", "||", ";", "|"], do: :reset
+  defp shell_token(token) when token in [">", ">>", "<"], do: :redirection
+
+  defp shell_token(token) do
+    cond do
+      String.contains?(token, "\n") or String.contains?(token, "\r") ->
+        :reset
+
+      Regex.match?(~r/^\d*(?:>>|>|<)$/, token) ->
+        :redirection
+
+      Regex.match?(~r/^[()&\s]+$/, token) ->
+        :delimiter
+
+      true ->
+        {:word, token}
+    end
+  end
+
+  defp add_shell_path_candidates(candidates, token) do
+    token
+    |> String.split("=", parts: 2, trim: true)
+    |> Enum.reduce(candidates, &[&1 | &2])
   end
 
   defp outside_workspace_token?(token, workspace) when is_binary(token) do

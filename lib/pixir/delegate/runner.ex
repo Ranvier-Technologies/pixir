@@ -25,7 +25,7 @@ defmodule Pixir.Delegate.Runner do
   `pixir delegate --spec` pretend to be a detached daemon.
   """
 
-  alias Pixir.{Conversation, Log, RecoveryCommands, Subagents, Workflows}
+  alias Pixir.{Config, Conversation, Log, RecoveryCommands, Subagents, Workflows}
   alias Pixir.Delegate.{Evidence, Handle, Owner}
   alias Pixir.Permissions.WritePolicy
   alias Pixir.Tools.Workspace
@@ -140,6 +140,8 @@ defmodule Pixir.Delegate.Runner do
          {:ok, max_threads} <- normalize_positive_integer(spec, ["subagents", "max_threads"]),
          {:ok, max_depth} <- normalize_non_negative_integer(spec, ["subagents", "max_depth"]),
          {:ok, provider_transport} <- normalize_provider_transport(spec),
+         {:ok, provider_model} <- normalize_provider_model(spec),
+         {:ok, reasoning_effort} <- normalize_reasoning_effort(spec),
          {:ok, workspace_mode} <- normalize_workspace_mode(spec),
          {:ok, agent} <- normalize_agent(spec),
          :ok <- ensure_child_count(tasks, spec_meta) do
@@ -156,6 +158,8 @@ defmodule Pixir.Delegate.Runner do
          max_threads: max_threads,
          max_depth: max_depth,
          provider_transport: provider_transport,
+         provider_model: provider_model,
+         reasoning_effort: reasoning_effort,
          workspace_mode: workspace_mode,
          agent: agent,
          planned_child_count: length(tasks)
@@ -285,7 +289,10 @@ defmodule Pixir.Delegate.Runner do
          )}
 
       true ->
-        {:ok, normalized}
+        {:ok,
+         normalized
+         |> Enum.with_index()
+         |> Enum.map(fn {task, index} -> %{task: task, index: index} end)}
     end
   end
 
@@ -318,6 +325,12 @@ defmodule Pixir.Delegate.Runner do
 
   defp normalize_task(%{"task" => task}) when is_binary(task), do: normalize_task(task)
   defp normalize_task(_task), do: nil
+
+  defp task_text(%{task: task}) when is_binary(task), do: task
+  defp task_text(task) when is_binary(task), do: task
+
+  defp task_index(%{index: index}) when is_integer(index), do: index
+  defp task_index(_task), do: nil
 
   defp invalid_tasks do
     error_payload("invalid_spec", "subagents delegate spec requires non-empty task text", %{
@@ -433,6 +446,62 @@ defmodule Pixir.Delegate.Runner do
       is_integer(value) and value >= 0 -> {:ok, value}
       true -> {:error, integer_error(path, value, "non_negative")}
     end
+  end
+
+  defp normalize_provider_model(spec) do
+    case get_in(spec, ["subagents", "model"]) do
+      nil -> {:ok, nil}
+      model when is_binary(model) -> {:ok, model}
+      value -> {:error, invalid_subagent_provider_knob("model", value, nil)}
+    end
+  end
+
+  defp normalize_reasoning_effort(spec) do
+    case get_in(spec, ["subagents", "reasoning_effort"]) do
+      nil ->
+        {:ok, nil}
+
+      effort when is_binary(effort) ->
+        if effort in Config.valid_reasoning_efforts() do
+          {:ok, effort}
+        else
+          {:error,
+           invalid_subagent_provider_knob(
+             "reasoning_effort",
+             effort,
+             Config.valid_reasoning_efforts()
+           )}
+        end
+
+      value ->
+        {:error,
+         invalid_subagent_provider_knob(
+           "reasoning_effort",
+           value,
+           Config.valid_reasoning_efforts()
+         )}
+    end
+  end
+
+  defp invalid_subagent_provider_knob(field, value, nil) do
+    error_payload("invalid_spec", "subagents.#{field} has an invalid value", %{
+      "field" => "subagents.#{field}",
+      "json_pointer" => "/subagents/#{field}",
+      "path" => ["subagents", field],
+      "observed" => value,
+      "next_actions" => ["set_subagents_#{field}_to_a_valid_value"]
+    })
+  end
+
+  defp invalid_subagent_provider_knob(field, value, accepted_values) do
+    error_payload("invalid_spec", "subagents.#{field} has an unsupported value", %{
+      "field" => "subagents.#{field}",
+      "json_pointer" => "/subagents/#{field}",
+      "path" => ["subagents", field],
+      "observed" => value,
+      "accepted_values" => accepted_values,
+      "next_actions" => ["set_subagents_#{field}_to_an_accepted_value"]
+    })
   end
 
   defp integer_error(path, value, kind) do
@@ -630,14 +699,18 @@ defmodule Pixir.Delegate.Runner do
 
     runtime.tasks
     |> Enum.reduce_while({:ok, []}, fn task, {:ok, agents} ->
-      args = %{
-        "task" => task,
-        "agent" => runtime.agent,
-        "max_threads" => runtime.max_threads,
-        "max_depth" => runtime.max_depth,
-        "timeout_ms" => runtime.child_timeout_ms,
-        "workspace_mode" => runtime.workspace_mode
-      }
+      args =
+        %{
+          "task" => task_text(task),
+          "agent" => runtime.agent,
+          "max_threads" => runtime.max_threads,
+          "max_depth" => runtime.max_depth,
+          "timeout_ms" => runtime.child_timeout_ms,
+          "workspace_mode" => runtime.workspace_mode
+        }
+        |> maybe_put("index", task_index(task))
+        |> maybe_put("model", runtime.provider_model)
+        |> maybe_put("reasoning_effort", runtime.reasoning_effort)
 
       spawn_opts =
         opts
@@ -1355,6 +1428,7 @@ defmodule Pixir.Delegate.Runner do
       "child_log_path" => agent["child_log_path"],
       "next_actions" => agent["next_actions"] || []
     }
+    |> maybe_put("index", agent["index"])
     |> maybe_put("timeout_ms", agent["timeout_ms"])
     |> maybe_put("write_policy", agent["write_policy"])
   end

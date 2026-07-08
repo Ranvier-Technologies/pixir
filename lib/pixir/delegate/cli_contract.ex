@@ -42,7 +42,10 @@ defmodule Pixir.Delegate.CLIContract do
   alias Pixir.Permissions.WritePolicy
 
   @contract_version 1
-  @envelope_schema_version 1
+  # Revision 2: additive children[].index + children_order envelope keys
+  # (#227). The pixir.delegate.envelope.v1 family name is reserved for
+  # breaking shape changes; additive keys bump this revision instead.
+  @envelope_schema_version 2
   @max_spec_bytes 1_000_000
   @supported_strategies ~w(subagents workflow)
   @supported_modes [nil, "read_only", "bounded_write"]
@@ -53,6 +56,19 @@ defmodule Pixir.Delegate.CLIContract do
   # follow streaming from a real Pixir-owned process instead of caller-side polling.
   @reserved_subcommands ~w(start status attach cancel daemon)
   @supported_progress_modes [nil, "stderr-jsonl"]
+  # Derived from actual spec reads in cli_contract.ex, runner.ex, and
+  # workflows.ex - every key here is consumed somewhere. Adding a key that
+  # nothing reads would reintroduce the silent-ignore #223 removes.
+  @known_spec_keys ~w(
+    contract_version strategy task tasks subagents agent mode write_policy transport workspace
+    workflow limits timeout_ms steps id name max_concurrency template_id template template_args
+    skill
+  )
+  @known_subagents_keys ~w(
+    role agent count max_threads max_depth timeout_ms transport workspace_mode model
+    reasoning_effort
+  )
+  @valid_reasoning_efforts Pixir.Config.valid_reasoning_efforts()
 
   @type rendered :: %{
           required(:exit_code) => non_neg_integer(),
@@ -258,6 +274,128 @@ defmodule Pixir.Delegate.CLIContract do
     else
       {:error, invalid_args("unexpected delegate argument", %{"argument" => arg}), acc.json?}
     end
+  end
+
+  # decode_spec/1 guarantees a JSON object, so a map is the only input shape.
+  defp validate_strict_spec_keys(%{} = spec) do
+    with :ok <- reject_unknown_keys(spec, @known_spec_keys, [], %{}),
+         :ok <- validate_subagents_shape_for_strict_keys(spec),
+         :ok <- validate_subagent_model(spec),
+         :ok <- validate_subagent_reasoning_effort(spec) do
+      :ok
+    end
+  end
+
+  defp validate_subagents_shape_for_strict_keys(%{"subagents" => %{} = subagents}) do
+    reject_unknown_keys(subagents, @known_subagents_keys, ["subagents"], %{
+      "max_thread" => "max_threads",
+      "thread_count" => "max_threads",
+      "roles" => "role"
+    })
+  end
+
+  # A present but non-object subagents value would crash later get_in/2
+  # access; fail it closed here with the structured error instead.
+  defp validate_subagents_shape_for_strict_keys(%{"subagents" => subagents}) do
+    {:error,
+     invalid_spec(
+       "delegate spec subagents must be an object",
+       %{
+         "observed_type" => json_type(subagents),
+         "next_actions" => ["set_subagents_to_an_object"]
+       }
+       |> Map.merge(object_location_details(["subagents"]))
+     )}
+  end
+
+  defp validate_subagents_shape_for_strict_keys(_spec), do: :ok
+
+  defp validate_subagent_model(%{"subagents" => %{"model" => model}}) when is_binary(model),
+    do: :ok
+
+  defp validate_subagent_model(%{"subagents" => %{"model" => model}}) do
+    {:error,
+     invalid_spec(
+       "subagents.model must be a string",
+       %{
+         "observed" => model,
+         "next_actions" => ["set_subagents_model_to_a_model_id_string"]
+       }
+       |> Map.merge(object_location_details(["subagents", "model"]))
+     )}
+  end
+
+  defp validate_subagent_model(_spec), do: :ok
+
+  defp validate_subagent_reasoning_effort(%{
+         "subagents" => %{"reasoning_effort" => effort}
+       })
+       when effort in @valid_reasoning_efforts,
+       do: :ok
+
+  defp validate_subagent_reasoning_effort(%{"subagents" => %{"reasoning_effort" => effort}}) do
+    {:error,
+     invalid_spec(
+       "subagents.reasoning_effort has an unsupported value",
+       %{
+         "observed" => effort,
+         "accepted_values" => @valid_reasoning_efforts,
+         "next_actions" => ["set_subagents_reasoning_effort_to_low_medium_high_or_xhigh"]
+       }
+       |> Map.merge(object_location_details(["subagents", "reasoning_effort"]))
+     )}
+  end
+
+  defp validate_subagent_reasoning_effort(_spec), do: :ok
+
+  defp reject_unknown_keys(map, known_keys, path, misplaced_hints) do
+    known = MapSet.new(known_keys)
+
+    case Enum.find(Map.keys(map), &(not MapSet.member?(known, &1))) do
+      nil ->
+        :ok
+
+      key ->
+        {:error, unknown_spec_key_error(path ++ [key], known_keys, Map.get(misplaced_hints, key))}
+    end
+  end
+
+  defp unknown_spec_key_error(path, accepted_keys, nil) do
+    invalid_spec(
+      "delegate spec contains an unknown field",
+      %{
+        "unknown_key" => List.last(path),
+        "accepted_keys" => accepted_keys,
+        "next_actions" => ["remove_unknown_field", "check_delegate_spec_contract"]
+      }
+      |> Map.merge(object_location_details(path))
+    )
+  end
+
+  # The hint names a sibling key in the SAME object: rename guidance, not
+  # relocation (a literal "move" edit would be wrong).
+  defp unknown_spec_key_error(path, accepted_keys, did_you_mean) do
+    invalid_spec(
+      "delegate spec contains an unknown field",
+      %{
+        "unknown_key" => List.last(path),
+        "accepted_keys" => accepted_keys,
+        "did_you_mean" => did_you_mean,
+        "next_actions" => [
+          "rename_field_to_#{did_you_mean}",
+          "check_delegate_spec_contract"
+        ]
+      }
+      |> Map.merge(object_location_details(path))
+    )
+  end
+
+  defp object_location_details(path) do
+    %{
+      "field" => Enum.join(path, "."),
+      "json_pointer" => json_pointer(path),
+      "path" => path
+    }
   end
 
   defp parse_subcommand_argv(subcommand, argv) do
@@ -943,8 +1081,11 @@ defmodule Pixir.Delegate.CLIContract do
   end
 
   defp load_and_validate_spec(request, read_stdin, runtime_opts) do
+    # Strict key validation runs right after decode: unknown-field diagnosis
+    # must not wait on (or be masked by) filesystem-backed role discovery.
     with {:ok, raw, source_meta} <- read_spec(request.spec_source, read_stdin),
          {:ok, spec} <- decode_spec(raw),
+         :ok <- validate_strict_spec_keys(spec),
          {:ok, spec_meta} <- validate_spec(spec, request.workspace, runtime_opts) do
       {:ok, spec, Map.merge(source_meta, spec_meta)}
     end
@@ -1127,13 +1268,36 @@ defmodule Pixir.Delegate.CLIContract do
 
   defp validate_write_policy(_spec, _mode), do: {:ok, nil}
 
+  # Branch precedence mirrors Runner.normalize_tasks/1: a list-valued tasks
+  # field owns task normalization (even when empty), before any legacy task.
   defp validate_strategy_shape("subagents", spec) do
+    tasks = Map.get(spec, "tasks")
+
     cond do
+      non_empty_list?(tasks) ->
+        case Enum.find_index(tasks, &(not valid_task_entry?(&1))) do
+          nil ->
+            {:ok, length(tasks)}
+
+          task_index ->
+            {:error,
+             invalid_spec(
+               "subagents.tasks entries must be non-empty task strings",
+               Map.merge(task_location_details(task_index), %{
+                 "next_actions" => ["fix_subagents_tasks_entries"]
+               })
+             )}
+        end
+
+      is_list(tasks) ->
+        {:error,
+         invalid_spec("subagents delegate spec requires non-empty task text", %{
+           "missing_any_of" => ["task", "tasks"],
+           "next_actions" => ["add_task_for_one_child", "add_tasks_for_fanout"]
+         })}
+
       non_empty_string?(Map.get(spec, "task")) ->
         planned_child_count(spec)
-
-      non_empty_list?(Map.get(spec, "tasks")) ->
-        {:ok, length(spec["tasks"])}
 
       true ->
         {:error,
@@ -1159,6 +1323,12 @@ defmodule Pixir.Delegate.CLIContract do
   end
 
   defp workflow_steps(spec), do: Map.get(spec, "steps") || get_in(spec, ["workflow", "steps"])
+
+  # Mirrors Pixir.Delegate.Runner.normalize_task/1 so dry-run rejects
+  # exactly the tasks[] entries the real run would reject.
+  defp valid_task_entry?(task) when is_binary(task), do: String.trim(task) != ""
+  defp valid_task_entry?(%{"task" => task}) when is_binary(task), do: String.trim(task) != ""
+  defp valid_task_entry?(_task), do: false
 
   defp planned_child_count(spec) do
     count = get_in(spec, ["subagents", "count"]) || 1
@@ -1471,6 +1641,20 @@ defmodule Pixir.Delegate.CLIContract do
 
   defp read_only_mode?(value), do: value in [:read_only, "read_only", "read-only"]
 
+  # Same location convention as step_location_details/2: the human-facing
+  # field label is 1-based, the machine fields (json_pointer/path/task_index)
+  # are 0-based. Takes the 0-based tasks[] position directly.
+  defp task_location_details(task_index) do
+    path = ["tasks", task_index]
+
+    %{
+      "field" => "tasks[#{task_index + 1}]",
+      "json_pointer" => json_pointer(path),
+      "path" => path,
+      "task_index" => task_index
+    }
+  end
+
   defp step_location_details(index, field \\ nil) do
     step_index = index - 1
 
@@ -1564,7 +1748,9 @@ defmodule Pixir.Delegate.CLIContract do
     end
   end
 
-  defp dry_run_result(request, _spec, spec_meta) do
+  defp dry_run_result(request, spec, spec_meta) do
+    dry_run_children = dry_run_children(spec, spec_meta)
+
     payload =
       %{
         "ok" => true,
@@ -1585,11 +1771,59 @@ defmodule Pixir.Delegate.CLIContract do
         "artifacts" => [],
         "next_actions" => dry_run_next_actions(spec_meta)
       }
+      |> put_if_present("children", dry_run_children)
+      |> put_if_present("children_order", dry_run_children_order(spec_meta, dry_run_children))
       |> put_if_present("role_validation", spec_meta["subagent_role_validation"])
       |> put_if_present("transport", spec_meta["transport"])
 
     {:ok, rendered(payload, request.json?, 0, human_success(payload))}
   end
+
+  defp dry_run_children(%{"tasks" => tasks}, %{"strategy" => "subagents"}) when is_list(tasks) do
+    tasks
+    |> Enum.map(&dry_run_task_text/1)
+    |> Enum.with_index()
+    |> Enum.map(fn {task, index} ->
+      %{
+        "status" => "planned",
+        "task" => task,
+        "index" => index
+      }
+    end)
+  end
+
+  defp dry_run_children(%{"task" => task} = spec, %{"strategy" => "subagents"})
+       when is_binary(task) do
+    count = get_in(spec, ["subagents", "count"]) || 1
+
+    if is_integer(count) and count > 0 do
+      Enum.map(1..count, fn _position ->
+        %{
+          "status" => "planned",
+          "task" => String.trim(task)
+        }
+      end)
+    else
+      nil
+    end
+  end
+
+  defp dry_run_children(_spec, _spec_meta), do: nil
+
+  defp dry_run_task_text(task) when is_binary(task) do
+    case String.trim(task) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp dry_run_task_text(%{"task" => task}) when is_binary(task), do: dry_run_task_text(task)
+  defp dry_run_task_text(_task), do: nil
+
+  defp dry_run_children_order(%{"strategy" => "subagents"}, children) when is_list(children),
+    do: "unspecified; use children[].index as task-position evidence when present"
+
+  defp dry_run_children_order(_spec_meta, _children), do: nil
 
   defp dry_run_next_actions(%{"strategy" => "workflow"}) do
     [

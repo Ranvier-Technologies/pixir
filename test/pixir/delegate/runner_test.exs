@@ -364,6 +364,41 @@ defmodule Pixir.Delegate.RunnerTest do
     end)
   end
 
+  test "subagent provider knobs are threaded to child spawn args and opts" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-provider-knobs")
+      test_pid = self()
+
+      spec = %{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "inspect model knobs",
+        "subagents" => %{"model" => "gpt-5.5", "reasoning_effort" => "high"}
+      }
+
+      spec_meta = %{"strategy" => "subagents", "planned_child_count" => 1}
+
+      spawn_agent = fn parent_session_id, args, opts ->
+        send(test_pid, {:spawn_agent_called, parent_session_id, args, opts})
+
+        {:ok,
+         %{
+           "id" => "subagent_1",
+           "agent" => args["agent"] || args[:agent],
+           "status" => "queued",
+           "summary" => "queued"
+         }}
+      end
+
+      assert {:ok, _payload} =
+               Runner.start(%{workspace: ws}, spec, spec_meta, spawn_agent: spawn_agent)
+
+      assert_received {:spawn_agent_called, _parent_session_id, args, _opts}
+      assert args["model"] == "gpt-5.5"
+      assert args["reasoning_effort"] == "high"
+    end)
+  end
+
   test "subagents transport rejects unsupported values" do
     ws = tmp_workspace("pixir-delegate-runner-bad-transport")
 
@@ -380,6 +415,41 @@ defmodule Pixir.Delegate.RunnerTest do
     assert error["kind"] == "invalid_spec"
     assert error["details"]["field"] == "subagents.transport"
     assert error["details"]["accepted_values"] == ["auto", "websocket", "http_sse"]
+  end
+
+  test "subagents model rejects non-string values" do
+    ws = tmp_workspace("pixir-delegate-runner-bad-model")
+
+    spec = %{
+      "contract_version" => 1,
+      "strategy" => "subagents",
+      "task" => "inspect model",
+      "subagents" => %{"model" => 123}
+    }
+
+    spec_meta = %{"strategy" => "subagents", "planned_child_count" => 1}
+
+    assert {:error, error} = Runner.start(%{workspace: ws}, spec, spec_meta)
+    assert error["kind"] == "invalid_spec"
+    assert error["details"]["field"] == "subagents.model"
+  end
+
+  test "subagents reasoning_effort rejects unsupported values" do
+    ws = tmp_workspace("pixir-delegate-runner-bad-effort")
+
+    spec = %{
+      "contract_version" => 1,
+      "strategy" => "subagents",
+      "task" => "inspect effort",
+      "subagents" => %{"reasoning_effort" => "ultra"}
+    }
+
+    spec_meta = %{"strategy" => "subagents", "planned_child_count" => 1}
+
+    assert {:error, error} = Runner.start(%{workspace: ws}, spec, spec_meta)
+    assert error["kind"] == "invalid_spec"
+    assert error["details"]["field"] == "subagents.reasoning_effort"
+    assert error["details"]["accepted_values"] == ["low", "medium", "high", "xhigh"]
   end
 
   test "bounded_write workflow does not infer observed writes from corrupt child log" do
@@ -465,6 +535,191 @@ defmodule Pixir.Delegate.RunnerTest do
 
       refute Map.has_key?(payload["write_destination"], "observed_applied_writes")
       refute Map.has_key?(hd(payload["children"]), "observed_applied_writes")
+    end)
+  end
+
+  test "subagent runtime assigns task indexes to spawned children and envelopes" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-indexes")
+      test_pid = self()
+
+      spec = %{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "tasks" => ["alpha", "beta"]
+      }
+
+      spec_meta = %{"strategy" => "subagents", "planned_child_count" => 2}
+
+      spawn_agent = fn _parent_session_id, args, _opts ->
+        send(test_pid, {:spawn_args, args})
+
+        {:ok,
+         %{
+           "id" => "subagent_#{args["index"]}",
+           "index" => args["index"],
+           "agent" => args["agent"],
+           "task" => args["task"],
+           "status" => "completed",
+           "summary" => "done",
+           "child_session_id" => "child-#{args["index"]}"
+         }}
+      end
+
+      wait_outcome = fn _parent_session_id, _ids, _timeout_ms, _opts ->
+        {:ok,
+         %{
+           "status" => "completed",
+           "summary" => "done",
+           "counts" => %{"completed" => 2},
+           "subagents" => [
+             %{
+               "id" => "subagent_0",
+               "index" => 0,
+               "agent" => "default",
+               "task" => "alpha",
+               "status" => "completed",
+               "summary" => "done",
+               "child_session_id" => "child-0"
+             },
+             %{
+               "id" => "subagent_1",
+               "index" => 1,
+               "agent" => "default",
+               "task" => "beta",
+               "status" => "completed",
+               "summary" => "done",
+               "child_session_id" => "child-1"
+             }
+           ]
+         }}
+      end
+
+      assert {:ok, payload} =
+               Runner.run(%{workspace: ws}, spec, spec_meta,
+                 spawn_agent: spawn_agent,
+                 wait_outcome: wait_outcome
+               )
+
+      assert_received {:spawn_args, %{"task" => "alpha", "index" => 0}}
+      assert_received {:spawn_args, %{"task" => "beta", "index" => 1}}
+      assert Enum.map(payload["children"], & &1["index"]) == [0, 1]
+    end)
+  end
+
+  test "partial spawn preserves indexes for children already spawned" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-partial-indexes")
+
+      spec = %{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "tasks" => ["first", "second"]
+      }
+
+      spec_meta = %{"strategy" => "subagents", "planned_child_count" => 2}
+
+      spawn_agent = fn
+        _parent_session_id, %{"task" => "first", "index" => 0} = args, _opts ->
+          {:ok,
+           %{
+             "id" => "subagent_0",
+             "index" => args["index"],
+             "agent" => args["agent"],
+             "task" => args["task"],
+             "status" => "running",
+             "summary" => "running",
+             "child_session_id" => "child-0"
+           }}
+
+        _parent_session_id, %{"task" => "second", "index" => 1}, _opts ->
+          # contract-shaped error: normalize_error/1 passes %{"ok" => false}
+          # maps through untouched; a bare map would be wrapped as
+          # runtime_error and hide the original kind
+          {:error,
+           %{
+             "ok" => false,
+             "status" => "rejected",
+             "kind" => "spawn_failed",
+             "message" => "boom",
+             "details" => %{}
+           }}
+      end
+
+      wait_outcome = fn _parent_session_id, _ids, _timeout_ms, _opts ->
+        {:ok,
+         %{
+           "status" => "incomplete",
+           "summary" => "one running",
+           "counts" => %{"incomplete" => 1},
+           "subagents" => [
+             %{
+               "id" => "subagent_0",
+               "index" => 0,
+               "agent" => "default",
+               "task" => "first",
+               "status" => "running",
+               "summary" => "running",
+               "child_session_id" => "child-0"
+             }
+           ]
+         }}
+      end
+
+      assert {:ok, payload} =
+               Runner.run(%{workspace: ws}, spec, spec_meta,
+                 spawn_agent: spawn_agent,
+                 wait_outcome: wait_outcome
+               )
+
+      assert payload["status"] == "partial"
+      assert [%{"index" => 0, "task" => "first"}] = payload["children"]
+      assert payload["spawn_failure"]["kind"] == "spawn_failed"
+    end)
+  end
+
+  test "running-at-horizon children keep their task index" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-horizon-indexes")
+
+      spec = %{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "tasks" => ["keeps running"]
+      }
+
+      spec_meta = %{"strategy" => "subagents", "planned_child_count" => 1}
+
+      running = %{
+        "id" => "subagent_0",
+        "index" => 0,
+        "agent" => "worker",
+        "task" => "keeps running",
+        "status" => "running",
+        "summary" => "still running",
+        "child_session_id" => "child-running"
+      }
+
+      spawn_agent = fn _parent_session_id, _args, _opts -> {:ok, running} end
+
+      wait_outcome = fn _parent_session_id, _ids, _timeout_ms, _opts ->
+        {:ok,
+         %{
+           "status" => "incomplete",
+           "summary" => "horizon reached",
+           "counts" => %{"incomplete" => 1},
+           "subagents" => [running]
+         }}
+      end
+
+      assert {:ok, payload} =
+               Runner.run(%{workspace: ws}, spec, spec_meta,
+                 spawn_agent: spawn_agent,
+                 wait_outcome: wait_outcome
+               )
+
+      assert payload["status"] == "timed_out"
+      assert [%{"index" => 0, "status" => "running"}] = payload["children"]
     end)
   end
 

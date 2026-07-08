@@ -168,7 +168,9 @@ Pixir's current Subagent and Workflow contract is operational but deliberately n
   performance claims from local resource-pressure samples.
 
 For a copyable agent-facing `pixir delegate` example, including Codex/Claude Code CLI
-calling patterns, see `docs/examples/delegate-cli-live/`.
+calling patterns, see `docs/examples/delegate-cli-live/`. Delegate subagent results
+carry `children[].index` (the zero-based `tasks[]` position); the `children` array
+order is unspecified, so join results to tasks by index, not position.
 
 ## Preview Scope
 

@@ -45,6 +45,12 @@ defmodule Pixir.Tools.SpawnAgent do
   def execute(%{"task" => task} = args, context) when is_binary(task) and task != "" do
     opts = subagent_opts(context)
 
+    # index is delegate-runner evidence (tasks[] position); a caller-authored
+    # value here would fabricate it in durable subagent_event data. model and
+    # reasoning_effort are operator knobs (delegate spec / ACP _meta), not a
+    # capability the spawning model may grant its children.
+    args = Map.drop(args, ["index", "model", "reasoning_effort"])
+
     with {:ok, agent} <- Subagents.spawn_agent(context.session_id, args, opts) do
       {:ok, %{"output" => render(agent), "subagent" => agent}}
     end

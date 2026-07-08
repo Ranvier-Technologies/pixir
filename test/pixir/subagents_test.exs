@@ -5,7 +5,7 @@ defmodule Pixir.SubagentsTest do
   alias Pixir.Permissions.WritePolicy
   alias Pixir.Subagents.DelegationContext
   alias Pixir.Subagents.WorkspaceSnapshot
-  alias Pixir.Tools.WaitAgent
+  alias Pixir.Tools.{SpawnAgent, WaitAgent}
 
   defmodule NoOAuth do
     def refresh_skew_ms, do: 60_000
@@ -104,6 +104,20 @@ defmodule Pixir.SubagentsTest do
     end
   end
 
+  defmodule KnobCaptureProvider do
+    def stream(request, opts) do
+      if pid = Process.whereis(:pixir_knob_capture) do
+        send(
+          pid,
+          {:provider_knobs, request[:model] || Keyword.get(opts, :model),
+           request[:reasoning_effort] || Keyword.get(opts, :reasoning_effort)}
+        )
+      end
+
+      {:ok, %{text: "done", reasoning: "", function_calls: [], finish_reason: :stop}}
+    end
+  end
+
   setup do
     ws =
       Path.join(
@@ -126,6 +140,166 @@ defmodule Pixir.SubagentsTest do
     end)
 
     %{ws: ws, sid: sid}
+  end
+
+  test "spawned Subagents expose and durably record task indexes", %{sid: sid, ws: ws} do
+    {:ok, agent} =
+      Subagents.spawn_agent(
+        sid,
+        %{"task" => "indexed task", "agent" => "worker", "index" => 3, "timeout_ms" => 5_000},
+        workspace: ws,
+        provider: WritingProvider,
+        permission_mode: :auto
+      )
+
+    assert agent["index"] == 3
+    assert {:ok, [completed]} = Subagents.wait(sid, [agent["id"]], 10_000, workspace: ws)
+    assert completed["index"] == 3
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    events =
+      Enum.filter(
+        history,
+        &(&1.type == :subagent_event and &1.data["subagent_id"] == agent["id"])
+      )
+
+    assert events != []
+    assert Enum.all?(events, &(&1.data["index"] == 3))
+    assert Subagents.reconstruct(history)[agent["id"]]["index"] == 3
+  end
+
+  test "spawn_agent rejects invalid authored indexes", %{sid: sid, ws: ws} do
+    assert {:error, %{error: %{kind: :invalid_args, details: details}}} =
+             Subagents.spawn_agent(
+               sid,
+               %{"task" => "bad index", "index" => -1},
+               workspace: ws,
+               provider: BlockingProvider,
+               permission_mode: :read_only
+             )
+
+    assert details["field"] == "index"
+  end
+
+  test "spawn_agent rejects non-string model knobs", %{sid: sid, ws: ws} do
+    assert {:error, %{error: %{kind: :invalid_args, details: details}}} =
+             Subagents.spawn_agent(
+               sid,
+               %{"task" => "bad model", "model" => 123},
+               workspace: ws,
+               provider: BlockingProvider,
+               permission_mode: :read_only
+             )
+
+    assert details["field"] == "model"
+  end
+
+  test "spawn_agent rejects unsupported reasoning_effort knobs", %{sid: sid, ws: ws} do
+    assert {:error, %{error: %{kind: :invalid_args, details: details}}} =
+             Subagents.spawn_agent(
+               sid,
+               %{"task" => "bad effort", "reasoning_effort" => "ultra"},
+               workspace: ws,
+               provider: BlockingProvider,
+               permission_mode: :read_only
+             )
+
+    assert details["field"] == "reasoning_effort"
+    assert details["accepted_values"] == ["low", "medium", "high", "xhigh"]
+  end
+
+  test "spawn_agent tool strips caller-authored index before spawning", %{sid: sid, ws: ws} do
+    context = %{
+      session_id: sid,
+      workspace: ws,
+      provider: WritingProvider,
+      permission: %{mode: :auto}
+    }
+
+    assert {:ok, %{"subagent" => agent}} =
+             SpawnAgent.execute(%{"task" => "smuggled index", "index" => 9}, context)
+
+    refute Map.has_key?(agent, "index")
+
+    assert {:ok, [completed]} = Subagents.wait(sid, [agent["id"]], 10_000, workspace: ws)
+    refute Map.has_key?(completed, "index")
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    events =
+      Enum.filter(
+        history,
+        &(&1.type == :subagent_event and &1.data["subagent_id"] == agent["id"])
+      )
+
+    assert events != []
+    refute Enum.any?(events, &Map.has_key?(&1.data, "index"))
+  end
+
+  test "spawn args thread model and reasoning_effort to the child provider", %{sid: sid, ws: ws} do
+    Process.register(self(), :pixir_knob_capture)
+
+    {:ok, agent} =
+      Subagents.spawn_agent(
+        sid,
+        %{
+          "task" => "capture knobs",
+          "model" => "gpt-5.5-test",
+          "reasoning_effort" => "xhigh",
+          "timeout_ms" => 5_000
+        },
+        workspace: ws,
+        provider: KnobCaptureProvider,
+        permission_mode: :auto
+      )
+
+    assert {:ok, [_completed]} = Subagents.wait(sid, [agent["id"]], 10_000, workspace: ws)
+    assert_received {:provider_knobs, "gpt-5.5-test", "xhigh"}
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    events =
+      Enum.filter(
+        history,
+        &(&1.type == :subagent_event and &1.data["subagent_id"] == agent["id"])
+      )
+
+    assert events != []
+    assert Enum.all?(events, &(&1.data["model"] == "gpt-5.5-test"))
+    assert Enum.all?(events, &(&1.data["reasoning_effort"] == "xhigh"))
+
+    # Evidence, not echo: the knobs live in the durable Log for replay, but
+    # public reconstruction does not surface them as envelope fields.
+    reconstructed = Subagents.reconstruct(history)[agent["id"]]
+    refute Map.has_key?(reconstructed, "model")
+    refute Map.has_key?(reconstructed, "reasoning_effort")
+  end
+
+  test "spawn_agent tool strips caller-authored provider knobs", %{sid: sid, ws: ws} do
+    Process.register(self(), :pixir_knob_capture)
+
+    context = %{
+      session_id: sid,
+      workspace: ws,
+      provider: KnobCaptureProvider,
+      permission: %{mode: :auto}
+    }
+
+    assert {:ok, %{"subagent" => agent}} =
+             SpawnAgent.execute(
+               %{
+                 "task" => "smuggled knobs",
+                 "model" => "gpt-omega",
+                 "reasoning_effort" => "xhigh"
+               },
+               context
+             )
+
+    assert {:ok, [_completed]} = Subagents.wait(sid, [agent["id"]], 10_000, workspace: ws)
+    assert_received {:provider_knobs, model, effort}
+    refute model == "gpt-omega"
+    refute effort == "xhigh"
   end
 
   test "documents the Subagent lifecycle transition contract" do

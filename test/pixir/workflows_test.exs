@@ -351,6 +351,9 @@ defmodule Pixir.WorkflowsTest do
     assert Enum.count(history, &(&1.type == :subagent_event and &1.data["event"] == "finished")) ==
              3
 
+    refute Enum.any?(history, &(&1.type == :subagent_event and Map.has_key?(&1.data, "index")))
+    refute Enum.any?(result["steps"], &Map.has_key?(&1, "index"))
+
     workflow_events = workflow_events(history)
     kinds = Enum.map(workflow_events, & &1.data["kind"])
 

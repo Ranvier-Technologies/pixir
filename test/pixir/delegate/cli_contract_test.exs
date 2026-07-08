@@ -29,6 +29,242 @@ defmodule Pixir.Delegate.CLIContractTest do
     assert details["step_index"] == step_index
   end
 
+  test "subagents dry-run exposes runtime task indexes without honoring authored index fields" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "tasks" => [
+          "first task",
+          %{"task" => "second task", "index" => 99},
+          "third task"
+        ]
+      })
+
+    assert {:ok,
+            %{
+              exit_code: 0,
+              payload: %{
+                "status" => "planned",
+                "strategy" => "subagents",
+                "children" => children,
+                "children_order" => order_note
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+
+    assert Enum.map(children, & &1["task"]) == ["first task", "second task", "third task"]
+    assert Enum.map(children, & &1["index"]) == [0, 1, 2]
+    assert order_note =~ "unspecified"
+    assert order_note =~ "children[].index"
+  end
+
+  test "unknown top-level delegate spec keys fail closed" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "inspect docs",
+        "modle" => "gpt-5.5"
+      })
+
+    assert {:error,
+            %{
+              exit_code: 2,
+              payload: %{
+                "kind" => "invalid_spec",
+                "details" => %{
+                  "json_pointer" => "/modle",
+                  "path" => ["modle"],
+                  "field" => "modle"
+                }
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "unknown subagents keys fail closed" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "inspect docs",
+        "subagents" => %{"max_thread" => 2}
+      })
+
+    assert {:error,
+            %{
+              exit_code: 2,
+              payload: %{
+                "kind" => "invalid_spec",
+                "details" => %{
+                  "json_pointer" => "/subagents/max_thread",
+                  "path" => ["subagents", "max_thread"],
+                  "field" => "subagents.max_thread"
+                }
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "subagents provider knobs validate with ACP reasoning effort values" do
+    valid =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "inspect docs",
+        "subagents" => %{"model" => "gpt-5.5", "reasoning_effort" => "xhigh"}
+      })
+
+    assert {:ok, %{payload: %{"status" => "planned"}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> valid end
+             )
+
+    invalid =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "inspect docs",
+        "subagents" => %{"reasoning_effort" => "ultra"}
+      })
+
+    assert {:error,
+            %{
+              payload: %{
+                "kind" => "invalid_spec",
+                "details" => %{
+                  "json_pointer" => "/subagents/reasoning_effort",
+                  "accepted_values" => ["low", "medium", "high", "xhigh"]
+                }
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> invalid end
+             )
+  end
+
+  test "non-object subagents values fail closed instead of crashing" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "inspect docs",
+        "subagents" => "explorer"
+      })
+
+    assert {:error,
+            %{
+              exit_code: 2,
+              payload: %{
+                "kind" => "invalid_spec",
+                "details" => %{
+                  "json_pointer" => "/subagents",
+                  "observed_type" => "string"
+                }
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "legacy single-task dry-run plans children without task-array indexes" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "same prompt",
+        "subagents" => %{"count" => 2}
+      })
+
+    assert {:ok, %{payload: %{"children" => children}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+
+    assert Enum.map(children, & &1["task"]) == ["same prompt", "same prompt"]
+    refute Enum.any?(children, &Map.has_key?(&1, "index"))
+  end
+
+  test "subagents dry-run rejects malformed tasks entries like the real runner" do
+    for bad_entry <- ["   ", 42, %{"other" => "shape"}] do
+      spec =
+        Jason.encode!(%{
+          "contract_version" => 1,
+          "strategy" => "subagents",
+          "tasks" => ["valid task", bad_entry]
+        })
+
+      assert {:error,
+              %{
+                exit_code: 2,
+                payload: %{
+                  "ok" => false,
+                  "status" => "rejected",
+                  "kind" => "invalid_spec",
+                  "details" => %{"next_actions" => next_actions} = details
+                }
+              }} =
+               CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+                 read_stdin: fn -> spec end
+               )
+
+      assert "fix_subagents_tasks_entries" in next_actions
+      assert details["task_index"] == 1
+      assert details["json_pointer"] == "/tasks/1"
+      assert details["path"] == ["tasks", 1]
+      assert details["field"] == "tasks[2]"
+    end
+  end
+
+  test "subagents dry-run mirrors runner precedence: a tasks list owns validation" do
+    empty_tasks_with_fallback =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "fallback task",
+        "tasks" => []
+      })
+
+    assert {:error,
+            %{
+              exit_code: 2,
+              payload: %{
+                "kind" => "invalid_spec",
+                "details" => %{"next_actions" => next_actions}
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> empty_tasks_with_fallback end
+             )
+
+    assert "add_tasks_for_fanout" in next_actions
+
+    both_present =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "legacy task",
+        "tasks" => ["a", "b", "c"],
+        "subagents" => %{"count" => 5}
+      })
+
+    assert {:ok, %{payload: %{"children" => children} = payload}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> both_present end
+             )
+
+    assert Enum.map(children, & &1["task"]) == ["a", "b", "c"]
+    assert payload["beam_coordination"]["planned_child_count"] == 3
+  end
+
   test "dry-run rejects an unknown subagent role before runtime starts" do
     ws = tmp_workspace("pixir-delegate-contract-role")
 

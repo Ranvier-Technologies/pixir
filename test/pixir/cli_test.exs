@@ -914,7 +914,7 @@ defmodule Pixir.CLITest do
                   "status" => "completed",
                   "kind" => "delegate_result",
                   "contract_version" => 1,
-                  "schema_version" => 1,
+                  "schema_version" => 2,
                   "schema" => "pixir.delegate.envelope.v1",
                   "command_ok" => true,
                   "work_complete" => true,
@@ -1131,7 +1131,7 @@ defmodule Pixir.CLITest do
 
           payload = Jason.decode!(stdout)
           assert payload["status"] == "completed"
-          assert payload["schema_version"] == 1
+          assert payload["schema_version"] == 2
           assert payload["command_ok"] == true
           assert payload["work_complete"] == true
           assert payload["outcome"] == "completed"
@@ -1293,7 +1293,7 @@ defmodule Pixir.CLITest do
                 "ok" => true,
                 "status" => "completed",
                 "kind" => "delegate_status",
-                "schema_version" => 1,
+                "schema_version" => 2,
                 "schema" => "pixir.delegate.envelope.v1",
                 "command_ok" => true,
                 "work_complete" => true,
@@ -1337,7 +1337,7 @@ defmodule Pixir.CLITest do
                "ok" => false,
                "status" => "rejected",
                "kind" => "not_found",
-               "schema_version" => 1,
+               "schema_version" => 2,
                "command_ok" => false,
                "work_complete" => false,
                "outcome" => "rejected",
@@ -1385,7 +1385,7 @@ defmodule Pixir.CLITest do
                 "ok" => true,
                 "status" => "running",
                 "kind" => "delegate_attach",
-                "schema_version" => 1,
+                "schema_version" => 2,
                 "schema" => "pixir.delegate.envelope.v1",
                 "command_ok" => true,
                 "work_complete" => false,

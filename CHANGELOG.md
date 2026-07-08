@@ -9,6 +9,43 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [Unreleased]
 
+## [0.1.7]
+
+### Added
+- Delegate subagent children now carry durable `children[].index` task-position
+  evidence across attached envelopes, async snapshots, tree projection, and retry
+  lineage (#227). The delegate envelope `schema_version` is now `2` to signal the
+  additive `children[].index` / `children_order` keys; the
+  `pixir.delegate.envelope.v1` family name is unchanged (reserved for breaking
+  shape changes).
+- Delegate specs are validated fail-closed (#223): unknown top-level or
+  `subagents` keys are rejected as structured `invalid_spec` with `field`,
+  `json_pointer`, `path`, and `next_actions`, in dry-run and real runs alike,
+  so a typo can no longer pass the rehearsal silently.
+- New delegate spec provider knobs mirroring ACP `session/prompt` `_meta`
+  (#223): `subagents.model` and `subagents.reasoning_effort`
+  (`low|medium|high|xhigh`) thread to every child's provider calls with
+  spec > config > default resolution; effective values are evidenced by child
+  `provider_usage` events, not echoed in the envelope. The model-facing
+  `spawn_agent` tool strips caller-authored `model`/`reasoning_effort` args:
+  provider knobs are operator decisions, not a capability a spawning model
+  grants its children.
+
+### Fixed
+- Delegate `--dry-run` now mirrors the runner's task normalization exactly:
+  malformed or blank `tasks[]` entries are rejected as `invalid_spec` instead of
+  silently planned, and a list-valued `tasks` field owns validation (even when
+  empty) before any legacy `task` fallback, matching real-run branch precedence.
+- The model-facing `spawn_agent` tool strips caller-authored `index` args so
+  task-position evidence in durable `subagent_event` data cannot be forged.
+- Workspace confinement no longer misreads leading POSIX environment
+  assignments as path arguments (#188): `TMPDIR=/tmp mix test` and
+  `PREFIX=/usr/local ./configure` pass, while literal outside paths,
+  redirection targets, and non-leading `NAME=VALUE` arguments keep failing
+  closed; the window resets after `;`, `&&`, `||`, and `|`. The residual
+  runtime-expansion vector (`VAR=/outside cmd $VAR`) is documented in
+  SECURITY.md: confinement is a defense-in-depth tripwire, not a sandbox.
+
 ## [0.1.6]
 
 ### Added

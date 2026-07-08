@@ -322,6 +322,109 @@ defmodule Pixir.Delegate.AsyncTest do
              )
   end
 
+  test "durable status and attach preserve task indexes independent of subagent id sorting", %{
+    ws: ws,
+    sid: sid
+  } do
+    write_raw_log(ws, sid, [
+      raw_event(sid, 0, "subagent_event", %{
+        "subagent_id" => "sub_b",
+        "child_session_id" => "child-b",
+        "event" => "started",
+        "status" => "running",
+        "agent" => "explorer",
+        "task" => "second task",
+        "workspace" => ws,
+        "index" => 1
+      }),
+      raw_event(sid, 1, "subagent_event", %{
+        "subagent_id" => "sub_a",
+        "child_session_id" => "child-a",
+        "event" => "started",
+        "status" => "completed",
+        "agent" => "explorer",
+        "task" => "first task",
+        "workspace" => ws,
+        "index" => 0
+      })
+    ])
+
+    assert {:ok, status} = Async.status(sid, workspace: ws)
+    assert Enum.map(status["children"], & &1["subagent_id"]) == ["sub_a", "sub_b"]
+    assert Enum.map(status["children"], & &1["index"]) == [0, 1]
+
+    assert {:ok, attach} = Async.attach(sid, workspace: ws)
+    assert Enum.map(attach["children"], & &1["index"]) == [0, 1]
+  end
+
+  test "cancel payloads preserve indexes for cancelled and stale live children", %{
+    ws: ws,
+    sid: sid
+  } do
+    write_raw_log(ws, sid, [
+      raw_event(sid, 0, "subagent_event", %{
+        "subagent_id" => "sub_cancel",
+        "child_session_id" => "child-cancel",
+        "event" => "started",
+        "status" => "running",
+        "agent" => "explorer",
+        "task" => "cancel me",
+        "workspace" => ws,
+        "index" => 0
+      }),
+      raw_event(sid, 1, "subagent_event", %{
+        "subagent_id" => "sub_stale",
+        "child_session_id" => "child-stale",
+        "event" => "started",
+        "status" => "running",
+        "agent" => "explorer",
+        "task" => "stale",
+        "workspace" => ws,
+        "index" => 1
+      })
+    ])
+
+    list_subagents = fn ^sid, opts ->
+      assert opts[:workspace] == ws
+
+      {:ok,
+       [
+         %{
+           "id" => "sub_cancel",
+           "index" => 0,
+           "child_session_id" => "child-cancel",
+           "status" => "running",
+           "agent" => "explorer",
+           "task" => "cancel me"
+         }
+       ]}
+    end
+
+    close_subagent = fn ^sid, "sub_cancel", opts ->
+      assert opts[:workspace] == ws
+
+      {:ok,
+       %{
+         "id" => "sub_cancel",
+         "index" => 0,
+         "child_session_id" => "child-cancel",
+         "status" => "cancelled",
+         "agent" => "explorer",
+         "task" => "cancel me"
+       }}
+    end
+
+    assert {:ok, payload} =
+             Async.cancel(sid,
+               workspace: ws,
+               list_subagents: list_subagents,
+               close_subagent: close_subagent
+             )
+
+    assert [%{"subagent_id" => "sub_cancel", "index" => 0}] = payload["cancelled_children"]
+    assert [%{"subagent_id" => "sub_stale", "index" => 1}] = payload["stale_live_children"]
+  end
+
   defp append!(workspace, event) do
     assert {:ok, _} = Log.append(event, workspace: workspace)
   end
