@@ -8,7 +8,11 @@ defmodule Pixir.CLITest do
   alias Pixir.Delegate.Evidence
 
   defmodule StubProvider do
-    def stream(_request, opts) do
+    def stream(request, opts) do
+      if test_pid = Keyword.get(opts, :test_pid) do
+        send(test_pid, {:provider_request, request, opts})
+      end
+
       agent = Keyword.fetch!(opts, :agent)
       on_delta = Keyword.get(opts, :on_delta, fn _ -> :ok end)
       result = Agent.get_and_update(agent, fn [head | tail] -> {head, tail} end)
@@ -56,6 +60,20 @@ defmodule Pixir.CLITest do
             other -> other
           end
       end
+    end
+  end
+
+  defmodule AttachmentCaptureProvider do
+    def stream(_request, opts) do
+      send(Keyword.fetch!(opts, :test_pid), {:attachments, Keyword.get(opts, :attachments, [])})
+      {:ok, %{text: "done", reasoning: "", function_calls: [], finish_reason: :stop}}
+    end
+  end
+
+  defmodule WebSearchCaptureProvider do
+    def stream(request, opts) do
+      send(Keyword.fetch!(opts, :test_pid), {:web_search_request, Map.get(request, :web_search)})
+      {:ok, %{text: "done", reasoning: "", function_calls: [], finish_reason: :stop}}
     end
   end
 
@@ -195,6 +213,217 @@ defmodule Pixir.CLITest do
 
   defp session_lease_files(ws),
     do: Path.wildcard(Path.join([ws, ".pixir", "session_leases", "*.json"]))
+
+  test "--attach accumulates in order and encodes resource links" do
+    in_tmp_workspace("pixir-cli-attach", fn ws ->
+      File.write!(Path.join(ws, "one.txt"), "one")
+      File.write!(Path.join(ws, "two.txt"), "two")
+
+      with_cli_turn_opts(
+        [
+          provider: AttachmentCaptureProvider,
+          provider_opts: [test_pid: self()],
+          skip_auth?: true,
+          quiet?: true,
+          session_id: "cli-attach-order"
+        ],
+        fn ->
+          assert :ok = CLI.route(["--attach", "one.txt", "--attach", "two.txt", "hello"])
+        end
+      )
+
+      # Attachments are a Turn opt consumed by ingestion, never provider opts:
+      # the durable evidence is the user_message resources in the session Log.
+      # The capture stub pins that boundary: providers must see no attachments.
+      assert_received {:attachments, []}
+      sid = only_session_id!(ws)
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+      assert %{data: %{"resources" => resources}} =
+               Enum.find(history, &(&1.type == :user_message))
+
+      assert Enum.map(resources, & &1["name"]) == ["one.txt", "two.txt"]
+      assert Enum.all?(resources, &(&1["size_bytes"] == 3))
+    end)
+  end
+
+  test "--attach reports structured errors for missing values and unsupported commands" do
+    assert {:error, 2} = CLI.route(["--attach"])
+    assert {:error, 2} = CLI.route(["--attach", "note.txt", "doctor"])
+  end
+
+  test "--web-search is accepted for one-shot and resume but rejected for other commands" do
+    in_tmp_workspace("pixir-cli-web-search", fn _ws ->
+      with_cli_provider([stop("ok")], fn ->
+        assert :ok = CLI.route(["--web-search", "hello"])
+      end)
+
+      sid = only_session_id!(File.cwd!())
+
+      # The capture provider proves the post-session-id flag is consumed as a
+      # flag (request carries the config) instead of leaking into the prompt.
+      with_cli_turn_opts(
+        [
+          provider: WebSearchCaptureProvider,
+          provider_opts: [test_pid: self()],
+          skip_auth?: true,
+          quiet?: true
+        ],
+        fn ->
+          assert :ok = CLI.route(["resume", sid, "--web-search", "again"])
+        end
+      )
+
+      assert_received {:web_search_request, %{"enabled" => true}}
+
+      assert {:ok, history} = Log.fold(sid, workspace: File.cwd!())
+      resumed_prompt = history |> Enum.filter(&(&1.type == :user_message)) |> List.last()
+      assert resumed_prompt.data["text"] == "again"
+    end)
+
+    assert {:error, 2} = CLI.route(["--web-search", "doctor"])
+  end
+
+  test "--web-search folds into provider_opts without clobbering the injected list" do
+    in_tmp_workspace("pixir-cli-web-search-fold", fn _ws ->
+      with_cli_turn_opts(
+        [
+          provider: WebSearchCaptureProvider,
+          provider_opts: [test_pid: self()],
+          skip_auth?: true,
+          quiet?: true,
+          session_id: "cli-web-search-fold"
+        ],
+        fn ->
+          assert :ok = CLI.route(["--web-search", "hello"])
+        end
+      )
+
+      # The provider stub still received test_pid (the injected provider_opts
+      # survived the fold) AND the request carries the flag-derived config.
+      assert_received {:web_search_request, %{"enabled" => true}}
+    end)
+  end
+
+  test "without --web-search the provider request omits web_search" do
+    in_tmp_workspace("pixir-cli-web-search-off", fn _ws ->
+      with_cli_turn_opts(
+        [
+          provider: WebSearchCaptureProvider,
+          provider_opts: [test_pid: self()],
+          skip_auth?: true,
+          quiet?: true,
+          session_id: "cli-web-search-off"
+        ],
+        fn ->
+          assert :ok = CLI.route(["hello"])
+        end
+      )
+
+      assert_received {:web_search_request, nil}
+    end)
+  end
+
+  test "resume placement --attach threads attachments into turn opts" do
+    in_tmp_workspace("pixir-cli-resume-attach", fn ws ->
+      File.write!(Path.join(ws, "resume.txt"), "resume")
+      sid = "cli-resume-attach"
+
+      assert {:ok, _} =
+               Log.append(Event.with_seq(Event.user_message(sid, "one"), 0), workspace: ws)
+
+      with_cli_turn_opts(
+        [
+          provider: AttachmentCaptureProvider,
+          provider_opts: [test_pid: self()],
+          skip_auth?: true,
+          quiet?: true
+        ],
+        fn ->
+          assert :ok = CLI.route(["resume", sid, "--attach", "resume.txt", "again"])
+        end
+      )
+
+      assert_received {:attachments, []}
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+      assert %{data: %{"resources" => [resource]}} =
+               history
+               |> Enum.filter(&(&1.type == :user_message))
+               |> Enum.find(&(&1.data["text"] == "again"))
+
+      assert resource["name"] == "resume.txt"
+      assert resource["size_bytes"] == byte_size("resume")
+    end)
+  end
+
+  test "--attach URI encoding round-trips reserved and UTF-8 path characters" do
+    in_tmp_workspace("pixir-cli-attach-roundtrip", fn ws ->
+      name = "space # question ? café.txt"
+      File.write!(Path.join(ws, name), "evidence")
+
+      with_cli_turn_opts(
+        [
+          provider: AttachmentCaptureProvider,
+          provider_opts: [test_pid: self()],
+          skip_auth?: true,
+          quiet?: true,
+          session_id: "cli-attach-roundtrip"
+        ],
+        fn ->
+          assert :ok = CLI.route(["--attach", name, "hello"])
+        end
+      )
+
+      # size_bytes matching the real file proves the encoded URI decoded back
+      # to the original hostile path (space, #, ?, UTF-8) before File.read.
+      assert_received {:attachments, []}
+      sid = only_session_id!(ws)
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+      assert %{data: %{"resources" => [resource]}} =
+               Enum.find(history, &(&1.type == :user_message))
+
+      assert resource["name"] == name
+      assert resource["size_bytes"] == byte_size("evidence")
+    end)
+  end
+
+  test "--attach outside the workspace is accepted as operator-supplied (ADR 0021)" do
+    in_tmp_workspace("pixir-cli-attach-outside", fn ws ->
+      outside_dir =
+        Path.join(System.tmp_dir!(), "pixir-cli-outside-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(outside_dir)
+      on_exit(fn -> File.rm_rf!(outside_dir) end)
+      outside = Path.join(outside_dir, "external.txt")
+      File.write!(outside, "outside evidence")
+
+      with_cli_turn_opts(
+        [
+          provider: AttachmentCaptureProvider,
+          provider_opts: [test_pid: self()],
+          skip_auth?: true,
+          quiet?: true
+        ],
+        fn ->
+          assert :ok = CLI.route(["--attach", outside, "hello"])
+        end
+      )
+
+      # ADR 0021: operator-supplied file:// links are deliberately exempt from
+      # workspace read confinement. This pins the CLI half of that decision.
+      assert_received {:attachments, []}
+      sid = only_session_id!(ws)
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+      assert %{data: %{"resources" => [resource]}} =
+               Enum.find(history, &(&1.type == :user_message))
+
+      assert resource["name"] == "external.txt"
+      assert resource["size_bytes"] == byte_size("outside evidence")
+    end)
+  end
 
   test "no args prints usage and succeeds" do
     out = capture_io(fn -> assert :ok = CLI.route([]) end)
@@ -914,7 +1143,7 @@ defmodule Pixir.CLITest do
                   "status" => "completed",
                   "kind" => "delegate_result",
                   "contract_version" => 1,
-                  "schema_version" => 1,
+                  "schema_version" => 3,
                   "schema" => "pixir.delegate.envelope.v1",
                   "command_ok" => true,
                   "work_complete" => true,
@@ -1131,7 +1360,7 @@ defmodule Pixir.CLITest do
 
           payload = Jason.decode!(stdout)
           assert payload["status"] == "completed"
-          assert payload["schema_version"] == 1
+          assert payload["schema_version"] == 3
           assert payload["command_ok"] == true
           assert payload["work_complete"] == true
           assert payload["outcome"] == "completed"
@@ -1293,7 +1522,7 @@ defmodule Pixir.CLITest do
                 "ok" => true,
                 "status" => "completed",
                 "kind" => "delegate_status",
-                "schema_version" => 1,
+                "schema_version" => 3,
                 "schema" => "pixir.delegate.envelope.v1",
                 "command_ok" => true,
                 "work_complete" => true,
@@ -1337,7 +1566,7 @@ defmodule Pixir.CLITest do
                "ok" => false,
                "status" => "rejected",
                "kind" => "not_found",
-               "schema_version" => 1,
+               "schema_version" => 3,
                "command_ok" => false,
                "work_complete" => false,
                "outcome" => "rejected",
@@ -1385,7 +1614,7 @@ defmodule Pixir.CLITest do
                 "ok" => true,
                 "status" => "running",
                 "kind" => "delegate_attach",
-                "schema_version" => 1,
+                "schema_version" => 3,
                 "schema" => "pixir.delegate.envelope.v1",
                 "command_ok" => true,
                 "work_complete" => false,

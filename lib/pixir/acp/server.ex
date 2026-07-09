@@ -53,6 +53,7 @@ defmodule Pixir.ACP.Server do
 
   alias Pixir.ACP.{Protocol, Translate}
   alias Pixir.Conversation
+  alias Pixir.Providers.Registry
 
   @protocol_version 1
   @idle_timeout 120_000
@@ -76,6 +77,10 @@ defmodule Pixir.ACP.Server do
     }
   ]
   @mode_ids ["build", "plan"]
+
+  defp meta_web_search(true), do: %{"enabled" => true}
+  defp meta_web_search(%{} = value), do: value
+  defp meta_web_search(_value), do: nil
 
   # ── public API ──────────────────────────────────────────────────────────────
 
@@ -501,9 +506,9 @@ defmodule Pixir.ACP.Server do
         write(state.out, Protocol.error(id, Protocol.invalid_params(), "unknown session"))
         state
 
-      not (is_binary(model_id) and Pixir.Provider.model_supported?(model_id)) ->
+      not (is_binary(model_id) and Registry.model_supported?(model_id)) ->
         # Mirror start_prompt's per-turn rejection: an id outside the advertised
-        # catalog (`Pixir.Provider.model_supported?/1`) is `-32602` with the
+        # catalog (`Registry.model_supported?/1`) is `-32602` with the
         # offending id in `data.model`. Validating here means the stored sticky
         # model never trips the per-turn rejection later.
         write(
@@ -575,7 +580,7 @@ defmodule Pixir.ACP.Server do
       "type" => "select",
       "currentValue" => current || default_model_id(),
       "options" =>
-        Enum.map(Pixir.Provider.models(), fn model ->
+        Enum.map(Registry.models(), fn model ->
           %{"name" => model["name"], "value" => model["id"]}
         end)
     }
@@ -598,7 +603,7 @@ defmodule Pixir.ACP.Server do
   # The `_meta.pixir` block: the model catalog (A.5) plus auth status (A.4),
   # under one namespace so a client reads everything Pixir-specific in one place.
   defp pixir_meta do
-    base = %{"models" => Pixir.Provider.models()}
+    base = %{"models" => Registry.models()}
 
     case auth_meta() do
       nil -> base
@@ -685,7 +690,7 @@ defmodule Pixir.ACP.Server do
     %{
       "currentModelId" => current_model,
       "availableModels" =>
-        Enum.map(Pixir.Provider.models(), fn m ->
+        Enum.map(Registry.models(), fn m ->
           %{"modelId" => m["id"], "name" => m["name"]}
         end)
     }
@@ -701,7 +706,7 @@ defmodule Pixir.ACP.Server do
 
   # Pixir's default model id, advertised as `currentModelId` at session/new.
   defp default_model_id do
-    case Enum.find(Pixir.Provider.models(), & &1["default"]) do
+    case Enum.find(Registry.models(), & &1["default"]) do
       %{"id" => id} -> id
       _ -> nil
     end
@@ -932,9 +937,9 @@ defmodule Pixir.ACP.Server do
   end
 
   # A per-turn model knob is allowed when absent (use Pixir's own resolution) or
-  # present in the advertised catalog (`Pixir.Provider.models/0`).
+  # present in the advertised catalog (`Pixir.Providers.Registry.models/0`).
   defp model_allowed?(nil), do: true
-  defp model_allowed?(model) when is_binary(model), do: Pixir.Provider.model_supported?(model)
+  defp model_allowed?(model) when is_binary(model), do: Registry.model_supported?(model)
 
   # Concatenate text blocks. Image/resource_link blocks are extracted separately
   # as Session Resource attachments; audio/embeddedContext remain unsupported.
@@ -1029,6 +1034,7 @@ defmodule Pixir.ACP.Server do
     []
     |> maybe_put(:model, meta_string(Map.get(meta, "model")))
     |> maybe_put(:reasoning_effort, meta_string(Map.get(meta, "reasoning_effort")))
+    |> maybe_put(:web_search, meta_web_search(Map.get(meta, "web_search")))
     |> maybe_put(:permission_mode, permission_mode_meta(Map.get(meta, "permission_mode")))
     |> maybe_put(:presenter_context, presenter_context_meta(meta, pixir_meta))
   end

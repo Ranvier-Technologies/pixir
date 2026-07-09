@@ -23,7 +23,9 @@ defmodule Pixir.ConversationTest do
     end
 
     defp ensure_usage({:ok, result}) when is_map(result) do
-      {:ok, Map.put_new(result, :usage, usage())}
+      result = Map.put_new(result, :usage, usage())
+      # Real providers own their usage_summary (ADR 0037 D7); the stub models that.
+      {:ok, Map.put_new(result, :usage_summary, Pixir.Provider.usage_summary(result[:usage]))}
     end
 
     defp ensure_usage(result), do: result

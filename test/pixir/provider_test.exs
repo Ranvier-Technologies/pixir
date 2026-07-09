@@ -100,7 +100,8 @@ defmodule Pixir.ProviderTest do
              output_tokens: 300,
              reasoning_tokens: 42,
              total_tokens: 2306,
-             cache_hit_rate: 1920 / 2006
+             cache_hit_rate: 1920 / 2006,
+             cache: %{"creation_tokens" => 0, "read_tokens" => 1920}
            }
   end
 

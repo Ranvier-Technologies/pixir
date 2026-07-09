@@ -30,6 +30,15 @@ defmodule Pixir.Provider.HostedTools do
         }
 
   @doc """
+  The full `web_search` config vocabulary (config-only flags plus tool fields).
+
+  Single source of truth for every parser of this shape: `Pixir.Config` validates
+  config.json against this same list so the two can never drift.
+  """
+  @spec web_search_config_fields() :: [String.t()]
+  def web_search_config_fields, do: @web_search_config_fields
+
+  @doc """
   Build an OpenAI hosted `web_search` tool spec.
 
   Pixir defaults `search_context_size` to `"low"` for beta ergonomics and cost

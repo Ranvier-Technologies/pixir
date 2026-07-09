@@ -66,7 +66,11 @@ reviews:
         json_pointer / path are reserved for WritePolicy's own context.
         The spec-level transport knob (subagents.transport / transport:
         auto|websocket|http_sse, validated at dry-run, surfaced as
-        limits.transport), the conditional children[] retry-confession
+        limits.transport), task entries (tasks[] strings or {"task",
+        "attachments"} objects, with unknown object keys invalid_spec
+        fail-closed), operator-supplied attachments (file paths threaded to child
+        Turns as Session Resources per ADR 0021 and never echoed in the
+        envelope), the conditional children[] retry-confession
         fields (retry_attempts, retry_max_attempts, current_attempt_index,
         retry_history - present only when a retry happened), and the
         conditional children[] recovery commands (resume_command,

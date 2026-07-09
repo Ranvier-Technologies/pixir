@@ -37,7 +37,8 @@ defmodule Pixir.SessionTreeTest do
           "status" => "running",
           "agent" => "explorer",
           "task" => "inspect logs",
-          "workspace" => child_ws
+          "workspace" => child_ws,
+          "index" => 7
         },
         seq: 1
       )
@@ -55,6 +56,7 @@ defmodule Pixir.SessionTreeTest do
           "agent" => "explorer",
           "summary" => "found one child",
           "workspace" => child_ws,
+          "index" => 7,
           "elapsed_ms" => 42,
           "reason" => "finished",
           "next_actions" => ["inspect_child_session_log"]
@@ -76,6 +78,7 @@ defmodule Pixir.SessionTreeTest do
     assert subagent["child_session_id"] == child_sid
     assert subagent["session_id"] == child_sid
     assert subagent["status"] == "completed"
+    assert subagent["index"] == 7
     assert subagent["events"] == ["started", "finished"]
     assert subagent["summary"] == "found one child"
     assert subagent["elapsed_ms"] == 42
@@ -206,7 +209,8 @@ defmodule Pixir.SessionTreeTest do
           "status" => "completed",
           "agent" => "explorer",
           "task" => "inspect logs",
-          "workspace" => child_ws
+          "workspace" => child_ws,
+          "index" => 2
         },
         seq: 0
       )
@@ -219,6 +223,7 @@ defmodule Pixir.SessionTreeTest do
     assert text =~ "subagent sub_1"
     assert text =~ "(explorer)"
     assert text =~ "child_session: child-1"
+    assert text =~ "index: 2"
     assert text =~ "task: inspect logs"
   end
 

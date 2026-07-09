@@ -24,7 +24,7 @@ defmodule Pixir.Config do
   """
 
   alias Pixir.Paths
-  alias Pixir.Permissions
+  alias Pixir.Provider.HostedTools
 
   @default_model "gpt-5.5"
   @default_bash_timeout_ms 120_000
@@ -84,6 +84,10 @@ defmodule Pixir.Config do
     end
   end
 
+  @doc "Accepted reasoning effort ids."
+  @spec valid_reasoning_efforts() :: [String.t()]
+  def valid_reasoning_efforts, do: @valid_reasoning_efforts
+
   @doc "Resolved permission default (`:auto`, `:ask`, or `:read_only`)."
   @spec permission_default(keyword()) :: Permissions.mode()
   def permission_default(opts \\ []) do
@@ -125,6 +129,10 @@ defmodule Pixir.Config do
   @spec compaction_tail_events(keyword()) :: pos_integer()
   def compaction_tail_events(opts \\ []),
     do: get_in(load(opts), ["effective", "compaction", "tail_events"])
+
+  @doc "Resolved hosted web search config, or `nil` when disabled/absent."
+  @spec web_search(keyword()) :: map() | nil
+  def web_search(opts \\ []), do: get_in(load(opts), ["effective", "web_search"])
 
   @doc "Whether model-assisted compaction is enabled (default `false`)."
   @spec compaction_model_assisted(keyword()) :: boolean()
@@ -170,6 +178,7 @@ defmodule Pixir.Config do
     |> Keyword.put_new(:stream_idle_timeout_ms, eff["stream_idle_timeout_ms"])
     |> put_optional(:reasoning_effort, eff["reasoning"]["effort"])
     |> put_optional(:text_verbosity, eff["text"]["verbosity"])
+    |> put_optional(:web_search, eff["web_search"])
   end
 
   defp put_optional(opts, _key, nil), do: opts
@@ -218,6 +227,7 @@ defmodule Pixir.Config do
       },
       "max_retries" => resolve_max_retries(raw, ignored),
       "stream_idle_timeout_ms" => resolve_stream_idle_timeout_ms(raw, ignored),
+      "web_search" => resolve_web_search(raw, ignored),
       "compaction" => %{
         "tail_events" => resolve_tail_events(raw, ignored),
         "model_assisted" => resolve_model_assisted(raw, ignored)
@@ -354,6 +364,73 @@ defmodule Pixir.Config do
     )
   end
 
+  defp resolve_web_search(raw, ignored) when is_struct(ignored, MapSet) do
+    app = Application.get_env(:pixir, :web_search)
+
+    cond do
+      not is_nil(app) -> normalize_web_search_config(app)
+      MapSet.member?(ignored, "web_search") -> nil
+      true -> normalize_web_search_config(Map.get(raw, "web_search"))
+    end
+  end
+
+  defp normalize_web_search_config(nil), do: nil
+
+  defp normalize_web_search_config(value) do
+    case web_search_config_status(value) do
+      {:ok, normalized} -> normalized
+      :invalid -> nil
+    end
+  end
+
+  # A validated-but-disabled config and a rejected config both normalize to nil;
+  # the status form keeps them distinguishable so warnings only name real errors.
+  # nil never reaches here: both call sites filter it before dispatching.
+  defp web_search_config_status(false), do: {:ok, nil}
+  defp web_search_config_status(true), do: {:ok, %{"enabled" => true}}
+
+  defp web_search_config_status(value) when is_map(value) or is_list(value) do
+    with {:ok, normalized} <- normalize_string_key_map(value),
+         :ok <- reject_web_search_config_fields(normalized),
+         {:ok, _tool} <- HostedTools.web_search(normalized) do
+      if Map.get(normalized, "enabled") == false, do: {:ok, nil}, else: {:ok, normalized}
+    else
+      _ -> :invalid
+    end
+  end
+
+  defp web_search_config_status(_value), do: :invalid
+
+  defp reject_web_search_config_fields(config) do
+    allowed = HostedTools.web_search_config_fields()
+    unsupported = config |> Map.keys() |> Enum.reject(&(&1 in allowed))
+
+    if unsupported == [], do: :ok, else: {:error, :unsupported_web_search_config_fields}
+  end
+
+  defp normalize_string_key_map(value) when is_map(value) do
+    {:ok, Map.new(value, fn {key, val} -> {normalize_config_key(key), val} end)}
+  rescue
+    ArgumentError -> {:error, :invalid_key}
+  end
+
+  # Non-pair list elements would raise FunctionClauseError inside Map.new/2
+  # before the rescue could run; reject them up front so a malformed
+  # config.json array cannot crash Config.load/1.
+  defp normalize_string_key_map(value) when is_list(value) do
+    if Enum.all?(value, &match?({_key, _val}, &1)) do
+      {:ok, Map.new(value, fn {key, val} -> {normalize_config_key(key), val} end)}
+    else
+      {:error, :invalid_key}
+    end
+  rescue
+    ArgumentError -> {:error, :invalid_key}
+  end
+
+  defp normalize_config_key(key) when is_binary(key), do: key
+  defp normalize_config_key(key) when is_atom(key), do: Atom.to_string(key)
+  defp normalize_config_key(key), do: raise(ArgumentError, "invalid config key #{inspect(key)}")
+
   defp resolve_tail_events(raw, ignored) do
     value =
       case Map.get(raw, "compaction") do
@@ -443,6 +520,7 @@ defmodule Pixir.Config do
       "stream_idle_timeout_ms",
       Map.get(raw, "stream_idle_timeout_ms")
     )
+    |> maybe_warn_web_search(raw)
     |> maybe_warn_tail_events(raw)
     |> maybe_warn_model_assisted(raw)
     |> maybe_warn_model(raw)
@@ -490,6 +568,22 @@ defmodule Pixir.Config do
             [warning("text.verbosity", "invalid value #{inspect(value)}; ignoring") | warnings]
 
           _ ->
+            warnings
+        end
+    end
+  end
+
+  defp maybe_warn_web_search(warnings, raw) do
+    case Map.get(raw, "web_search") do
+      nil ->
+        warnings
+
+      value ->
+        case web_search_config_status(value) do
+          :invalid ->
+            [warning("web_search", "invalid value #{inspect(value)}; ignoring") | warnings]
+
+          {:ok, _normalized} ->
             warnings
         end
     end

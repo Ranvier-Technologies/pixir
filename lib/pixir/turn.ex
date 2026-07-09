@@ -40,6 +40,7 @@ defmodule Pixir.Turn do
   }
 
   alias Pixir.Provider.{Cache, ContextWindow}
+  alias Pixir.Providers.Registry, as: ProviderRegistry
   alias Pixir.Tools.{Executor, Registry}
 
   @default_max_iterations :infinity
@@ -87,8 +88,11 @@ defmodule Pixir.Turn do
 
     mode = normalize_mode(Keyword.get(opts, :mode, :build))
 
+    provider =
+      Keyword.get(opts, :provider) || ProviderRegistry.resolve(provider_opts[:model]).provider
+
     state = %{
-      provider: Keyword.get(opts, :provider, Pixir.Provider),
+      provider: provider,
       provider_opts: provider_opts,
       skills_opts: skills_opts,
       agents_opts: Keyword.get(opts, :agents_opts, []),
@@ -98,7 +102,7 @@ defmodule Pixir.Turn do
       delegation_context: Keyword.get(opts, :delegation_context),
       # Model that will produce reasoning items this Turn — stamped on each `reasoning`
       # event so replay can drop items captured under a different model (ADR 0007).
-      model: provider_opts[:model] || Pixir.Provider.default_model(),
+      model: provider_opts[:model] || ProviderRegistry.entry_for(provider).default_model,
       dry_run: Keyword.get(opts, :dry_run, false),
       # ADR 0020 overflow recovery uses a finite tail-shrinking sequence. A
       # compacted retry can still overflow on smaller-window models, so subsequent
@@ -133,6 +137,26 @@ defmodule Pixir.Turn do
   # Plan mode is read-only by definition; otherwise honor the caller's posture.
   defp permission_mode(:plan, _requested), do: :read_only
   defp permission_mode(_build, requested), do: requested
+
+  defp maybe_put_provider_request(request, _key, nil), do: request
+  defp maybe_put_provider_request(request, key, value), do: Map.put(request, key, value)
+
+  defp reasoning_dialect(provider),
+    do: ProviderRegistry.entry_for(provider).capabilities.reasoning_dialect
+
+  defp provider_tool_specs(provider) do
+    case ProviderRegistry.entry_for(provider).capabilities.tool_dialect do
+      :anthropic -> Registry.anthropic_specs()
+      :responses -> Registry.responses_specs()
+    end
+  end
+
+  defp reasoning_event_opts(state) do
+    case reasoning_dialect(state.provider) do
+      dialect when is_binary(dialect) -> [dialect: dialect]
+      _ -> []
+    end
+  end
 
   @doc "Default tool-loop iteration cap. `:infinity` means no cap."
   def default_max_iterations,
@@ -273,25 +297,27 @@ defmodule Pixir.Turn do
     # visible. See ADR 0020 update.
     history = maybe_preflight_critical_compaction(ctx, history)
 
-    tools = Registry.responses_specs()
+    tools = provider_tool_specs(state.provider)
     system_prompt = system_prompt(ctx, state.mode, state.skills_opts, state.agent_instructions)
-    cache_metadata = cache_metadata(ctx, state, tools)
+    cache_metadata = cache_metadata(ctx, state, tools) |> provider_cache_metadata(state.provider)
 
-    request = %{
-      system_prompt: system_prompt,
-      developer_context:
-        developer_context(
-          ctx,
-          state.mode,
-          state.permission.mode,
-          state.presenter_context,
-          state.delegation_context
-        ),
-      workspace: ctx.workspace,
-      history: history,
-      tools: tools,
-      prompt_cache_key: cache_metadata["prompt_cache_key"]
-    }
+    request =
+      %{
+        system_prompt: system_prompt,
+        developer_context:
+          developer_context(
+            ctx,
+            state.mode,
+            state.permission.mode,
+            state.presenter_context,
+            state.delegation_context
+          ),
+        workspace: ctx.workspace,
+        history: history,
+        tools: tools,
+        prompt_cache_key: cache_metadata["prompt_cache_key"]
+      }
+      |> maybe_put_provider_request(:web_search, state.provider_opts[:web_search])
 
     {:ok, delta_acc} = Agent.start_link(fn -> [] end)
 
@@ -311,7 +337,14 @@ defmodule Pixir.Turn do
         {:ok, %{finish_reason: :tool_calls, function_calls: calls} = result} ->
           with :ok <-
                  record_provider_usage(sid, result, state, cache_metadata, iteration, history) do
-            continue_or_cap(ctx, iteration, state, calls, result[:reasoning_items] || [])
+            continue_or_cap(
+              ctx,
+              iteration,
+              state,
+              calls,
+              result[:reasoning_items] || [],
+              result[:output_items] || []
+            )
           end
 
         {:error, error} ->
@@ -832,18 +865,19 @@ defmodule Pixir.Turn do
   end
 
   defp record_provider_usage(sid, result, state, cache_metadata, iteration, history) do
-    summary = result[:usage_summary] || Pixir.Provider.usage_summary(result[:usage])
+    summary = provider_usage_summary(result, state.provider)
     {:ok, assessment} = ContextWindow.assess(summary, state.model)
 
     data =
       %{
         "model" => state.model,
+        "usage_summary_missing" => is_nil(summary),
         "mode" => Atom.to_string(state.mode),
         "iteration" => iteration,
         "call_index" => iteration,
         "usage_available" => not is_nil(result[:usage]),
         "usage" => stringify(result[:usage] || %{}),
-        "usage_summary" => summary |> stringify() |> Map.put_new("model", state.model)
+        "usage_summary" => (summary || %{}) |> stringify() |> Map.put_new("model", state.model)
       }
       |> Map.merge(cache_metadata)
       |> Map.merge(stringify(result[:provider_metadata] || %{}))
@@ -977,12 +1011,56 @@ defmodule Pixir.Turn do
     ]
   end
 
+  # Provider-aware neutral cache metadata at the Turn seam (ADR 0037 D7),
+  # routed by the registry's cache dialect (D1). Public-but-hidden so the seam
+  # contract stays pinned by tests independent of a full Turn.run assertion.
+  @doc false
+  def provider_cache_metadata(metadata, provider) when is_map(metadata) do
+    case ProviderRegistry.entry_for(provider).capabilities do
+      %{prompt_cache: :cache_control, prompt_contract_version: version} ->
+        metadata
+        |> Map.put("prompt_contract_version", version)
+        |> Map.delete("prompt_cache_key")
+
+      %{prompt_cache: :prompt_cache_key} ->
+        metadata
+    end
+  end
+
+  defp provider_usage_summary(result, Pixir.Provider) do
+    result[:usage_summary] || Pixir.Provider.usage_summary(result[:usage])
+  end
+
+  defp provider_usage_summary(result, _provider) do
+    case result[:usage_summary] do
+      %{} = summary -> summary
+      _ -> nil
+    end
+  end
+
   defp stringify(map) when is_map(map) do
     Map.new(map, fn {key, value} -> {to_string(key), stringify(value)} end)
   end
 
   defp stringify(list) when is_list(list), do: Enum.map(list, &stringify/1)
   defp stringify(value), do: value
+
+  defp continue_or_cap(ctx, iteration, state, calls, reasoning_items, output_items) do
+    cond do
+      capped?(iteration, state.cap) ->
+        continue_or_cap(ctx, iteration, state, calls, reasoning_items)
+
+      output_items == [] ->
+        continue_or_cap(ctx, iteration, state, calls, reasoning_items)
+
+      true ->
+        case walk_output_items(ctx, state, output_items) do
+          :ok -> loop(ctx, iteration + 1, state)
+          {:terminal_tool_error, result} -> finish_tool_error(ctx.session_id, result)
+          {:error, error} -> {:error, error}
+        end
+    end
+  end
 
   defp continue_or_cap(ctx, iteration, state, calls, reasoning_items) do
     sid = ctx.session_id
@@ -1000,7 +1078,7 @@ defmodule Pixir.Turn do
     else
       # Record reasoning items (ADR 0007) BEFORE the calls so monotonic `seq` keeps every
       # `rs_` ahead of its paired `fc_` (the Executor records each `tool_call` in turn).
-      with :ok <- record_reasoning(sid, reasoning_items, state.model) do
+      with :ok <- record_reasoning(sid, reasoning_items, state) do
         case run_calls(ctx, calls, state) do
           :ok -> loop(ctx, iteration + 1, state)
           {:error, error} -> finish_tool_error(sid, error)
@@ -1019,9 +1097,48 @@ defmodule Pixir.Turn do
   defp normalize_max_iterations(cap) when is_integer(cap) and cap > 0, do: cap
   defp normalize_max_iterations(_other), do: :infinity
 
-  defp record_reasoning(sid, items, model) do
+  defp walk_output_items(ctx, state, output_items) do
+    Enum.reduce_while(output_items, :ok, fn
+      {:reasoning, item}, :ok ->
+        case record_reasoning(ctx.session_id, [item], state) do
+          :ok -> {:cont, :ok}
+          {:error, error} -> {:halt, {:error, error}}
+        end
+
+      {:function_call, call}, :ok ->
+        case run_calls(ctx, [call], state) do
+          :ok -> {:cont, :ok}
+          {:error, error} -> {:halt, {:terminal_tool_error, error}}
+        end
+
+      {:provider_hosted_tool, _item}, :ok ->
+        {:cont, :ok}
+
+      {kind, _item}, :ok ->
+        # Unknown kinds are skipped fail-open for forward compatibility, but never
+        # silently: dropped evidence must be visible (ADR 0007).
+        Logger.warning("walk_output_items skipped an unrecognized item kind",
+          kind: inspect(kind),
+          session_id: ctx.session_id
+        )
+
+        {:cont, :ok}
+
+      item, :ok ->
+        Logger.warning("walk_output_items skipped a malformed output item",
+          item: inspect(item),
+          session_id: ctx.session_id
+        )
+
+        {:cont, :ok}
+    end)
+  end
+
+  defp record_reasoning(sid, items, state) do
+    opts = reasoning_event_opts(state)
+
     Enum.reduce_while(items, :ok, fn item, :ok ->
-      case safe_session_record(sid, Event.reasoning(sid, item, model), "reasoning") do
+      case safe_session_record(sid, Event.reasoning(sid, item, state.model, opts), "reasoning") do
         {:ok, _} -> {:cont, :ok}
         {:error, _} = error -> {:halt, error}
       end

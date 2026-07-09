@@ -224,6 +224,40 @@ defmodule Pixir.SessionResourcesTest do
     refute rendered =~ "fragment"
   end
 
+  test "local_attachment_link resolves paths, encodes reserved characters, and keeps names" do
+    assert {:ok, link} = SessionResources.local_attachment_link("report#final.pdf", "/ws")
+    assert link["uri"] == "file:///ws/report%23final.pdf"
+    assert link["name"] == "report#final.pdf"
+
+    assert {:ok, abs} = SessionResources.local_attachment_link("/abs/n o t e.txt", "/ws")
+    assert abs["uri"] == "file:///abs/n%20o%20t%20e.txt"
+  end
+
+  test "local_attachment_link rejects the URI edge cases honestly" do
+    assert {:error, :empty_path} = SessionResources.local_attachment_link("  ", "/ws")
+
+    assert {:error, :remote_uri} =
+             SessionResources.local_attachment_link("file://evil.host/x", "/ws")
+
+    # A raw # or ? in an unencoded file URI silently truncates the path at
+    # parse time, so it rejects instead of ingesting the wrong file.
+    assert {:error, :uri_query_or_fragment} =
+             SessionResources.local_attachment_link("file:///ws/report#final.pdf", "/ws")
+
+    assert {:error, :uri_query_or_fragment} =
+             SessionResources.local_attachment_link("file:///ws/report?v=2", "/ws")
+
+    # file: without // must not expand as a relative path.
+    assert {:error, :invalid_path} =
+             SessionResources.local_attachment_link("file:/tmp/notes.txt", "/ws")
+  end
+
+  test "local_attachment_link treats an uppercase scheme as a URI, normalized" do
+    assert {:ok, link} = SessionResources.local_attachment_link("FILE:///tmp/notes.txt", "/ws")
+    assert link["uri"] == "file:///tmp/notes.txt"
+    assert link["name"] == "notes.txt"
+  end
+
   defp tmp_source_dir(label) do
     path =
       Path.join(

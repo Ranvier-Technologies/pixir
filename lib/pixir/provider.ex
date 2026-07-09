@@ -316,10 +316,12 @@ defmodule Pixir.Provider do
         "stream" => true,
         "instructions" => request[:system_prompt] || "You are a helpful coding assistant.",
         "input" =>
-          developer_context_items(request[:developer_context]) ++
-            fold_input(request[:history] || [], model,
-              workspace: request[:workspace] || File.cwd!()
-            ),
+          openai_input_items(
+            developer_context_items(request[:developer_context]) ++
+              fold_input(request[:history] || [], model,
+                workspace: request[:workspace] || File.cwd!()
+              )
+          ),
         "include" => Enum.uniq(include),
         "tool_choice" => "auto",
         "parallel_tool_calls" => true
@@ -351,6 +353,16 @@ defmodule Pixir.Provider do
   end
 
   defp developer_context_items(_), do: []
+
+  # Defense in depth behind the `to_input_item/3` dialect guard: the request
+  # boundary stays deterministic even if a future fold path surfaces a raw
+  # Anthropic thinking block through another route.
+  defp openai_input_items(items) when is_list(items) do
+    Enum.reject(items, fn
+      %{"type" => type} when type in ["thinking", "redacted_thinking"] -> true
+      _item -> false
+    end)
+  end
 
   # Set the Responses-API reasoning effort when the client picked one; otherwise
   # omit it and let the model use its own default.
@@ -594,12 +606,19 @@ defmodule Pixir.Provider do
   # produced by the current model — an encrypted item is invalid for a different model,
   # and dropping it is always safe. Pixir sends no `fc_` ids, so no pairing to neutralize.
   defp to_input_item(
-         %{type: :reasoning, data: %{"item" => item, "model" => item_model}},
+         %{type: :reasoning, data: %{"item" => item, "model" => item_model} = data},
          model,
          _opts
        )
-       when item_model == model,
-       do: [item]
+       when item_model == model do
+    # Dialect guard (ADR 0037 D5): reasoning captured under a foreign provider
+    # dialect never enters a Responses input array, even on a model-name match.
+    # Absent dialect = pre-P5 OpenAI event, replays unchanged.
+    case Map.get(data, "dialect", "openai") do
+      "openai" -> [item]
+      _foreign_dialect -> []
+    end
+  end
 
   defp to_input_item(%{type: :reasoning}, _model, _opts), do: []
 
@@ -1235,7 +1254,8 @@ defmodule Pixir.Provider do
       output_tokens: output_tokens || 0,
       reasoning_tokens: reasoning_tokens || 0,
       total_tokens: total_tokens,
-      cache_hit_rate: cache_hit_rate(cached_tokens, input_tokens)
+      cache_hit_rate: cache_hit_rate(cached_tokens, input_tokens),
+      cache: %{"creation_tokens" => 0, "read_tokens" => cached_tokens || 0}
     }
   end
 

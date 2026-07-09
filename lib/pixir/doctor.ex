@@ -7,7 +7,7 @@ defmodule Pixir.Doctor do
   and ACP availability. Provider connectivity remains an explicit smoke/probe step.
   """
 
-  alias Pixir.{Auth, Config, Paths, Provider}
+  alias Pixir.{Auth, Config, Paths}
 
   @type check :: %{required(String.t()) => term()}
 
@@ -16,7 +16,10 @@ defmodule Pixir.Doctor do
   def run(opts \\ []) do
     workspace = Keyword.get(opts, :workspace, File.cwd!())
     config = config_snapshot(opts)
-    checks = checks(workspace, opts, config)
+    model_before_default = Keyword.get(opts, :model) || get_in(config, ["effective", "model"])
+    entry = registry_entry(model_before_default)
+    model = model_before_default || entry.default_model
+    checks = checks(workspace, opts, config, entry, model)
     failed = Enum.filter(checks, &(&1["status"] == "failed"))
 
     %{
@@ -59,13 +62,13 @@ defmodule Pixir.Doctor do
     """
   end
 
-  defp checks(workspace, opts, config) do
+  defp checks(workspace, opts, config, entry, model) do
     [
       runtime_check(),
       source_binary_check(workspace, opts),
       workspace_check(workspace),
-      auth_check(opts),
-      config_check(opts, config),
+      auth_check(opts, entry, model),
+      config_check(opts, config, entry, model),
       acp_check()
     ]
   end
@@ -174,36 +177,66 @@ defmodule Pixir.Doctor do
     end
   end
 
-  defp auth_check(opts) do
-    status = Keyword.get_lazy(opts, :auth_status, fn -> Auth.status() end)
+  defp auth_check(opts, entry, model) do
+    case entry.auth do
+      %{scheme: :api_key_header, login_supported: false} ->
+        api_key_auth_check(opts, entry, model)
 
-    cond do
-      not Map.get(status, :authenticated?, false) ->
-        warning("auth", "No local credential is currently available.", %{
-          "kind" => nil,
-          "next_actions" => ["run ./pixir login or set OPENAI_API_KEY"]
-        })
+      _ ->
+        status = Keyword.get_lazy(opts, :auth_status, fn -> Auth.status() end)
 
-      Map.get(status, :expired?, false) ->
-        warning("auth", "Stored subscription credential appears expired.", %{
-          "kind" => auth_kind(status),
-          "next_actions" => ["run ./pixir login if the next provider call cannot refresh"]
-        })
+        cond do
+          not Map.get(status, :authenticated?, false) ->
+            warning("auth", "No local credential is currently available.", %{
+              "kind" => nil,
+              "next_actions" => ["run ./pixir login or set OPENAI_API_KEY"]
+            })
 
-      true ->
-        passed("auth", "A local credential is available.", %{"kind" => auth_kind(status)})
+          Map.get(status, :expired?, false) ->
+            warning("auth", "Stored subscription credential appears expired.", %{
+              "kind" => auth_kind(status),
+              "next_actions" => ["run ./pixir login if the next provider call cannot refresh"]
+            })
+
+          true ->
+            passed("auth", "A local credential is available.", %{"kind" => auth_kind(status)})
+        end
     end
   end
 
-  defp config_check(opts, config) do
+  defp api_key_auth_check(opts, entry, model) do
+    env = Keyword.get(opts, :env, &System.get_env/1)
+    env_var = entry.auth.env_var
+    value = env.(env_var)
+
+    details =
+      %{
+        "kind" => "api_key",
+        "provider" => provider_label(entry.provider),
+        "env_var" => env_var
+      }
+      |> put_retention_notes(model)
+
+    if is_binary(value) and value != "" do
+      passed("auth", "A local credential is available.", details)
+    else
+      warning(
+        "auth",
+        "No local credential is currently available.",
+        Map.put(details, "next_actions", ["set #{env_var}"])
+      )
+    end
+  end
+
+  defp config_check(opts, config, entry, model) do
     config_path = Keyword.get(opts, :config_path, Paths.config_file())
-    model = Keyword.get_lazy(opts, :model, &Provider.default_model/0)
     effective = config["effective"]
     warnings = config["warnings"] || []
 
     base_details = %{
       "path" => config["path"] || Path.expand(config_path),
-      "model" => effective["model"] || model,
+      "model" => model,
+      "provider" => provider_label(entry.provider),
       "effective" => effective,
       "warnings" => warnings
     }
@@ -261,6 +294,25 @@ defmodule Pixir.Doctor do
     |> Enum.flat_map(fn check -> get_in(check, ["details", "next_actions"]) || [] end)
     |> Enum.uniq()
   end
+
+  # Covered Models per current Anthropic docs: only these carry the 30-day
+  # retention requirement, so the note must not ride other claude-* models.
+  @retention_covered_models ["claude-fable-5", "claude-mythos-5"]
+
+  defp put_retention_notes(details, model) when model in @retention_covered_models do
+    Map.put(details, "notes", [
+      "#{model} requires 30-day organization data retention; a 400 on every " <>
+        "valid-looking request usually points at org/workspace data-retention " <>
+        "configuration, not the payload."
+    ])
+  end
+
+  defp put_retention_notes(details, _model), do: details
+
+  defp provider_label(Pixir.Providers.Anthropic), do: "anthropic"
+  defp provider_label(_provider), do: "openai"
+
+  defp registry_entry(model), do: Pixir.Providers.Registry.resolve(model)
 
   defp auth_kind(status) do
     status

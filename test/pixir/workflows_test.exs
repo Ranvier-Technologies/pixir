@@ -14,6 +14,12 @@ defmodule Pixir.WorkflowsTest do
       if pid = Keyword.get(opts, :test_pid) do
         send(pid, {:workflow_prompt, prompt})
         send(pid, {:workflow_request, request})
+
+        send(
+          pid,
+          {:workflow_knobs, request[:model] || Keyword.get(opts, :model),
+           request[:reasoning_effort] || Keyword.get(opts, :reasoning_effort)}
+        )
       end
 
       step =
@@ -301,6 +307,230 @@ defmodule Pixir.WorkflowsTest do
              )
   end
 
+  test "dry_run exposes workflow step runtime knobs without attachment paths", %{ws: ws} do
+    assert {:ok, plan} =
+             Workflows.dry_run(
+               %{
+                 "steps" => [
+                   %{
+                     "id" => "knobbed",
+                     "task" => "inspect knobs",
+                     "agent" => "explorer",
+                     "model" => "gpt-4.1-mini",
+                     "reasoning_effort" => "high",
+                     "attachments" => ["source.txt", "notes/context.md"]
+                   }
+                 ]
+               },
+               workspace: ws
+             )
+
+    assert [step] = plan["would_run"]
+    assert step["model"] == "gpt-4.1-mini"
+    assert step["reasoning_effort"] == "high"
+    assert step["attachment_count"] == 2
+    refute Map.has_key?(step, "attachments")
+    refute inspect(step) =~ "source.txt"
+    refute inspect(step) =~ "notes/context.md"
+  end
+
+  test "dry_run omits runtime knob keys for ordinary steps", %{ws: ws} do
+    assert {:ok, plan} =
+             Workflows.dry_run(
+               %{
+                 "steps" => [
+                   %{"id" => "plain", "task" => "plain task", "agent" => "explorer"}
+                 ]
+               },
+               workspace: ws
+             )
+
+    assert [step] = plan["would_run"]
+    refute Map.has_key?(step, "model")
+    refute Map.has_key?(step, "reasoning_effort")
+    refute Map.has_key?(step, "attachment_count")
+    refute Map.has_key?(step, "attachments")
+  end
+
+  test "dry_run rejects invalid reasoning_effort with step id and vocabulary", %{ws: ws} do
+    assert {:error, %{error: %{kind: :invalid_args, details: details}}} =
+             Workflows.dry_run(
+               %{
+                 "steps" => [
+                   %{
+                     "id" => "bad_effort",
+                     "task" => "bad effort",
+                     "reasoning_effort" => "ultra"
+                   }
+                 ]
+               },
+               workspace: ws
+             )
+
+    assert details["id"] == "bad_effort"
+    assert details["field"] == "reasoning_effort"
+    assert details["allowed"] == ~w(low medium high xhigh)
+  end
+
+  test "dry_run rejects invalid workflow step attachments", %{ws: ws} do
+    for attachments <- ["source.txt", [""]] do
+      assert {:error, %{error: %{kind: :invalid_args, details: details}}} =
+               Workflows.dry_run(
+                 %{
+                   "steps" => [
+                     %{
+                       "id" => "bad_attachments",
+                       "task" => "bad attachments",
+                       "attachments" => attachments
+                     }
+                   ]
+                 },
+                 workspace: ws
+               )
+
+      assert details["id"] == "bad_attachments"
+      assert details["field"] == "attachments"
+    end
+  end
+
+  test "run threads workflow step model, reasoning_effort, and attachments through child opts",
+       %{
+         sid: sid,
+         ws: ws
+       } do
+    File.write!(Path.join(ws, "source.txt"), "attachment sentinel")
+
+    assert {:ok, result} =
+             Workflows.run(
+               sid,
+               %{
+                 "steps" => [
+                   %{
+                     "id" => "knobbed",
+                     "task" => "inspect knobs",
+                     "agent" => "explorer",
+                     "model" => "gpt-4.1-mini",
+                     "reasoning_effort" => "high",
+                     "attachments" => ["source.txt"]
+                   }
+                 ]
+               },
+               workspace: ws,
+               provider: EchoProvider,
+               provider_opts: [test_pid: self()],
+               poll_ms: 10,
+               timeout_ms: 5_000
+             )
+
+    assert result["status"] == "completed"
+    assert [request] = collect_requests(1)
+    assert_received {:workflow_knobs, "gpt-4.1-mini", "high"}
+    refute request.developer_context =~ ~s("model")
+    refute request.developer_context =~ ~s("reasoning_effort")
+    refute request.developer_context =~ ~s("attachments")
+
+    # The attachment must reach the child as a durable Session Resource: the
+    # child Log's user_message carries the ingested descriptor, proving the
+    # opts channel threaded end to end (not just that validation passed).
+    assert [%{"child_session_id" => child_sid}] = result["steps"]
+    assert is_binary(child_sid)
+    assert {:ok, child_history} = Log.fold(child_sid, workspace: ws)
+    user_message = Enum.find(child_history, &(&1.type == :user_message))
+    assert [resource] = user_message.data["resources"]
+    assert resource["name"] == "source.txt"
+  end
+
+  test "step knobs ride subagent opts and never spawn args", %{sid: sid, ws: ws} do
+    File.write!(Path.join(ws, "source.txt"), "sentinel")
+    test_pid = self()
+
+    spawn_agent = fn parent_sid, args, opts ->
+      send(test_pid, {:spawn_seam, args, opts})
+      Pixir.Subagents.spawn_agent(parent_sid, args, opts)
+    end
+
+    assert {:ok, %{"status" => "completed"}} =
+             Workflows.run(
+               sid,
+               %{
+                 "steps" => [
+                   %{
+                     "id" => "knobbed",
+                     "task" => "inspect",
+                     "agent" => "explorer",
+                     "model" => "gpt-4.1-mini",
+                     "reasoning_effort" => "high",
+                     "attachments" => ["source.txt"]
+                   }
+                 ]
+               },
+               workspace: ws,
+               provider: EchoProvider,
+               provider_opts: [test_pid: self()],
+               spawn_agent: spawn_agent,
+               poll_ms: 10,
+               timeout_ms: 5_000
+             )
+
+    assert_received {:spawn_seam, args, opts}
+    refute Map.has_key?(args, "model")
+    refute Map.has_key?(args, "reasoning_effort")
+    refute Map.has_key?(args, "attachments")
+    assert Keyword.get(opts, :model) == "gpt-4.1-mini"
+    assert Keyword.get(opts, :reasoning_effort) == "high"
+    assert [%{"type" => "resource_link"}] = Keyword.get(opts, :attachments)
+    refute Keyword.has_key?(opts, :spawn_agent)
+  end
+
+  test "inherited caller opts never reach knobless steps", %{sid: sid, ws: ws} do
+    test_pid = self()
+
+    spawn_agent = fn parent_sid, args, opts ->
+      send(test_pid, {:spawn_seam, args, opts})
+      Pixir.Subagents.spawn_agent(parent_sid, args, opts)
+    end
+
+    assert {:ok, %{"status" => "completed"}} =
+             Workflows.run(
+               sid,
+               %{"steps" => [%{"id" => "plain", "task" => "t", "agent" => "explorer"}]},
+               workspace: ws,
+               provider: EchoProvider,
+               provider_opts: [test_pid: self()],
+               spawn_agent: spawn_agent,
+               model: "from-parent",
+               reasoning_effort: "xhigh",
+               poll_ms: 10,
+               timeout_ms: 5_000
+             )
+
+    assert_received {:spawn_seam, _args, opts}
+    refute Keyword.has_key?(opts, :model)
+    refute Keyword.has_key?(opts, :reasoning_effort)
+    refute Keyword.has_key?(opts, :attachments)
+  end
+
+  test "virtual_overlay steps reject the knobs the run would ignore", %{ws: _ws} do
+    spec = %{
+      "steps" => [
+        %{
+          "id" => "scratch",
+          "task" => "t",
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["a"],
+          "virtual_commands" => ["true"],
+          "model" => "gpt-x"
+        }
+      ]
+    }
+
+    assert {:error, %{error: %{kind: :invalid_args, message: message, details: details}}} =
+             Workflows.dry_run(spec)
+
+    assert message =~ "virtual_overlay workflow steps do not take"
+    assert details["id"] == "scratch"
+  end
+
   test "run schedules subagents and feeds dependency summaries", %{sid: sid, ws: ws} do
     spec = dependency_workflow()
 
@@ -350,6 +580,9 @@ defmodule Pixir.WorkflowsTest do
 
     assert Enum.count(history, &(&1.type == :subagent_event and &1.data["event"] == "finished")) ==
              3
+
+    refute Enum.any?(history, &(&1.type == :subagent_event and Map.has_key?(&1.data, "index")))
+    refute Enum.any?(result["steps"], &Map.has_key?(&1, "index"))
 
     workflow_events = workflow_events(history)
     kinds = Enum.map(workflow_events, & &1.data["kind"])

@@ -9,6 +9,103 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [Unreleased]
 
+## [0.1.8]
+
+### Added
+- **Anthropic (Claude) as a second provider**, built evidence-first behind the
+  existing provider seam (epic #243, design in ADR 0037):
+  - Messages API transport core with streaming SSE and a fail-closed error
+    taxonomy (#249).
+  - `pa1` prompt contract: a frozen, cache-maximal prefix with a deliberate
+    `cache_control` breakpoint planner (#254). The planner is unit-tested but
+    not yet wired into the live request path — the integration is tracked in
+    #272, found by this release's audit.
+  - Provider-owned usage as durable evidence: an explicit cache map
+    (`usage_summary.cache` with `creation_tokens` / `read_tokens`) on
+    `provider_usage` events, `pa1` family identity stamped alongside, costs
+    reconciled from Logs rather than estimates (#258).
+  - Thinking replay: reasoning events are dialect-labeled at record time and
+    re-injected verbatim next to their `tool_use` blocks on the next turn,
+    guarded by model identity so a dialect never replays into the wrong
+    provider (#262).
+  - Tool-use mapping: Pixir tools project to Anthropic `tools` specs and the
+    session history folds to Messages with correctly grouped `tool_result`
+    blocks (#261).
+  - Provider registry: `claude-*` model ids route to the Anthropic provider,
+    auth checks are provider-scoped, and `pixir doctor` reports honestly per
+    provider — `ANTHROPIC_API_KEY` guidance and data-retention notes only where
+    they apply (#265).
+- Threaded the opt-in hosted `web_search` knob through effective config, CLI parsing,
+  Turn request assembly, delegate validation, spawn-agent stripping, and Anthropic
+  fail-closed rejection so Provider-hosted search remains default-off and explicit
+  (#255).
+- Delegate/CLI attachments channel (#250, ADR 0021): a `tasks[]` entry may be an
+  object `{"task": ..., "attachments": [...]}` and one-shot/resume take a
+  repeatable `--attach <path>`; each local path becomes a durable Session
+  Resource in the child, dry-run plans confess a per-child `attachment_count`,
+  unknown task-object keys reject fail-closed, and the model-facing
+  `spawn_agent` tool strips caller-authored attachments (operator knob, not a
+  model capability).
+- Workflow steps accept per-step `model`, `reasoning_effort`, and `attachments`
+  (#270): validated at plan time, threaded through the runtime-owned opts
+  channel only, and reported honestly in plans (`attachment_count`, omission
+  over null); `virtual_overlay` steps reject the knobs, and the model-facing
+  `run_workflow` tool strips them from step objects so a workflow-spawning
+  model cannot smuggle provider knobs to children.
+
+### Fixed
+- Provider `output_items` order is preserved through Turn recording (ADR 0007):
+  interleaved reasoning/message/tool items no longer regroup by type (#246).
+- Workflow dry-run now validates the DAG through the runner's own path (#263):
+  cycles, unknown dependencies, and duplicate step ids are rejected identically
+  in attached, async, and dry-run modes — rehearsal parity by construction, not
+  by a second copy of the rules.
+- Subagent identity is runtime-owned (#234): child ids are always generated and
+  task-position `index` arrives via the runtime opts channel, so caller-authored
+  `id`/`index` args are ignored and can no longer influence workspace paths or
+  forge position evidence in durable logs.
+- Attachment URI handling is centralized and hardened (ADR 0021): case-variant
+  `FILE://` schemes normalize, `file:` without `//` and URIs carrying query or
+  fragment parts are rejected with specific reasons, and paths percent-encode
+  correctly on the way in.
+
+## [0.1.7]
+
+### Added
+- Delegate subagent children now carry durable `children[].index` task-position
+  evidence across attached envelopes, async snapshots, tree projection, and retry
+  lineage (#227). The delegate envelope `schema_version` is now `2` to signal the
+  additive `children[].index` / `children_order` keys; the
+  `pixir.delegate.envelope.v1` family name is unchanged (reserved for breaking
+  shape changes).
+- Delegate specs are validated fail-closed (#223): unknown top-level or
+  `subagents` keys are rejected as structured `invalid_spec` with `field`,
+  `json_pointer`, `path`, and `next_actions`, in dry-run and real runs alike,
+  so a typo can no longer pass the rehearsal silently.
+- New delegate spec provider knobs mirroring ACP `session/prompt` `_meta`
+  (#223): `subagents.model` and `subagents.reasoning_effort`
+  (`low|medium|high|xhigh`) thread to every child's provider calls with
+  spec > config > default resolution; effective values are evidenced by child
+  `provider_usage` events, not echoed in the envelope. The model-facing
+  `spawn_agent` tool strips caller-authored `model`/`reasoning_effort` args:
+  provider knobs are operator decisions, not a capability a spawning model
+  grants its children.
+
+### Fixed
+- Delegate `--dry-run` now mirrors the runner's task normalization exactly:
+  malformed or blank `tasks[]` entries are rejected as `invalid_spec` instead of
+  silently planned, and a list-valued `tasks` field owns validation (even when
+  empty) before any legacy `task` fallback, matching real-run branch precedence.
+- The model-facing `spawn_agent` tool strips caller-authored `index` args so
+  task-position evidence in durable `subagent_event` data cannot be forged.
+- Workspace confinement no longer misreads leading POSIX environment
+  assignments as path arguments (#188): `TMPDIR=/tmp mix test` and
+  `PREFIX=/usr/local ./configure` pass, while literal outside paths,
+  redirection targets, and non-leading `NAME=VALUE` arguments keep failing
+  closed; the window resets after `;`, `&&`, `||`, and `|`. The residual
+  runtime-expansion vector (`VAR=/outside cmd $VAR`) is documented in
+  SECURITY.md: confinement is a defense-in-depth tripwire, not a sandbox.
+
 ## [0.1.6]
 
 ### Added

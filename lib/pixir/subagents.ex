@@ -155,6 +155,7 @@ defmodule Pixir.Subagents do
       "max_depth",
       "workspace",
       "workspace_mode",
+      "index",
       "parent_log_path",
       "child_log_path",
       "summary",

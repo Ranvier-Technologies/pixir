@@ -20,9 +20,23 @@ defmodule Pixir.TurnTest do
       end
 
       case result do
-        {:delta_then_error, _text, error} -> error
-        other -> other
+        {:delta_then_error, _text, error} ->
+          error
+
+        {:ok, map} when is_map(map) ->
+          # Real providers own their usage_summary (ADR 0037 D7); the stub models that.
+          {:ok, Map.put_new(map, :usage_summary, Pixir.Provider.usage_summary(map[:usage]))}
+
+        other ->
+          other
       end
+    end
+  end
+
+  defmodule RequestCaptureProvider do
+    def stream(request, opts) do
+      send(Keyword.fetch!(opts, :test_pid), {:provider_request, request})
+      {:ok, %{text: "ok", reasoning: "", function_calls: [], finish_reason: :stop}}
     end
   end
 
@@ -89,6 +103,18 @@ defmodule Pixir.TurnTest do
          finish_reason: :tool_calls
        }}
 
+  defp tool_calls_with_output_items(calls, reasoning_items, output_items),
+    do:
+      {:ok,
+       %{
+         text: "",
+         reasoning: "",
+         reasoning_items: reasoning_items,
+         function_calls: calls,
+         output_items: output_items,
+         finish_reason: :tool_calls
+       }}
+
   setup do
     ws =
       Path.join(
@@ -105,6 +131,38 @@ defmodule Pixir.TurnTest do
     end)
 
     %{ws: ws, sid: sid, pid: pid, ctx: %{session_id: sid, workspace: ws, role: :build}}
+  end
+
+  test "threads web_search provider opt into provider request", %{ctx: ctx} do
+    assert {:ok, "ok"} =
+             Turn.run(ctx, "search",
+               provider: RequestCaptureProvider,
+               provider_opts: [test_pid: self(), web_search: %{"enabled" => true}]
+             )
+
+    assert_received {:provider_request, %{web_search: %{"enabled" => true}}}
+  end
+
+  test "omits web_search provider request field when absent", %{ctx: ctx} do
+    assert {:ok, "ok"} =
+             Turn.run(ctx, "no search",
+               provider: RequestCaptureProvider,
+               provider_opts: [test_pid: self()]
+             )
+
+    assert_received {:provider_request, request}
+    refute Map.has_key?(request, :web_search)
+  end
+
+  test "explicit provider seam wins even for a claude model id", %{ctx: ctx} do
+    assert {:ok, "ok"} =
+             Turn.run(ctx, "stub wins",
+               provider: RequestCaptureProvider,
+               provider_opts: [test_pid: self(), model: "claude-fable-5"]
+             )
+
+    assert_received {:provider_request, request}
+    assert request.tools == Pixir.Tools.Registry.responses_specs()
   end
 
   defp run_with(ctx, prompt, script, opts \\ []) do
@@ -144,6 +202,55 @@ defmodule Pixir.TurnTest do
     assert usage.data["usage_summary"]["cached_tokens"] == 0
     refute usage.data["prompt_cache_key"] =~ ws
     refute usage.data["prompt_cache_key"] =~ "hello"
+  end
+
+  test "cache metadata seam relabels Anthropic runs pa1 and drops prompt_cache_key" do
+    metadata = %{
+      "prompt_cache_key" => "px3:m_x:r_build:s_fam:t_tools:k_skills",
+      "prompt_contract_version" => "px3",
+      "toolset_hash" => "t",
+      "skill_index_hash" => "k",
+      "session_family_hash" => "s"
+    }
+
+    anthropic = Turn.provider_cache_metadata(metadata, Pixir.Providers.Anthropic)
+    assert anthropic["prompt_contract_version"] == "pa1"
+    refute Map.has_key?(anthropic, "prompt_cache_key")
+    assert anthropic["toolset_hash"] == "t"
+    assert anthropic["session_family_hash"] == "s"
+
+    # Any other provider (OpenAI included) passes through byte-identical.
+    assert Turn.provider_cache_metadata(metadata, Pixir.Provider) == metadata
+    assert Turn.provider_cache_metadata(metadata, StubProvider) == metadata
+  end
+
+  test "foreign provider without usage_summary records the violation, never OpenAI-normalizes", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    defmodule NakedProvider do
+      # Deliberately returns raw usage but NO usage_summary: under ADR 0037 D7
+      # Turn must record the violation instead of normalizing with OpenAI rules.
+      def stream(_request, _opts) do
+        {:ok,
+         %{
+           text: "ok",
+           reasoning: "",
+           function_calls: [],
+           finish_reason: :stop,
+           usage: %{"input_tokens" => 42, "input_tokens_details" => %{"cached_tokens" => 16}}
+         }}
+      end
+    end
+
+    assert {:ok, "ok"} = Turn.run(ctx, "hello", provider: NakedProvider, provider_opts: [])
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+    usage = Enum.find(history, &(&1.type == :provider_usage))
+    assert usage.data["usage_summary_missing"] == true
+    assert usage.data["usage_available"] == true
+    refute Map.has_key?(usage.data["usage_summary"], "cached_tokens")
   end
 
   test "provider_usage records transport metadata from the provider result", %{
@@ -456,6 +563,192 @@ defmodule Pixir.TurnTest do
     reasoning = Enum.find(history, &(&1.type == :reasoning))
     assert reasoning.data["item"] == item
     assert reasoning.data["model"] == "gpt-test"
+    # Non-Anthropic providers stamp no dialect (ADR 0037 D5: absent = OpenAI).
+    refute Map.has_key?(reasoning.data, "dialect")
+  end
+
+  test "preserves provider output_items order for interleaved reasoning and tool calls", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    File.write!(Path.join(ws, "a.txt"), "hi")
+
+    rs1 = %{"type" => "reasoning", "id" => "rs_1", "encrypted_content" => "ENC1"}
+    rs2 = %{"type" => "reasoning", "id" => "rs_2", "encrypted_content" => "ENC2"}
+    fc1 = %{call_id: "c1", name: "read", args: %{"path" => "a.txt"}}
+    fc2 = %{call_id: "c2", name: "read", args: %{"path" => "a.txt"}}
+
+    script = [
+      tool_calls_with_output_items(
+        [fc1, fc2],
+        [rs1, rs2],
+        [{:reasoning, rs1}, {:function_call, fc1}, {:reasoning, rs2}, {:function_call, fc2}]
+      ),
+      stop("done")
+    ]
+
+    assert {:ok, "done"} =
+             run_with(ctx, "read twice", script, provider_opts: [model: "gpt-test"])
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    assert Enum.map(history, & &1.type) == [
+             :user_message,
+             :provider_usage,
+             :reasoning,
+             :tool_call,
+             :tool_result,
+             :reasoning,
+             :tool_call,
+             :tool_result,
+             :provider_usage,
+             :assistant_message
+           ]
+
+    events = Enum.filter(history, &(&1.type in [:reasoning, :tool_call, :tool_result]))
+    assert Enum.at(events, 0).data["item"] == rs1
+    assert Enum.at(events, 1).data["call_id"] == "c1"
+    assert Enum.at(events, 2).data["call_id"] == "c1"
+    assert Enum.at(events, 3).data["item"] == rs2
+    assert Enum.at(events, 4).data["call_id"] == "c2"
+    assert Enum.at(events, 5).data["call_id"] == "c2"
+  end
+
+  test "falls back to flat reasoning before calls when output_items are absent", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    File.write!(Path.join(ws, "a.txt"), "hi")
+
+    rs1 = %{"type" => "reasoning", "id" => "rs_1", "encrypted_content" => "ENC1"}
+    rs2 = %{"type" => "reasoning", "id" => "rs_2", "encrypted_content" => "ENC2"}
+    call = %{call_id: "c1", name: "read", args: %{"path" => "a.txt"}}
+
+    script = [tool_calls_with_reasoning([call], [rs1, rs2]), stop("done")]
+
+    assert {:ok, "done"} =
+             run_with(ctx, "read once", script, provider_opts: [model: "gpt-test"])
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    assert Enum.map(history, & &1.type) == [
+             :user_message,
+             :provider_usage,
+             :reasoning,
+             :reasoning,
+             :tool_call,
+             :tool_result,
+             :provider_usage,
+             :assistant_message
+           ]
+
+    events = Enum.filter(history, &(&1.type in [:reasoning, :tool_call]))
+    assert Enum.at(events, 0).data["item"] == rs1
+    assert Enum.at(events, 1).data["item"] == rs2
+    assert Enum.at(events, 2).data["call_id"] == "c1"
+  end
+
+  test "skips provider_hosted_tool output_items while walking local calls", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    File.write!(Path.join(ws, "a.txt"), "hi")
+    call = %{call_id: "c1", name: "read", args: %{"path" => "a.txt"}}
+
+    script = [
+      tool_calls_with_output_items(
+        [call],
+        [],
+        [
+          {:provider_hosted_tool, %{"type" => "web_search_call", "id" => "ws_1"}},
+          {:function_call, call}
+        ]
+      ),
+      stop("done")
+    ]
+
+    assert {:ok, "done"} = run_with(ctx, "read once", script)
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+    assert Enum.count(history, &(&1.type == :reasoning)) == 0
+    assert Enum.count(history, &(&1.type == :tool_call)) == 1
+    assert Enum.count(history, &(&1.type == :tool_result)) == 1
+  end
+
+  test "terminal tool error stops ordered output_items before later reasoning is recorded", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    {:ok, policy} =
+      WritePolicy.normalize(%{
+        "version" => 1,
+        "metadata" => %{"id" => "turn-test"},
+        "allow_writes" => ["allowed/**"]
+      })
+
+    after_error = %{"type" => "reasoning", "id" => "rs_after", "encrypted_content" => "ENC"}
+
+    failing_call = %{
+      call_id: "c1",
+      name: "write",
+      args: %{"path" => "blocked.txt", "content" => "no"}
+    }
+
+    later_call = %{call_id: "c2", name: "read", args: %{"path" => "a.txt"}}
+
+    script = [
+      tool_calls_with_output_items(
+        [failing_call, later_call],
+        [after_error],
+        [{:function_call, failing_call}, {:reasoning, after_error}, {:function_call, later_call}]
+      ),
+      stop("should not be called")
+    ]
+
+    assert {:error, %{error: %{kind: :write_policy_denied}}} =
+             run_with(ctx, "write outside policy", script, write_policy: policy)
+
+    refute File.exists?(Path.join(ws, "blocked.txt"))
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    refute Enum.any?(history, &(&1.type == :reasoning and &1.data["item"] == after_error))
+
+    assert Enum.map(Enum.filter(history, &(&1.type == :tool_call)), & &1.data["call_id"]) == [
+             "c1"
+           ]
+
+    assert List.last(history).type == :turn_failed
+  end
+
+  test "capped turn with output_items persists no reasoning from the capped iteration", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    File.write!(Path.join(ws, "a.txt"), "hi")
+
+    kept = %{"type" => "reasoning", "id" => "rs_kept", "encrypted_content" => "ENC1"}
+    capped = %{"type" => "reasoning", "id" => "rs_capped", "encrypted_content" => "ENC2"}
+    call = %{call_id: "c1", name: "read", args: %{"path" => "a.txt"}}
+
+    script = [
+      tool_calls_with_output_items([call], [kept], [{:reasoning, kept}, {:function_call, call}]),
+      tool_calls_with_output_items([call], [capped], [
+        {:reasoning, capped},
+        {:function_call, call}
+      ])
+    ]
+
+    assert {:error, %{error: %{kind: :iteration_cap}}} =
+             run_with(ctx, "loop", script, provider_opts: [model: "gpt-test"], max_iterations: 2)
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+    assert Enum.any?(history, &(&1.type == :reasoning and &1.data["item"] == kept))
+    refute Enum.any?(history, &(&1.type == :reasoning and &1.data["item"] == capped))
   end
 
   test "does not persist reasoning items on an iteration-capped turn (ADR 0007)", %{

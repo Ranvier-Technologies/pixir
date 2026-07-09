@@ -45,6 +45,10 @@ proof that useful partial work exists. Before acting, inspect:
 
 - `children[*].status`, `children[*].checkpoint_status`, and child
   `child_session_id`;
+- for subagents spawned from delegate `tasks[]`, `children[*].index` is the
+  zero-based task-array position. Treat the `children` array order as
+  unspecified; join results to requested tasks by `children[*].index`, not by
+  display position;
 - workflow buckets such as `held_steps`, `failed_steps`, `partial_steps`,
   `needs_orchestrator_steps`, and `safe_next_actions`;
 - bounded-write `write_destination`;
@@ -179,6 +183,19 @@ Optional transport preference: `subagents.transport` (or top-level
 the dry-run with a structured error, and the effective value is surfaced as
 `limits.transport` in plan and envelope.
 
+Optional provider knobs, mirroring ACP `session/prompt` `_meta`:
+`subagents.model` (a model id string) and `subagents.reasoning_effort`
+(`low`, `medium`, `high`, or `xhigh`) apply to every child of the
+delegation; a spec knob wins over config defaults. Effective use is
+evidenced by each child's `provider_usage` events, not echoed in the
+delegate envelope.
+
+Delegate specs are validated fail-closed: an unknown top-level or
+`subagents` key is rejected as `invalid_spec` with `field`, `json_pointer`,
+`path`, and `next_actions` (the dry-run reports it exactly like the real
+run). Workflow step internals remain governed by the workflow strategy
+validator.
+
 Useful fields for callers:
 
 - `ok`
@@ -186,6 +203,9 @@ Useful fields for callers:
 - `delegate_id`
 - `parent_session_id`
 - `children[].status`
+- `children[].index` - for subagents spawned from `tasks[]`, the durable
+  zero-based source task position; `children` array order is unspecified, so
+  callers must not rely on it for task/result matching
 - `children[].child_session_id`
 - `children[].retry_attempts` / `children[].retry_max_attempts` /
   `children[].current_attempt_index` / `children[].retry_history` - present
@@ -225,7 +245,9 @@ delegate_id="$(printf '%s\n' "$delegate_json" | jq -r '.delegate_id')"
 
 After the daemon stops, `attach` falls back to a durable snapshot from the local
 Session Log. That fallback is expected and should be treated as inspectable
-state, not as live owner capability.
+state, not as live owner capability. Async `status`, `attach`, and `cancel`
+project the same `children[].index` values from durable parent Log
+`subagent_event` data, even when snapshot children are sorted by subagent id.
 
 ## Claude Code Pattern
 

@@ -14,10 +14,13 @@ defmodule Pixir.Tools.Bash do
 
   v0.1 safety confines the cwd and rejects shell tokens that visibly resolve outside
   the workspace — parent-directory references, absolute paths, home/env-home paths, and
-  existing symlink-prefix escapes — before crossing the host boundary. This is a
-  conservative tripwire, not a full shell sandbox. The permission gate (ADR 0006) is
-  still the higher-level guard: under `:ask`, non-safe commands prompt; under
-  `:read_only` they are refused.
+  existing symlink-prefix escapes — before crossing the host boundary. Only RHS values
+  of leading POSIX environment assignments before a simple command are ignored; literal
+  path arguments, redirection targets, and non-leading `NAME=VALUE` values are still
+  checked. The accepted residual vector `VAR=/outside cmd $VAR` can expand at runtime,
+  because this is a conservative tripwire, not a full shell parser or sandbox. The
+  permission gate (ADR 0006) is still the higher-level guard: under `:ask`, non-safe
+  commands prompt; under `:read_only` they are refused.
   """
 
   use Pixir.Tool

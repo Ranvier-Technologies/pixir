@@ -340,6 +340,7 @@ defmodule Pixir.SessionTree do
       |> Enum.join(" ")
 
     acc = [header | acc]
+    acc = maybe_line(acc, "    index: ", subagent["index"])
     acc = maybe_line(acc, "    child_session: ", subagent["child_session_id"])
     acc = maybe_line(acc, "    child_log: ", subagent["child_log_path"])
     acc = maybe_line(acc, "    task: ", subagent["task"])
@@ -390,6 +391,7 @@ defmodule Pixir.SessionTree do
       "depth",
       "max_depth",
       "workspace",
+      "index",
       "parent_log_path",
       "child_log_path",
       "summary",

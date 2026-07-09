@@ -130,11 +130,23 @@ defmodule Pixir.Event do
   requires re-injected on subsequent turns (ADR 0007). `item` is the raw, opaque
   provider object (string-keyed, incl. `encrypted_content`); `model` is the model id
   that produced it, so replay can drop items captured under a different model.
+
+  Optional `:dialect` is additive provider evidence (for example `"anthropic"`). It
+  is included only when provided so old reasoning events fold byte-identically.
   """
   @spec reasoning(String.t(), map(), String.t(), keyword()) :: t()
   def reasoning(session_id, item, model, opts \\ [])
       when is_map(item) and is_binary(model) do
-    new(session_id, :reasoning, %{"item" => item, "model" => model}, opts)
+    data =
+      case Keyword.get(opts, :dialect) do
+        dialect when is_binary(dialect) and dialect != "" ->
+          %{"item" => item, "model" => model, "dialect" => dialect}
+
+        _ ->
+          %{"item" => item, "model" => model}
+      end
+
+    new(session_id, :reasoning, data, Keyword.delete(opts, :dialect))
   end
 
   @doc """
