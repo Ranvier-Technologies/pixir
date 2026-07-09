@@ -41,7 +41,8 @@ defmodule Pixir.Provider.ContextWindow do
     "gpt-5.4-mini" => 272_000,
     "gpt-5.3-codex" => 272_000,
     "gpt-5.3-codex-spark" => 128_000,
-    "gpt-5.2" => 272_000
+    "gpt-5.2" => 272_000,
+    "claude-fable-5" => 1_000_000
   }
 
   @doc """

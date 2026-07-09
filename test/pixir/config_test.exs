@@ -20,6 +20,7 @@ defmodule Pixir.ConfigTest do
     previous_app_bash_timeout = Application.get_env(:pixir, :bash_timeout_ms)
     previous_app_bash_timeout_max = Application.get_env(:pixir, :bash_timeout_max_ms)
     previous_app_host_commands = Application.get_env(:pixir, :host_commands)
+    previous_app_web_search = Application.get_env(:pixir, :web_search)
 
     System.put_env("PIXIR_HOME", home)
     System.delete_env("PIXIR_MODEL")
@@ -28,6 +29,7 @@ defmodule Pixir.ConfigTest do
     Application.delete_env(:pixir, :bash_timeout_ms)
     Application.delete_env(:pixir, :bash_timeout_max_ms)
     Application.delete_env(:pixir, :host_commands)
+    Application.delete_env(:pixir, :web_search)
 
     on_exit(fn ->
       if previous_home,
@@ -58,6 +60,10 @@ defmodule Pixir.ConfigTest do
         do: Application.put_env(:pixir, :host_commands, previous_app_host_commands),
         else: Application.delete_env(:pixir, :host_commands)
 
+      if previous_app_web_search,
+        do: Application.put_env(:pixir, :web_search, previous_app_web_search),
+        else: Application.delete_env(:pixir, :web_search)
+
       File.rm_rf!(home)
     end)
 
@@ -83,6 +89,7 @@ defmodule Pixir.ConfigTest do
              },
              "max_retries" => 2,
              "stream_idle_timeout_ms" => 180_000,
+             "web_search" => nil,
              "compaction" => %{"tail_events" => 40, "model_assisted" => false},
              "model" => "gpt-5.5",
              "models" => nil,
@@ -106,6 +113,11 @@ defmodule Pixir.ConfigTest do
         },
         "max_retries" => 4,
         "stream_idle_timeout_ms" => 60_000,
+        "web_search" => %{
+          "enabled" => true,
+          "search_context_size" => "medium",
+          "include_sources" => false
+        },
         "compaction" => %{"tail_events" => 12, "model_assisted" => true},
         "model" => "gpt-5.3-codex",
         "models" => ["gpt-5.3-codex"],
@@ -132,11 +144,33 @@ defmodule Pixir.ConfigTest do
 
     assert result["effective"]["max_retries"] == 4
     assert result["effective"]["stream_idle_timeout_ms"] == 60_000
+
+    assert result["effective"]["web_search"] == %{
+             "enabled" => true,
+             "search_context_size" => "medium",
+             "include_sources" => false
+           }
+
     assert result["effective"]["compaction"]["tail_events"] == 12
     assert result["effective"]["compaction"]["model_assisted"] == true
     assert result["effective"]["model"] == "gpt-5.3-codex"
     assert result["effective"]["models"] == ["gpt-5.3-codex"]
     assert result["effective"]["context_windows"] == %{"gpt-5.3-codex" => 64_000}
+  end
+
+  test "web_search explicit disable stays unwarned and malformed lists warn without crashing",
+       %{config_path: config_path} do
+    File.write!(config_path, Jason.encode!(%{"web_search" => %{"enabled" => false}}))
+
+    result = Config.load(config_path: config_path)
+    assert result["warnings"] == []
+    assert result["effective"]["web_search"] == nil
+
+    File.write!(config_path, Jason.encode!(%{"web_search" => [1, 2, 3]}))
+
+    result = Config.load(config_path: config_path)
+    assert Enum.any?(result["warnings"], &(&1["field"] == "web_search"))
+    assert result["effective"]["web_search"] == nil
   end
 
   test "keeps bash timeout max at least as large as an explicit timeout and warns", %{
@@ -176,6 +210,7 @@ defmodule Pixir.ConfigTest do
         },
         "max_retries" => -1,
         "stream_idle_timeout_ms" => "forever",
+        "web_search" => %{"enabled" => true, "unknown" => true},
         "compaction" => %{"tail_events" => 0, "model_assisted" => "yes"},
         "model" => 42,
         "models" => ["ok", 7],
@@ -196,6 +231,7 @@ defmodule Pixir.ConfigTest do
     assert MapSet.member?(fields, "host_commands.queue_timeout_ms")
     assert MapSet.member?(fields, "max_retries")
     assert MapSet.member?(fields, "stream_idle_timeout_ms")
+    assert MapSet.member?(fields, "web_search")
     assert MapSet.member?(fields, "compaction.tail_events")
     assert MapSet.member?(fields, "compaction.model_assisted")
     assert MapSet.member?(fields, "model")
@@ -216,6 +252,7 @@ defmodule Pixir.ConfigTest do
 
     assert result["effective"]["max_retries"] == 2
     assert result["effective"]["stream_idle_timeout_ms"] == 180_000
+    assert result["effective"]["web_search"] == nil
     assert result["effective"]["compaction"]["tail_events"] == 40
     assert result["effective"]["compaction"]["model_assisted"] == false
     assert result["effective"]["model"] == "gpt-5.5"
@@ -273,6 +310,7 @@ defmodule Pixir.ConfigTest do
       Jason.encode!(%{
         "max_retries" => 9,
         "stream_idle_timeout_ms" => 77,
+        "web_search" => %{"enabled" => true},
         "reasoning" => %{"effort" => "low"},
         "text" => %{"verbosity" => "high"}
       })
@@ -287,6 +325,7 @@ defmodule Pixir.ConfigTest do
     assert merged[:max_retries] == 1
     assert merged[:reasoning_effort] == "high"
     assert merged[:text_verbosity] == "medium"
+    assert merged[:web_search] == %{"enabled" => true}
     assert merged[:stream_idle_timeout_ms] == 77
   end
 

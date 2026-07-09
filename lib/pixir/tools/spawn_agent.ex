@@ -45,6 +45,15 @@ defmodule Pixir.Tools.SpawnAgent do
   def execute(%{"task" => task} = args, context) when is_binary(task) and task != "" do
     opts = subagent_opts(context)
 
+    # index is delegate-runner evidence (tasks[] position), and id is
+    # runtime-owned durable identity. Dropping them here is defense in depth;
+    # the enforcement barrier is that Subagents.Manager.build_spec/3 does not
+    # read either value from args. attachments, model, reasoning_effort, and
+    # web_search are operator knobs (delegate spec / ACP _meta), not a
+    # capability the spawning model may grant its children.
+    args =
+      Map.drop(args, ["index", "id", "attachments", "model", "reasoning_effort", "web_search"])
+
     with {:ok, agent} <- Subagents.spawn_agent(context.session_id, args, opts) do
       {:ok, %{"output" => render(agent), "subagent" => agent}}
     end

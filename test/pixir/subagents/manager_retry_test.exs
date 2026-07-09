@@ -113,13 +113,15 @@ defmodule Pixir.Subagents.ManagerRetryTest do
         },
         workspace: ws,
         provider: ScriptedProvider,
-        permission_mode: :read_only
+        permission_mode: :read_only,
+        index: 3
       )
 
     failed_child_session_id = agent["child_session_id"]
 
     assert {:ok, [completed]} = Subagents.wait(sid, [agent["id"]], 5_000, workspace: ws)
     assert completed["status"] == "completed"
+    assert completed["index"] == 3
     assert completed["child_session_id"] != failed_child_session_id
     assert completed["retry_attempts"] == 1
     assert completed["retry_max_attempts"] == 1
@@ -146,7 +148,15 @@ defmodule Pixir.Subagents.ManagerRetryTest do
     assert Enum.any?(
              history,
              &(&1.type == :subagent_event and &1.data["subagent_id"] == agent["id"] and
-                 &1.data["event"] == "retrying")
+                 &1.data["event"] == "retrying" and &1.data["index"] == 3)
+           )
+
+    assert Enum.all?(
+             Enum.filter(
+               history,
+               &(&1.type == :subagent_event and &1.data["subagent_id"] == agent["id"])
+             ),
+             &(&1.data["index"] == 3)
            )
   end
 

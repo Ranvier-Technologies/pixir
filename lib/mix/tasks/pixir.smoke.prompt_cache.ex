@@ -225,7 +225,7 @@ defmodule Mix.Tasks.Pixir.Smoke.PromptCache do
       "prompt_cache_key" => config.cache_key,
       "prompt_cache_retention" => config.prompt_cache_retention,
       "runs" => runs,
-      "cache_hit_observed" => Enum.any?(runs, &((&1["usage_summary"]["cached_tokens"] || 0) > 0)),
+      "cache_hit_observed" => Enum.any?(runs, &(cache_read_tokens(&1["usage_summary"]) > 0)),
       "caveats" => [
         "cached_tokens is the evidence; latency is not used as proof",
         "the first comparable request may warm cache and still report zero cached tokens",
@@ -372,6 +372,12 @@ defmodule Mix.Tasks.Pixir.Smoke.PromptCache do
     Enum.each(next_steps, &Mix.shell().error("next: #{&1}"))
     exit({:shutdown, 1})
   end
+
+  defp cache_read_tokens(%{"cache" => %{"read_tokens" => value}}) when is_integer(value),
+    do: value
+
+  defp cache_read_tokens(%{"cached_tokens" => value}) when is_integer(value), do: value
+  defp cache_read_tokens(_summary), do: 0
 
   defp stringify(map) when is_map(map) do
     Map.new(map, fn {key, value} -> {to_string(key), stringify(value)} end)

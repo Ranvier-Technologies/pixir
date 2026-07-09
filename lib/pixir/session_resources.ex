@@ -24,6 +24,88 @@ defmodule Pixir.SessionResources do
   @type descriptor :: map()
 
   @doc """
+  The single source of the local `file://` acceptance rule: empty/localhost
+  host and a real path, nothing remote. Delegate and Workflow attachment
+  surfaces share it so their mirrors cannot drift.
+  """
+  @spec local_file_uri?(String.t()) :: boolean()
+  def local_file_uri?(uri) when is_binary(uri) do
+    match?(
+      %URI{host: host, path: path} when host in [nil, "", "localhost"] and is_binary(path),
+      URI.parse(uri)
+    )
+  end
+
+  @doc """
+  Normalize an operator-supplied local attachment (filesystem path or
+  `file://` URI) into the `resource_link` map `ingest_attachments/3` accepts.
+  Relative paths resolve against `workspace`; remote URIs are rejected.
+  Existence is checked at ingestion, not here.
+  """
+  @spec local_attachment_link(String.t(), Path.t()) ::
+          {:ok, map()}
+          | {:error, :empty_path | :remote_uri | :uri_query_or_fragment | :invalid_path}
+  def local_attachment_link(path_or_uri, workspace) when is_binary(path_or_uri) do
+    trimmed = String.trim(path_or_uri)
+
+    cond do
+      trimmed == "" ->
+        {:error, :empty_path}
+
+      file_uri?(trimmed) ->
+        # Scheme case normalizes to the literal prefix ingestion matches on;
+        # "FILE:///x" is a URI to validate, never a relative path to re-encode.
+        local_file_uri_link("file://" <> String.slice(trimmed, 7..-1//1))
+
+      String.starts_with?(String.downcase(trimmed), "file:") ->
+        # file: without // (e.g. "file:/tmp/x") would otherwise expand as a
+        # relative path into garbage the dry-run accepts and the run cannot read.
+        {:error, :invalid_path}
+
+      true ->
+        # Percent-encoded so ingestion's URI.decode round-trips reserved characters.
+        encoded =
+          trimmed
+          |> Path.expand(workspace)
+          |> URI.encode(&(&1 == ?/ or URI.char_unreserved?(&1)))
+
+        {:ok, resource_link("file://" <> encoded, Path.basename(trimmed))}
+    end
+  end
+
+  def local_attachment_link(_path_or_uri, _workspace), do: {:error, :invalid_path}
+
+  defp file_uri?(value), do: value |> String.downcase() |> String.starts_with?("file://")
+
+  defp local_file_uri_link(uri) do
+    parsed = URI.parse(uri)
+
+    cond do
+      not local_file_uri?(uri) ->
+        {:error, :remote_uri}
+
+      parsed.query != nil or parsed.fragment != nil ->
+        # A raw `#`/`?` in an unencoded file URI silently truncates the path at
+        # parse time; rejecting is honest, percent-encode them in the source.
+        {:error, :uri_query_or_fragment}
+
+      true ->
+        {:ok, resource_link(uri, decode_link_basename(Path.basename(parsed.path)))}
+    end
+  end
+
+  defp resource_link(uri, name) do
+    link = %{"type" => "resource_link", "uri" => uri}
+    if is_binary(name) and name != "", do: Map.put(link, "name", name), else: link
+  end
+
+  defp decode_link_basename(name) do
+    URI.decode(name)
+  rescue
+    ArgumentError -> name
+  end
+
+  @doc """
   Ingest supported attachment maps into the Session Resource store.
 
   Callers may pass T3-style image attachment maps (`type`, `name`, `mimeType`,

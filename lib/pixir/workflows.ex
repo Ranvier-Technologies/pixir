@@ -27,6 +27,7 @@ defmodule Pixir.Workflows do
     Event,
     Permissions.WritePolicy,
     Session,
+    SessionResources,
     Skills,
     Subagents,
     Tool,
@@ -107,7 +108,7 @@ defmodule Pixir.Workflows do
          "workflow_id" => workflow.id,
          "template" => template_metadata(workflow),
          "proof_states" => @dry_run_proof_states,
-         "would_run" => Enum.map(workflow.steps, &step_plan/1),
+         "would_run" => Enum.map(workflow.steps, &step_plan_with_knobs/1),
          "waves" => waves,
          "summary" => %{
            "steps" => length(workflow.steps),
@@ -122,6 +123,27 @@ defmodule Pixir.Workflows do
 
   def dry_run(_spec, _opts),
     do: {:error, Tool.error(:invalid_args, "workflow spec must be an object", %{})}
+
+  defp step_plan_with_knobs(step) do
+    step
+    |> step_plan()
+    |> put_step_plan_field("model", step.model)
+    |> put_step_plan_field("reasoning_effort", step.reasoning_effort)
+    |> put_attachment_count(step.attachments)
+  end
+
+  defp put_step_plan_field(plan, _key, nil), do: plan
+  defp put_step_plan_field(plan, key, value), do: Map.put(plan, key, value)
+
+  defp put_attachment_count(plan, attachments)
+       when is_list(attachments) and length(attachments) > 0,
+       do: Map.put(plan, "attachment_count", length(attachments))
+
+  defp put_attachment_count(plan, _attachments), do: plan
+
+  defp keyword_put_if_present(opts, _key, nil), do: opts
+  defp keyword_put_if_present(opts, _key, []), do: opts
+  defp keyword_put_if_present(opts, key, value), do: Keyword.put(opts, key, value)
 
   @doc "Run a Workflow by scheduling its steps through `Pixir.Subagents`."
   @spec run(String.t(), map(), keyword()) :: {:ok, map()} | {:error, map()}
@@ -271,6 +293,13 @@ defmodule Pixir.Workflows do
                {:ok, virtual_limits} <- normalize_virtual_limits(raw, workspace_mode, id),
                {:ok, write_set} <-
                  normalize_write_set(raw, read_only?, workspace_mode, id, opts),
+               {:ok, model} <- normalize_optional_model(field(raw, "model"), id),
+               {:ok, reasoning_effort} <-
+                 normalize_optional_reasoning_effort(field(raw, "reasoning_effort"), id),
+               {:ok, attachments} <-
+                 normalize_optional_attachments(field(raw, "attachments"), id, workspace),
+               :ok <-
+                 validate_knobs_apply(workspace_mode, model, reasoning_effort, attachments, id),
                {:ok, write_policy} <-
                  step_write_policy(Keyword.get(opts, :write_policy), write_set, read_only?) do
             {:ok,
@@ -287,6 +316,10 @@ defmodule Pixir.Workflows do
                write_policy: write_policy,
                virtual_commands: virtual_commands,
                virtual_limits: virtual_limits,
+               # Runtime knobs are trusted subagent opts, never spawn args.
+               model: model,
+               reasoning_effort: reasoning_effort,
+               attachments: attachments,
                timeout_ms: maybe_positive_integer(field(raw, "timeout_ms"), "timeout_ms", id)
              }}
           end
@@ -296,6 +329,103 @@ defmodule Pixir.Workflows do
 
   defp normalize_step(_raw, index, _workspace, _agents_opts, _opts),
     do: {:error, Tool.error(:invalid_args, "workflow step must be an object", %{index: index})}
+
+  defp normalize_optional_model(nil, _id), do: {:ok, nil}
+
+  defp normalize_optional_model(model, id) when is_binary(model) do
+    model = String.trim(model)
+
+    if model == "" do
+      invalid_optional_model(id)
+    else
+      {:ok, model}
+    end
+  end
+
+  defp normalize_optional_model(_model, id), do: invalid_optional_model(id)
+
+  defp invalid_optional_model(id) do
+    {:error,
+     Tool.error(:invalid_args, "workflow step model must be a non-empty string", %{
+       "id" => id,
+       "field" => "model"
+     })}
+  end
+
+  defp normalize_optional_reasoning_effort(nil, _id), do: {:ok, nil}
+
+  defp normalize_optional_reasoning_effort(effort, _id) when effort in ~w(low medium high xhigh),
+    do: {:ok, effort}
+
+  defp normalize_optional_reasoning_effort(_effort, id) do
+    {:error,
+     Tool.error(
+       :invalid_args,
+       "workflow step reasoning_effort must be one of: low, medium, high, xhigh",
+       %{
+         "id" => id,
+         "field" => "reasoning_effort",
+         "allowed" => ~w(low medium high xhigh)
+       }
+     )}
+  end
+
+  defp normalize_optional_attachments(nil, _id, _workspace), do: {:ok, []}
+
+  # Paths convert to the resource_link maps the Subagent opts channel accepts,
+  # through the canonical ADR 0021 rule (workspace-relative, local-only) shared
+  # with the delegate task surface. Existence is checked at ingestion.
+  defp normalize_optional_attachments(attachments, id, workspace)
+       when is_list(attachments) do
+    attachments
+    |> Enum.reduce_while({:ok, []}, fn attachment, {:ok, acc} ->
+      if is_binary(attachment) do
+        case SessionResources.local_attachment_link(attachment, workspace) do
+          {:ok, link} -> {:cont, {:ok, [link | acc]}}
+          {:error, reason} -> {:halt, invalid_optional_attachments(id, reason)}
+        end
+      else
+        {:halt, invalid_optional_attachments(id, :not_a_string)}
+      end
+    end)
+    |> case do
+      {:ok, links} -> {:ok, Enum.reverse(links)}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp normalize_optional_attachments(_attachments, id, _workspace),
+    do: invalid_optional_attachments(id, :not_a_list)
+
+  defp invalid_optional_attachments(id, reason) do
+    {:error,
+     Tool.error(
+       :invalid_args,
+       "workflow step attachments must be a list of local paths or file:// URIs",
+       %{
+         "id" => id,
+         "field" => "attachments",
+         "reason" => to_string(reason)
+       }
+     )}
+  end
+
+  # virtual_overlay steps never spawn Subagents, so accepting these knobs there
+  # would make the dry-run plan advertise settings the run ignores.
+  defp validate_knobs_apply("virtual_overlay", model, reasoning_effort, attachments, id)
+       when model != nil or reasoning_effort != nil or attachments != [] do
+    {:error,
+     Tool.error(
+       :invalid_args,
+       "virtual_overlay workflow steps do not take model, reasoning_effort, or attachments",
+       %{
+         "id" => id,
+         "next_actions" => ["remove_the_knobs_or_use_a_subagent_step"]
+       }
+     )}
+  end
+
+  defp validate_knobs_apply(_workspace_mode, _model, _effort, _attachments, _id), do: :ok
 
   defp normalize_workspace_mode(mode, id) do
     WorkspaceStrategy.normalize_runtime_mode(mode, "workflow step", %{"id" => id},
@@ -769,15 +899,24 @@ defmodule Pixir.Workflows do
 
     subagent_opts =
       opts
+      # Step knobs are the only source for these keys: inherited caller opts
+      # must not reach children the dry-run plan showed as knobless. The
+      # spawn_agent test seam never travels to the child either.
+      |> Keyword.drop([:model, :reasoning_effort, :attachments, :spawn_agent])
       |> Keyword.put(:workspace, workflow.workspace)
       |> Keyword.put(:permission_mode, step.permission_mode)
       |> Keyword.put(:write_policy, step.write_policy)
+      |> keyword_put_if_present(:model, step.model)
+      |> keyword_put_if_present(:reasoning_effort, step.reasoning_effort)
+      |> keyword_put_if_present(:attachments, step.attachments)
       |> Keyword.put(
         :delegation_context,
         workflow_delegation_context(workflow, step, wave, completed)
       )
 
-    with {:ok, agent} <- Subagents.spawn_agent(parent_sid, args, subagent_opts) do
+    spawn_agent = Keyword.get(opts, :spawn_agent, &Subagents.spawn_agent/3)
+
+    with {:ok, agent} <- spawn_agent.(parent_sid, args, subagent_opts) do
       {:ok,
        %{
          step: step,

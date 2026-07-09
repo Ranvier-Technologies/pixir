@@ -74,4 +74,16 @@ defmodule Pixir.Tools.Registry do
     |> Enum.sort_by(fn {name, _module} -> name end)
     |> Enum.map(fn {_name, module} -> Provider.tool_spec(module.__tool__()) end)
   end
+
+  @doc "Tool specs for Anthropic Messages API `tools` field."
+  @spec anthropic_specs() :: [map()]
+  def anthropic_specs do
+    @tools
+    |> Enum.sort_by(fn {name, _module} -> name end)
+    |> Enum.map(fn {_name, module} -> anthropic_tool_spec(module.__tool__()) end)
+  end
+
+  defp anthropic_tool_spec(%{name: name, description: description, parameters: parameters}) do
+    %{"name" => name, "description" => description, "input_schema" => parameters}
+  end
 end

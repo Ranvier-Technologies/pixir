@@ -230,7 +230,7 @@ defmodule Pixir.ACP.ServerTest do
     assert length(Enum.filter(models, & &1["default"])) == 1
 
     ids = Enum.map(models, & &1["id"])
-    assert ids == Enum.map(Pixir.Provider.models(), & &1["id"])
+    assert ids == Enum.map(Pixir.Providers.Registry.models(), & &1["id"])
   end
 
   test "initialize surfaces auth status under _meta.pixir.auth when Auth is running (A.4)", %{
@@ -299,11 +299,14 @@ defmodule Pixir.ACP.ServerTest do
     model_opt = Enum.find(resp["result"]["configOptions"], &(&1["id"] == "model"))
     assert model_opt["type"] == "select"
     assert model_opt["category"] == "model"
-    assert model_opt["currentValue"] == Enum.find(Pixir.Provider.models(), & &1["default"])["id"]
+
+    assert model_opt["currentValue"] ==
+             Enum.find(Pixir.Providers.Registry.models(), & &1["default"])["id"]
+
     assert Enum.all?(model_opt["options"], &match?(%{"name" => _, "value" => _}, &1))
 
     assert Enum.map(model_opt["options"], & &1["value"]) ==
-             Enum.map(Pixir.Provider.models(), & &1["id"])
+             Enum.map(Pixir.Providers.Registry.models(), & &1["id"])
   end
 
   test "session/set_mode switches mode and emits current_mode_update (D.2)", %{out: out, ws: ws} do
@@ -362,7 +365,7 @@ defmodule Pixir.ACP.ServerTest do
     Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
     [new_resp] = await_lines(out, 1)
     sid = new_resp["result"]["sessionId"]
-    sticky = Enum.find(Pixir.Provider.models(), &(not &1["default"]))["id"]
+    sticky = Enum.find(Pixir.Providers.Registry.models(), &(not &1["default"]))["id"]
 
     Server.feed(
       server,
@@ -388,6 +391,80 @@ defmodule Pixir.ACP.ServerTest do
     prompt_resp = await_id(out, 7)
     assert prompt_resp["result"]["stopReason"] == "end_turn"
     assert Agent.get(sink, & &1)[:model] == sticky
+  end
+
+  test "sticky model accepts an Anthropic catalog id through the registry (#264)", %{
+    out: out,
+    ws: ws
+  } do
+    {:ok, sink} = Agent.start_link(fn -> nil end)
+    server = start_server(out, provider: CapturingProvider, provider_opts: [sink: sink])
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    [new_resp] = await_lines(out, 1)
+    sid = new_resp["result"]["sessionId"]
+
+    sticky = "claude-fable-5"
+    assert sticky in Enum.map(Pixir.Providers.Registry.models(), & &1["id"])
+
+    Server.feed(
+      server,
+      request(6, "session/set_config_option", %{
+        "sessionId" => sid,
+        "configId" => "model",
+        "value" => sticky
+      })
+    )
+
+    [set_resp] = await_lines(out, 1)
+    model_opt = Enum.find(set_resp["result"]["configOptions"], &(&1["id"] == "model"))
+    assert model_opt["currentValue"] == sticky
+
+    Server.feed(
+      server,
+      request(7, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "hi"}]
+      })
+    )
+
+    prompt_resp = await_id(out, 7)
+    assert prompt_resp["result"]["stopReason"] == "end_turn"
+    assert Agent.get(sink, & &1)[:model] == sticky
+  end
+
+  test "session/prompt _meta.web_search threads to provider request", %{out: out, ws: ws} do
+    {:ok, sink} = Agent.start_link(fn -> nil end)
+    server = start_server(out, provider: RequestCapturingProvider, provider_opts: [sink: sink])
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    [new_resp] = await_lines(out, 1)
+    sid = new_resp["result"]["sessionId"]
+
+    Server.feed(
+      server,
+      request(7, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "search"}],
+        "_meta" => %{"web_search" => true}
+      })
+    )
+
+    prompt_resp = await_id(out, 7)
+    assert prompt_resp["result"]["stopReason"] == "end_turn"
+    assert Agent.get(sink, & &1).request.web_search == %{"enabled" => true}
+
+    Server.feed(
+      server,
+      request(8, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "no search"}]
+      })
+    )
+
+    prompt_off = await_id(out, 8)
+    assert prompt_off["result"]["stopReason"] == "end_turn"
+    assert Agent.get(sink, & &1).request[:web_search] == nil
   end
 
   test "session/set_config_option with an unknown config id is invalid params", %{
@@ -460,7 +537,7 @@ defmodule Pixir.ACP.ServerTest do
     assert Enum.all?(models["availableModels"], &match?(%{"modelId" => _, "name" => _}, &1))
 
     advertised = Enum.map(models["availableModels"], & &1["modelId"])
-    assert advertised == Enum.map(Pixir.Provider.models(), & &1["id"])
+    assert advertised == Enum.map(Pixir.Providers.Registry.models(), & &1["id"])
 
     # currentModelId is the catalog default. New ACP clients should prefer the
     # canonical configOptions model selector; this field remains compatibility
@@ -481,7 +558,7 @@ defmodule Pixir.ACP.ServerTest do
 
     # A non-default catalog id, so we can tell the sticky model apart from Pixir's
     # own resolution (which would inject no :model at all).
-    sticky = Enum.find(Pixir.Provider.models(), &(not &1["default"]))["id"]
+    sticky = Enum.find(Pixir.Providers.Registry.models(), &(not &1["default"]))["id"]
 
     Server.feed(
       server,
@@ -516,7 +593,7 @@ defmodule Pixir.ACP.ServerTest do
     sid = new_resp["result"]["sessionId"]
 
     [model_a, model_b] =
-      Pixir.Provider.models() |> Enum.map(& &1["id"]) |> Enum.take(2)
+      Pixir.Providers.Registry.models() |> Enum.map(& &1["id"]) |> Enum.take(2)
 
     Server.feed(
       server,
@@ -559,7 +636,7 @@ defmodule Pixir.ACP.ServerTest do
   test "session/set_model on an unknown session is invalid params (A.3)", %{out: out} do
     server = start_server(out)
 
-    sticky = Enum.find(Pixir.Provider.models(), & &1["default"])["id"]
+    sticky = Enum.find(Pixir.Providers.Registry.models(), & &1["default"])["id"]
 
     Server.feed(
       server,
@@ -1315,7 +1392,7 @@ defmodule Pixir.ACP.ServerTest do
     [new_resp] = await_lines(out, 1)
     sid = new_resp["result"]["sessionId"]
 
-    known = hd(Pixir.Provider.models())["id"]
+    known = hd(Pixir.Providers.Registry.models())["id"]
 
     Server.feed(
       server,
@@ -1845,7 +1922,7 @@ defmodule Pixir.ACP.ServerTest do
 
   # ── helpers ──────────────────────────────────────────────────────────────────
 
-  defp default_model_id, do: Enum.find(Pixir.Provider.models(), & &1["default"])["id"]
+  defp default_model_id, do: Enum.find(Pixir.Providers.Registry.models(), & &1["default"])["id"]
 
   defp shell_escape(path) do
     "'" <> String.replace(path, "'", "'\"'\"'") <> "'"

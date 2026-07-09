@@ -17,6 +17,10 @@ defmodule Pixir.Delegate.Runner do
   merge-back/apply, or any process-per-child shell fanout. Bounded-write Workflow support
   is attached-only, requires explicit per-step write sets, and reports where writes land.
 
+  Delegate task attachments are operator-supplied Session Resource links under ADR 0021;
+  they are consumed by each child Session's first user message and are not echoed in
+  the delegate envelope.
+
   ## TODO(delegate-service-v1)
 
   Keep the attached runner as the synchronous compatibility path. The service owner
@@ -25,7 +29,7 @@ defmodule Pixir.Delegate.Runner do
   `pixir delegate --spec` pretend to be a detached daemon.
   """
 
-  alias Pixir.{Conversation, Log, RecoveryCommands, Subagents, Workflows}
+  alias Pixir.{Config, Conversation, Log, RecoveryCommands, Subagents, Workflows}
   alias Pixir.Delegate.{Evidence, Handle, Owner}
   alias Pixir.Permissions.WritePolicy
   alias Pixir.Tools.Workspace
@@ -75,6 +79,18 @@ defmodule Pixir.Delegate.Runner do
       {:ok,
        workflow_result_payload(parent_session_id, runtime, result)
        |> refresh_evidence_payload()}
+    else
+      {:error, error} -> {:error, normalize_error(error)}
+    end
+  end
+
+  @doc false
+  @spec rehearse_workflow_spec(map(), String.t() | nil, keyword()) ::
+          {:ok, map()} | {:error, map()}
+  def rehearse_workflow_spec(spec, mode, opts \\ []) when is_map(spec) do
+    with {:ok, workflow_spec} <- normalize_workflow_spec(spec, mode),
+         {:ok, plan} <- Workflows.dry_run(workflow_spec, opts) do
+      {:ok, plan}
     else
       {:error, error} -> {:error, normalize_error(error)}
     end
@@ -135,11 +151,14 @@ defmodule Pixir.Delegate.Runner do
     with {:ok, workspace} <- normalize_workspace(spec, request.workspace),
          {:ok, mode} <- normalize_mode(Map.get(spec, "mode")),
          {:ok, write_policy} <- normalize_write_policy(spec, mode),
-         {:ok, tasks} <- normalize_tasks(spec),
+         {:ok, tasks} <- normalize_tasks(spec, workspace),
          {:ok, timeouts} <- normalize_timeouts(request, spec),
          {:ok, max_threads} <- normalize_positive_integer(spec, ["subagents", "max_threads"]),
          {:ok, max_depth} <- normalize_non_negative_integer(spec, ["subagents", "max_depth"]),
          {:ok, provider_transport} <- normalize_provider_transport(spec),
+         {:ok, provider_model} <- normalize_provider_model(spec),
+         {:ok, reasoning_effort} <- normalize_reasoning_effort(spec),
+         {:ok, web_search} <- normalize_web_search(spec),
          {:ok, workspace_mode} <- normalize_workspace_mode(spec),
          {:ok, agent} <- normalize_agent(spec),
          :ok <- ensure_child_count(tasks, spec_meta) do
@@ -156,6 +175,9 @@ defmodule Pixir.Delegate.Runner do
          max_threads: max_threads,
          max_depth: max_depth,
          provider_transport: provider_transport,
+         provider_model: provider_model,
+         reasoning_effort: reasoning_effort,
+         web_search: web_search,
          workspace_mode: workspace_mode,
          agent: agent,
          planned_child_count: length(tasks)
@@ -267,29 +289,28 @@ defmodule Pixir.Delegate.Runner do
 
   defp normalize_write_policy(_spec, _mode), do: {:ok, nil}
 
-  defp normalize_tasks(%{"tasks" => tasks}) when is_list(tasks) do
-    normalized = Enum.map(tasks, &normalize_task/1)
-
+  defp normalize_tasks(%{"tasks" => tasks}, workspace) when is_list(tasks) do
     cond do
-      normalized == [] ->
+      tasks == [] ->
         {:error, invalid_tasks()}
 
-      Enum.any?(normalized, &is_nil/1) ->
-        {:error,
-         error_payload(
-           "invalid_spec",
-           "subagents.tasks entries must be non-empty task strings",
-           %{
-             "next_actions" => ["fix_subagents_tasks_entries"]
-           }
-         )}
-
       true ->
-        {:ok, normalized}
+        tasks
+        |> Enum.with_index()
+        |> Enum.reduce_while({:ok, []}, fn {entry, index}, {:ok, acc} ->
+          case normalize_task_entry(entry, index, workspace) do
+            {:ok, task} -> {:cont, {:ok, [task | acc]}}
+            {:error, error} -> {:halt, {:error, error}}
+          end
+        end)
+        |> case do
+          {:ok, normalized} -> {:ok, Enum.reverse(normalized)}
+          {:error, _} = error -> error
+        end
     end
   end
 
-  defp normalize_tasks(%{"task" => task} = spec) when is_binary(task) do
+  defp normalize_tasks(%{"task" => task} = spec, _workspace) when is_binary(task) do
     count = get_in(spec, ["subagents", "count"]) || 1
     task = String.trim(task)
 
@@ -309,15 +330,167 @@ defmodule Pixir.Delegate.Runner do
     end
   end
 
-  defp normalize_tasks(_spec), do: {:error, invalid_tasks()}
+  defp normalize_tasks(_spec, _workspace), do: {:error, invalid_tasks()}
 
-  defp normalize_task(task) when is_binary(task) do
+  defp normalize_task_entry(task, index, _workspace) when is_binary(task) do
     task = String.trim(task)
-    if task == "", do: nil, else: task
+
+    if task == "" do
+      {:error, invalid_task_entry(index)}
+    else
+      {:ok, %{task: task, index: index, attachments: []}}
+    end
   end
 
-  defp normalize_task(%{"task" => task}) when is_binary(task), do: normalize_task(task)
-  defp normalize_task(_task), do: nil
+  defp normalize_task_entry(%{} = entry, index, workspace) do
+    with :ok <- reject_unknown_task_entry_keys(entry, index),
+         {:ok, task} <- normalize_task_text(Map.get(entry, "task"), index),
+         {:ok, attachments} <-
+           normalize_task_attachments(Map.get(entry, "attachments", []), index, workspace) do
+      {:ok, %{task: task, index: index, attachments: attachments}}
+    end
+  end
+
+  defp normalize_task_entry(_entry, index, _workspace), do: {:error, invalid_task_entry(index)}
+
+  defp normalize_task_text(task, index) when is_binary(task) do
+    task = String.trim(task)
+    if task == "", do: {:error, invalid_task_entry(index)}, else: {:ok, task}
+  end
+
+  defp normalize_task_text(_task, index), do: {:error, invalid_task_entry(index)}
+
+  defp reject_unknown_task_entry_keys(entry, index) do
+    allowed = MapSet.new(["task", "attachments"])
+
+    case Enum.find(Map.keys(entry), &(not MapSet.member?(allowed, &1))) do
+      nil ->
+        :ok
+
+      key ->
+        {:error,
+         task_entry_error(
+           index,
+           "delegate tasks entries may only include task and attachments",
+           %{
+             "unknown_key" => key,
+             "accepted_keys" => ["task", "attachments"],
+             "next_actions" => ["remove_unknown_field", "check_delegate_spec_contract"]
+           }
+         )}
+    end
+  end
+
+  defp normalize_task_attachments(nil, index, _workspace) do
+    {:error,
+     task_entry_error(index, "delegate task attachments must be a list of paths", %{
+       "field" => "tasks[#{index + 1}].attachments",
+       "json_pointer" => "/tasks/#{index}/attachments",
+       "path" => ["tasks", index, "attachments"],
+       "task_index" => index,
+       "next_actions" => ["set_attachments_to_a_list_of_paths_or_file_uris"]
+     })}
+  end
+
+  defp normalize_task_attachments(attachments, index, workspace) when is_list(attachments) do
+    attachments
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, []}, fn {attachment, attachment_index}, {:ok, acc} ->
+      case normalize_task_attachment(attachment, index, attachment_index, workspace) do
+        {:ok, normalized} -> {:cont, {:ok, [normalized | acc]}}
+        {:error, error} -> {:halt, {:error, error}}
+      end
+    end)
+    |> case do
+      {:ok, normalized} -> {:ok, Enum.reverse(normalized)}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp normalize_task_attachments(_attachments, index, _workspace) do
+    {:error,
+     task_entry_error(index, "delegate task attachments must be a list of paths", %{
+       "field" => "tasks[#{index + 1}].attachments",
+       "json_pointer" => "/tasks/#{index}/attachments",
+       "path" => ["tasks", index, "attachments"],
+       "task_index" => index,
+       "next_actions" => ["set_attachments_to_a_list_of_paths_or_file_uris"]
+     })}
+  end
+
+  defp normalize_task_attachment(path, task_index, attachment_index, workspace)
+       when is_binary(path) do
+    case Pixir.SessionResources.local_attachment_link(path, workspace) do
+      {:ok, attachment} -> {:ok, attachment}
+      {:error, :remote_uri} -> invalid_file_uri_attachment(task_index, attachment_index)
+      {:error, _reason} -> invalid_task_attachment(task_index, attachment_index)
+    end
+  end
+
+  defp normalize_task_attachment(_path, task_index, attachment_index, _workspace),
+    do: invalid_task_attachment(task_index, attachment_index)
+
+  @doc false
+  # Delegates to the canonical local file:// acceptance rule, now owned by
+  # Pixir.SessionResources (ADR 0021) and shared with the Workflow step
+  # attachment surface; kept public here for the dry-run contract callers.
+  @spec local_file_uri?(String.t()) :: boolean()
+  def local_file_uri?(uri) when is_binary(uri),
+    do: Pixir.SessionResources.local_file_uri?(uri)
+
+  defp invalid_file_uri_attachment(task_index, attachment_index) do
+    {:error,
+     task_entry_error(task_index, "delegate task file URI is invalid", %{
+       "field" => "tasks[#{task_index + 1}].attachments[#{attachment_index + 1}]",
+       "json_pointer" => "/tasks/#{task_index}/attachments/#{attachment_index}",
+       "path" => ["tasks", task_index, "attachments", attachment_index],
+       "task_index" => task_index,
+       "attachment_index" => attachment_index,
+       "next_actions" => ["replace_attachment_with_a_file_uri_path_or_filesystem_path"]
+     })}
+  end
+
+  defp invalid_task_attachment(task_index, attachment_index) do
+    {:error,
+     task_entry_error(task_index, "delegate task attachments must be non-empty strings", %{
+       "field" => "tasks[#{task_index + 1}].attachments[#{attachment_index + 1}]",
+       "json_pointer" => "/tasks/#{task_index}/attachments/#{attachment_index}",
+       "path" => ["tasks", task_index, "attachments", attachment_index],
+       "task_index" => task_index,
+       "attachment_index" => attachment_index,
+       "next_actions" => ["replace_attachment_with_a_non_empty_path_or_file_uri"]
+     })}
+  end
+
+  defp invalid_task_entry(index) do
+    task_entry_error(
+      index,
+      "subagents.tasks entries must be non-empty task strings or task objects",
+      %{
+        "next_actions" => ["fix_subagents_tasks_entries"]
+      }
+    )
+  end
+
+  defp task_entry_error(index, message, details) do
+    base = %{
+      "field" => "tasks[#{index + 1}]",
+      "json_pointer" => "/tasks/#{index}",
+      "path" => ["tasks", index],
+      "task_index" => index
+    }
+
+    error_payload("invalid_spec", message, Map.merge(base, details))
+  end
+
+  defp task_text(%{task: task}) when is_binary(task), do: task
+  defp task_text(task) when is_binary(task), do: task
+
+  defp task_index(%{index: index}) when is_integer(index), do: index
+  defp task_index(_task), do: nil
+
+  defp task_attachments(%{attachments: attachments}) when is_list(attachments), do: attachments
+  defp task_attachments(_task), do: []
 
   defp invalid_tasks do
     error_payload("invalid_spec", "subagents delegate spec requires non-empty task text", %{
@@ -433,6 +606,73 @@ defmodule Pixir.Delegate.Runner do
       is_integer(value) and value >= 0 -> {:ok, value}
       true -> {:error, integer_error(path, value, "non_negative")}
     end
+  end
+
+  defp normalize_provider_model(spec) do
+    case get_in(spec, ["subagents", "model"]) do
+      nil -> {:ok, nil}
+      model when is_binary(model) -> {:ok, model}
+      value -> {:error, invalid_subagent_provider_knob("model", value, nil)}
+    end
+  end
+
+  defp normalize_reasoning_effort(spec) do
+    case get_in(spec, ["subagents", "reasoning_effort"]) do
+      nil ->
+        {:ok, nil}
+
+      effort when is_binary(effort) ->
+        if effort in Config.valid_reasoning_efforts() do
+          {:ok, effort}
+        else
+          {:error,
+           invalid_subagent_provider_knob(
+             "reasoning_effort",
+             effort,
+             Config.valid_reasoning_efforts()
+           )}
+        end
+
+      value ->
+        {:error,
+         invalid_subagent_provider_knob(
+           "reasoning_effort",
+           value,
+           Config.valid_reasoning_efforts()
+         )}
+    end
+  end
+
+  # Shape validation lives in the spec contract (cli_contract) and the spawn
+  # seam (Manager); the runner only refuses values neither of those would take.
+  defp normalize_web_search(spec) do
+    case get_in(spec, ["subagents", "web_search"]) do
+      nil -> {:ok, nil}
+      true -> {:ok, true}
+      %{} = web_search -> {:ok, web_search}
+      value -> {:error, invalid_subagent_provider_knob("web_search", value, [true, "object"])}
+    end
+  end
+
+  defp invalid_subagent_provider_knob(field, value, nil) do
+    error_payload("invalid_spec", "subagents.#{field} has an invalid value", %{
+      "field" => "subagents.#{field}",
+      "json_pointer" => "/subagents/#{field}",
+      "path" => ["subagents", field],
+      "observed" => value,
+      "next_actions" => ["set_subagents_#{field}_to_a_valid_value"]
+    })
+  end
+
+  defp invalid_subagent_provider_knob(field, value, accepted_values) do
+    error_payload("invalid_spec", "subagents.#{field} has an unsupported value", %{
+      "field" => "subagents.#{field}",
+      "json_pointer" => "/subagents/#{field}",
+      "path" => ["subagents", field],
+      "observed" => value,
+      "accepted_values" => accepted_values,
+      "next_actions" => ["set_subagents_#{field}_to_an_accepted_value"]
+    })
   end
 
   defp integer_error(path, value, kind) do
@@ -630,19 +870,25 @@ defmodule Pixir.Delegate.Runner do
 
     runtime.tasks
     |> Enum.reduce_while({:ok, []}, fn task, {:ok, agents} ->
-      args = %{
-        "task" => task,
-        "agent" => runtime.agent,
-        "max_threads" => runtime.max_threads,
-        "max_depth" => runtime.max_depth,
-        "timeout_ms" => runtime.child_timeout_ms,
-        "workspace_mode" => runtime.workspace_mode
-      }
+      args =
+        %{
+          "task" => task_text(task),
+          "agent" => runtime.agent,
+          "max_threads" => runtime.max_threads,
+          "max_depth" => runtime.max_depth,
+          "timeout_ms" => runtime.child_timeout_ms,
+          "workspace_mode" => runtime.workspace_mode
+        }
+        |> maybe_put("attachments", task_attachments(task))
+        |> maybe_put("model", runtime.provider_model)
+        |> maybe_put("reasoning_effort", runtime.reasoning_effort)
+        |> maybe_put("web_search", runtime.web_search)
 
       spawn_opts =
         opts
         |> Keyword.take([:provider, :provider_opts, :skills_opts, :agents_opts])
         |> Keyword.put(:workspace, runtime.workspace)
+        |> maybe_put_opt(:index, task_index(task))
         |> Keyword.put(:permission_mode, runtime_permission_mode(runtime))
         |> Keyword.put(:write_policy, runtime.write_policy)
 
@@ -1355,6 +1601,7 @@ defmodule Pixir.Delegate.Runner do
       "child_log_path" => agent["child_log_path"],
       "next_actions" => agent["next_actions"] || []
     }
+    |> maybe_put("index", agent["index"])
     |> maybe_put("timeout_ms", agent["timeout_ms"])
     |> maybe_put("write_policy", agent["write_policy"])
   end
@@ -1529,4 +1776,7 @@ defmodule Pixir.Delegate.Runner do
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, _key, ""), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp maybe_put_opt(opts, _key, nil), do: opts
+  defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 end

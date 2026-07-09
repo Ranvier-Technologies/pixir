@@ -71,3 +71,15 @@ This refines ADR 0004 rather than overturning it.
   strictly id-based is unconfirmed (Pi relies on order + omitted ids); resolve via the
   live-verify harness if a batched replay is ever rejected. Strict per-pair `fc_` ids
   remain a deferred refinement.
+
+## Amendment (2026-07-08)
+
+`Pixir.Turn` now consumes the Provider's ordered `output_items` stream for tool-call
+iterations, so reasoning/function-call interleaving captured by the Provider is recorded
+verbatim in Log `seq` order. Providers or tests that omit `output_items` continue to use
+the legacy flat-list fallback: record all `reasoning_items`, then execute all
+`function_calls`. Provider-hosted tool items in `output_items` are Provider evidence and
+are skipped by the local tool walker. A terminal tool error stops the ordered walk
+immediately: reasoning items that arrive after the failing call in the same
+`output_items` batch are never persisted, the same no-reasoning-without-a-following-item
+principle the iteration-cap branch applies.

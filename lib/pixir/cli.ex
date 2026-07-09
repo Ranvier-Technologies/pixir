@@ -9,10 +9,10 @@ defmodule Pixir.CLI do
       pixir fork <id>          Create a child Session from a parent History prefix
       pixir inspect-replay <id> Inspect Provider replay input without network
       pixir delegate           Validate or run a Delegate CLI spec
-      pixir "prompt"           Run one Turn in the current directory, stream to stdout
-      pixir [--json] [--bash-timeout-ms N] --write-policy <policy.json> "prompt"
+      pixir [--web-search] [--attach PATH] "prompt"           Run one Turn in the current directory, stream to stdout
+      pixir [--json] [--attach PATH] [--bash-timeout-ms N] --write-policy <policy.json> "prompt"
                                Run a bounded-write headless Turn with JSON output
-      pixir resume <id> "..."  Continue a persisted Session
+      pixir resume <id> [--web-search] [--attach PATH] "..."  Continue a persisted Session
       pixir acp                Speak Agent Client Protocol over stdio (ADR 0009)
       pixir help               Show help
 
@@ -52,6 +52,8 @@ defmodule Pixir.CLI do
     login doctor diagnose tree compact fork inspect-replay delegate acp help version --version -v -h --help
   )
   @bash_timeout_unsupported_commands @write_policy_unsupported_commands
+  @attach_unsupported_commands @write_policy_unsupported_commands
+  @web_search_unsupported_commands @write_policy_unsupported_commands
 
   @spec main([String.t()]) :: no_return()
   def main(argv) do
@@ -106,6 +108,30 @@ defmodule Pixir.CLI do
     {:error, 2}
   end
 
+  defp route_command([command | _rest], _mode, %{attach_paths: paths} = runtime)
+       when is_list(paths) and paths != [] and command in @attach_unsupported_commands do
+    Pixir.Tool.error(:invalid_args, "--attach only applies to one-shot or resume", %{
+      "command" => command,
+      "usage" => "pixir [--json] [--attach PATH] \"prompt\"",
+      "next_actions" => ["move_--attach_to_prompt_or_resume", "remove_--attach"]
+    })
+    |> print_runtime_error(runtime.json?)
+
+    {:error, 2}
+  end
+
+  defp route_command([command | _rest], _mode, %{web_search?: true} = runtime)
+       when command in @web_search_unsupported_commands do
+    Pixir.Tool.error(:invalid_args, "--web-search only applies to one-shot or resume", %{
+      "command" => command,
+      "usage" => "pixir [--json] [--web-search] \"prompt\"",
+      "next_actions" => ["move_--web-search_to_prompt_or_resume", "remove_--web-search"]
+    })
+    |> print_runtime_error(runtime.json?)
+
+    {:error, 2}
+  end
+
   defp route_command(["login" | rest], _mode, _runtime) do
     cond do
       help?(rest) -> login_help()
@@ -147,7 +173,16 @@ defmodule Pixir.CLI do
   end
 
   defp route_command(["resume" | rest], mode, runtime) do
-    if help?(rest), do: resume_help(), else: resume(mode, rest, runtime)
+    cond do
+      help?(rest) ->
+        resume_help()
+
+      true ->
+        case extract_resume_attachments(rest, runtime) do
+          {:ok, rest, runtime} -> resume(mode, rest, runtime)
+          {:error, error} -> print_runtime_error_exit(error, runtime.json?)
+        end
+    end
   end
 
   # ACP agent transport (ADR 0009): speak Agent Client Protocol over stdio. The Server
@@ -165,6 +200,36 @@ defmodule Pixir.CLI do
   defp route_command([prompt | rest], mode, runtime) do
     if help?(rest), do: usage(), else: one_shot(mode, read_prompt([prompt | rest]), runtime)
   end
+
+  defp extract_resume_attachments([session_id | rest], runtime) do
+    extract_resume_attachments(rest, runtime, [session_id])
+  end
+
+  defp extract_resume_attachments(rest, runtime), do: {:ok, rest, runtime}
+
+  defp extract_resume_attachments(["--attach", path | rest], runtime, acc)
+       when is_binary(path) and path != "" do
+    runtime = %{runtime | attach_paths: runtime.attach_paths ++ [path]}
+    extract_resume_attachments(rest, runtime, acc)
+  end
+
+  defp extract_resume_attachments(["--attach" | _rest], _runtime, _acc) do
+    {:error,
+     Pixir.Tool.error(:invalid_args, "--attach requires a path", %{
+       "usage" => "pixir resume <session-id> [--attach PATH] \"prompt\"",
+       "next_actions" => ["provide_attachment_path", "remove_--attach"]
+     })}
+  end
+
+  # Post-session-id flags must be consumed here or they leak into the prompt
+  # text: the generic clause below accumulates unrecognized args as positional.
+  defp extract_resume_attachments(["--web-search" | rest], runtime, acc),
+    do: extract_resume_attachments(rest, %{runtime | web_search?: true}, acc)
+
+  defp extract_resume_attachments([arg | rest], runtime, acc),
+    do: extract_resume_attachments(rest, runtime, acc ++ [arg])
+
+  defp extract_resume_attachments([], runtime, acc), do: {:ok, acc, runtime}
 
   # Permission mode comes from flags; default :auto (YOLO, ADR 0006). Flags are
   # stripped so the remainder is the command + prompt.
@@ -184,7 +249,9 @@ defmodule Pixir.CLI do
       extract_runtime_options(argv, %{
         json?: "--json" in argv,
         write_policy_path: nil,
-        bash_timeout_ms: nil
+        bash_timeout_ms: nil,
+        web_search?: false,
+        attach_paths: []
       })
 
   defp extract_runtime_options(["--json" | rest], acc),
@@ -220,7 +287,56 @@ defmodule Pixir.CLI do
      }), acc.json?}
   end
 
+  defp extract_runtime_options(["--web-search" | rest], acc),
+    do: extract_runtime_options(rest, %{acc | web_search?: true})
+
+  defp extract_runtime_options(["--attach", path | rest], acc)
+       when is_binary(path) and path != "",
+       do: extract_runtime_options(rest, %{acc | attach_paths: acc.attach_paths ++ [path]})
+
+  defp extract_runtime_options(["--attach" | _rest], acc) do
+    {:error,
+     Pixir.Tool.error(:invalid_args, "--attach requires a path", %{
+       "usage" => "pixir [--json] [--attach PATH] \"prompt\"",
+       "next_actions" => ["provide_attachment_path", "remove_--attach"]
+     }), acc.json?}
+  end
+
   defp extract_runtime_options(argv, acc), do: {:ok, argv, acc}
+
+  defp cli_attachments(%{attach_paths: paths}) when is_list(paths) do
+    Enum.map(paths, fn path ->
+      uri =
+        if String.starts_with?(path, "file://") do
+          path
+        else
+          # Percent-encoded so ingestion's URI.decode round-trips reserved characters.
+          encoded =
+            path
+            |> Path.expand(File.cwd!())
+            |> URI.encode(&(&1 == ?/ or URI.char_unreserved?(&1)))
+
+          "file://" <> encoded
+        end
+
+      name =
+        case URI.parse(uri) do
+          %{path: parsed_path} when is_binary(parsed_path) ->
+            decode_basename(Path.basename(parsed_path))
+
+          _parsed ->
+            Path.basename(path)
+        end
+
+      %{"type" => "resource_link", "uri" => uri, "name" => name}
+    end)
+  end
+
+  defp decode_basename(name) do
+    URI.decode(name)
+  rescue
+    ArgumentError -> name
+  end
 
   defp parse_bash_timeout_ms(value) do
     max_ms = Config.bash_timeout_max_ms()
@@ -241,7 +357,7 @@ defmodule Pixir.CLI do
       %{
         "value" => value,
         "max_timeout_ms" => max_ms,
-        "usage" => "pixir [--json] [--bash-timeout-ms N] \"prompt\"",
+        "usage" => "pixir [--json] [--attach PATH] [--bash-timeout-ms N] \"prompt\"",
         "next_actions" => [
           "choose_a_positive_integer_no_larger_than_bash_timeout_max_ms",
           "increase_bash_timeout_max_ms_in_config_if_needed",
@@ -942,6 +1058,7 @@ defmodule Pixir.CLI do
 
     turn_opts =
       turn_opts
+      |> fold_web_search_flag()
       |> Keyword.drop([:skip_auth?, :idle_timeout, :json?])
       |> Keyword.merge(permission_mode: mode, asker: asker)
 
@@ -1193,10 +1310,41 @@ defmodule Pixir.CLI do
     end
   end
 
-  defp runtime_turn_opts(%{bash_timeout_ms: timeout_ms}) when is_integer(timeout_ms),
-    do: [bash_timeout_ms: timeout_ms, bash_timeout_source: "cli"]
+  defp runtime_turn_opts(runtime) do
+    bash_opts =
+      case runtime do
+        %{bash_timeout_ms: timeout_ms} when is_integer(timeout_ms) ->
+          [bash_timeout_ms: timeout_ms, bash_timeout_source: "cli"]
 
-  defp runtime_turn_opts(_runtime), do: []
+        _runtime ->
+          []
+      end
+
+    bash_opts ++ attachment_turn_opts(runtime) ++ web_search_turn_opts(runtime)
+  end
+
+  defp attachment_turn_opts(%{attach_paths: [_ | _]} = runtime),
+    do: [attachments: cli_attachments(runtime)]
+
+  defp attachment_turn_opts(_runtime), do: []
+
+  defp web_search_turn_opts(%{web_search?: true}), do: [web_search?: true]
+  defp web_search_turn_opts(_runtime), do: []
+
+  # The --web-search flag folds into provider_opts at the one site shared by
+  # one-shot and resume, so it can never clobber a provider_opts list injected
+  # through the cli_turn_opts seam.
+  defp fold_web_search_flag(turn_opts) do
+    case Keyword.pop(turn_opts, :web_search?) do
+      {true, rest} ->
+        Keyword.update(rest, :provider_opts, [web_search: %{"enabled" => true}], fn opts ->
+          Keyword.put_new(opts, :web_search, %{"enabled" => true})
+        end)
+
+      {_absent, rest} ->
+        rest
+    end
+  end
 
   defp ensure_policy_mode(_mode, [], _runtime), do: :ok
 
@@ -1425,7 +1573,7 @@ defmodule Pixir.CLI do
 
     Usage:
       pixir "prompt"            Run one Turn in the current directory
-      pixir [--json] [--bash-timeout-ms N] --write-policy <policy.json> "prompt"
+      pixir [--json] [--attach PATH] [--bash-timeout-ms N] --write-policy <policy.json> "prompt"
                                 Run a bounded-write headless Turn
       pixir resume <id> "..."   Continue a persisted Session
       pixir resume --force-release-writer-lease <id> "..."

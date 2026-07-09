@@ -134,7 +134,8 @@ honest contract is operational but narrow:
 - completed Subagents and Workflow steps may produce useful checkpoint bundles;
 - partial Workflow outcomes are not success;
 - timed-out, failed, cancelled, or detached children must be reported honestly with
-  child ids and actionable state;
+  child ids, task-position `children[].index` when spawned from delegate `tasks[]`,
+  and actionable state;
 - direct CLI fanout and parent-led Subagent fanout are covered by the no-network fanout
   regression gauntlet;
 - long-running non-blocking Subagent status/result retrieval remains an experimental

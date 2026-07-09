@@ -14,7 +14,11 @@ references, absolute paths, home/env-home paths, and existing symlink-prefix
 escapes) before crossing the host boundary, and it confines the `read`/`write`/
 `edit` tools to the workspace. It does **not** claim to contain an adversary who
 controls the model's output and computes escapes at runtime (for example, a path
-assembled inside a shell subshell or an interpreter). Run Pixir against
+assembled inside a shell subshell or an interpreter). The leading
+environment-assignment exception is a documented residual of the same kind:
+`VAR=/outside cmd $VAR` is accepted because the outside path is visible only as
+the RHS of a leading assignment and may be expanded by the shell at runtime;
+confinement is defense-in-depth, not a sandbox. Run Pixir against
 workspaces and credentials you are willing to expose to the tasks you delegate.
 
 ## Reporting a vulnerability
@@ -60,8 +64,9 @@ valuable:
 
 ## Out of scope
 
-- The tripwire not catching a runtime-computed shell escape (documented limitation
-  above, not a full sandbox).
+- The tripwire not catching a runtime-computed shell escape, including
+  `VAR=/outside cmd $VAR` where the outside path is expanded at runtime
+  (documented limitation above, not a full sandbox).
 - Vulnerabilities in the underlying Provider, model output, Erlang/OTP, or
   third-party dependencies — report those upstream.
 - Anything requiring the operator to have already granted the task access to the

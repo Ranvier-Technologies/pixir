@@ -126,6 +126,8 @@ defmodule Pixir.Tools.RunWorkflow do
   """
   @spec execute(map(), map()) :: {:ok, map()} | {:error, term()}
   def execute(args, context) when is_map(args) do
+    args = strip_step_operator_knobs(args)
+
     with {:ok, result} <- Workflows.run(context.session_id, args, workflow_opts(context)) do
       {:ok, %{"output" => render(result), "workflow" => result}}
     end
@@ -154,6 +156,8 @@ defmodule Pixir.Tools.RunWorkflow do
   """
   @spec dry_run(map(), map()) :: {:ok, map()} | {:error, any()}
   def dry_run(args, context) when is_map(args) do
+    args = strip_step_operator_knobs(args)
+
     with {:ok, result} <- Workflows.dry_run(args, workflow_opts(context)) do
       {:ok, %{"dry_run" => true, "output" => render_dry_run(result), "workflow" => result}}
     end
@@ -161,6 +165,28 @@ defmodule Pixir.Tools.RunWorkflow do
 
   def dry_run(_args, _context),
     do: {:error, Tool.error(:invalid_args, "workflow arguments must be an object", %{})}
+
+  # model, reasoning_effort, and attachments are operator knobs (delegate spec /
+  # ACP _meta), not a capability the workflow-authoring model may grant its
+  # steps' children — the same rule spawn_agent enforces on its args.
+  @step_operator_knobs ~w(model reasoning_effort attachments)
+
+  defp strip_step_operator_knobs(args) do
+    case Map.get(args, "steps") do
+      steps when is_list(steps) ->
+        Map.put(
+          args,
+          "steps",
+          Enum.map(steps, fn
+            %{} = step -> Map.drop(step, @step_operator_knobs)
+            step -> step
+          end)
+        )
+
+      _other ->
+        args
+    end
+  end
 
   defp workflow_opts(context) do
     [

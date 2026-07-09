@@ -21,6 +21,7 @@ defmodule Pixir.Subagents.Manager do
   }
 
   alias Pixir.Permissions.WritePolicy
+  alias Pixir.Provider.HostedTools
 
   @server __MODULE__
   @manager_child_event_types ~w(assistant_message status turn_failed)a
@@ -137,7 +138,8 @@ defmodule Pixir.Subagents.Manager do
 
     with {:ok, agent} <- fetch_agent(state, parent_sid, id),
          :ok <- ensure_idle_for_input(agent),
-         {:ok, updated, state} <- restart_agent(agent, prompt, opts, state) do
+         {:ok, updated, state} <-
+           restart_agent(agent, prompt, Keyword.put(opts, :attachments, []), state) do
       {:reply, {:ok, public_agent(updated)}, state}
     else
       {:error, :busy} ->
@@ -452,9 +454,33 @@ defmodule Pixir.Subagents.Manager do
       retry_max_attempts = Map.get(args, "retry_attempts", limits.retry_attempts)
       retry_jitter_ms = Map.get(args, "retry_jitter_ms", limits.retry_jitter_ms)
       workspace_mode = Map.get(args, "workspace_mode", "isolated")
-      id = Map.get(args, "id") || gen_id()
+      provider_model = Map.get(args, "model") || Keyword.get(opts, :model)
+      reasoning_effort = Map.get(args, "reasoning_effort") || Keyword.get(opts, :reasoning_effort)
+      # Map.fetch, not ||: an explicit "web_search" => false in args must beat
+      # an inherited truthy default in opts (explicit opt-out stays an opt-out).
+      web_search =
+        case Map.fetch(args, "web_search") do
+          {:ok, value} -> value
+          :error -> Keyword.get(opts, :web_search)
+        end
 
-      with :ok <- validate_subagent_id(id),
+      attachments = Keyword.get(opts, :attachments, Map.get(args, "attachments", []))
+
+      # Runtime-owned identity and evidence ride opts, never args. The
+      # spawn_agent tool strips caller-authored runtime fields as defense in
+      # depth, but this builder is the enforcement barrier: forged args values
+      # for index/id are not read at all. Existing operator knobs that still
+      # ride args (model, reasoning_effort, web_search, attachments) migrate
+      # opportunistically; new runtime knobs must enter through opts from day
+      # one.
+      index = Keyword.get(opts, :index)
+      id = gen_id()
+
+      with :ok <- validate_optional_non_negative_integer("index", index),
+           :ok <- validate_optional_binary("model", provider_model),
+           {:ok, web_search} <- validate_optional_web_search(web_search),
+           :ok <- validate_optional_reasoning_effort(reasoning_effort),
+           :ok <- validate_attachments(attachments),
            :ok <- validate_positive_integer("max_threads", max_threads),
            :ok <- validate_non_negative_integer("max_depth", max_depth),
            :ok <- validate_positive_integer("timeout_ms", timeout_ms),
@@ -466,6 +492,7 @@ defmodule Pixir.Subagents.Manager do
          %{
            id: id,
            parent_session_id: parent_sid,
+           index: index,
            child_session_id: nil,
            child_pid: nil,
            task: task,
@@ -487,6 +514,10 @@ defmodule Pixir.Subagents.Manager do
            workspace: workspace,
            child_workspace: nil,
            workspace_mode: workspace_mode,
+           provider_model: provider_model,
+           reasoning_effort: reasoning_effort,
+           web_search: web_search,
+           attachments: attachments,
            workspace_snapshot: nil,
            workspace_snapshot_opts: Keyword.get(opts, :workspace_snapshot_opts, []),
            provider: Keyword.get(opts, :provider, Pixir.Provider),
@@ -526,6 +557,96 @@ defmodule Pixir.Subagents.Manager do
      })}
   end
 
+  defp validate_optional_non_negative_integer(_field, nil), do: :ok
+
+  defp validate_optional_non_negative_integer(field, value),
+    do: validate_non_negative_integer(field, value)
+
+  defp validate_attachments(attachments) when is_list(attachments) do
+    if Enum.all?(attachments, &valid_attachment?/1) do
+      :ok
+    else
+      {:error,
+       Tool.error(:invalid_args, "attachments must be resource_link maps", %{
+         "field" => "attachments",
+         "expected" => "list of resource_link maps with non-empty uri"
+       })}
+    end
+  end
+
+  defp validate_attachments(_attachments) do
+    {:error,
+     Tool.error(:invalid_args, "attachments must be a list", %{
+       "field" => "attachments",
+       "expected" => "list of resource_link maps"
+     })}
+  end
+
+  # Only local file:// links: remote resource_links stay descriptor-only on the
+  # ACP surface (CONTEXT.md) and the delegate surface never fabricates them.
+  defp valid_attachment?(%{"type" => "resource_link", "uri" => "file://" <> rest})
+       when rest != "",
+       do: true
+
+  defp valid_attachment?(_attachment), do: false
+
+  defp validate_optional_binary(_field, nil), do: :ok
+  defp validate_optional_binary(_field, value) when is_binary(value) and value != "", do: :ok
+
+  defp validate_optional_binary(field, value) do
+    {:error,
+     Tool.error(:invalid_args, "#{field} must be a non-empty string", %{
+       "field" => field,
+       "value" => inspect(value)
+     })}
+  end
+
+  # Building the error report must never crash the Manager: the catch-all
+  # covers non-JSON terms reachable through the internal opts path (atoms,
+  # tuples, pids). Maps, nil, and booleans are consumed by earlier validate
+  # clauses and never reach this helper.
+  defp json_type(value) when is_binary(value), do: "string"
+  defp json_type(value) when is_integer(value) or is_float(value), do: "number"
+  defp json_type(value) when is_list(value), do: "array"
+  defp json_type(_value), do: "unknown"
+
+  defp validate_optional_web_search(nil), do: {:ok, nil}
+  defp validate_optional_web_search(false), do: {:ok, nil}
+  defp validate_optional_web_search(true), do: {:ok, %{"enabled" => true}}
+
+  defp validate_optional_web_search(%{} = web_search) do
+    case HostedTools.web_search(web_search) do
+      {:ok, _tool} -> {:ok, web_search}
+      {:error, reason} -> {:error, Tool.error(reason.kind, reason.message, reason.details)}
+    end
+  end
+
+  defp validate_optional_web_search(other) do
+    {:error,
+     Tool.error(:invalid_args, "web_search must be true or an object", %{
+       "field" => "web_search",
+       "observed_type" => json_type(other),
+       "accepted_values" => [true, "object"]
+     })}
+  end
+
+  defp validate_optional_reasoning_effort(nil), do: :ok
+
+  defp validate_optional_reasoning_effort(value) do
+    accepted = Pixir.Config.valid_reasoning_efforts()
+
+    if value in accepted do
+      :ok
+    else
+      {:error,
+       Tool.error(:invalid_args, "reasoning_effort has an unsupported value", %{
+         "field" => "reasoning_effort",
+         "value" => inspect(value),
+         "accepted_values" => accepted
+       })}
+    end
+  end
+
   defp validate_non_negative_integer(_field, value) when is_integer(value) and value >= 0,
     do: :ok
 
@@ -534,28 +655,6 @@ defmodule Pixir.Subagents.Manager do
      Tool.error(:invalid_args, "#{field} must be a non-negative integer", %{
        "field" => field,
        "value" => inspect(value)
-     })}
-  end
-
-  defp validate_subagent_id(id) when is_binary(id) and id != "" do
-    if Regex.match?(~r/\A[A-Za-z0-9_-]+\z/, id) do
-      :ok
-    else
-      {:error,
-       Tool.error(:invalid_args, "subagent id must be a safe path basename", %{
-         "field" => "id",
-         "value" => id,
-         "allowed_pattern" => "A-Za-z0-9_-",
-         "next_actions" => ["use_a_simple_subagent_id_without_path_separators"]
-       })}
-    end
-  end
-
-  defp validate_subagent_id(id) do
-    {:error,
-     Tool.error(:invalid_args, "subagent id must be a non-empty string", %{
-       "field" => "id",
-       "value" => inspect(id)
      })}
   end
 
@@ -642,7 +741,10 @@ defmodule Pixir.Subagents.Manager do
     case start_child_turn(
            turn_agent,
            agent.child_session_id,
-           agent.child_workspace
+           agent.child_workspace,
+           # Same-session restarts must not re-ingest operator attachments: the
+           # first Turn already persisted them as durable Session Resources.
+           attachments: []
          ) do
       {:ok, _ref} ->
         timer =
@@ -681,14 +783,24 @@ defmodule Pixir.Subagents.Manager do
   defp restart_agent(_agent, _prompt, _opts, _state),
     do: {:error, Tool.error(:invalid_args, "prompt is required", %{})}
 
-  defp start_child_turn(agent, child_sid, child_workspace) do
+  defp start_child_turn(agent, child_sid, child_workspace, turn_overrides \\ []) do
     instructions = agent.agent_config.developer_instructions
+
+    # The Turn reads model/reasoning_effort from provider_opts (same seam ACP
+    # uses for _meta knobs); a spec knob wins over any inherited default.
+    provider_opts =
+      agent.provider_opts
+      |> List.wrap()
+      |> put_provider_knob(:model, Map.get(agent, :provider_model))
+      |> put_provider_knob(:reasoning_effort, Map.get(agent, :reasoning_effort))
+      |> put_provider_knob(:web_search, Map.get(agent, :web_search))
 
     Session.start_turn(child_sid, fn ctx ->
       Turn.run(%{ctx | workspace: child_workspace}, agent.prompt,
         provider: agent.provider,
-        provider_opts: agent.provider_opts,
+        provider_opts: provider_opts,
         permission_mode: agent.permission_mode,
+        attachments: Keyword.get(turn_overrides, :attachments, Map.get(agent, :attachments, [])),
         write_policy: agent.write_policy,
         skills_opts: agent.skills_opts,
         agents_opts: agent.agents_opts,
@@ -698,6 +810,9 @@ defmodule Pixir.Subagents.Manager do
       )
     end)
   end
+
+  defp put_provider_knob(opts, _key, nil), do: opts
+  defp put_provider_knob(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp subscribe_child_events(child_sid),
     do: Events.subscribe(child_sid, only: @manager_child_event_types)
@@ -1007,6 +1122,10 @@ defmodule Pixir.Subagents.Manager do
     %{
       id: data["id"] || data["subagent_id"],
       parent_session_id: parent_sid,
+      index: data["index"],
+      provider_model: data["model"],
+      reasoning_effort: data["reasoning_effort"],
+      web_search: data["web_search"],
       child_session_id: data["child_session_id"],
       child_pid: nil,
       task: task,
@@ -1356,6 +1475,7 @@ defmodule Pixir.Subagents.Manager do
       "child_indexed" => child_indexed?(state, agent),
       "child_pid_alive" => child_pid_alive?(agent)
     }
+    |> maybe_put_public("index", Map.get(agent, :index))
     |> maybe_put_public("write_policy", WritePolicy.metadata(Map.get(agent, :write_policy)))
   end
 
@@ -1520,6 +1640,10 @@ defmodule Pixir.Subagents.Manager do
         "summary" => agent.summary,
         "parent_log_path" => parent_log_path(agent)
       }
+      |> maybe_put_event("index", Map.get(agent, :index))
+      |> maybe_put_event("model", Map.get(agent, :provider_model))
+      |> maybe_put_event("reasoning_effort", Map.get(agent, :reasoning_effort))
+      |> maybe_put_event("web_search", Map.get(agent, :web_search))
       |> maybe_put_event("deadline_at", agent.deadline_at)
       |> maybe_put_event("child_log_path", child_log_path(agent))
       |> maybe_put_event("workspace_snapshot", agent.workspace_snapshot)
@@ -1688,6 +1812,7 @@ defmodule Pixir.Subagents.Manager do
       "parent_log_path" => parent_log_path(agent)
     }
     |> Map.merge(child_log_fields(agent))
+    |> maybe_put_public("index", Map.get(agent, :index))
     |> maybe_put_public("child_last_event_seq", agent.last_seen_child_event_seq)
     |> maybe_put_public("child_last_event_type", agent.last_seen_child_event_type)
     |> maybe_put_public("child_last_event_ts", agent.last_seen_child_event_ts)

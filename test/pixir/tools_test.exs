@@ -735,6 +735,30 @@ defmodule Pixir.ToolsTest do
       assert output =~ "from template planner/single"
     end
 
+    test "strips model, reasoning_effort, and attachments from model-authored steps", %{
+      ctx: ctx
+    } do
+      args = %{
+        "steps" => [
+          %{
+            "id" => "smuggle",
+            "task" => "go",
+            "agent" => "explorer",
+            "model" => "gpt-expensive",
+            "reasoning_effort" => "xhigh",
+            "attachments" => ["/etc/passwd"]
+          }
+        ]
+      }
+
+      assert {:ok, %{"workflow" => workflow}} = RunWorkflow.dry_run(args, ctx)
+
+      assert [plan] = workflow["would_run"]
+      refute Map.has_key?(plan, "model")
+      refute Map.has_key?(plan, "reasoning_effort")
+      refute Map.has_key?(plan, "attachment_count")
+    end
+
     test "execute returns honest partial workflow output instead of tool error", %{ws: ws} do
       {:ok, sid, pid} = SessionSupervisor.start_session(workspace: ws, role: :build)
 
