@@ -23,7 +23,10 @@ defmodule Pixir.Turn do
   Options: `:provider` (module, default `Pixir.Provider`), `:provider_opts` (passed to
   the provider — e.g. `:auth`, `:transport`), `:dry_run` (Turn-level dry-run, ADR
   0005), `:max_iterations`, `:bash_timeout_ms` for per-Turn bash execution, and
-  `:delegation_context` for Subagent child Turns.
+  `:delegation_context` for Subagent child Turns, and `:virtual_overlay` for the
+  operator-owned `%{read_set: [...], limits: map | nil}` context used by virtual
+  command Tools. String-keyed virtual overlay maps are normalized to that atom-keyed
+  representation at Turn intake.
   """
 
   require Logger
@@ -65,6 +68,9 @@ defmodule Pixir.Turn do
     sid = ctx.session_id
     skills_opts = Keyword.get(opts, :skills_opts, [])
 
+    {:ok, pre_turn_history} = Session.history(sid)
+    previous_turn_boundary_seq = previous_turn_boundary_seq(pre_turn_history)
+
     record_explicit_skill_activations(sid, ctx.workspace, user_text, skills_opts)
 
     with {:ok, resources} <-
@@ -75,13 +81,36 @@ defmodule Pixir.Turn do
            ),
          {:ok, _} <-
            Session.record(sid, Event.user_message(sid, user_text, resources: resources)) do
-      run_after_user_message(ctx, user_text, opts, resources, skills_opts)
+      run_after_user_message(
+        ctx,
+        user_text,
+        opts,
+        resources,
+        skills_opts,
+        previous_turn_boundary_seq
+      )
     end
   end
 
-  defp run_after_user_message(ctx, _user_text, opts, _resources, skills_opts) do
+  defp previous_turn_boundary_seq(pre_turn_history) do
+    case List.last(pre_turn_history) do
+      %{seq: seq} when is_integer(seq) -> seq
+      %{"seq" => seq} when is_integer(seq) -> seq
+      _ -> nil
+    end
+  end
+
+  defp run_after_user_message(
+         ctx,
+         _user_text,
+         opts,
+         _resources,
+         skills_opts,
+         previous_turn_boundary_seq
+       ) do
     provider_opts = opts |> Keyword.get(:provider_opts, []) |> Config.merge_provider_opts()
     bash_timeout_ms = Keyword.get(opts, :bash_timeout_ms)
+    virtual_overlay = normalize_virtual_overlay(Keyword.get(opts, :virtual_overlay))
 
     bash_timeout_source =
       if bash_timeout_ms, do: Keyword.get(opts, :bash_timeout_source, "context")
@@ -98,6 +127,13 @@ defmodule Pixir.Turn do
       agents_opts: Keyword.get(opts, :agents_opts, []),
       subagent_depth: Keyword.get(opts, :subagent_depth, 0),
       agent_instructions: Keyword.get(opts, :agent_instructions),
+      previous_turn_boundary_seq: previous_turn_boundary_seq,
+      # Rendered once per turn: the Skills index does filesystem discovery and
+      # the cache_control request fields are rebuilt every tool-loop iteration.
+      rendered_skills_index:
+        if ProviderRegistry.entry_for(provider).capabilities.prompt_cache == :cache_control do
+          rendered_skills_index(ctx.workspace, skills_opts)
+        end,
       presenter_context: Keyword.get(opts, :presenter_context),
       delegation_context: Keyword.get(opts, :delegation_context),
       # Model that will produce reasoning items this Turn — stamped on each `reasoning`
@@ -120,6 +156,7 @@ defmodule Pixir.Turn do
         |> normalize_max_iterations(),
       bash_timeout_ms: bash_timeout_ms,
       bash_timeout_source: bash_timeout_source,
+      virtual_overlay: virtual_overlay,
       permission: %{
         mode: permission_mode(mode, Keyword.get(opts, :permission_mode, :auto)),
         asker: Keyword.get(opts, :asker, fn _request -> :deny end),
@@ -138,8 +175,59 @@ defmodule Pixir.Turn do
   defp permission_mode(:plan, _requested), do: :read_only
   defp permission_mode(_build, requested), do: requested
 
+  defp normalize_virtual_overlay(nil), do: nil
+
+  defp normalize_virtual_overlay(config) when is_map(config) do
+    %{
+      read_set: virtual_overlay_field(config, :read_set, "read_set"),
+      limits: virtual_overlay_field(config, :limits, "limits")
+    }
+  end
+
+  defp normalize_virtual_overlay(_config), do: nil
+
+  defp virtual_overlay_field(config, atom_key, string_key) do
+    case Map.fetch(config, atom_key) do
+      {:ok, value} -> value
+      :error -> Map.get(config, string_key)
+    end
+  end
+
   defp maybe_put_provider_request(request, _key, nil), do: request
   defp maybe_put_provider_request(request, key, value), do: Map.put(request, key, value)
+
+  defp maybe_put_cache_control_prompt_fields(request, state) do
+    case ProviderRegistry.entry_for(state.provider).capabilities.prompt_cache do
+      :cache_control ->
+        request =
+          request
+          |> Map.put(:prompt_mode, state.mode)
+          |> maybe_put_provider_request(
+            :previous_turn_boundary_seq,
+            state.previous_turn_boundary_seq
+          )
+
+        request
+        |> maybe_put_non_empty(:skills_index, state.rendered_skills_index)
+        |> maybe_put_non_empty(:agent_instructions, state.agent_instructions)
+
+      _other ->
+        request
+    end
+  end
+
+  defp maybe_put_non_empty(request, _key, value) when not is_binary(value), do: request
+  defp maybe_put_non_empty(request, _key, ""), do: request
+  defp maybe_put_non_empty(request, key, value), do: Map.put(request, key, value)
+
+  defp rendered_skills_index(workspace, skills_opts) do
+    with {:ok, %{skills: skills}} <- Skills.discover(workspace, skills_opts),
+         true <- Enum.any?(skills, &(not Map.get(&1, :disable_model_invocation, false))) do
+      Skills.render_index(workspace, skills_opts)
+    else
+      _ -> nil
+    end
+  end
 
   defp reasoning_dialect(provider),
     do: ProviderRegistry.entry_for(provider).capabilities.reasoning_dialect
@@ -318,6 +406,7 @@ defmodule Pixir.Turn do
         prompt_cache_key: cache_metadata["prompt_cache_key"]
       }
       |> maybe_put_provider_request(:web_search, state.provider_opts[:web_search])
+      |> maybe_put_cache_control_prompt_fields(state)
 
     {:ok, delta_acc} = Agent.start_link(fn -> [] end)
 
@@ -1157,6 +1246,7 @@ defmodule Pixir.Turn do
             dry_run: state.dry_run,
             bash_timeout_ms: state.bash_timeout_ms,
             bash_timeout_source: state.bash_timeout_source,
+            virtual_overlay: state.virtual_overlay,
             skills_opts: state.skills_opts,
             agents_opts: state.agents_opts,
             provider: state.provider,

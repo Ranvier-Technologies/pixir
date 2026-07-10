@@ -34,6 +34,14 @@ defmodule Pixir.ACP.ServerTest do
     end
   end
 
+  defmodule SignallingBlockingProvider do
+    def stream(_request, opts) do
+      send(Keyword.fetch!(opts, :sink), :provider_started)
+      Process.sleep(10_000)
+      {:ok, %{text: "never", reasoning: "", function_calls: [], finish_reason: :stop}}
+    end
+  end
+
   defmodule FailingProvider do
     def stream(_request, _opts) do
       {:error, %{ok: false, error: %{kind: :provider_http_error, message: "boom", details: %{}}}}
@@ -307,6 +315,23 @@ defmodule Pixir.ACP.ServerTest do
 
     assert Enum.map(model_opt["options"], & &1["value"]) ==
              Enum.map(Pixir.Providers.Registry.models(), & &1["id"])
+
+    reasoning_opt =
+      Enum.find(resp["result"]["configOptions"], &(&1["id"] == "reasoning_effort"))
+
+    assert Enum.map(resp["result"]["configOptions"], & &1["id"]) ==
+             ["mode", "model", "reasoning_effort"]
+
+    assert reasoning_opt["name"] == "Reasoning effort"
+    assert reasoning_opt["type"] == "select"
+    assert reasoning_opt["currentValue"] == (Pixir.Config.reasoning_effort() || "default")
+
+    assert Enum.map(reasoning_opt["options"], & &1["value"]) ==
+             ["default", "low", "medium", "high", "xhigh"]
+
+    assert Enum.all?(reasoning_opt["options"], fn option ->
+             option["name"] == option["value"]
+           end)
   end
 
   test "session/set_mode switches mode and emits current_mode_update (D.2)", %{out: out, ws: ws} do
@@ -345,6 +370,10 @@ defmodule Pixir.ACP.ServerTest do
     # set_config_option's response must carry the full configOptions list (ACP
     # SetSessionConfigOptionResponse requires it), with the mode reflecting plan.
     result = Enum.find(lines, &(&1["id"] == 6))["result"]
+
+    assert Enum.map(result["configOptions"], & &1["id"]) ==
+             ["mode", "model", "reasoning_effort"]
+
     mode_opt = Enum.find(result["configOptions"], &(&1["id"] == "mode"))
     assert mode_opt["currentValue"] == "plan"
 
@@ -377,6 +406,10 @@ defmodule Pixir.ACP.ServerTest do
     )
 
     [set_resp] = await_lines(out, 1)
+
+    assert Enum.map(set_resp["result"]["configOptions"], & &1["id"]) ==
+             ["mode", "model", "reasoning_effort"]
+
     model_opt = Enum.find(set_resp["result"]["configOptions"], &(&1["id"] == "model"))
     assert model_opt["currentValue"] == sticky
 
@@ -391,6 +424,251 @@ defmodule Pixir.ACP.ServerTest do
     prompt_resp = await_id(out, 7)
     assert prompt_resp["result"]["stopReason"] == "end_turn"
     assert Agent.get(sink, & &1)[:model] == sticky
+  end
+
+  test "default sentinel suppresses configured effort on the anthropic path resolved from base opts",
+       %{out: out, ws: ws} do
+    previous = Application.fetch_env(:pixir, :reasoning_effort)
+    Application.put_env(:pixir, :reasoning_effort, "low")
+
+    on_exit(fn ->
+      case previous do
+        {:ok, value} -> Application.put_env(:pixir, :reasoning_effort, value)
+        :error -> Application.delete_env(:pixir, :reasoning_effort)
+      end
+    end)
+
+    test_pid = self()
+
+    transport = fn http_request, acc, fun ->
+      send(test_pid, {:anthropic_body, Jason.decode!(http_request.body)})
+      acc = fun.({:status, 200}, acc)
+
+      chunks = [
+        "data: " <>
+          Jason.encode!(%{
+            type: "message_start",
+            message: %{model: "claude-fable-5", usage: %{input_tokens: 1, output_tokens: 0}}
+          }) <> "\n\n",
+        "data: " <>
+          Jason.encode!(%{
+            type: "content_block_start",
+            index: 0,
+            content_block: %{type: "text", text: ""}
+          }) <> "\n\n",
+        "data: " <>
+          Jason.encode!(%{
+            type: "content_block_delta",
+            index: 0,
+            delta: %{type: "text_delta", text: "ok"}
+          }) <> "\n\n",
+        "data: " <>
+          Jason.encode!(%{
+            type: "message_delta",
+            delta: %{stop_reason: "end_turn"},
+            usage: %{output_tokens: 1}
+          }) <> "\n\n",
+        "data: " <> Jason.encode!(%{type: "message_stop"}) <> "\n\n"
+      ]
+
+      Enum.reduce(chunks, acc, fn chunk, a -> fun.({:data, chunk}, a) end)
+      |> then(&{:ok, &1})
+    end
+
+    # No :provider injection — the model rides the server's BASE provider_opts,
+    # so the sentinel classification must resolve the provider from THIS model
+    # (the fresh-review major: classifying with the global default routed the
+    # sentinel down the OpenAI path while the turn ran Anthropic).
+    server =
+      start_server(out,
+        provider_opts: [model: "claude-fable-5", api_key: "sk-ant-test", transport: transport]
+      )
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    [new_resp] = await_lines(out, 1)
+    sid = new_resp["result"]["sessionId"]
+
+    Server.feed(
+      server,
+      request(3, "session/set_config_option", %{
+        "sessionId" => sid,
+        "configId" => "reasoning_effort",
+        "value" => "default"
+      })
+    )
+
+    assert await_id(out, 3)["result"]["configOptions"]
+
+    Server.feed(
+      server,
+      request(4, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "hello"}]
+      })
+    )
+
+    assert await_id(out, 4)["result"]["stopReason"] == "end_turn"
+
+    assert_receive {:anthropic_body, body}, 2_000
+    # The suppression proof lives on the effort surfaces only (the broad body
+    # contains unrelated text like the skills index): no reasoning/effort
+    # field at all — neither the configured "low" nor the "default" sentinel
+    # reached the Anthropic request.
+    refute Map.has_key?(body, "reasoning")
+    refute Map.has_key?(body, "output_config")
+    refute Map.has_key?(body, "reasoning_effort")
+  end
+
+  test "session/set_config_option reasoning_effort is sticky and prompt _meta wins for one turn",
+       %{
+         out: out,
+         ws: ws
+       } do
+    previous_reasoning_effort = Application.fetch_env(:pixir, :reasoning_effort)
+    Application.put_env(:pixir, :reasoning_effort, "low")
+
+    on_exit(fn ->
+      case previous_reasoning_effort do
+        {:ok, value} -> Application.put_env(:pixir, :reasoning_effort, value)
+        :error -> Application.delete_env(:pixir, :reasoning_effort)
+      end
+    end)
+
+    {:ok, sink} = Agent.start_link(fn -> nil end)
+    server = start_server(out, provider: CapturingProvider, provider_opts: [sink: sink])
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    [new_resp] = await_lines(out, 1)
+    sid = new_resp["result"]["sessionId"]
+
+    initial_effort =
+      Enum.find(new_resp["result"]["configOptions"], &(&1["id"] == "reasoning_effort"))
+
+    assert initial_effort["currentValue"] == "low"
+
+    Server.feed(
+      server,
+      request(3, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "config default"}]
+      })
+    )
+
+    assert await_id(out, 3)["result"]["stopReason"] == "end_turn"
+    assert Agent.get(sink, & &1)[:reasoning_effort] == "low"
+
+    Server.feed(
+      server,
+      request(6, "session/set_config_option", %{
+        "sessionId" => sid,
+        "configId" => "reasoning_effort",
+        "value" => "medium"
+      })
+    )
+
+    set_resp = await_id(out, 6)
+    config_options = set_resp["result"]["configOptions"]
+
+    assert Enum.map(config_options, & &1["id"]) == ["mode", "model", "reasoning_effort"]
+    assert Enum.find(config_options, &(&1["id"] == "mode"))["currentValue"] == "build"
+
+    assert Enum.find(config_options, &(&1["id"] == "model"))["currentValue"] ==
+             default_model_id()
+
+    assert Enum.find(config_options, &(&1["id"] == "reasoning_effort"))["currentValue"] ==
+             "medium"
+
+    Server.feed(
+      server,
+      request(7, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "sticky"}]
+      })
+    )
+
+    assert await_id(out, 7)["result"]["stopReason"] == "end_turn"
+    assert Agent.get(sink, & &1)[:reasoning_effort] == "medium"
+
+    Server.feed(
+      server,
+      request(8, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "override"}],
+        "_meta" => %{"reasoning_effort" => "high"}
+      })
+    )
+
+    assert await_id(out, 8)["result"]["stopReason"] == "end_turn"
+    assert Agent.get(sink, & &1)[:reasoning_effort] == "high"
+
+    Server.feed(
+      server,
+      request(9, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "sticky again"}]
+      })
+    )
+
+    assert await_id(out, 9)["result"]["stopReason"] == "end_turn"
+    assert Agent.get(sink, & &1)[:reasoning_effort] == "medium"
+
+    Server.feed(
+      server,
+      request(10, "session/set_config_option", %{
+        "sessionId" => sid,
+        "configId" => "reasoning_effort",
+        "value" => "default"
+      })
+    )
+
+    default_resp = await_id(out, 10)
+
+    assert Enum.find(
+             default_resp["result"]["configOptions"],
+             &(&1["id"] == "reasoning_effort")
+           )["currentValue"] == "default"
+
+    Server.feed(
+      server,
+      request(11, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "provider default"}]
+      })
+    )
+
+    assert await_id(out, 11)["result"]["stopReason"] == "end_turn"
+    default_opts = Agent.get(sink, & &1)
+    assert Keyword.has_key?(default_opts, :reasoning_effort)
+    assert default_opts[:reasoning_effort] == nil
+  end
+
+  test "session/set_config_option rejects an unknown reasoning_effort value", %{
+    out: out,
+    ws: ws
+  } do
+    server = start_server(out)
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    [new_resp] = await_lines(out, 1)
+    sid = new_resp["result"]["sessionId"]
+
+    Server.feed(
+      server,
+      request(6, "session/set_config_option", %{
+        "sessionId" => sid,
+        "configId" => "reasoning_effort",
+        "value" => "extreme"
+      })
+    )
+
+    [error_resp] = await_lines(out, 1)
+    assert error_resp["error"]["code"] == Protocol.invalid_params()
+    assert error_resp["error"]["message"] == "unknown config option value"
+
+    assert error_resp["error"]["data"] == %{
+             "configId" => "reasoning_effort",
+             "value" => "extreme"
+           }
   end
 
   test "sticky model accepts an Anthropic catalog id through the registry (#264)", %{
@@ -417,6 +695,10 @@ defmodule Pixir.ACP.ServerTest do
     )
 
     [set_resp] = await_lines(out, 1)
+
+    assert Enum.map(set_resp["result"]["configOptions"], & &1["id"]) ==
+             ["mode", "model", "reasoning_effort"]
+
     model_opt = Enum.find(set_resp["result"]["configOptions"], &(&1["id"] == "model"))
     assert model_opt["currentValue"] == sticky
 
@@ -1514,6 +1796,129 @@ defmodule Pixir.ACP.ServerTest do
     assert tool_result_index < prompt_response_index
 
     assert Enum.at(lines, prompt_response_index)["result"]["stopReason"] == "end_turn"
+  end
+
+  test "cancel ordered before terminal status resolves the prompt with cancelled", %{
+    out: out,
+    ws: ws
+  } do
+    test_pid = self()
+
+    resolve_hook = fn outcome ->
+      send(test_pid, {:prompt_at_resolve, outcome, self()})
+
+      receive do
+        :resolve_prompt -> :ok
+      end
+    end
+
+    server =
+      start_server(out,
+        provider: SignallingBlockingProvider,
+        provider_opts: [sink: test_pid],
+        prompt_resolve_hook: resolve_hook
+      )
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 2)["result"]["sessionId"]
+
+    Server.feed(
+      server,
+      request(3, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "wait"}]
+      })
+    )
+
+    assert_receive :provider_started, 1_000
+    Server.feed(server, notification("session/cancel", %{"sessionId" => sid}))
+    Server.feed(server, request(91, "initialize", %{"protocolVersion" => 1}))
+    assert await_id(out, 91)["result"]["protocolVersion"] == 1
+
+    assert_receive {:prompt_at_resolve, :interrupted, prompt_task}, 1_000
+    send(prompt_task, :resolve_prompt)
+
+    assert await_id(out, 3)["result"]["stopReason"] == "cancelled"
+  end
+
+  test "terminal status resolved before cancel request keeps end_turn", %{out: out, ws: ws} do
+    {:ok, agent} = Agent.start_link(fn -> [stop("done")] end)
+    test_pid = self()
+
+    resolve_hook = fn outcome ->
+      send(test_pid, {:prompt_at_resolve, outcome, self()})
+
+      receive do
+        :resolve_prompt -> :ok
+      end
+    end
+
+    server =
+      start_server(out,
+        provider: StubProvider,
+        provider_opts: [agent: agent],
+        prompt_resolve_hook: resolve_hook
+      )
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 2)["result"]["sessionId"]
+
+    Server.feed(
+      server,
+      request(3, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "finish"}]
+      })
+    )
+
+    assert_receive {:prompt_at_resolve, :done, prompt_task}, 1_000
+    send(prompt_task, :resolve_prompt)
+    assert await_id(out, 3)["result"]["stopReason"] == "end_turn"
+
+    Server.feed(server, notification("session/cancel", %{"sessionId" => sid}))
+    Server.feed(server, request(92, "initialize", %{"protocolVersion" => 1}))
+    assert await_id(out, 92)["result"]["protocolVersion"] == 1
+    assert await_id(out, 3)["result"]["stopReason"] == "end_turn"
+  end
+
+  test "cancel racing terminal status wins at the resolve seam", %{out: out, ws: ws} do
+    {:ok, agent} = Agent.start_link(fn -> [stop("done")] end)
+    test_pid = self()
+
+    resolve_hook = fn outcome ->
+      send(test_pid, {:prompt_at_resolve, outcome, self()})
+
+      receive do
+        :resolve_prompt -> :ok
+      end
+    end
+
+    server =
+      start_server(out,
+        provider: StubProvider,
+        provider_opts: [agent: agent],
+        prompt_resolve_hook: resolve_hook
+      )
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 2)["result"]["sessionId"]
+
+    Server.feed(
+      server,
+      request(3, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "finish"}]
+      })
+    )
+
+    assert_receive {:prompt_at_resolve, :done, prompt_task}, 1_000
+
+    Server.feed(server, notification("session/cancel", %{"sessionId" => sid}))
+    Server.feed(server, request(93, "initialize", %{"protocolVersion" => 1}))
+    assert await_id(out, 93)["result"]["protocolVersion"] == 1
+
+    send(prompt_task, :resolve_prompt)
+    assert await_id(out, 3)["result"]["stopReason"] == "cancelled"
   end
 
   test "session/cancel mid-turn resolves the prompt with cancelled", %{out: out, ws: ws} do

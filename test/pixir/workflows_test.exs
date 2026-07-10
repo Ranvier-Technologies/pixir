@@ -118,6 +118,67 @@ defmodule Pixir.WorkflowsTest do
     %{ws: ws, sid: sid}
   end
 
+  defp workflow_policy(paths) do
+    WritePolicy.normalize(%{
+      "version" => 1,
+      "metadata" => %{"id" => "workflow-test"},
+      "allow_writes" => paths
+    })
+  end
+
+  defp apply_workflow(path) do
+    %{
+      "steps" => [
+        %{
+          "id" => "propose",
+          "task" => "propose edit",
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["source.txt"],
+          "virtual_commands" => ["true"]
+        },
+        %{
+          "id" => "apply",
+          "apply_from" => "propose",
+          "depends_on" => ["propose"],
+          "write_set" => [path]
+        }
+      ]
+    }
+  end
+
+  defp add_artifact(path, content) do
+    %{
+      "kind" => "virtual_diff",
+      "version" => 1,
+      "changes" => [
+        %{
+          "path" => path,
+          "operation" => "add",
+          "after" => %{"content" => content, "sha256" => sha256(content)},
+          "diff" => %{"truncated" => false}
+        }
+      ]
+    }
+  end
+
+  defp modify_artifact(path, before, after_content) do
+    %{
+      "kind" => "virtual_diff",
+      "version" => 1,
+      "changes" => [
+        %{
+          "path" => path,
+          "operation" => "modify",
+          "before" => %{"sha256" => sha256(before)},
+          "after" => %{"content" => after_content, "sha256" => sha256(after_content)},
+          "diff" => %{"truncated" => false}
+        }
+      ]
+    }
+  end
+
+  defp sha256(content), do: :crypto.hash(:sha256, content) |> Base.encode16(case: :lower)
+
   test "documents the Workflow result and checkpoint status contract" do
     assert Workflows.workflow_statuses() == ~w(completed partial)
 
@@ -143,6 +204,44 @@ defmodule Pixir.WorkflowsTest do
 
     writer_plans = Enum.filter(plan["would_run"], &(&1["posture"] == "writer"))
     assert Enum.all?(writer_plans, &(&1["write_set"] == ["shared/result.txt"]))
+  end
+
+  test "dry_run serializes apply against overlapping readers", %{ws: ws} do
+    {:ok, policy} = workflow_policy(["shared.txt"])
+
+    spec = %{
+      "steps" => [
+        %{
+          "id" => "propose",
+          "task" => "p",
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["source.txt"],
+          "virtual_commands" => ["true"]
+        },
+        %{
+          "id" => "apply",
+          "apply_from" => "propose",
+          "depends_on" => ["propose"],
+          "write_set" => ["shared.txt"]
+        },
+        %{
+          "id" => "reader",
+          "task" => "read the applied file",
+          "agent" => "explorer",
+          "permission_mode" => "read_only",
+          "read_set" => ["shared.txt"],
+          "depends_on" => ["propose"]
+        }
+      ]
+    }
+
+    assert {:ok, plan} = Workflows.dry_run(spec, workspace: ws, write_policy: policy)
+
+    # apply mutates the parent workspace directly: a reader with an
+    # overlapping read_set never shares its wave, in either wave order.
+    refute Enum.any?(plan["waves"], &("apply" in &1 and "reader" in &1))
+    assert Enum.any?(plan["waves"], &("apply" in &1))
+    assert Enum.any?(plan["waves"], &("reader" in &1))
   end
 
   test "dry_run respects max_concurrency", %{ws: ws} do
@@ -293,6 +392,248 @@ defmodule Pixir.WorkflowsTest do
                "virtual_commands" => ["sed -i 's/workflow/virtual/' source.txt"]
              }
            ] = plan["would_run"]
+  end
+
+  test "dry_run plans apply_from steps without artifact content", %{ws: ws} do
+    {:ok, policy} = workflow_policy(["applied.txt"])
+
+    assert {:ok, plan} =
+             Workflows.dry_run(apply_workflow("applied.txt"), workspace: ws, write_policy: policy)
+
+    assert [_producer, apply] = plan["would_run"]
+    assert apply["id"] == "apply"
+    assert apply["posture"] == "apply"
+    assert apply["apply_from"] == "propose"
+    assert apply["write_set"] == ["applied.txt"]
+    refute Map.has_key?(apply, "virtual_diff")
+    refute Map.has_key?(apply, "virtual_diff_apply")
+  end
+
+  test "apply_from validation rejects in dry_run and run", %{sid: sid, ws: ws} do
+    {:ok, policy} = workflow_policy(["applied.txt"])
+
+    specs = [
+      %{
+        "steps" => [
+          %{
+            "id" => "apply",
+            "apply_from" => "missing",
+            "depends_on" => ["missing"],
+            "write_set" => ["applied.txt"]
+          }
+        ]
+      },
+      %{
+        "steps" => [
+          # read_only so the general writer-needs-write_set rule does not fire
+          # first: this case pins the apply_from-must-be-virtual rejection.
+          %{"id" => "plain", "task" => "plain", "permission_mode" => "read_only"},
+          %{
+            "id" => "apply",
+            "apply_from" => "plain",
+            "depends_on" => ["plain"],
+            "write_set" => ["applied.txt"]
+          }
+        ]
+      },
+      %{
+        "steps" => [
+          %{
+            "id" => "propose",
+            "task" => "p",
+            "workspace_mode" => "virtual_overlay",
+            "read_set" => ["source.txt"],
+            "virtual_commands" => ["true"]
+          },
+          %{"id" => "apply", "apply_from" => "propose", "write_set" => ["applied.txt"]}
+        ]
+      },
+      %{
+        "steps" => [
+          %{
+            "id" => "propose",
+            "task" => "p",
+            "workspace_mode" => "virtual_overlay",
+            "read_set" => ["source.txt"],
+            "virtual_commands" => ["true"]
+          },
+          %{"id" => "apply", "apply_from" => "propose", "depends_on" => ["propose"]}
+        ]
+      },
+      %{
+        "steps" => [
+          %{
+            "id" => "propose",
+            "task" => "p",
+            "workspace_mode" => "virtual_overlay",
+            "read_set" => ["source.txt"],
+            "virtual_commands" => ["true"]
+          },
+          %{
+            "id" => "apply",
+            "apply_from" => "propose",
+            "depends_on" => ["propose"],
+            "write_set" => ["applied.txt"],
+            "agent" => "worker"
+          }
+        ]
+      }
+    ]
+
+    # Each negative spec must fail for ITS OWN reason: expected
+    # {location, message-fragment} per case, in order. Locations are
+    # zero-based JSON pointers into the spec.
+    expectations = [
+      {"/steps/0/apply_from", "must reference a previous virtual_overlay step"},
+      {"/steps/1/apply_from", "must use workspace_mode virtual_overlay"},
+      {"/steps/1/apply_from", "must be listed in depends_on"},
+      {"/steps/1/apply_from", "requires write_set"},
+      {"/steps/1/apply_from", "do not spawn subagents"}
+    ]
+
+    for {spec, {location, fragment}} <- Enum.zip(specs, expectations) do
+      assert {:error, %{error: %{kind: :invalid_spec, message: message, details: details}}} =
+               Workflows.dry_run(spec, workspace: ws, write_policy: policy)
+
+      assert details["location"] == location,
+             "expected #{location} for fragment #{fragment}, got #{details["location"]}"
+
+      assert message =~ fragment
+
+      assert {:error, %{error: %{kind: :invalid_spec, message: ^message}}} =
+               Workflows.run(sid, spec, workspace: ws, write_policy: policy)
+    end
+
+    assert {:error, %{error: %{kind: :invalid_spec}}} =
+             Workflows.dry_run(apply_workflow("applied.txt"), workspace: ws)
+  end
+
+  test "apply starts on a completed producer and fails structurally without virtual_diff", %{
+    sid: sid,
+    ws: ws
+  } do
+    {:ok, policy} = workflow_policy(["applied.txt"])
+
+    spec =
+      update_in(apply_workflow("applied.txt"), ["steps"], fn [propose, apply] ->
+        [Map.put(propose, "timeout_ms", 1), apply]
+      end)
+
+    assert {:ok, result} =
+             Workflows.run(sid, spec,
+               workspace: ws,
+               write_policy: policy,
+               virtual_overlay_runner: fn _workspace, _params, _opts ->
+                 Process.sleep(100)
+                 {:ok, add_artifact("applied.txt", "late\n")}
+               end,
+               poll_ms: 10,
+               timeout_ms: 5_000
+             )
+
+    assert [producer, apply] = result["steps"]
+    assert producer["status"] == "timed_out"
+    refute producer["checkpoint_status"] == "checkpoint_ready"
+
+    # The apply_from dependency deliberately gates on completion, not on
+    # checkpoint_ready: the apply runs and fails with a producer-specific
+    # structured reason instead of holding as dependency_not_checkpoint_ready.
+    assert apply["status"] == "failed"
+    assert apply["virtual_diff_apply"]["reason"] == "producer_did_not_yield_virtual_diff"
+    refute File.exists?(Path.join(ws, "applied.txt"))
+  end
+
+  test "run applies virtual_diff evidence byte-exact", %{sid: sid, ws: ws} do
+    {:ok, policy} = workflow_policy(["applied.txt"])
+    content = "landed from apply\n"
+    artifact = add_artifact("applied.txt", content)
+
+    assert {:ok, result} =
+             Workflows.run(sid, apply_workflow("applied.txt"),
+               workspace: ws,
+               write_policy: policy,
+               virtual_overlay_runner: fn _workspace, _params, _opts -> {:ok, artifact} end,
+               poll_ms: 10,
+               timeout_ms: 5_000
+             )
+
+    assert result["status"] == "completed"
+    assert File.read!(Path.join(ws, "applied.txt")) == content
+    assert [_producer, %{"virtual_diff_apply" => %{"status" => "applied"}}] = result["steps"]
+  end
+
+  test "apply_from conflict keeps target untouched with engine evidence", %{sid: sid, ws: ws} do
+    File.write!(Path.join(ws, "source.txt"), "current\n")
+    {:ok, policy} = workflow_policy(["source.txt"])
+    artifact = modify_artifact("source.txt", "stale\n", "new\n")
+
+    assert {:ok, result} =
+             Workflows.run(sid, apply_workflow("source.txt"),
+               workspace: ws,
+               write_policy: policy,
+               virtual_overlay_runner: fn _workspace, _params, _opts -> {:ok, artifact} end,
+               poll_ms: 10,
+               timeout_ms: 5_000
+             )
+
+    assert result["status"] == "partial"
+    assert File.read!(Path.join(ws, "source.txt")) == "current\n"
+    assert [_producer, apply] = result["steps"]
+    assert apply["checkpoint_status"] == "failed"
+    assert apply["virtual_diff_apply"]["status"] in ["conflicted", "not_applied"]
+  end
+
+  test "apply_from step write_set bounds artifact paths before engine", %{sid: sid, ws: ws} do
+    {:ok, policy} = workflow_policy(["allowed.txt", "outside.txt"])
+    artifact = add_artifact("outside.txt", "nope\n")
+
+    assert {:ok, result} =
+             Workflows.run(sid, apply_workflow("allowed.txt"),
+               workspace: ws,
+               write_policy: policy,
+               virtual_overlay_runner: fn _workspace, _params, _opts -> {:ok, artifact} end,
+               poll_ms: 10,
+               timeout_ms: 5_000
+             )
+
+    refute File.exists?(Path.join(ws, "outside.txt"))
+    assert [_producer, apply] = result["steps"]
+    assert apply["virtual_diff_apply"]["reason"] == "artifact_path_outside_step_write_set"
+  end
+
+  test "bounded_write rejects writer posture read-only agents but allows read-only posture", %{
+    ws: ws
+  } do
+    {:ok, policy} = workflow_policy(["notes.txt"])
+
+    writer_spec = %{
+      "steps" => [
+        %{
+          "id" => "bad",
+          "task" => "write",
+          "agent" => "explorer",
+          "permission_mode" => "auto",
+          "write_set" => ["notes.txt"]
+        }
+      ]
+    }
+
+    assert {:error, %{error: %{kind: :invalid_spec, details: details}}} =
+             Workflows.dry_run(writer_spec, workspace: ws, write_policy: policy)
+
+    assert details["location"] == "/steps/0/agent"
+    assert details["role"] == "explorer"
+    assert details["role_sandbox_mode"] == "read-only"
+    assert details["mode"] == "bounded_write"
+
+    assert {:ok, plan} =
+             Workflows.dry_run(
+               %{"steps" => [%{"id" => "ok", "task" => "read", "agent" => "explorer"}]},
+               workspace: ws,
+               write_policy: policy
+             )
+
+    assert [%{"posture" => "read_only"}] = plan["would_run"]
   end
 
   test "malformed nested values return structured invalid_args", %{ws: ws} do

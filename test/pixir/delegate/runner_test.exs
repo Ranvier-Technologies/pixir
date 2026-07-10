@@ -63,6 +63,285 @@ defmodule Pixir.Delegate.RunnerTest do
     }
   end
 
+  defp run_child_projection(workspace, child, mode) do
+    spec = projection_spec(mode)
+    terminal_status = child["status"]
+    completed = if terminal_status == "completed", do: 1, else: 0
+    failed = if terminal_status == "failed", do: 1, else: 0
+    outcome_status = if completed == 1, do: "completed", else: "partial"
+
+    spawn_agent = fn _parent_session_id, _args, _opts -> {:ok, child} end
+
+    wait_outcome = fn _parent_session_id, _ids, _timeout_ms, _opts ->
+      {:ok,
+       %{
+         "status" => outcome_status,
+         "complete" => true,
+         "counts" => %{
+           "completed" => completed,
+           "failed" => failed,
+           "timed_out" => 0,
+           "cancelled" => 0,
+           "detached" => 0,
+           "incomplete" => 0
+         },
+         "subagents" => [child],
+         "summary" => outcome_status
+       }}
+    end
+
+    assert {:ok, %{"children" => [projected]}} =
+             Runner.run(
+               %{workspace: workspace},
+               spec,
+               %{"strategy" => "subagents", "planned_child_count" => 1},
+               spawn_agent: spawn_agent,
+               wait_outcome: wait_outcome
+             )
+
+    projected
+  end
+
+  defp projection_spec("read_only") do
+    %{
+      "contract_version" => 1,
+      "strategy" => "subagents",
+      "mode" => "read_only",
+      "task" => "project one child"
+    }
+  end
+
+  defp projection_spec("bounded_write") do
+    %{
+      "contract_version" => 1,
+      "strategy" => "subagents",
+      "mode" => "bounded_write",
+      "task" => "project one writer",
+      "write_policy" => %{
+        "version" => 1,
+        "metadata" => %{"id" => "guided-resume-test"},
+        "allow_writes" => ["notes/out.md"]
+      }
+    }
+  end
+
+  test "transport-dead writer projects guided resume with write-safe notes" do
+    with_pixir_home("pixir-delegate-writer-resume-home", fn ->
+      ws = tmp_workspace("pixir-delegate-writer-resume")
+      child_session_id = "20260710T000001-writer"
+
+      write_raw_session_log(ws, child_session_id, [
+        raw_event(child_session_id, 1, "turn_failed", %{
+          "terminal_status" => "provider_error",
+          "error_kind" => "provider_http_error",
+          "error_message" => "provider transport failed",
+          "details" => %{
+            "retryable" => true,
+            "type" => "service_unavailable_error"
+          }
+        })
+      ])
+
+      child = %{
+        "id" => "subagent_writer",
+        "child_session_id" => child_session_id,
+        "agent" => "worker",
+        "status" => "failed",
+        "summary" => "provider transport failed",
+        "task" => "write notes",
+        "workspace_mode" => "shared",
+        "workspace" => ws,
+        "permission_mode" => "auto",
+        "write_policy" => %{"allow_writes" => ["notes/out.md"]},
+        "reason" => "provider_error",
+        "child_log_path" => Path.join(ws, "writer.ndjson"),
+        "next_actions" => []
+      }
+
+      projected = run_child_projection(ws, child, "bounded_write")
+
+      assert projected["recovery"]["kind"] == "resume_suggested"
+
+      assert projected["recovery"]["reason"] ==
+               "terminal transport error: service_unavailable_error"
+
+      assert projected["resume_command"] =~ "pixir resume #{child_session_id}"
+      assert projected["diagnose_command"] =~ "pixir diagnose session #{child_session_id}"
+
+      notes = projected["recovery"]["notes"]
+
+      assert "The child Log is the source of truth; the resumed turn continues with context intact." in notes
+
+      assert "Inspect the child Log for already-applied writes before resuming so work is not duplicated." in notes
+
+      assert "A stale writer lease fails closed on purpose; inspect with pixir diagnose and never force-release it as a default." in notes
+    end)
+  end
+
+  test "transport-dead read-only child projects guided resume after retries exhaust" do
+    with_pixir_home("pixir-delegate-reader-resume-home", fn ->
+      ws = tmp_workspace("pixir-delegate-reader-resume")
+      child_session_id = "20260710T000002-reader"
+
+      write_raw_session_log(ws, child_session_id, [
+        raw_event(child_session_id, 1, "turn_failed", %{
+          "terminal_status" => "provider_error",
+          "error_kind" => "websocket_closed",
+          "error_message" => "websocket closed"
+        })
+      ])
+
+      child = %{
+        "id" => "subagent_reader",
+        "child_session_id" => child_session_id,
+        "agent" => "explorer",
+        "status" => "failed",
+        "summary" => "websocket closed",
+        "task" => "inspect notes",
+        "workspace_mode" => "shared",
+        "workspace" => ws,
+        "permission_mode" => "read_only",
+        "reason" => "provider_error",
+        "retry_attempts" => 2,
+        "retry_max_attempts" => 2,
+        "current_attempt_index" => 2,
+        "retry_history" => [
+          %{"attempt_index" => 0, "error_kind" => "websocket_closed"},
+          %{"attempt_index" => 1, "error_kind" => "websocket_closed"}
+        ],
+        "child_log_path" => Path.join(ws, "reader.ndjson"),
+        "next_actions" => []
+      }
+
+      projected = run_child_projection(ws, child, "read_only")
+
+      assert projected["recovery"] == %{
+               "kind" => "resume_suggested",
+               "reason" => "terminal transport error: websocket_closed"
+             }
+
+      assert projected["resume_command"] =~ "pixir resume #{child_session_id}"
+      assert projected["retry_attempts"] == 2
+      assert length(projected["retry_history"]) == 2
+    end)
+  end
+
+  test "detached child with transport evidence projects guided resume" do
+    with_pixir_home("pixir-delegate-detached-resume-home", fn ->
+      ws = tmp_workspace("pixir-delegate-detached-resume")
+      child_session_id = "20260710T000003-detached"
+
+      write_raw_session_log(ws, child_session_id, [
+        raw_event(child_session_id, 1, "turn_failed", %{
+          "terminal_status" => "provider_error",
+          "error_kind" => "websocket_read_failed",
+          "error_message" => "Could not read WebSocket frame.",
+          "details" => %{"reason" => ":closed"}
+        })
+      ])
+
+      child = %{
+        "id" => "subagent_detached",
+        "child_session_id" => child_session_id,
+        "agent" => "worker",
+        "status" => "detached",
+        "summary" => "child from a previous Pixir runtime",
+        "task" => "write notes",
+        "workspace_mode" => "shared",
+        "workspace" => ws,
+        "permission_mode" => "auto",
+        "write_policy" => %{"allow_writes" => ["notes/out.md"]},
+        "reason" => "detached",
+        "child_log_path" => Path.join(ws, "detached.ndjson"),
+        "next_actions" => []
+      }
+
+      # The most common real-world shape: the runtime that owned the child
+      # died, the child shows detached after restart, and its Log carries the
+      # transport death — guided resume must reach it too.
+      projected = run_child_projection(ws, child, "bounded_write")
+
+      assert projected["recovery"]["kind"] == "resume_suggested"
+      assert projected["recovery"]["reason"] =~ "websocket_read_failed"
+      assert is_binary(projected["resume_command"])
+      assert projected["diagnose_command"] =~ "pixir diagnose session #{child_session_id}"
+      assert Enum.any?(projected["recovery"]["notes"], &(&1 =~ "lease"))
+    end)
+  end
+
+  test "non-transport child failure keeps the existing recovery shape" do
+    with_pixir_home("pixir-delegate-nontransport-home", fn ->
+      ws = tmp_workspace("pixir-delegate-nontransport")
+      child_session_id = "20260710T000003-nontransport"
+
+      write_raw_session_log(ws, child_session_id, [
+        raw_event(child_session_id, 1, "turn_failed", %{
+          "terminal_status" => "tool_error",
+          "error_kind" => "invalid_args",
+          "error_message" => "invalid task"
+        })
+      ])
+
+      child = %{
+        "id" => "subagent_nontransport",
+        "child_session_id" => child_session_id,
+        "agent" => "explorer",
+        "status" => "failed",
+        "summary" => "invalid task",
+        "task" => "inspect notes",
+        "workspace_mode" => "shared",
+        "workspace" => ws,
+        "permission_mode" => "read_only",
+        "reason" => "tool_error",
+        "child_log_path" => Path.join(ws, "nontransport.ndjson"),
+        "next_actions" => []
+      }
+
+      projected = run_child_projection(ws, child, "read_only")
+
+      refute Map.has_key?(projected, "recovery")
+      assert projected["resume_command"] =~ "pixir resume #{child_session_id}"
+      assert projected["diagnose_command"] =~ "pixir diagnose session #{child_session_id}"
+    end)
+  end
+
+  test "completed child stays untouched even with stale transport evidence" do
+    with_pixir_home("pixir-delegate-completed-home", fn ->
+      ws = tmp_workspace("pixir-delegate-completed")
+      child_session_id = "20260710T000004-completed"
+
+      # The stale evidence rides the child Log — the source the projection
+      # actually reads when results collapse the reason — not an inline field.
+      write_raw_session_log(ws, child_session_id, [
+        raw_event(child_session_id, 1, "turn_failed", %{
+          "terminal_status" => "provider_error",
+          "error_kind" => "websocket_read_failed",
+          "error_message" => "stale transport event from an earlier attempt",
+          "details" => %{"reason" => ":closed"}
+        })
+      ])
+
+      child = %{
+        "id" => "subagent_completed",
+        "child_session_id" => child_session_id,
+        "agent" => "explorer",
+        "status" => "completed",
+        "summary" => "done",
+        "task" => "inspect notes",
+        "workspace_mode" => "shared",
+        "permission_mode" => "read_only",
+        "child_log_path" => Path.join(ws, "completed.ndjson"),
+        "next_actions" => []
+      }
+
+      projected = run_child_projection(ws, child, "read_only")
+
+      refute Map.has_key?(projected, "recovery")
+      refute Map.has_key?(projected, "resume_command")
+      refute Map.has_key?(projected, "diagnose_command")
+    end)
+  end
+
   test "bounded_write workflow runtime pairs auto permission mode with the write policy" do
     with_pixir_home("pixir-delegate-runner-home", fn ->
       ws = tmp_workspace("pixir-delegate-runner-workflow-write")
@@ -361,6 +640,251 @@ defmodule Pixir.Delegate.RunnerTest do
       assert get_in(payload.payload, ["limits", "transport"]) == "websocket"
       assert_received {:spawn_agent_called, _parent_session_id, _args, opts}
       assert Keyword.fetch!(opts, :provider_transport) == "websocket"
+    end)
+  end
+
+  test "virtual_overlay spec context threads to child spawn opts" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-virtual-overlay")
+      test_pid = self()
+
+      spec = %{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "produce a virtual diff",
+        "mode" => "read_only",
+        "subagents" => %{
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["mix.exs"],
+          "limits" => %{"max_virtual_commands" => 2}
+        }
+      }
+
+      spec_meta = %{"strategy" => "subagents", "planned_child_count" => 1}
+
+      spawn_agent = fn parent_session_id, args, opts ->
+        send(test_pid, {:virtual_spawn_called, parent_session_id, args, opts})
+
+        {:ok,
+         %{
+           "id" => "subagent_virtual",
+           "agent" => "explorer",
+           "status" => "queued",
+           "summary" => "queued",
+           "workspace_mode" => "virtual_overlay"
+         }}
+      end
+
+      assert {:ok, _payload} =
+               Runner.start(%{workspace: ws}, spec, spec_meta, spawn_agent: spawn_agent)
+
+      assert_received {:virtual_spawn_called, _parent_session_id, args, opts}
+      assert args["workspace_mode"] == "virtual_overlay"
+
+      assert Keyword.fetch!(opts, :virtual_overlay) == %{
+               read_set: ["mix.exs"],
+               limits: %{"max_virtual_commands" => 2}
+             }
+
+      assert Keyword.fetch!(opts, :permission_mode) == :read_only
+      assert Keyword.fetch!(opts, :write_policy) == nil
+    end)
+  end
+
+  test "virtual child result projects artifact and explicit apply affordance" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-virtual-envelope")
+
+      artifact = %{
+        "kind" => "virtual_diff",
+        "version" => 1,
+        "changes" => [],
+        "summary" => %{"diff_bytes" => 0},
+        "apply" => %{"status" => "not_applied", "requires_explicit_apply" => true}
+      }
+
+      child = %{
+        "id" => "subagent_virtual",
+        "child_session_id" => "child-session",
+        "agent" => "explorer",
+        "status" => "completed",
+        "summary" => "done",
+        "task" => "produce a virtual diff",
+        "workspace_mode" => "virtual_overlay",
+        "child_log_path" => Path.join(ws, "child.ndjson"),
+        "next_actions" => [],
+        "virtual_diff" => artifact,
+        "virtual_diff_ref" => %{"kind" => "virtual_diff", "encoded_bytes" => 100}
+      }
+
+      spec = %{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "produce a virtual diff",
+        "subagents" => %{
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["mix.exs"]
+        }
+      }
+
+      spawn_agent = fn _parent_session_id, _args, _opts -> {:ok, child} end
+
+      wait_outcome = fn _parent_session_id, _ids, _timeout_ms, _opts ->
+        {:ok,
+         %{
+           "status" => "completed",
+           "complete" => true,
+           "counts" => %{
+             "completed" => 1,
+             "failed" => 0,
+             "timed_out" => 0,
+             "cancelled" => 0,
+             "detached" => 0,
+             "incomplete" => 0
+           },
+           "subagents" => [child],
+           "summary" => "completed"
+         }}
+      end
+
+      assert {:ok, %{"children" => [projected]}} =
+               Runner.run(
+                 %{workspace: ws},
+                 spec,
+                 %{"strategy" => "subagents", "planned_child_count" => 1},
+                 spawn_agent: spawn_agent,
+                 wait_outcome: wait_outcome
+               )
+
+      assert projected["virtual_diff"] == artifact
+
+      assert projected["apply"] == %{
+               "status" => "not_applied",
+               "requires_explicit_apply" => true,
+               "tool" => "apply_virtual_diff",
+               "dry_run_default" => true,
+               "workflow_apply_from_compatible" => false
+             }
+    end)
+  end
+
+  test "failed virtual child projects preserved artifact and strategy-aware recovery" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-failed-virtual-envelope")
+
+      artifact = %{
+        "kind" => "virtual_diff",
+        "version" => 1,
+        "changes" => [],
+        "summary" => %{"diff_bytes" => 0},
+        "apply" => %{"status" => "not_applied", "requires_explicit_apply" => true}
+      }
+
+      ref = %{"kind" => "virtual_diff", "encoded_bytes" => 100, "source_seq" => 4}
+
+      child = %{
+        "id" => "subagent_virtual_failed",
+        "child_session_id" => "failed-child-session",
+        "agent" => "explorer",
+        "status" => "failed",
+        "summary" => "provider transport failed after artifact export",
+        "task" => "produce then fail",
+        "workspace_mode" => "virtual_overlay",
+        "child_log_path" => Path.join(ws, "failed-child.ndjson"),
+        "next_actions" => ["inspect_child_session_log"],
+        "virtual_diff" => artifact,
+        "virtual_diff_ref" => ref
+      }
+
+      spec = %{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "produce then fail",
+        "subagents" => %{
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["mix.exs"]
+        }
+      }
+
+      spawn_agent = fn _parent_session_id, _args, _opts -> {:ok, child} end
+
+      wait_outcome = fn _parent_session_id, _ids, _timeout_ms, _opts ->
+        {:ok,
+         %{
+           "status" => "partial",
+           "complete" => false,
+           "counts" => %{"completed" => 0, "failed" => 1},
+           "subagents" => [child],
+           "summary" => "failed"
+         }}
+      end
+
+      assert {:ok, %{"children" => [projected]}} =
+               Runner.run(
+                 %{workspace: ws},
+                 spec,
+                 %{"strategy" => "subagents", "planned_child_count" => 1},
+                 spawn_agent: spawn_agent,
+                 wait_outcome: wait_outcome
+               )
+
+      assert projected["status"] == "failed"
+      assert projected["virtual_diff"] == artifact
+      assert projected["virtual_diff_ref"] == ref
+      assert projected["apply"]["tool"] == "apply_virtual_diff"
+      assert projected["recovery"]["virtual_diff_preserved"] == true
+      assert projected["recovery"]["virtual_diff_ref"] == ref
+      assert projected["recovery"]["apply_is_separate_explicit_decision"] == true
+
+      assert Enum.any?(projected["recovery"]["notes"], &String.contains?(&1, "no longer exists"))
+
+      assert Enum.any?(
+               projected["recovery"]["notes"],
+               &String.contains?(&1, "Inspect the child Log")
+             )
+    end)
+  end
+
+  test "non-virtual child result does not gain virtual artifact keys" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-shared-envelope")
+
+      child = %{
+        "id" => "subagent_shared",
+        "child_session_id" => "child-session",
+        "agent" => "explorer",
+        "status" => "completed",
+        "summary" => "done",
+        "task" => "inspect",
+        "workspace_mode" => "shared",
+        "child_log_path" => Path.join(ws, "child.ndjson"),
+        "next_actions" => []
+      }
+
+      spawn_agent = fn _parent_session_id, _args, _opts -> {:ok, child} end
+
+      wait_outcome = fn _parent_session_id, _ids, _timeout_ms, _opts ->
+        {:ok,
+         %{
+           "status" => "completed",
+           "counts" => %{"completed" => 1},
+           "subagents" => [child],
+           "summary" => "completed"
+         }}
+      end
+
+      assert {:ok, %{"children" => [projected]}} =
+               Runner.run(
+                 %{workspace: ws},
+                 %{"strategy" => "subagents", "task" => "inspect"},
+                 %{"strategy" => "subagents", "planned_child_count" => 1},
+                 spawn_agent: spawn_agent,
+                 wait_outcome: wait_outcome
+               )
+
+      refute Map.has_key?(projected, "virtual_diff")
+      refute Map.has_key?(projected, "virtual_diff_ref")
+      refute Map.has_key?(projected, "apply")
     end)
   end
 

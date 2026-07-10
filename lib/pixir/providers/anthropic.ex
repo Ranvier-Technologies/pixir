@@ -9,7 +9,9 @@ defmodule Pixir.Providers.Anthropic do
   """
 
   alias Pixir.Provider.{FinchTransport, StreamIdle}
+  alias Pixir.Providers.ErrBody
   alias Pixir.Providers.Anthropic.Replay
+  alias Pixir.Providers.Anthropic.Prompt
   alias Pixir.Providers.Anthropic.Tools, as: AnthropicTools
   alias Pixir.Tool
 
@@ -119,7 +121,7 @@ defmodule Pixir.Providers.Anthropic do
   defp do_stream(request, opts) do
     with {:ok, transport_metadata} <-
            transport_metadata(Keyword.get(opts, :provider_transport, :auto)),
-         {:ok, body} <- build_body(request, opts),
+         {:ok, body, prompt_metadata} <- build_body(request, opts),
          {:ok, headers} <- auth_headers(opts) do
       http_request = %{
         method: :post,
@@ -128,7 +130,7 @@ defmodule Pixir.Providers.Anthropic do
         body: Jason.encode!(body)
       }
 
-      init = initial_acc(opts, request, transport_metadata)
+      init = initial_acc(opts, request, transport_metadata, prompt_metadata)
 
       case run_stream(http_request, init, opts) do
         {:ok, acc} ->
@@ -152,7 +154,7 @@ defmodule Pixir.Providers.Anthropic do
     end
   end
 
-  defp initial_acc(opts, request, transport_metadata) do
+  defp initial_acc(opts, request, transport_metadata, prompt_metadata) do
     %{
       status: nil,
       headers: [],
@@ -169,7 +171,7 @@ defmodule Pixir.Providers.Anthropic do
       stream_error: nil,
       delivered_output: false,
       on_delta: Keyword.get(opts, :on_delta, fn _ -> :ok end),
-      provider_metadata: transport_metadata
+      provider_metadata: Map.merge(transport_metadata, prompt_metadata)
     }
   end
 
@@ -232,9 +234,7 @@ defmodule Pixir.Providers.Anthropic do
     with :ok <- reject_output_schema(request),
          :ok <- reject_hosted_tools(request),
          {:ok, model} <- request_model(request, opts),
-         {:ok, messages} <- request_messages(request, model),
-         {:ok, system} <-
-           optional_system(get_field(request, :system) || get_field(request, :system_prompt)),
+         {:ok, prompt_parts} <- request_prompt_parts(request, model),
          {:ok, tools} <- AnthropicTools.project(get_field(request, :tools)),
          {:ok, max_tokens} <- max_tokens(request, opts),
          {:ok, effort} <-
@@ -243,18 +243,162 @@ defmodule Pixir.Providers.Anthropic do
            ) do
       body = %{
         "model" => model,
-        "messages" => messages,
+        "messages" => prompt_parts.messages,
         "max_tokens" => max_tokens,
         "stream" => true
       }
 
       {:ok,
        body
-       |> maybe_put("system", system)
+       |> maybe_put("system", prompt_parts.system)
        |> maybe_put("tools", tools)
-       |> maybe_put_effort(effort)}
+       |> maybe_put_effort(effort), prompt_parts.provider_metadata}
     end
   end
+
+  defp request_prompt_parts(request, model) do
+    if prompt_mode_present?(request) do
+      with {:ok, messages, prev_turn_boundary} <- request_messages_with_boundary(request, model),
+           {:ok, prompt} <-
+             Prompt.build(%{
+               mode: get_field(request, :prompt_mode),
+               skills_index: get_field(request, :skills_index),
+               messages: messages,
+               late_context: pa1_late_context(request),
+               prev_turn_boundary: prev_turn_boundary
+             }) do
+        {:ok,
+         %{
+           messages: prompt.messages,
+           system: prompt.system,
+           provider_metadata: %{"prompt_contract" => prompt.contract}
+         }}
+      end
+    else
+      with {:ok, messages} <- request_messages(request, model),
+           {:ok, system} <-
+             optional_system(get_field(request, :system) || get_field(request, :system_prompt)) do
+        {:ok, %{messages: messages, system: system, provider_metadata: %{}}}
+      end
+    end
+  end
+
+  defp prompt_mode_present?(request),
+    do: Map.has_key?(request, :prompt_mode) or Map.has_key?(request, "prompt_mode")
+
+  defp request_messages_with_boundary(request, model) do
+    cond do
+      is_list(get_field(request, :history)) ->
+        history = request_provider_history(get_field(request, :history))
+        messages = fold_history(history, model)
+
+        prev_turn_boundary =
+          previous_turn_content_count(
+            history,
+            get_field(request, :previous_turn_boundary_seq),
+            model
+          )
+
+        {:ok, messages, prev_turn_boundary}
+
+      is_list(get_field(request, :messages)) ->
+        {:ok, get_field(request, :messages), nil}
+
+      true ->
+        {:error,
+         Tool.error(:invalid_args, "Anthropic request is missing a required field.", %{
+           field: :messages,
+           expected: "list"
+         })}
+    end
+  end
+
+  defp previous_turn_content_count(_history, nil, _model), do: nil
+
+  defp previous_turn_content_count(history, previous_turn_boundary_seq, model)
+       when is_integer(previous_turn_boundary_seq) and previous_turn_boundary_seq >= 0 do
+    case leading_compaction_event(history) do
+      head when is_map(head) ->
+        if is_integer(event_seq(head)) and event_seq(head) > previous_turn_boundary_seq do
+          # HONEST CLAMP: a compaction fired during the current turn, so there is no
+          # stable prior-turn prefix this turn; the cache re-primes after compaction anyway.
+          nil
+        else
+          previous_turn_prefix_content_count(history, previous_turn_boundary_seq, model)
+        end
+
+      _other ->
+        previous_turn_prefix_content_count(history, previous_turn_boundary_seq, model)
+    end
+  end
+
+  defp previous_turn_content_count(_history, _previous_turn_boundary_seq, _model), do: nil
+
+  defp previous_turn_prefix_content_count(history, previous_turn_boundary_seq, model) do
+    history
+    |> Enum.take_while(fn event ->
+      seq = event_seq(event)
+      is_integer(seq) and seq <= previous_turn_boundary_seq
+    end)
+    |> fold_history(model)
+    |> content_block_count()
+  end
+
+  defp leading_compaction_event([head | _tail]) do
+    if event_type(head) == :history_compaction, do: head, else: nil
+  end
+
+  defp leading_compaction_event(_history), do: nil
+
+  defp event_seq(%{seq: seq}) when is_integer(seq), do: seq
+  defp event_seq(%{"seq" => seq}) when is_integer(seq), do: seq
+
+  defp event_seq(%{seq: seq}) when is_binary(seq) do
+    case Integer.parse(seq) do
+      {int, ""} -> int
+      _ -> nil
+    end
+  end
+
+  defp event_seq(%{"seq" => seq}) when is_binary(seq) do
+    case Integer.parse(seq) do
+      {int, ""} -> int
+      _ -> nil
+    end
+  end
+
+  defp event_seq(_event), do: nil
+
+  defp content_block_count(messages) do
+    Enum.reduce(messages, 0, fn message, count ->
+      count + length(Map.get(message, "content", []))
+    end)
+  end
+
+  defp pa1_late_context(request) do
+    [
+      non_empty_string(get_field(request, :developer_context)),
+      agent_instructions_section(request)
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> nil
+      parts -> Enum.join(parts, "\n\n")
+    end
+  end
+
+  defp agent_instructions_section(request) do
+    case non_empty_string(get_field(request, :agent_instructions)) do
+      nil -> nil
+      text -> "Subagent role instructions:\n" <> text
+    end
+  end
+
+  defp non_empty_string(value) when is_binary(value) do
+    if value == "", do: nil, else: value
+  end
+
+  defp non_empty_string(_value), do: nil
 
   defp request_model(request, opts) do
     case get_field(request, :model) || Keyword.get(opts, :model) do
@@ -276,7 +420,7 @@ defmodule Pixir.Providers.Anthropic do
         {:ok, get_field(request, :messages)}
 
       is_list(get_field(request, :history)) ->
-        {:ok, fold_history(get_field(request, :history), model)}
+        {:ok, request |> get_field(:history) |> request_provider_history() |> fold_history(model)}
 
       true ->
         {:error,
@@ -287,84 +431,289 @@ defmodule Pixir.Providers.Anthropic do
     end
   end
 
+  defp request_provider_history(history) do
+    history
+    |> Enum.map(&provider_history_event/1)
+    |> Pixir.Compaction.provider_history()
+  end
+
+  defp provider_history_event(%{} = event) do
+    # Compaction.provider_history/1 reads :type/:seq/:data as atom keys; raw
+    # NDJSON events are string-keyed, so mirror all three (cold-resume rule).
+    event
+    |> Map.put_new(:type, event_type(event))
+    |> Map.put_new(:seq, event_seq(event))
+    |> Map.put_new(:data, event_data(event))
+  end
+
+  defp provider_history_event(event), do: event
+
   # One assistant turn's pending items accumulate as raw events (reasoning and
   # tool_call, arrival order) and render at flush through Replay.assistant_content:
   # thinking blocks re-inject verbatim, model- and dialect-guarded (ADR 0037 D5),
   # positioned exactly as captured next to their tool_use blocks.
   defp fold_history(history, model) do
-    {messages, pending_items, pending_results} =
-      Enum.reduce(history, {[], [], []}, fn event, {messages, assistant_items, results} ->
-        case event_type(event) do
-          :user_message ->
-            messages = flush_pending(messages, assistant_items, results, model)
-            {messages ++ [text_message("user", event_text(event))], [], []}
+    history
+    |> Enum.reduce(
+      %{
+        messages: [],
+        assistant_items: [],
+        results: [],
+        pending_calls: %{},
+        deferred_skill_activations: %{}
+      },
+      &fold_history_event(&1, &2, model)
+    )
+    |> close_deferred_skill_activations(model)
+    |> then(fn state ->
+      flush_pending(state.messages, state.assistant_items, state.results, model)
+    end)
+  end
 
-          :assistant_message ->
-            messages = flush_pending(messages, assistant_items, results, model)
-            {messages ++ [text_message("assistant", event_text(event))], [], []}
+  defp fold_history_event(event, state, model) do
+    case event_type(event) do
+      :user_message ->
+        append_history_text(state, "user", event_text(event), model)
 
-          :skill_activation ->
-            messages = flush_pending(messages, assistant_items, results, model)
+      :assistant_message ->
+        append_history_text(state, "assistant", event_text(event), model)
 
-            {messages ++
-               [text_message("user", Pixir.Skills.render_activation(event_data(event)))], [], []}
+      :skill_activation ->
+        case pending_skill_view_call_id(event, state.pending_calls) do
+          {:ok, call_id} ->
+            Map.update!(state, :deferred_skill_activations, fn deferred ->
+              Map.update(deferred, call_id, [event], &(&1 ++ [event]))
+            end)
 
-          :subagent_event ->
-            # Terminal subagent events render as user context, exactly like the
-            # OpenAI fold; non-terminal lifecycle events are never model context.
-            case subagent_event_text(event_data(event)) do
-              nil ->
-                {messages, assistant_items, results}
-
-              text ->
-                messages = flush_pending(messages, assistant_items, results, model)
-                {messages ++ [text_message("user", text)], [], []}
-            end
-
-          :history_compaction ->
-            messages = flush_pending(messages, assistant_items, results, model)
-
-            {messages ++
-               [
-                 text_message(
-                   "user",
-                   Pixir.Compaction.render_for_provider(event_data(event))
-                 )
-               ], [], []}
-
-          :branch_summary ->
-            messages = flush_pending(messages, assistant_items, results, model)
-
-            {messages ++
-               [
-                 text_message(
-                   "user",
-                   Pixir.BranchSummary.render_for_provider(event_data(event))
-                 )
-               ], [], []}
-
-          :tool_call ->
-            messages = flush_results(messages, results)
-            {messages, assistant_items ++ [normalize_event(event, :tool_call)], []}
-
-          :reasoning ->
-            messages = flush_results(messages, results)
-            {messages, assistant_items ++ [normalize_event(event, :reasoning)], []}
-
-          :tool_result ->
-            messages = flush_assistant_items(messages, assistant_items, model)
-            {messages, [], results ++ [tool_result_block(event)]}
-
-          type when type in [:provider_usage, :turn_failed, :permission_decision] ->
-            {messages, assistant_items, results}
-
-          _other ->
-            {messages, assistant_items, results}
+          :error ->
+            state
+            |> close_deferred_skill_activations(model)
+            |> close_pending_tool_calls_as_orphans(model)
+            |> append_history_text(
+              "user",
+              Pixir.Skills.render_activation(event_data(event)),
+              model
+            )
         end
+
+      :subagent_event ->
+        case subagent_event_text(event_data(event)) do
+          nil -> state
+          text -> append_history_text(state, "user", text, model)
+        end
+
+      :history_compaction ->
+        append_history_text(
+          state,
+          "user",
+          Pixir.Compaction.render_for_provider(event_data(event)),
+          model
+        )
+
+      :branch_summary ->
+        append_history_text(
+          state,
+          "user",
+          Pixir.BranchSummary.render_for_provider(event_data(event)),
+          model
+        )
+
+      :tool_call ->
+        state = close_deferred_skill_activations(state, model)
+        call_id = get_field(event_data(event), :call_id)
+
+        %{
+          state
+          | messages: flush_results(state.messages, state.results),
+            assistant_items: state.assistant_items ++ [normalize_event(event, :tool_call)],
+            results: [],
+            pending_calls: Map.put(state.pending_calls, call_id, event)
+        }
+
+      :reasoning ->
+        state = close_deferred_skill_activations(state, model)
+
+        %{
+          state
+          | messages: flush_results(state.messages, state.results),
+            assistant_items: state.assistant_items ++ [normalize_event(event, :reasoning)],
+            results: []
+        }
+
+      :tool_result ->
+        fold_history_tool_result(event, state, model)
+
+      type when type in [:provider_usage, :turn_failed, :permission_decision] ->
+        state
+
+      _other ->
+        state
+    end
+  end
+
+  defp fold_history_tool_result(event, state, model) do
+    call_id = get_field(event_data(event), :call_id)
+
+    cond do
+      Map.has_key?(state.deferred_skill_activations, call_id) ->
+        messages = flush_assistant_items(state.messages, state.assistant_items, model)
+        messages = flush_results(messages, state.results ++ [tool_result_block(event)])
+
+        messages =
+          append_activation_messages(
+            messages,
+            Map.fetch!(state.deferred_skill_activations, call_id)
+          )
+
+        %{
+          state
+          | messages: messages,
+            assistant_items: [],
+            results: [],
+            pending_calls: Map.delete(state.pending_calls, call_id),
+            deferred_skill_activations: Map.delete(state.deferred_skill_activations, call_id)
+        }
+
+      map_size(state.deferred_skill_activations) > 0 ->
+        state
+        |> close_deferred_skill_activations(model)
+        |> queue_tool_result(event, model)
+
+      true ->
+        queue_tool_result(state, event, model)
+    end
+  end
+
+  defp queue_tool_result(state, event, model) do
+    call_id = get_field(event_data(event), :call_id)
+
+    %{
+      state
+      | messages: flush_assistant_items(state.messages, state.assistant_items, model),
+        assistant_items: [],
+        results: state.results ++ [tool_result_block(event)],
+        pending_calls: Map.delete(state.pending_calls, call_id)
+    }
+  end
+
+  defp append_history_text(state, role, text, model) do
+    state = close_deferred_skill_activations(state, model)
+
+    %{
+      state
+      | messages:
+          flush_pending(state.messages, state.assistant_items, state.results, model) ++
+            [text_message(role, text)],
+        assistant_items: [],
+        results: [],
+        pending_calls: %{},
+        deferred_skill_activations: %{}
+    }
+  end
+
+  defp close_deferred_skill_activations(
+         %{deferred_skill_activations: deferred} = state,
+         _model
+       )
+       when map_size(deferred) == 0,
+       do: state
+
+  defp close_deferred_skill_activations(state, model) do
+    messages = flush_assistant_items(state.messages, state.assistant_items, model)
+    messages = flush_results(messages, state.results)
+
+    {messages, pending_calls} =
+      state.deferred_skill_activations
+      |> Enum.sort_by(fn {call_id, _events} -> call_id end)
+      |> Enum.reduce({messages, state.pending_calls}, fn {call_id, activations},
+                                                         {messages, pending_calls} ->
+        call = Map.get(pending_calls, call_id)
+        messages = flush_results(messages, [orphan_tool_result_block(call_id, call)])
+        messages = append_activation_messages(messages, activations)
+        {messages, Map.delete(pending_calls, call_id)}
       end)
 
-    flush_pending(messages, pending_items, pending_results, model)
+    %{
+      state
+      | messages: messages,
+        assistant_items: [],
+        results: [],
+        pending_calls: pending_calls,
+        deferred_skill_activations: %{}
+    }
   end
+
+  defp close_pending_tool_calls_as_orphans(%{pending_calls: pending_calls} = state, _model)
+       when map_size(pending_calls) == 0,
+       do: state
+
+  defp close_pending_tool_calls_as_orphans(state, model) do
+    messages = flush_assistant_items(state.messages, state.assistant_items, model)
+    messages = flush_results(messages, state.results)
+
+    orphan_results =
+      state.pending_calls
+      |> Enum.sort_by(fn {call_id, _call} -> call_id end)
+      |> Enum.map(fn {call_id, call} -> orphan_tool_result_block(call_id, call) end)
+
+    %{
+      state
+      | messages: flush_results(messages, orphan_results),
+        assistant_items: [],
+        results: [],
+        pending_calls: %{}
+    }
+  end
+
+  defp orphan_tool_result_block(call_id, call) do
+    tool = call |> event_data() |> get_field(:name)
+
+    %{
+      "type" => "tool_result",
+      "tool_use_id" => call_id,
+      "content" =>
+        Jason.encode!(%{
+          ok: false,
+          error: %{
+            kind: "orphan_tool_call",
+            message: "Pixir replay found a tool_call without a matching tool_result",
+            details: %{call_id: call_id, tool: tool}
+          }
+        }),
+      "is_error" => true
+    }
+  end
+
+  defp append_activation_messages(messages, activations) do
+    messages ++
+      Enum.map(activations, fn activation ->
+        text_message("user", Pixir.Skills.render_activation(event_data(activation)))
+      end)
+  end
+
+  defp pending_skill_view_call_id(event, pending_calls) when map_size(pending_calls) == 1 do
+    activation_name = get_field(event_data(event), :name)
+
+    case Map.to_list(pending_calls) do
+      [{call_id, call}] when is_binary(activation_name) ->
+        call_data = event_data(call)
+        args = get_field(call_data, :args)
+        path = if is_map(args), do: get_field(args, :path) || "SKILL.md", else: nil
+
+        if get_field(call_data, :name) == "skill_view" and is_map(args) and
+             get_field(args, :name) == activation_name and is_binary(path) and
+             Pixir.Skills.main_file?(path) do
+          {:ok, call_id}
+        else
+          :error
+        end
+
+      _other ->
+        :error
+    end
+  end
+
+  defp pending_skill_view_call_id(_event, _pending_calls), do: :error
 
   defp flush_pending(messages, assistant_items, results, model) do
     messages
@@ -622,7 +971,7 @@ defmodule Pixir.Providers.Anthropic do
 
   defp handle_chunk({:data, data}, %{status: status} = acc)
        when is_integer(status) and (status < 200 or status >= 300) do
-    %{acc | err_body: acc.err_body <> to_string(data)}
+    %{acc | err_body: ErrBody.append(acc.err_body, to_string(data))}
   end
 
   defp handle_chunk({:data, data}, acc), do: decode_sse(acc.buffer <> to_string(data), acc)
@@ -975,6 +1324,16 @@ defmodule Pixir.Providers.Anthropic do
   end
 
   defp classify_http_error(status, body, headers) do
+    error = do_classify_http_error(status, body, headers)
+
+    if ErrBody.truncated?(body) do
+      update_in(error, [:error, :details], &Map.put(&1, :err_body_truncated, true))
+    else
+      error
+    end
+  end
+
+  defp do_classify_http_error(status, body, headers) do
     error = decode_error_body(body)
     classify_anthropic_error(status, error, headers)
   end

@@ -35,6 +35,28 @@ defmodule Pixir.ProviderTest do
     end
   end
 
+  defp canned_attempts(attempts) do
+    test = self()
+    {:ok, agent} = Agent.start_link(fn -> :queue.from_list(attempts) end)
+
+    fn http_request, acc, fun ->
+      send(test, {:request, http_request})
+
+      {chunks, status} =
+        Agent.get_and_update(agent, fn queue ->
+          case :queue.out(queue) do
+            {{:value, {chunks, status}}, rest} -> {{chunks, status}, rest}
+            {{:value, chunks}, rest} -> {{chunks, 200}, rest}
+            {:empty, empty} -> raise "no canned provider attempt left: #{inspect(empty)}"
+          end
+        end)
+
+      acc = fun.({:status, status}, acc)
+      acc = Enum.reduce(chunks, acc, fn chunk, a -> fun.({:data, chunk}, a) end)
+      {:ok, acc}
+    end
+  end
+
   defp sse(map), do: "data: " <> Jason.encode!(map) <> "\n\n"
 
   defp tmp_workspace do
@@ -202,7 +224,99 @@ defmodule Pixir.ProviderTest do
                   type: "server_error"
                 }
               }
-            }} = Provider.stream(%{history: []}, auth: auth, transport: canned(chunks))
+            }} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned(chunks),
+               max_retries: 0
+             )
+  end
+
+  test "retryable in-band transient stream error retries and succeeds", %{auth: auth} do
+    overloaded =
+      sse(%{
+        type: "error",
+        error: %{
+          code: "server_is_overloaded",
+          type: "service_unavailable_error",
+          message: "Our servers are currently overloaded."
+        }
+      })
+
+    success = [
+      sse(%{type: "response.output_text.delta", delta: "ok"}),
+      sse(%{type: "response.completed"})
+    ]
+
+    assert {:ok, %{text: "ok"}} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned_attempts([[overloaded], success]),
+               max_retries: 1,
+               sleep: fn _ -> :ok end
+             )
+
+    assert_received {:request, _}
+    assert_received {:request, _}
+  end
+
+  test "retryable in-band transient stream error stamps retryable details", %{auth: auth} do
+    chunks = [
+      sse(%{
+        type: "error",
+        error: %{
+          code: "server_is_overloaded",
+          type: "service_unavailable_error",
+          message: "Our servers are currently overloaded."
+        }
+      })
+    ]
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :provider_http_error,
+                details: %{status: 200, event_type: "error", retryable: true}
+              }
+            }} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned(chunks),
+               max_retries: 0
+             )
+  end
+
+  test "non-transient in-band stream error is not retryable", %{auth: auth} do
+    chunks = [
+      sse(%{
+        type: "error",
+        error: %{
+          code: "invalid_request",
+          type: "invalid_request_error",
+          message: "Invalid request."
+        }
+      })
+    ]
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :provider_http_error,
+                details: details
+              }
+            }} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned(chunks),
+               max_retries: 1,
+               sleep: fn _ -> :ok end
+             )
+
+    assert details.status == 200
+    assert details.event_type == "error"
+    refute Map.has_key?(details, :retryable)
+    assert_received {:request, _}
+    refute_received {:request, _}
   end
 
   test "in-band overflow rejections on a 200 stream get kind :context_overflow", %{auth: auth} do
@@ -258,7 +372,55 @@ defmodule Pixir.ProviderTest do
                   type: "server_error"
                 }
               }
-            }} = Provider.stream(%{history: []}, auth: auth, transport: canned(chunks))
+            }} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned(chunks),
+               max_retries: 0
+             )
+  end
+
+  test "oversized non-2xx error body is capped and marked truncated", %{auth: auth} do
+    payload = String.duplicate("x", Pixir.Providers.ErrBody.max_bytes() * 2)
+    body = Jason.encode!(%{error: %{type: "server_error", message: payload}})
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :provider_http_error,
+                message: message,
+                details: details
+              }
+            }} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned([body], 500),
+               max_retries: 0
+             )
+
+    assert details.err_body_truncated == true
+    assert byte_size(details.body) <= Pixir.Providers.ErrBody.max_bytes()
+    refute message =~ payload
+    refute inspect(details) =~ payload
+  end
+
+  test "small non-2xx error body does not carry truncation marker", %{auth: auth} do
+    body = Jason.encode!(%{error: %{type: "server_error", message: "small failure"}})
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :provider_http_error,
+                details: details
+              }
+            }} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned([body], 500),
+               max_retries: 0
+             )
+
+    refute Map.has_key?(details, :err_body_truncated)
   end
 
   test "folds History into Responses input items", %{auth: auth} do
@@ -781,6 +943,200 @@ defmodule Pixir.ProviderTest do
     refute Enum.any?(outputs, fn %{"output" => output} ->
              match?({:ok, %{"error" => %{"kind" => "orphan_tool_call"}}}, Jason.decode(output))
            end)
+  end
+
+  test "pairs a skill_view result across its canonical skill activation", %{auth: auth} do
+    activation = %{
+      "name" => "diagnose",
+      "source" => "repo",
+      "scope" => "repo",
+      "path" => "/skills/diagnose/SKILL.md",
+      "content_hash" => "activation-hash",
+      "content" => "# Diagnose\n\nInspect evidence first."
+    }
+
+    history = [
+      Event.user_message("s", "diagnose this"),
+      Event.tool_call("s", "call_skill", "skill_view", %{"name" => "diagnose"}),
+      Event.skill_activation("s", activation),
+      Event.tool_result("s", "call_skill", %{
+        "ok" => true,
+        "activated" => true,
+        "content_hash" => "activation-hash"
+      })
+    ]
+
+    {:ok, _} =
+      Provider.stream(%{history: history},
+        auth: auth,
+        transport: canned([sse(%{type: "response.completed"})])
+      )
+
+    assert_received {:request, %{body: body}}
+    input = Jason.decode!(body)["input"]
+
+    assert output = Enum.find(input, &(&1["type"] == "function_call_output"))
+
+    assert %{"ok" => true, "content_hash" => "activation-hash"} =
+             Jason.decode!(output["output"])
+
+    refute Enum.any?(input, fn
+             %{"type" => "function_call_output", "output" => output} ->
+               match?(
+                 {:ok, %{"error" => %{"kind" => "orphan_tool_call"}}},
+                 Jason.decode(output)
+               )
+
+             _item ->
+               false
+           end)
+  end
+
+  test "emits a deferred skill activation after its matched result with exact snapshot" do
+    activation = %{
+      "name" => "diagnose",
+      "source" => "repo",
+      "scope" => "repo",
+      "path" => "/skills/diagnose/SKILL.md",
+      "content_hash" => "exact-logged-hash",
+      "content" => "# Exact logged instructions"
+    }
+
+    history = [
+      Event.tool_call("s", "call_skill", "skill_view", %{
+        "name" => "diagnose",
+        "path" => "SKILL.md"
+      }),
+      Event.skill_activation("s", activation),
+      Event.tool_result("s", "call_skill", %{"ok" => true})
+    ]
+
+    assert {:ok, body} = Provider.request_body_preview(%{history: history})
+    assert [call, output, projected_activation] = body["input"]
+    assert call["call_id"] == "call_skill"
+    assert output["type"] == "function_call_output"
+    assert Jason.decode!(output["output"])["ok"] == true
+
+    assert projected_activation == %{
+             "role" => "user",
+             "content" => [
+               %{
+                 "type" => "input_text",
+                 "text" => Pixir.Skills.render_activation(activation)
+               }
+             ]
+           }
+
+    assert get_in(projected_activation, ["content", Access.at(0), "text"]) =~
+             ~s(content_sha256="exact-logged-hash")
+  end
+
+  test "repairs a true orphaned skill_view before preserving its activation" do
+    activation = %{
+      "name" => "diagnose",
+      "source" => "repo",
+      "scope" => "repo",
+      "path" => "/skills/diagnose/SKILL.md",
+      "content_hash" => "orphan-hash",
+      "content" => "# Instructions survive orphan repair"
+    }
+
+    history = [
+      Event.tool_call("s", "call_skill", "skill_view", %{"name" => "diagnose"}),
+      Event.skill_activation("s", activation)
+    ]
+
+    assert {:ok, body} = Provider.request_body_preview(%{history: history})
+    assert [call, synthetic_output, projected_activation] = body["input"]
+    assert call["call_id"] == "call_skill"
+    assert synthetic_output["call_id"] == "call_skill"
+
+    assert %{"ok" => false, "error" => %{"kind" => "orphan_tool_call"}} =
+             Jason.decode!(synthetic_output["output"])
+
+    assert get_in(projected_activation, ["content", Access.at(0), "text"]) ==
+             Pixir.Skills.render_activation(activation)
+  end
+
+  test "replays raw incident NDJSON seq 8 through 10 without inventing an orphan" do
+    workspace = tmp_workspace()
+    session_id = "raw-skill-incident"
+    log_path = Pixir.Log.path(session_id, workspace: workspace)
+    File.mkdir_p!(Path.dirname(log_path))
+
+    raw_ndjson =
+      ~S({"id":"e8","session_id":"raw-skill-incident","seq":8,"ts":"2026-07-05T00:00:08Z","type":"tool_call","data":{"call_id":"call_incident","name":"skill_view","args":{"name":"diagnose"}}}) <>
+        "\n" <>
+        ~S({"id":"e9","session_id":"raw-skill-incident","seq":9,"ts":"2026-07-05T00:00:09Z","type":"skill_activation","data":{"name":"diagnose","source":"repo","scope":"repo","path":"/skills/diagnose/SKILL.md","content_hash":"incident-hash","content":"# Incident snapshot"}}) <>
+        "\n" <>
+        ~S({"id":"e10","session_id":"raw-skill-incident","seq":10,"ts":"2026-07-05T00:00:10Z","type":"tool_result","data":{"call_id":"call_incident","ok":true,"output":"# Incident snapshot","activated":true,"content_hash":"incident-hash"}}) <>
+        "\n"
+
+    try do
+      File.write!(log_path, raw_ndjson)
+      assert {:ok, history} = Pixir.Log.fold(session_id, workspace: workspace)
+      assert Enum.map(history, & &1.seq) == [8, 9, 10]
+
+      assert {:ok, body} =
+               Provider.request_body_preview(%{history: history, workspace: workspace})
+
+      assert [call, output, projected_activation] = body["input"]
+      assert call["call_id"] == "call_incident"
+      assert output["call_id"] == "call_incident"
+      assert output["output"] == "# Incident snapshot"
+
+      assert get_in(projected_activation, ["content", Access.at(0), "text"]) =~
+               ~s(content_sha256="incident-hash")
+
+      refute match?(
+               {:ok, %{"error" => %{"kind" => "orphan_tool_call"}}},
+               Jason.decode(output["output"])
+             )
+    after
+      File.rm_rf!(workspace)
+    end
+  end
+
+  test "ambiguous pending calls fail through ordinary orphan repair" do
+    activation = %{
+      "name" => "diagnose",
+      "source" => "repo",
+      "scope" => "repo",
+      "path" => "/skills/diagnose/SKILL.md",
+      "content_hash" => "ambiguous-hash",
+      "content" => "# Ambiguous activation"
+    }
+
+    history = [
+      Event.tool_call("s", "call_read", "read", %{"path" => "README.md"}),
+      Event.tool_call("s", "call_skill", "skill_view", %{"name" => "diagnose"}),
+      Event.skill_activation("s", activation),
+      Event.tool_result("s", "call_read", %{"ok" => true, "output" => "read body"}),
+      Event.tool_result("s", "call_skill", %{"ok" => true, "output" => "skill body"})
+    ]
+
+    assert {:ok, body} = Provider.request_body_preview(%{history: history})
+
+    assert [read_call, skill_call, read_repair, skill_repair, projected_activation] =
+             body["input"]
+
+    assert read_call["call_id"] == "call_read"
+    assert skill_call["call_id"] == "call_skill"
+
+    assert Enum.map([read_repair, skill_repair], & &1["call_id"]) == [
+             "call_read",
+             "call_skill"
+           ]
+
+    assert Enum.all?([read_repair, skill_repair], fn output ->
+             match?(
+               %{"ok" => false, "error" => %{"kind" => "orphan_tool_call"}},
+               Jason.decode!(output["output"])
+             )
+           end)
+
+    assert get_in(projected_activation, ["content", Access.at(0), "text"]) ==
+             Pixir.Skills.render_activation(activation)
   end
 
   test "folds compacted History as checkpoint plus recent tail", %{auth: auth} do

@@ -38,6 +38,22 @@ defmodule Pixir.Providers.AnthropicFoldTest do
 
   defp raw(line), do: Jason.decode!(line)
 
+  defp compaction(seq, from_seq, to_seq, summary) do
+    %{
+      "seq" => seq,
+      "type" => "history_compaction",
+      "data" => %{
+        "range" => %{"from_seq" => from_seq, "to_seq" => to_seq},
+        "source_event_count" => to_seq - from_seq + 1,
+        "strategy" => "deterministic_operational_summary_v1",
+        "summary" => summary,
+        "files_touched" => [],
+        "open_tasks" => [],
+        "limitations" => []
+      }
+    }
+  end
+
   describe "tool projection" do
     test "projects Responses function tools to Anthropic shape preserving order" do
       tools = [
@@ -247,6 +263,145 @@ defmodule Pixir.Providers.AnthropicFoldTest do
                }
              ]
     end
+
+    test "pa1 boundary stays on completed prior turn when current tool results are folded" do
+      history = [
+        raw(~s({"seq":1,"type":"user_message","data":{"text":"prior question"}})),
+        raw(~s({"seq":2,"type":"assistant_message","data":{"text":"prior answer"}})),
+        raw(~s({"seq":3,"type":"user_message","data":{"text":"current question"}})),
+        raw(
+          ~s({"seq":4,"type":"tool_call","data":{"call_id":"toolu_1","name":"read","args":{"path":"a.txt"}}})
+        ),
+        raw(
+          ~s({"seq":5,"type":"tool_result","data":{"call_id":"toolu_1","ok":true,"output":"A"}})
+        )
+      ]
+
+      assert {:ok, _} =
+               Anthropic.stream(
+                 %{history: history, prompt_mode: :build, previous_turn_boundary_seq: 2},
+                 api_key: "sk-ant-test",
+                 model: "claude-fable-5",
+                 transport: capture_transport(ok_chunks())
+               )
+
+      assert_received {:anthropic_body, body}
+      [_prior_user, prior_assistant, _current_user, _tool_use, tool_result] = body["messages"]
+
+      assert prior_assistant["content"] == [
+               %{
+                 "type" => "text",
+                 "text" => "prior answer",
+                 "cache_control" => %{"type" => "ephemeral"}
+               }
+             ]
+
+      refute inspect(tool_result) =~ "cache_control"
+
+      assert body["messages"]
+             |> List.last()
+             |> Map.fetch!("content")
+             |> hd()
+             |> Map.fetch!("type") ==
+               "tool_result"
+    end
+
+    test "pa1 compaction interplay drops compacted events and anchors late context on current user" do
+      history = [
+        raw(~s({"seq":1,"type":"user_message","data":{"text":"compacted-away question"}})),
+        raw(~s({"seq":2,"type":"assistant_message","data":{"text":"compacted-away answer"}})),
+        compaction(3, 1, 2, "summary of the compacted prior turn"),
+        raw(~s({"seq":4,"type":"user_message","data":{"text":"current question"}}))
+      ]
+
+      assert {:ok, _} =
+               Anthropic.stream(
+                 %{
+                   history: history,
+                   prompt_mode: :build,
+                   previous_turn_boundary_seq: 3,
+                   developer_context: "Developer context text"
+                 },
+                 api_key: "sk-ant-test",
+                 model: "claude-fable-5",
+                 transport: capture_transport(ok_chunks())
+               )
+
+      assert_received {:anthropic_body, body}
+      body_text = inspect(body)
+      refute body_text =~ "compacted-away question"
+      refute body_text =~ "compacted-away answer"
+
+      [compaction_message | _] = body["messages"]
+      assert compaction_message["role"] == "user"
+
+      assert compaction_message["content"] |> hd() |> Map.fetch!("text") =~
+               "summary of the compacted prior turn"
+
+      latest_user = List.last(body["messages"])
+      assert latest_user["role"] == "user"
+      [fence_block, question_block] = latest_user["content"]
+
+      assert fence_block["text"] =~
+               "<<<PIXIR_PA1_LATE_CONTEXT:AUTHORITY>>>\nDeveloper context text"
+
+      assert question_block["text"] == "current question"
+    end
+
+    test "pa1 honestly clamps boundary when compaction checkpoint is newer than turn boundary" do
+      history = [
+        raw(~s({"seq":1,"type":"user_message","data":{"text":"prior question"}})),
+        raw(~s({"seq":2,"type":"assistant_message","data":{"text":"prior answer"}})),
+        raw(~s({"seq":3,"type":"user_message","data":{"text":"current question"}})),
+        compaction(5, 1, 2, "fresh compaction during this turn")
+      ]
+
+      assert {:ok, result} =
+               Anthropic.stream(
+                 %{history: history, prompt_mode: :build, previous_turn_boundary_seq: 2},
+                 api_key: "sk-ant-test",
+                 model: "claude-fable-5",
+                 transport: capture_transport(ok_chunks())
+               )
+
+      assert_received {:anthropic_body, body}
+      assert is_list(body["messages"])
+      refute Enum.member?(result.provider_metadata["prompt_contract"]["breakpoints"], "B2")
+    end
+
+    test "legacy Anthropic history path applies compaction provider history parity" do
+      history = [
+        raw(~s({"seq":1,"type":"user_message","data":{"text":"legacy compacted-away question"}})),
+        raw(
+          ~s({"seq":2,"type":"assistant_message","data":{"text":"legacy compacted-away answer"}})
+        ),
+        compaction(3, 1, 2, "legacy compacted summary"),
+        raw(~s({"seq":4,"type":"user_message","data":{"text":"legacy current question"}}))
+      ]
+
+      assert {:ok, _} =
+               Anthropic.stream(%{history: history, system_prompt: "legacy system"},
+                 api_key: "sk-ant-test",
+                 model: "claude-fable-5",
+                 transport: capture_transport(ok_chunks())
+               )
+
+      assert_received {:anthropic_body, body}
+      body_text = inspect(body)
+      refute body_text =~ "legacy compacted-away question"
+      refute body_text =~ "legacy compacted-away answer"
+      assert body["system"] == "legacy system"
+
+      assert body["messages"] |> hd() |> Map.fetch!("content") |> hd() |> Map.fetch!("text") =~
+               "legacy compacted summary"
+
+      assert body["messages"]
+             |> List.last()
+             |> Map.fetch!("content")
+             |> hd()
+             |> Map.fetch!("text") ==
+               "legacy current question"
+    end
   end
 end
 
@@ -305,6 +460,68 @@ defmodule Pixir.Providers.AnthropicTurnProofTest do
     %{ws: ws, sid: sid, ctx: %{session_id: sid, workspace: ws, role: :build}}
   end
 
+  defp write_skill(root, name, description) do
+    File.mkdir_p!(root)
+
+    File.write!(
+      Path.join(root, "SKILL.md"),
+      """
+      ---
+      name: #{name}
+      description: #{description}
+      ---
+
+      #{description}
+      """
+    )
+  end
+
+  test "Turn Anthropic request carries pa1 fields while preserving legacy prompt context", %{
+    ctx: ctx,
+    ws: ws
+  } do
+    assert {:ok, "prior answer"} =
+             Turn.run(ctx, "prior question",
+               provider: Anthropic,
+               skills_opts: [roots: []],
+               provider_opts: [
+                 api_key: "sk-ant-test",
+                 model: "claude-fable-5",
+                 transport: capture_transport(ok_chunks("prior answer"))
+               ]
+             )
+
+    assert_received {:anthropic_body, _prior_body}
+
+    write_skill(Path.join(ws, ".agents/skills/sample"), "sample", "Use for sample work")
+
+    assert {:ok, "ok"} =
+             Turn.run(ctx, "hello",
+               provider: Anthropic,
+               agent_instructions: "Keep the subagent scoped.",
+               skills_opts: [roots: [%{scope: "repo", path: Path.join(ws, ".agents/skills")}]],
+               provider_opts: [
+                 api_key: "sk-ant-test",
+                 model: "claude-fable-5",
+                 transport: capture_transport(ok_chunks("ok"))
+               ]
+             )
+
+    assert_received {:anthropic_body, body}
+    assert [_, skills_block] = body["system"]
+    assert skills_block["text"] =~ "<name>sample</name>"
+    assert skills_block["cache_control"] == %{"type" => "ephemeral"}
+
+    [_prior_user, prior_assistant, _current_user] = body["messages"]
+    assert hd(prior_assistant["content"])["cache_control"] == %{"type" => "ephemeral"}
+
+    latest_user_text =
+      body["messages"] |> List.last() |> Map.fetch!("content") |> hd() |> Map.fetch!("text")
+
+    assert latest_user_text =~ "Developer context: the workspace root is \"#{ws}\"."
+    assert latest_user_text =~ "Subagent role instructions:\nKeep the subagent scoped."
+  end
+
   test "text-only Turn.run records pa1 usage without prompt_cache_key", %{
     ctx: ctx,
     sid: sid,
@@ -313,12 +530,16 @@ defmodule Pixir.Providers.AnthropicTurnProofTest do
     assert {:ok, "hello"} =
              Turn.run(ctx, "say hello",
                provider: Anthropic,
+               skills_opts: [roots: []],
                provider_opts: [
                  api_key: "sk-ant-test",
                  model: "claude-fable-5",
                  transport: capture_transport(ok_chunks("hello"))
                ]
              )
+
+    assert_received {:anthropic_body, body}
+    assert [%{"cache_control" => %{"type" => "ephemeral"}}] = body["system"]
 
     assert {:ok, history} = Log.fold(sid, workspace: ws)
     usage = Enum.find(history, &(&1.type == :provider_usage))

@@ -9,6 +9,187 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-07-10
+
+### Added
+- Orchestrator ergonomics (#205 items 1 and 3): the doctor JSON envelope
+  carries an explicit delegation decision — `proceed: "true" | "judge" |
+  "block"` with `judge_checks` listing the non-passing check ids (populated
+  for `block` too; severity lives in `proceed`, detail in `checks[]`) — and
+  the `read` tool gains optional line-based `offset`/`limit` with
+  self-teaching continuation: sliced or truncated results end with
+  `[truncated: showing lines X-Y of Z; continue with offset=N]` plus
+  `lines_total`/`lines_returned`/`offset_effective`/`next_offset` metadata,
+  an oversized single line advances past itself with a caveat, and default
+  small-file reads stay byte-identical.
+- Virtual delegate children (#284 F3): `subagents.workspace_mode:
+  "virtual_overlay"` runs each child as a real model conversation against a
+  bounded in-memory import of `subagents.read_set` — zero physical snapshots,
+  zero real writes. The child's only mutation surface is the new
+  `run_virtual_commands` tool (commands only; `read_set`/`limits` come from
+  operator context, never model arguments), the Executor confines real reads
+  to the imported read set and denies bash/write/nested orchestration for
+  virtual children, and each child's proposed changes return as
+  `children[].virtual_diff` with a bounded provenance ref in the durable
+  `subagent_event` (envelope schema revision 4, additive). A child that
+  finishes without producing an artifact fails honestly
+  (`virtual_diff_missing`); oversize artifacts fail with the ref preserved.
+  Transport retries for virtual children are gated by child-Log evidence
+  (ADR 0036): any durable model/tool output blocks the retry, and a child
+  that dies after producing a valid artifact keeps it on the failed result.
+  Applying an artifact remains a separate explicit operation
+  (`apply_virtual_diff`); `workflow_apply_from_compatible: false` is
+  confessed on the affordance.
+- `pixir gc` (#221 phase 2): `--json` builds an effect-free reclamation plan
+  for terminal isolated subagent snapshots in the current workspace;
+  `--apply` executes it. Fail-closed classification (reclaimable only when
+  every parent-log reference reconstructs terminal — the status vocabulary
+  derives from `Pixir.Subagents.terminal?/1`, `closed` included; running,
+  detached, and unreferenced dirs are skipped with reasons; corrupt parent
+  logs block planning), every `*.ndjson` under any `.pixir/sessions` path preserved
+  byte-intact at its original path, per-dir apply errors recorded without
+  aborting, and `reclaimable_bytes` reported net of preserved logs.
+- Guided resume for transport-dead delegate children (#285): when a child
+  dies on a terminal transport error and was not auto-retried, the envelope
+  child carries `recovery.kind: "resume_suggested"` with a reason naming the
+  error kind, the ready-made resume/diagnose commands, and — for
+  write-capable children — notes that the session log is the source of
+  truth, applied writes should be inspected before resuming, and a stale
+  writer lease fails closed by design. Transport classification reuses the
+  #278/#280 retryable vocabularies; when public results collapse the reason,
+  the runner reads the latest `turn_failed` from the child Log.
+- Native Subagents rehearsal (#204): `spawn_agent {"validate_only": true}`
+  runs the exact validation a real spawn runs (shared pure core in the
+  Manager) with zero side effects and returns an allowlist plan projection —
+  effective knobs and limits, the workspace fidelity contract, effective
+  permission, and an explicit `limitations` list confessing what validation
+  cannot prove. Non-mutating only on exact boolean `true` (read-only and ask
+  postures rehearse without prompting; malformed values fail closed), the
+  Turn-level dry-run returns the same normalized plan, and virtual children
+  may rehearse spawns while real spawns remain denied there.
+- A worked example of the propose→review→apply cycle at
+  `docs/examples/propose-review-apply.md` — written into the repository by
+  the exact workflow it documents (#284 F4), including the honest limits it
+  demonstrated in production: review verdicts are advisory (checkpoints gate
+  order and failure, never verdict content) and truncated diffs are
+  review-only evidence.
+
+- Workflow apply step (#284 F2): a step may declare `"apply_from":
+  "<producer_step_id>"` to explicitly apply the `virtual_diff` a
+  `virtual_overlay` step produced — the propose-review-apply DAG. Validated at
+  plan time (producer must exist, be virtual, and be in `depends_on`; knobs
+  and spawning fields rejected; an explicit non-empty `write_set` is required
+  and bounds the artifact paths BEFORE the engine runs), executed without
+  spawning a subagent, and evidenced by the engine result stored verbatim in
+  the completed-step record; a non-applied outcome fails the step and holds
+  dependents.
+
+- ACP exposes `reasoning_effort` as a session config option (#289): a third
+  select alongside mode and model (`default|low|medium|high|xhigh`), sticky
+  per session, with prompt-time precedence `_meta.reasoning_effort` >
+  session option > config. The unset state renders honestly as `default`
+  (both providers omit effort from the request body when none is set), and
+  selecting `default` suppresses a configured effort rather than inventing a
+  value. The requested effort is recorded as durable `subagent_event`
+  evidence (operator-side truth); providers do not echo an effective effort
+  back, so no such proof is claimed.
+- Virtual Diff Apply (#284 F1, ADR 0030): `Pixir.VirtualDiffApply` plans and
+  applies `virtual_diff` artifacts through a staged two-phase commit —
+  all add/modify content is written to temp files before any target mutates
+  (a staging failure, the dominant class, leaves every target byte-identical),
+  the rename/delete commit phase has a narrow residual window whose rollback
+  is total and non-raising, and the failed result confesses recovery
+  (`recovery.rolled_back`, structured `restore_failures` kinds) instead of
+  claiming filesystem transactionality it cannot have. Hash-checked
+  preconditions, canonical workspace confinement with symlink resolution,
+  per-file authorization through the write-policy seam, evidence paths
+  protected at the Executor exactly like `write`/`edit`, and the ADR result
+  shape as durable evidence (contents stripped). The model-visible
+  `apply_virtual_diff` tool defaults `dry_run` to true and only counts as
+  mutating when `dry_run` is explicitly false, so plans stay available in
+  read-only mode. Apply is never automatic: overlays keep producing
+  `apply.status: "not_applied"` until this operation is explicitly invoked.
+- Bounded-write workers can self-verify (#240, v1 conservative): the write
+  policy's `bash` key accepts `{"verify": [commands]}` alongside `"disabled"`,
+  where each operator-declared command must be a literal `mix format` or
+  `mix compile` invocation (no shell metacharacters, no parent-directory
+  tokens, at most 8 entries). Authorization is exact match against the
+  declared list after leading/trailing-whitespace trimming on both sides
+  (no substring or prefix matching), after the existing confinement and
+  read-only safe-list checks; denials now confess how many verify commands the policy declares.
+  The effective list travels with the policy (normalize/metadata/rehydrate)
+  and bounded_write dry-run plans report the per-child count. `mix test`
+  entries are rejected with their own message: test execution stays with the
+  orchestrator until this v1 is dogfooded.
+- A no-network regression gauntlet for the Anthropic arc (#274): eight
+  pins with canned transports — six end-to-end through `Turn.run`, two at
+  the provider seam (`Anthropic.stream`) — covering the pa1
+  request body (system blocks + `cache_control` + fenced late context),
+  registry routing and its stub fallback, verbatim thinking replay with the
+  foreign-dialect guard, the tool loop (including the pa1 fence riding the
+  latest tool_result group — the P3 latest-user-message contract), durable
+  cache evidence on `provider_usage`, compaction interplay at the Turn level,
+  the error taxonomy (rate limit, overflow, overloaded, bounded `err_body`),
+  and the fail-closed web_search/hosted-tools rejections.
+
+### Fixed
+- Every `bounded_write` workflow spec containing an `apply_from` step was
+  rejected by the CLI validation gate — in dry-run AND real runs — because
+  the rehearsal ran without the write policy the gate itself had just
+  normalized (#291). The F2 apply-step runtime was unreachable through the
+  CLI until this fix; the policy is now threaded into the shared rehearsal
+  path and the acceptance is pinned end-to-end through the CLI contract.
+- ACP prompts now resolve at a single total-order synchronization point
+  (#267): a `session/cancel` racing a Turn's terminal status could flip the
+  reply's `stopReason` under parallel load because the cancel flag was
+  snapshotted in one server call while the reply was written in another.
+  Cancel-wins-ties semantics (ADR 0009 §5) are preserved exactly and both
+  orders plus the raced tie are pinned through an injectable resolution seam.
+- Replay no longer orphans a `skill_view` tool call whose canonical
+  `skill_activation` was recorded between the call and its result (#204):
+  the activation is deferred past the matching `function_call_output`
+  (byte-exact, only when exactly one unresolved matching call exists —
+  ambiguous histories fall back to ordinary orphan repair), true orphans
+  keep the synthetic repair without losing the activation, and the Anthropic
+  history folding mirrors the rule so `tool_use`/`tool_result` adjacency
+  cannot drift across providers.
+- Workflow steps gained the #239-class gate (#282): in a bounded_write
+  workflow, a writer-posture step whose agent resolves to a read-only
+  `sandbox_mode` is rejected fail-closed at plan time with step-level
+  location details; a read-only `subagents.role` at the spec level is
+  correctly ignored by the workflow strategy.
+- In-band provider overload errors are retryable again (#278): when the
+  Responses stream delivers an `error`/`response.failed` event over HTTP 200
+  with a transient type or code (`server_is_overloaded`,
+  `service_unavailable_error`, `server_error`, `overloaded`, rate-limit
+  codes), the classifier stamps `retryable: true` in the error details —
+  mirroring the Anthropic 529 precedent — and BOTH retry layers read that
+  classification: the provider's turn-level retry and the delegate's
+  read-only-child auto-retry (which keeps honoring the legacy
+  `type: "server_error"` shape for events recorded before this change).
+- A `bounded_write` delegate spec with a read-only role (e.g. `explorer`) is
+  now rejected fail-closed as `invalid_spec` at validation — dry-run and real
+  runs identically (#239). The role's `sandbox_mode: "read-only"` used to
+  silently override the spec mode: the delegation rehearsed clean, ran, and
+  wrote nothing while the envelope looked successful. The rejection names the
+  conflicting role and offers the two honest exits (write-capable role, or
+  `read_only` mode).
+- The pa1 prompt contract is now actually wired into the Anthropic request
+  path (#272): when the provider registry reports `prompt_cache:
+  :cache_control`, Turn threads the neutral pa1 ingredients (`prompt_mode`,
+  `skills_index`, `agent_instructions`, `previous_turn_boundary_seq`) and the
+  Anthropic provider assembles the body through `Prompt.build/1` — layer0 and
+  skills-index system blocks with their `cache_control` breakpoints, and the
+  previously-dropped `developer_context` (plus subagent role instructions)
+  fenced into the latest user message as pa1 late context. The planned
+  contract (version, breakpoints, layer0_hash) rides `provider_metadata`
+  under `"prompt_contract"` as durable evidence. The OpenAI request shape and
+  the legacy Anthropic path (no `prompt_mode`) are byte-unchanged.
+- Error-body capture on non-2xx provider responses is bounded (#268): both
+  transports retain at most 16 KiB through a shared helper, and a capped
+  capture is confessed as `err_body_truncated: true` in the classified error
+  details (key absent when nothing was dropped).
+
 ## [0.1.8]
 
 ### Added

@@ -4,6 +4,7 @@ defmodule Pixir.CLI do
 
       pixir login              Browser OAuth (device-code fallback) → ~/.pixir/auth.json
       pixir doctor             Run local first-run diagnostics (no network)
+      pixir gc                 Plan isolated Subagent workspace reclamation
       pixir tree <id>          Project a Session/Subagent tree from local Logs
       pixir compact <id>       Record a durable History compaction checkpoint
       pixir fork <id>          Create a child Session from a parent History prefix
@@ -47,9 +48,10 @@ defmodule Pixir.CLI do
   }
 
   alias Pixir.CLI.Sigint
+  alias Pixir.Subagents.GC
 
   @write_policy_unsupported_commands ~w(
-    login doctor diagnose tree compact fork inspect-replay delegate acp help version --version -v -h --help
+    login doctor gc diagnose tree compact fork inspect-replay delegate acp help version --version -v -h --help
   )
   @bash_timeout_unsupported_commands @write_policy_unsupported_commands
   @attach_unsupported_commands @write_policy_unsupported_commands
@@ -146,6 +148,10 @@ defmodule Pixir.CLI do
       invalid_doctor_args?(rest) -> print_error_return("usage: pixir doctor [--json]", 2)
       true -> doctor("--json" in rest)
     end
+  end
+
+  defp route_command(["gc" | rest], _mode, runtime) do
+    if help?(rest), do: gc_help(), else: gc(rest, runtime.json?)
   end
 
   defp route_command(["diagnose" | rest], _mode, _runtime) do
@@ -425,6 +431,70 @@ defmodule Pixir.CLI do
     {exe, args} = cmd
     _ = System.cmd(exe, args, stderr_to_stdout: true)
     :ok
+  end
+
+  defp gc_help do
+    IO.puts("""
+    Reclaim terminal isolated Subagent workspace snapshots while preserving child Logs.
+
+    Usage:
+      pixir gc --json
+      pixir gc --apply --json
+
+    The default is an effect-free plan. --apply deletes only entries proven terminal by
+    parent Session Logs. Every *.ndjson below any .pixir/sessions path remains byte-intact
+    at its original path.
+    """)
+
+    :ok
+  end
+
+  defp gc(rest, json?) do
+    rest = Enum.reject(rest, &(&1 == "--json"))
+
+    result =
+      case rest do
+        [] -> GC.plan(workspace: File.cwd!())
+        ["--apply"] -> GC.apply(workspace: File.cwd!())
+        _other -> {:invalid_args, gc_invalid_args_envelope(rest)}
+      end
+
+    case result do
+      {:ok, envelope} ->
+        print_gc(envelope, json?)
+        :ok
+
+      {:error, envelope} ->
+        print_gc(envelope, json?)
+        {:error, 1}
+
+      {:invalid_args, envelope} ->
+        print_gc(envelope, json?)
+        {:error, 2}
+    end
+  end
+
+  defp gc_invalid_args_envelope(args) do
+    %{
+      "ok" => false,
+      "status" => "invalid_args",
+      "kind" => "subagent_gc_invalid_args",
+      "details" => %{"args" => args, "usage" => "pixir gc [--apply] [--json]"},
+      "next_actions" => ["remove_unsupported_gc_arguments"]
+    }
+  end
+
+  defp print_gc(envelope, true), do: IO.puts(Jason.encode!(envelope))
+
+  defp print_gc(envelope, false) do
+    IO.puts("Pixir gc")
+    IO.puts("status: #{envelope["status"]}")
+    IO.puts("kind: #{envelope["kind"]}")
+
+    if totals = envelope["totals"] do
+      IO.puts("reclaimable bytes: #{totals["reclaimable_bytes"]}")
+      IO.puts("preserved log bytes: #{totals["preserved_logs_bytes"]}")
+    end
   end
 
   defp doctor(json?) do
@@ -1582,6 +1652,8 @@ defmodule Pixir.CLI do
                                 Continue with the same bounded-write guard
       pixir login               Sign in (browser OAuth; device-code fallback)
       pixir doctor [--json]     Run local first-run diagnostics (no network)
+      pixir gc [--apply] [--json]
+                                Plan or apply isolated Subagent reclamation
       pixir diagnose session <id> [--json]
       pixir tree <id> [--json]  Project a Session/Subagent tree from local Logs
       pixir compact <id>        Record a durable History compaction checkpoint
@@ -1606,8 +1678,9 @@ defmodule Pixir.CLI do
                                 bash in v1
 
     Runtime output:
-      --json                    For one-shot/resume, suppress streaming presenter
-                                output and emit one final JSON envelope on stdout
+      --json                    Emit machine-readable output for gc; for one-shot/resume,
+                                suppress streaming presenter output and emit one final
+                                JSON envelope on stdout
       --bash-timeout-ms <ms>    Override bash tool timeout for this one-shot/resume
                                 run, bounded by config bash_timeout_max_ms
 
@@ -1629,6 +1702,10 @@ defmodule Pixir.CLI do
     binary, workspace/session-log writability, local credential presence, config.json
     shape, and ACP command availability. It may create .pixir/sessions and remove a
     temporary probe file. Use --json for machine-readable output.
+
+    The JSON envelope carries "proceed" for automation: "true" (delegate freely),
+    "judge" (ready with warnings — read "judge_checks" for the non-ok check ids
+    and decide), or "block" (do not delegate).
     """)
 
     :ok

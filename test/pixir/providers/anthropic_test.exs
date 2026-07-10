@@ -28,6 +28,183 @@ defmodule Pixir.Providers.AnthropicTest do
     )
   end
 
+  test "pa1 request path emits cache-controlled system, breakpoints, and fenced late context" do
+    chunks = [sse(%{type: "message_delta", delta: %{stop_reason: "end_turn"}})]
+
+    history = [
+      %{"seq" => 1, "type" => "user_message", "data" => %{"text" => "prior question"}},
+      %{"seq" => 2, "type" => "assistant_message", "data" => %{"text" => "prior answer"}},
+      %{"seq" => 3, "type" => "user_message", "data" => %{"text" => "current question"}}
+    ]
+
+    assert {:ok, result} =
+             Anthropic.stream(
+               request(%{
+                 history: history,
+                 prompt_mode: :build,
+                 previous_turn_boundary_seq: 2,
+                 skills_index: "Skills index:\n- sample",
+                 developer_context: "Developer context text",
+                 agent_instructions: "Stay scoped."
+               })
+               |> Map.delete(:messages),
+               api_key: "sk-ant-test",
+               transport: canned(chunks)
+             )
+
+    assert_received {:request, http_request}
+    body = Jason.decode!(http_request.body)
+
+    assert [_, system_b1] = body["system"]
+    assert system_b1["text"] == "Skills index:\n- sample"
+    assert system_b1["cache_control"] == %{"type" => "ephemeral"}
+
+    assert {:ok, expected} =
+             Pixir.Providers.Anthropic.Prompt.build(%{
+               mode: :build,
+               skills_index: "Skills index:\n- sample",
+               messages: [
+                 %{
+                   "role" => "user",
+                   "content" => [%{"type" => "text", "text" => "prior question"}]
+                 },
+                 %{
+                   "role" => "assistant",
+                   "content" => [%{"type" => "text", "text" => "prior answer"}]
+                 },
+                 %{
+                   "role" => "user",
+                   "content" => [%{"type" => "text", "text" => "current question"}]
+                 }
+               ],
+               late_context:
+                 "Developer context text\n\nSubagent role instructions:\nStay scoped.",
+               prev_turn_boundary: 2
+             })
+
+    assert body["messages"] == expected.messages
+
+    assert body["messages"] |> List.last() |> Map.fetch!("content") |> hd() |> Map.fetch!("text") =~
+             "<<<PIXIR_PA1_LATE_CONTEXT:AUTHORITY>>>\nDeveloper context text"
+
+    assert body["messages"] |> List.last() |> Map.fetch!("content") |> hd() |> Map.fetch!("text") =~
+             "Subagent role instructions:\nStay scoped."
+
+    assert expected.contract["breakpoints"] == ["B1", "B2"]
+    assert result.provider_metadata["prompt_contract"] == expected.contract
+  end
+
+  test "legacy Anthropic request without prompt_mode keeps system_prompt passthrough" do
+    chunks = [sse(%{type: "message_delta", delta: %{stop_reason: "end_turn"}})]
+
+    assert {:ok, result} =
+             Anthropic.stream(request(%{system_prompt: "legacy system"}),
+               api_key: "sk-ant-test",
+               transport: canned(chunks)
+             )
+
+    assert_received {:request, http_request}
+    body = Jason.decode!(http_request.body)
+    assert body["system"] == "legacy system"
+    refute inspect(body["system"]) =~ "cache_control"
+    refute Map.has_key?(result.provider_metadata, "prompt_contract")
+  end
+
+  test "replays a skill_view result before its deferred activation" do
+    chunks = [sse(%{type: "message_delta", delta: %{stop_reason: "end_turn"}})]
+
+    activation = %{
+      "name" => "diagnose",
+      "source" => "repo",
+      "scope" => "repo",
+      "path" => "/skills/diagnose/SKILL.md",
+      "content_hash" => "anthropic-activation-hash",
+      "content" => "# Anthropic activation"
+    }
+
+    history = [
+      %{"type" => "user_message", "data" => %{"text" => "diagnose this"}},
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "call_skill",
+          "name" => "skill_view",
+          "args" => %{"name" => "diagnose"}
+        }
+      },
+      %{"type" => "skill_activation", "data" => activation},
+      %{
+        "type" => "tool_result",
+        "data" => %{
+          "call_id" => "call_skill",
+          "ok" => true,
+          "output" => "# Anthropic activation"
+        }
+      }
+    ]
+
+    assert {:ok, _result} =
+             Anthropic.stream(
+               request(%{history: history}) |> Map.delete(:messages),
+               api_key: "sk-ant-test",
+               transport: canned(chunks)
+             )
+
+    assert_received {:request, http_request}
+    messages = Jason.decode!(http_request.body)["messages"]
+    blocks = Enum.flat_map(messages, & &1["content"])
+
+    tool_use_index = Enum.find_index(blocks, &(&1["type"] == "tool_use"))
+    tool_result_index = Enum.find_index(blocks, &(&1["type"] == "tool_result"))
+
+    activation_index =
+      Enum.find_index(blocks, fn block ->
+        block["type"] == "text" and block["text"] == Pixir.Skills.render_activation(activation)
+      end)
+
+    assert is_integer(tool_use_index)
+    assert is_integer(tool_result_index)
+    assert is_integer(activation_index)
+    assert tool_use_index < tool_result_index
+    assert tool_result_index < activation_index
+
+    result_block = Enum.at(blocks, tool_result_index)
+    assert result_block["tool_use_id"] == "call_skill"
+    assert result_block["content"] == "# Anthropic activation"
+    refute result_block["is_error"]
+  end
+
+  test "pa1 provider_metadata carries prompt contract evidence" do
+    chunks = [sse(%{type: "message_delta", delta: %{stop_reason: "end_turn"}})]
+
+    assert {:ok, result} =
+             Anthropic.stream(
+               request(%{prompt_mode: :plan, previous_turn_boundary_seq: 0}),
+               api_key: "sk-ant-test",
+               transport: canned(chunks)
+             )
+
+    contract = result.provider_metadata["prompt_contract"]
+    assert contract["prompt_contract_version"] == "pa1"
+    assert is_list(contract["breakpoints"])
+    assert is_binary(contract["layer0_hash"])
+  end
+
+  test "pa1 omits late context block when developer context and agent instructions are absent" do
+    chunks = [sse(%{type: "message_delta", delta: %{stop_reason: "end_turn"}})]
+
+    assert {:ok, _result} =
+             Anthropic.stream(request(%{prompt_mode: :build, previous_turn_boundary_seq: 0}),
+               api_key: "sk-ant-test",
+               transport: canned(chunks)
+             )
+
+    assert_received {:request, http_request}
+    body = Jason.decode!(http_request.body)
+    [message] = body["messages"]
+    assert message["content"] == [%{"type" => "text", "text" => "hello"}]
+  end
+
   test "text-only happy path assembles text, emits deltas, and summarizes zero cache" do
     parent = self()
 
@@ -389,6 +566,48 @@ defmodule Pixir.Providers.AnthropicTest do
                  max_retries: 0
                )
     end
+  end
+
+  test "oversized non-2xx error body is capped and marked truncated" do
+    payload = String.duplicate("x", Pixir.Providers.ErrBody.max_bytes() * 2)
+    body = Jason.encode!(%{error: %{type: "api_error", message: payload}})
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :provider_http_error,
+                message: message,
+                details: details
+              }
+            }} =
+             Anthropic.stream(request(),
+               api_key: "sk-ant-test",
+               transport: canned([body], 500),
+               max_retries: 0
+             )
+
+    assert details.err_body_truncated == true
+    refute message =~ payload
+    refute inspect(details) =~ payload
+  end
+
+  test "small non-2xx error body does not carry truncation marker" do
+    body = Jason.encode!(%{error: %{type: "api_error", message: "small failure"}})
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :provider_http_error,
+                details: details
+              }
+            }} =
+             Anthropic.stream(request(),
+               api_key: "sk-ant-test",
+               transport: canned([body], 500),
+               max_retries: 0
+             )
+
+    refute Map.has_key?(details, :err_body_truncated)
   end
 
   test "terminal 400 does not retry and preserves anthropic error.type" do

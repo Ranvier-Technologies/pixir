@@ -15,6 +15,44 @@ defmodule Pixir.Delegate.CLIContractTest do
     path
   end
 
+  defp apply_workflow_spec(mode, write_policy) do
+    spec = %{
+      "contract_version" => 1,
+      "strategy" => "workflow",
+      "mode" => mode,
+      "steps" => [
+        %{
+          "id" => "inspect",
+          "task" => "inspect input",
+          "permission_mode" => "read_only",
+          "workspace_mode" => "shared"
+        },
+        %{
+          "id" => "producer",
+          "task" => "produce a virtual diff",
+          "permission_mode" => "read_only",
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["input.txt"],
+          "virtual_commands" => ["true"],
+          "depends_on" => ["inspect"]
+        },
+        %{
+          "id" => "apply",
+          "apply_from" => "producer",
+          "workspace_mode" => "shared",
+          "depends_on" => ["producer"],
+          "write_set" => ["notes/output.txt"]
+        }
+      ]
+    }
+
+    if is_nil(write_policy) do
+      spec
+    else
+      Map.put(spec, "write_policy", write_policy)
+    end
+  end
+
   defp assert_step_location(details, field, step_index \\ 0) do
     assert details["field"] == "steps[#{step_index + 1}].#{field}"
     assert details["json_pointer"] == "/steps/#{step_index}/#{field}"
@@ -245,6 +283,84 @@ defmodule Pixir.Delegate.CLIContractTest do
     assert "fix_workflow_dependency_graph" in next_actions
   end
 
+  test "workflow rehearsal accepts bounded_write apply_from with spec write_policy" do
+    workspace = tmp_workspace("pixir-delegate-apply-rehearsal")
+    File.write!(Path.join(workspace, "input.txt"), "source\n")
+
+    spec =
+      "bounded_write"
+      |> apply_workflow_spec(%{"version" => 1, "allow_writes" => ["notes/**"]})
+      |> Jason.encode!()
+
+    assert {:ok,
+            %{
+              exit_code: 0,
+              payload: %{
+                "ok" => true,
+                "status" => "planned",
+                "strategy" => "workflow",
+                "beam_coordination" => %{"planned_child_count" => 3}
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               workspace: workspace,
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "workflow rehearsal rejects apply_from without write_policy" do
+    workspace = tmp_workspace("pixir-delegate-apply-rehearsal-fail-closed")
+    File.write!(Path.join(workspace, "input.txt"), "source\n")
+
+    spec =
+      "read_only"
+      |> apply_workflow_spec(nil)
+      |> Jason.encode!()
+
+    assert {:error,
+            %{
+              exit_code: 2,
+              payload: %{
+                "ok" => false,
+                "status" => "rejected",
+                "kind" => "invalid_spec",
+                "details" => details
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               workspace: workspace,
+               read_stdin: fn -> spec end
+             )
+
+    assert details["field"] == "apply_from"
+    assert "run_with_bounded_write_policy" in details["next_actions"]
+  end
+
+  test "workflow bounded_write ignores spec-level read-only subagents role" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "mode" => "bounded_write",
+        "subagents" => %{"role" => "explorer"},
+        "write_policy" => %{"version" => 1, "allow_writes" => ["notes/**"]},
+        "steps" => [
+          %{
+            "id" => "write",
+            "task" => "write notes",
+            "agent" => "worker",
+            "workspace_mode" => "shared",
+            "write_set" => ["notes/out.txt"]
+          }
+        ]
+      })
+
+    assert {:ok, %{payload: %{"status" => "planned", "strategy" => "workflow"}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
   test "subagents dry-run exposes runtime task indexes and attachment counts" do
     spec =
       Jason.encode!(%{
@@ -278,10 +394,310 @@ defmodule Pixir.Delegate.CLIContractTest do
     assert Enum.map(children, & &1["task"]) == ["first task", "second task", "third task"]
     assert Enum.map(children, & &1["index"]) == [0, 1, 2]
     assert Enum.map(children, & &1["attachment_count"]) == [0, 2, 0]
-    # Additive envelope key -> schema revision 3 (family v1 unchanged).
-    assert payload["schema_version"] == 3
+    # Additive envelope key -> schema revision 4 (family v1 unchanged).
+    assert payload["schema_version"] == 4
     assert order_note =~ "unspecified"
     assert order_note =~ "children[].index"
+  end
+
+  test "bounded_write dry-run exposes verify command count without echoing commands" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "mode" => "bounded_write",
+        "task" => "format only",
+        "write_policy" => %{
+          "version" => 1,
+          "allow_writes" => ["notes/**"],
+          "bash" => %{
+            "verify" => ["mix format --check-formatted", "mix compile --warnings-as-errors"]
+          }
+        }
+      })
+
+    assert {:ok,
+            %{
+              payload: %{
+                "status" => "planned",
+                "verify_command_count" => 2,
+                "children" => [%{"verify_command_count" => 2}]
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "virtual_overlay dry-run accepts bounded operator context and projects it" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "mode" => "read_only",
+        "task" => "produce a virtual diff",
+        "subagents" => %{
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["lib/pixir/delegate/*.ex", "mix.exs"],
+          "limits" => %{"max_import_files" => 8, "max_diff_bytes" => 4_096}
+        }
+      })
+
+    assert {:ok,
+            %{
+              payload: %{
+                "status" => "planned",
+                "schema_version" => 4,
+                "children" => [
+                  %{
+                    "workspace_mode" => "virtual_overlay",
+                    "read_set_count" => 2,
+                    "limits" => %{
+                      "max_import_files" => 8,
+                      "max_diff_bytes" => 4_096
+                    }
+                  }
+                ]
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "virtual_overlay dry-run omits limits when absent" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "produce a virtual diff",
+        "subagents" => %{
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["mix.exs"]
+        }
+      })
+
+    assert {:ok, %{payload: %{"children" => [child]}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+
+    refute Map.has_key?(child, "limits")
+  end
+
+  test "virtual_overlay dry-run rejects missing read_set" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "produce a virtual diff",
+        "subagents" => %{"workspace_mode" => "virtual_overlay"}
+      })
+
+    assert {:error,
+            %{
+              payload: %{
+                "kind" => "invalid_spec",
+                "details" => %{
+                  "json_pointer" => "/subagents/read_set",
+                  "path" => ["subagents", "read_set"]
+                }
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "virtual_overlay dry-run rejects unbounded read_set" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "produce a virtual diff",
+        "subagents" => %{
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["**/*"]
+        }
+      })
+
+    assert {:error,
+            %{
+              payload: %{
+                "kind" => "invalid_spec",
+                "details" => %{
+                  "matched_rule" => "unbounded_read_set",
+                  "field" => "subagents.read_set[1]",
+                  "json_pointer" => "/subagents/read_set/0"
+                }
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "virtual_overlay read_set element labels are one-based while machine locations are zero-based" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "produce a virtual diff",
+        "subagents" => %{
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["mix.exs", ""]
+        }
+      })
+
+    assert {:error,
+            %{
+              payload: %{
+                "kind" => "invalid_spec",
+                "details" => %{
+                  "field" => "subagents.read_set[2]",
+                  "json_pointer" => "/subagents/read_set/1",
+                  "path" => ["subagents", "read_set", 1]
+                }
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "virtual_overlay attachment rejection uses task attachment location details" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "tasks" => [
+          %{"task" => "first"},
+          %{"task" => "second", "attachments" => ["notes.txt"]}
+        ],
+        "subagents" => %{
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["mix.exs"]
+        }
+      })
+
+    assert {:error,
+            %{
+              payload: %{
+                "kind" => "invalid_spec",
+                "details" => %{
+                  "field" => "tasks[2].attachments",
+                  "json_pointer" => "/tasks/1/attachments",
+                  "path" => ["tasks", 1, "attachments"],
+                  "task_index" => 1
+                }
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "virtual_overlay dry-run rejects bounded_write mode" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "mode" => "bounded_write",
+        "write_policy" => %{"version" => 1, "allow_writes" => ["notes/**"]},
+        "task" => "produce a virtual diff",
+        "subagents" => %{
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["mix.exs"]
+        }
+      })
+
+    assert {:error,
+            %{
+              payload: %{
+                "kind" => "invalid_spec",
+                "details" => %{"json_pointer" => "/write_policy"}
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "virtual_overlay dry-run rejects unknown limits" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "produce a virtual diff",
+        "subagents" => %{
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["mix.exs"],
+          "limits" => %{"max_magic_bytes" => 1}
+        }
+      })
+
+    assert {:error,
+            %{
+              payload: %{
+                "kind" => "invalid_spec",
+                "details" => %{
+                  "unknown_key" => "max_magic_bytes",
+                  "json_pointer" => "/subagents/limits/max_magic_bytes"
+                }
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "virtual_overlay dry-run rejects negative limits" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "produce a virtual diff",
+        "subagents" => %{
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["mix.exs"],
+          "limits" => %{"max_diff_bytes" => -1}
+        }
+      })
+
+    assert {:error,
+            %{
+              payload: %{
+                "kind" => "invalid_spec",
+                "details" => %{
+                  "observed" => -1,
+                  "json_pointer" => "/subagents/limits/max_diff_bytes"
+                }
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "shared mode rejects virtual-only read_set" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "inspect docs",
+        "subagents" => %{"workspace_mode" => "shared", "read_set" => ["mix.exs"]}
+      })
+
+    assert {:error,
+            %{
+              payload: %{
+                "kind" => "invalid_spec",
+                "details" => %{"json_pointer" => "/subagents/read_set"}
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
   end
 
   test "unknown top-level delegate spec keys fail closed" do
@@ -456,6 +872,185 @@ defmodule Pixir.Delegate.CLIContractTest do
              CLIContract.run(["--spec", "-", "--dry-run", "--json"],
                read_stdin: fn -> spec end
              )
+  end
+
+  test "bounded_write rejects read-only subagent role during dry-run and attached validation" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "mode" => "bounded_write",
+        "write_policy" => %{"version" => 1, "allow_writes" => ["notes/**"]},
+        "task" => "inspect docs",
+        "subagents" => %{"role" => "explorer"}
+      })
+
+    for argv <- [["--spec", "-", "--dry-run", "--json"], ["--spec", "-", "--json"]] do
+      assert {:error,
+              %{
+                exit_code: 2,
+                payload: %{
+                  "ok" => false,
+                  "status" => "rejected",
+                  "kind" => "invalid_spec",
+                  "message" => "bounded_write conflicts with the read-only role explorer",
+                  "details" => details
+                }
+              }} =
+               CLIContract.run(argv,
+                 read_stdin: fn -> spec end
+               )
+
+      assert details["field"] == "subagents.role"
+      assert details["json_pointer"] == "/subagents/role"
+      assert details["path"] == ["subagents", "role"]
+      assert details["role"] == "explorer"
+      assert details["role_sandbox_mode"] == "read-only"
+      assert details["mode"] == "bounded_write"
+
+      assert details["next_actions"] == [
+               "use_a_write_capable_role",
+               "set_mode_to_read_only"
+             ]
+    end
+  end
+
+  test "bounded_write accepts a write-capable worker role during validation" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "mode" => "bounded_write",
+        "write_policy" => %{"version" => 1, "allow_writes" => ["notes/**"]},
+        "task" => "inspect docs",
+        "subagents" => %{"role" => "worker"}
+      })
+
+    assert {:ok, %{payload: %{"status" => "planned"}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "read_only accepts a read-only explorer role during validation" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "mode" => "read_only",
+        "task" => "inspect docs",
+        "subagents" => %{"role" => "explorer"}
+      })
+
+    assert {:ok, %{payload: %{"status" => "planned"}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "bounded_write without an explicit role validates the delegate default role" do
+    # Subagents.Manager defaults missing spawn-agent args to the built-in "default" role;
+    # that role has no read-only sandbox mode, so bounded_write stays valid here.
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "mode" => "bounded_write",
+        "write_policy" => %{"version" => 1, "allow_writes" => ["notes/**"]},
+        "task" => "inspect docs"
+      })
+
+    assert {:ok, %{payload: %{"status" => "planned"}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "bounded_write rejects a custom role spelled sandbox_mode read_only" do
+    ws =
+      Path.join(
+        System.tmp_dir!(),
+        "pixir-239-raw-spelling-" <> Base.encode16(:crypto.strong_rand_bytes(5), case: :lower)
+      )
+
+    agents_dir = Path.join(ws, ".pixir/agents")
+    File.mkdir_p!(agents_dir)
+
+    File.write!(Path.join(agents_dir, "raw_reader.toml"), """
+    name = "raw_reader"
+    description = "Reader with the raw sandbox spelling"
+    developer_instructions = "Read only."
+    sandbox_mode = "read_only"
+    """)
+
+    on_exit(fn -> File.rm_rf!(ws) end)
+
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "mode" => "bounded_write",
+        "write_policy" => %{"version" => 1, "allow_writes" => ["notes/**"]},
+        "task" => "inspect docs",
+        "subagents" => %{"role" => "raw_reader"}
+      })
+
+    assert {:error, %{exit_code: 2, payload: %{"kind" => "invalid_spec", "details" => details}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               workspace: ws,
+               read_stdin: fn -> spec end
+             )
+
+    assert details["role"] == "raw_reader"
+    assert details["role_sandbox_mode"] == "read_only"
+  end
+
+  test "agent lookup for the conflict gate never escapes the caller workspace" do
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "pixir-239-confine-" <> Base.encode16(:crypto.strong_rand_bytes(5), case: :lower)
+      )
+
+    caller_ws = Path.join(base, "caller")
+    outside = Path.join(base, "outside")
+    File.mkdir_p!(caller_ws)
+
+    # A write-capable "explorer" override planted OUTSIDE the caller workspace:
+    # an unconfined lookup would find it and let the conflicting spec pass.
+    outside_agents = Path.join(outside, ".pixir/agents")
+    File.mkdir_p!(outside_agents)
+
+    File.write!(Path.join(outside_agents, "explorer.toml"), """
+    name = "explorer"
+    description = "Write-capable impostor outside the workspace"
+    developer_instructions = "Write freely."
+    sandbox_mode = "workspace-write"
+    """)
+
+    on_exit(fn -> File.rm_rf!(base) end)
+
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "mode" => "bounded_write",
+        "workspace" => "../outside",
+        "write_policy" => %{"version" => 1, "allow_writes" => ["notes/**"]},
+        "task" => "inspect docs",
+        "subagents" => %{"role" => "explorer"}
+      })
+
+    # The lookup stays confined to the caller workspace, so the built-in
+    # read-only explorer wins and the conflict is still rejected.
+    assert {:error, %{exit_code: 2, payload: %{"kind" => "invalid_spec", "details" => details}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               workspace: caller_ws,
+               read_stdin: fn -> spec end
+             )
+
+    assert details["role"] == "explorer"
+    assert details["role_sandbox_mode"] == "read-only"
   end
 
   test "legacy single-task dry-run plans children without task-array indexes" do

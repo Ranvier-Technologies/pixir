@@ -4,7 +4,6 @@ defmodule Pixir.Tools.SpawnAgent do
   use Pixir.Tool
 
   alias Pixir.{Subagents, Tool}
-  alias Pixir.Permissions.WritePolicy
 
   @impl Pixir.Tool
   def __tool__ do
@@ -34,6 +33,11 @@ defmodule Pixir.Tools.SpawnAgent do
             "enum" => ["isolated", "shared"],
             "description" =>
               "isolated (default) or shared. virtual_overlay is modeled for delegation context, but is not accepted here until runtime support lands."
+          },
+          "validate_only" => %{
+            "type" => "boolean",
+            "description" =>
+              "When exactly true, validate and normalize this spawn without creating a Subagent."
           }
         },
         "required" => ["task"]
@@ -44,18 +48,28 @@ defmodule Pixir.Tools.SpawnAgent do
   @impl Pixir.Tool
   def execute(%{"task" => task} = args, context) when is_binary(task) and task != "" do
     opts = subagent_opts(context)
+    args = sanitize_args(args)
 
-    # index is delegate-runner evidence (tasks[] position), and id is
-    # runtime-owned durable identity. Dropping them here is defense in depth;
-    # the enforcement barrier is that Subagents.Manager.build_spec/3 does not
-    # read either value from args. attachments, model, reasoning_effort, and
-    # web_search are operator knobs (delegate spec / ACP _meta), not a
-    # capability the spawning model may grant its children.
-    args =
-      Map.drop(args, ["index", "id", "attachments", "model", "reasoning_effort", "web_search"])
+    case Map.get(args, "validate_only", false) do
+      true ->
+        rehearse(Map.delete(args, "validate_only"), context, opts)
 
-    with {:ok, agent} <- Subagents.spawn_agent(context.session_id, args, opts) do
-      {:ok, %{"output" => render(agent), "subagent" => agent}}
+      false ->
+        with {:ok, agent} <-
+               Subagents.spawn_agent(
+                 context.session_id,
+                 Map.delete(args, "validate_only"),
+                 opts
+               ) do
+          {:ok, %{"output" => render(agent), "subagent" => agent}}
+        end
+
+      _malformed ->
+        {:error,
+         Tool.error(:invalid_args, "validate_only must be a boolean", %{
+           "field" => "validate_only",
+           "accepted_type" => "boolean"
+         })}
     end
   end
 
@@ -64,20 +78,46 @@ defmodule Pixir.Tools.SpawnAgent do
 
   @impl Pixir.Tool
   def dry_run(%{"task" => task} = args, context) when is_binary(task) and task != "" do
-    {:ok,
-     %{
-       "dry_run" => true,
-       "would" => "spawn_agent",
-       "task" => task,
-       "agent" => Map.get(args, "agent", "default"),
-       "timeout_ms" => Map.get(args, "timeout_ms"),
-       "max_depth" => Map.get(args, "max_depth")
-     }
-     |> maybe_put("write_policy", WritePolicy.metadata(get_in(context, [:permission, :policy])))}
+    args = sanitize_args(args)
+
+    case Map.get(args, "validate_only", false) do
+      value when is_boolean(value) ->
+        rehearse(Map.delete(args, "validate_only"), context, subagent_opts(context))
+
+      _malformed ->
+        {:error,
+         Tool.error(:invalid_args, "validate_only must be a boolean", %{
+           "field" => "validate_only",
+           "accepted_type" => "boolean"
+         })}
+    end
   end
 
   def dry_run(_args, _context),
     do: {:error, Tool.error(:invalid_args, "task is required", %{})}
+
+  defp rehearse(args, context, opts) do
+    with {:ok, plan} <- Subagents.validate_spawn(context.session_id, args, opts) do
+      {:ok, %{"output" => render_plan(plan), "plan" => plan}}
+    end
+  end
+
+  defp sanitize_args(args) do
+    # index is delegate-runner evidence (tasks[] position), and id is
+    # runtime-owned durable identity. Dropping them here is defense in depth;
+    # the enforcement barrier is that Subagents.Manager normalization does not
+    # read either value from args. attachments, model, reasoning_effort, and
+    # web_search are operator knobs (delegate spec / ACP _meta), not a
+    # capability the spawning model may grant its children.
+    Map.drop(args, [
+      "index",
+      "id",
+      "attachments",
+      "model",
+      "reasoning_effort",
+      "web_search"
+    ])
+  end
 
   defp subagent_opts(context) do
     [
@@ -111,6 +151,8 @@ defmodule Pixir.Tools.SpawnAgent do
     "Spawned #{agent["id"]} (#{agent["agent"]}) with status #{agent["status"]}#{child}#{depth}."
   end
 
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+  defp render_plan(plan) do
+    "Validated spawn_agent plan for #{plan["agent"]} at depth " <>
+      "#{plan["depth"]}/#{plan["max_depth"]}; no Subagent was created."
+  end
 end

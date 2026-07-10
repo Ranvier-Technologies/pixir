@@ -20,6 +20,22 @@ defmodule Pixir.PermissionsTest do
       assert :allow = Permissions.decide(:read_only, "wait_agent", %{})
       assert :allow = Permissions.decide(:read_only, "list_agents", %{})
       assert :allow = Permissions.decide(:read_only, "bash", %{"command" => "ls -la"})
+
+      assert :allow =
+               Permissions.decide(:read_only, "apply_virtual_diff", %{"artifact" => %{}})
+
+      assert :allow =
+               Permissions.decide(:read_only, "apply_virtual_diff", %{
+                 "artifact" => %{},
+                 "dry_run" => true
+               })
+
+      assert :deny =
+               Permissions.decide(:read_only, "apply_virtual_diff", %{
+                 "artifact" => %{},
+                 "dry_run" => false
+               })
+
       assert :deny = Permissions.decide(:read_only, "write", %{"path" => "a", "content" => "b"})
       assert :deny = Permissions.decide(:read_only, "run_workflow", %{"steps" => []})
       assert :deny = Permissions.decide(:read_only, "spawn_agent", %{"task" => "do work"})
@@ -54,6 +70,20 @@ defmodule Pixir.PermissionsTest do
 
       assert {:ask, "close a subagent"} =
                Permissions.decide(:ask, "close_agent", %{"id" => "sub_1"})
+
+      assert {:ask, "apply a virtual diff"} =
+               Permissions.decide(:ask, "apply_virtual_diff", %{
+                 "artifact" => %{},
+                 "dry_run" => false
+               })
+
+      assert :allow =
+               Permissions.decide(:ask, "apply_virtual_diff", %{
+                 "artifact" => %{},
+                 "dry_run" => true
+               })
+
+      assert :allow = Permissions.decide(:ask, "apply_virtual_diff", %{"artifact" => %{}})
 
       assert {:ask, _} = Permissions.decide(:ask, "bash", %{"command" => "rm file"})
       assert {:ask, _} = Permissions.decide(:ask, "bash", %{"command" => "npm install"})

@@ -214,6 +214,27 @@ defmodule Pixir.CLITest do
   defp session_lease_files(ws),
     do: Path.wildcard(Path.join([ws, ".pixir", "session_leases", "*.json"]))
 
+  # GC folds parent logs cold; seed them from raw NDJSON, never constructors
+  # (path convention: a decode regression must fail these tests).
+  defp write_gc_subagent_event!(ws, session_id, seq, subagent_id, child_workspace, status) do
+    data = %{
+      "subagent_id" => subagent_id,
+      "child_session_id" => "child-#{subagent_id}",
+      "event" => status,
+      "status" => status,
+      "workspace" => child_workspace,
+      "workspace_mode" => "isolated"
+    }
+
+    path = Log.path(session_id, workspace: ws)
+    File.mkdir_p!(Path.dirname(path))
+
+    line =
+      Jason.encode!(raw_event(session_id, seq, "subagent_event", data)) <> "\n"
+
+    File.write!(path, line, [:append])
+  end
+
   test "--attach accumulates in order and encodes resource links" do
     in_tmp_workspace("pixir-cli-attach", fn ws ->
       File.write!(Path.join(ws, "one.txt"), "one")
@@ -429,6 +450,7 @@ defmodule Pixir.CLITest do
     out = capture_io(fn -> assert :ok = CLI.route([]) end)
     assert out =~ "OTP-native coding agent"
     assert out =~ "pixir resume"
+    assert out =~ "pixir gc [--apply] [--json]"
     assert out =~ "pixir delegate"
     assert out =~ "pixir delegate daemon"
   end
@@ -457,6 +479,218 @@ defmodule Pixir.CLITest do
     out = capture_io(fn -> assert :ok = CLI.route(["doctor", "--help"]) end)
     assert out =~ "first-run diagnostics"
     assert out =~ "--json"
+  end
+
+  test "gc --json classifies a closed-referenced snapshot as reclaimable" do
+    in_tmp_workspace("pixir-cli-gc-closed", fn ws ->
+      closed_dir = Path.join([ws, ".pixir", "subagents", "closed"])
+      payload = Path.join([closed_dir, "workspace", "payload.bin"])
+      File.mkdir_p!(Path.dirname(payload))
+      File.write!(payload, "closed payload")
+
+      write_gc_subagent_event!(
+        ws,
+        "gc-closed-parent",
+        0,
+        "closed",
+        Path.join(closed_dir, "workspace"),
+        "closed"
+      )
+
+      output = capture_io(fn -> assert :ok = CLI.route(["gc", "--json"]) end)
+      assert {:ok, %{"entries" => [entry]}} = Jason.decode(output)
+      assert entry["classification"] == "reclaimable"
+    end)
+  end
+
+  test "gc --json plans terminal snapshots without changing the filesystem" do
+    in_tmp_workspace("pixir-cli-gc-plan", fn ws ->
+      terminal_dir = Path.join([ws, ".pixir", "subagents", "terminal"])
+      unreferenced_dir = Path.join([ws, ".pixir", "subagents", "unreferenced"])
+      terminal_payload = Path.join([terminal_dir, "workspace", "payload.bin"])
+      unreferenced_payload = Path.join(unreferenced_dir, "keep.txt")
+
+      File.mkdir_p!(Path.dirname(terminal_payload))
+      File.mkdir_p!(unreferenced_dir)
+      File.write!(terminal_payload, "terminal payload")
+      File.write!(unreferenced_payload, "unreferenced payload")
+
+      write_gc_subagent_event!(
+        ws,
+        "gc-plan-parent",
+        0,
+        "terminal",
+        Path.join(terminal_dir, "workspace"),
+        "completed"
+      )
+
+      output = capture_io(fn -> assert :ok = CLI.route(["gc", "--json"]) end)
+      assert {:ok, envelope} = Jason.decode(output)
+      assert envelope["ok"] == true
+      assert envelope["status"] == "planned"
+      assert envelope["kind"] == "subagent_gc_plan"
+      assert envelope["apply"] == false
+
+      entries = Map.new(envelope["entries"], &{Path.basename(&1["dir"]), &1})
+      assert entries["terminal"]["classification"] == "reclaimable"
+      assert entries["terminal"]["bytes"] == byte_size("terminal payload")
+      assert entries["terminal"]["preserved_log_count"] == 0
+      assert entries["unreferenced"]["classification"] == "skipped_unreferenced"
+      assert envelope["totals"]["reclaimable_bytes"] == byte_size("terminal payload")
+      assert envelope["totals"]["preserved_logs_bytes"] == 0
+
+      assert File.read!(terminal_payload) == "terminal payload"
+      assert File.read!(unreferenced_payload) == "unreferenced payload"
+    end)
+  end
+
+  test "gc blocks planning on a corrupt parent log" do
+    in_tmp_workspace("pixir-cli-gc-corrupt", fn ws ->
+      dir = Path.join([ws, ".pixir", "subagents", "terminal"])
+      File.mkdir_p!(Path.join(dir, "workspace"))
+      File.write!(Path.join(dir, "workspace/payload.bin"), "x")
+
+      corrupt = Path.join([ws, ".pixir", "sessions", "corrupt-parent.ndjson"])
+      File.mkdir_p!(Path.dirname(corrupt))
+      File.write!(corrupt, "{not json at all\n")
+
+      output = capture_io(fn -> assert {:error, _} = CLI.route(["gc", "--json"]) end)
+      assert {:ok, envelope} = Jason.decode(output)
+      assert envelope["ok"] == false
+      assert envelope["status"] == "blocked"
+      assert Enum.any?(envelope["next_actions"], &(&1 =~ "parent_log"))
+
+      # Nothing was touched.
+      assert File.exists?(Path.join(dir, "workspace/payload.bin"))
+    end)
+  end
+
+  test "gc --apply records per-dir failures and continues (partial honesty)" do
+    in_tmp_workspace("pixir-cli-gc-partial", fn ws ->
+      good = Path.join([ws, ".pixir", "subagents", "good"])
+      locked = Path.join([ws, ".pixir", "subagents", "locked"])
+      File.mkdir_p!(Path.join(good, "workspace"))
+      File.mkdir_p!(Path.join(locked, "workspace/frozen"))
+      File.write!(Path.join(good, "workspace/a.bin"), "a")
+      File.write!(Path.join(locked, "workspace/frozen/b.bin"), "b")
+
+      write_gc_subagent_event!(
+        ws,
+        "gc-partial-parent",
+        0,
+        "good",
+        Path.join(good, "workspace"),
+        "completed"
+      )
+
+      write_gc_subagent_event!(
+        ws,
+        "gc-partial-parent",
+        1,
+        "locked",
+        Path.join(locked, "workspace"),
+        "completed"
+      )
+
+      # Make the second dir undeletable (read-only + no-exec parent).
+      File.chmod!(Path.join(locked, "workspace/frozen"), 0o555)
+      File.chmod!(Path.join(locked, "workspace"), 0o555)
+
+      output = capture_io(fn -> assert {:error, _} = CLI.route(["gc", "--apply", "--json"]) end)
+
+      # Restore permissions before in_tmp_workspace's own rm_rf teardown.
+      File.chmod!(Path.join(locked, "workspace"), 0o755)
+      File.chmod!(Path.join(locked, "workspace/frozen"), 0o755)
+
+      assert {:ok, envelope} = Jason.decode(output)
+      assert envelope["ok"] == false
+      assert envelope["status"] == "partial"
+
+      entries = Map.new(envelope["entries"], &{Path.basename(&1["dir"]), &1})
+      assert entries["good"]["outcome"] == "reclaimed"
+      refute File.exists?(Path.join(good, "workspace/a.bin"))
+      assert entries["locked"]["outcome"] == "failed"
+    end)
+  end
+
+  test "gc --apply preserves child Logs and leaves running and unreferenced dirs untouched" do
+    in_tmp_workspace("pixir-cli-gc-apply", fn ws ->
+      terminal_dir = Path.join([ws, ".pixir", "subagents", "terminal"])
+      running_dir = Path.join([ws, ".pixir", "subagents", "running"])
+      unreferenced_dir = Path.join([ws, ".pixir", "subagents", "unreferenced"])
+      terminal_payload = Path.join([terminal_dir, "workspace", "large.bin"])
+      running_payload = Path.join([running_dir, "workspace", "running.txt"])
+      unreferenced_payload = Path.join(unreferenced_dir, "unknown.txt")
+
+      child_log =
+        Path.join([
+          terminal_dir,
+          "workspace",
+          ".pixir",
+          "sessions",
+          "child-terminal.ndjson"
+        ])
+
+      child_log_bytes = "{\"child\":\"byte-intact\"}\n"
+
+      for path <- [terminal_payload, running_payload, unreferenced_payload, child_log] do
+        File.mkdir_p!(Path.dirname(path))
+      end
+
+      File.write!(terminal_payload, "delete me")
+      File.write!(running_payload, "keep running")
+      File.write!(unreferenced_payload, "keep unknown")
+      File.write!(child_log, child_log_bytes)
+
+      write_gc_subagent_event!(
+        ws,
+        "gc-apply-parent",
+        0,
+        "terminal",
+        Path.join(terminal_dir, "workspace"),
+        "failed"
+      )
+
+      write_gc_subagent_event!(
+        ws,
+        "gc-apply-parent",
+        1,
+        "running",
+        Path.join(running_dir, "workspace"),
+        "running"
+      )
+
+      output = capture_io(fn -> assert :ok = CLI.route(["gc", "--apply", "--json"]) end)
+      assert {:ok, envelope} = Jason.decode(output)
+      assert envelope["ok"] == true
+      assert envelope["status"] == "applied"
+      assert envelope["kind"] == "subagent_gc_apply"
+      assert envelope["apply"] == true
+
+      # File.cwd!/0 resolves the /var -> /private/var symlink on macOS while the
+      # fixture path does not; join on basenames instead of absolute equality.
+      entries = Map.new(envelope["entries"], &{Path.basename(&1["dir"]), &1})
+      assert entries["terminal"]["classification"] == "reclaimable"
+      assert entries["terminal"]["outcome"] == "reclaimed"
+      assert entries["terminal"]["preserved_log_count"] == 1
+      assert entries["running"]["classification"] == "skipped_running"
+      assert entries["running"]["outcome"] == "skipped"
+      assert entries["unreferenced"]["classification"] == "skipped_unreferenced"
+      assert entries["unreferenced"]["outcome"] == "skipped"
+
+      refute File.exists?(terminal_payload)
+      assert File.read!(child_log) == child_log_bytes
+      assert File.read!(running_payload) == "keep running"
+      assert File.read!(unreferenced_payload) == "keep unknown"
+      assert envelope["totals"]["preserved_logs_bytes"] == byte_size(child_log_bytes)
+    end)
+  end
+
+  test "gc --help is self-describing and advertises dry-run and apply" do
+    out = capture_io(fn -> assert :ok = CLI.route(["gc", "--help"]) end)
+    assert out =~ "effect-free plan"
+    assert out =~ "pixir gc --apply --json"
+    assert out =~ ".pixir/sessions"
   end
 
   test "diagnose --help is self-describing without network" do
@@ -1143,7 +1377,7 @@ defmodule Pixir.CLITest do
                   "status" => "completed",
                   "kind" => "delegate_result",
                   "contract_version" => 1,
-                  "schema_version" => 3,
+                  "schema_version" => 4,
                   "schema" => "pixir.delegate.envelope.v1",
                   "command_ok" => true,
                   "work_complete" => true,
@@ -1349,7 +1583,7 @@ defmodule Pixir.CLITest do
                 "metadata" => %{"id" => "mirror-test"},
                 "allow_writes" => ["src/**"]
               },
-              "subagents" => %{"role" => "explorer", "count" => 1},
+              "subagents" => %{"role" => "worker", "count" => 1},
               "limits" => %{"timeout_ms" => 7_000, "child_timeout_ms" => 3_000}
             })
 
@@ -1360,7 +1594,7 @@ defmodule Pixir.CLITest do
 
           payload = Jason.decode!(stdout)
           assert payload["status"] == "completed"
-          assert payload["schema_version"] == 3
+          assert payload["schema_version"] == 4
           assert payload["command_ok"] == true
           assert payload["work_complete"] == true
           assert payload["outcome"] == "completed"
@@ -1522,7 +1756,7 @@ defmodule Pixir.CLITest do
                 "ok" => true,
                 "status" => "completed",
                 "kind" => "delegate_status",
-                "schema_version" => 3,
+                "schema_version" => 4,
                 "schema" => "pixir.delegate.envelope.v1",
                 "command_ok" => true,
                 "work_complete" => true,
@@ -1566,7 +1800,7 @@ defmodule Pixir.CLITest do
                "ok" => false,
                "status" => "rejected",
                "kind" => "not_found",
-               "schema_version" => 3,
+               "schema_version" => 4,
                "command_ok" => false,
                "work_complete" => false,
                "outcome" => "rejected",
@@ -1614,7 +1848,7 @@ defmodule Pixir.CLITest do
                 "ok" => true,
                 "status" => "running",
                 "kind" => "delegate_attach",
-                "schema_version" => 3,
+                "schema_version" => 4,
                 "schema" => "pixir.delegate.envelope.v1",
                 "command_ok" => true,
                 "work_complete" => false,

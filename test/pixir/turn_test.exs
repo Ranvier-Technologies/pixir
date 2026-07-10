@@ -33,6 +33,22 @@ defmodule Pixir.TurnTest do
     end
   end
 
+  defmodule ScriptedRequestCaptureProvider do
+    def stream(request, opts) do
+      send(Keyword.fetch!(opts, :test_pid), {:scripted_provider_request, request})
+      agent = Keyword.fetch!(opts, :agent)
+      result = Agent.get_and_update(agent, fn [head | tail] -> {head, tail} end)
+
+      case result do
+        {:ok, map} when is_map(map) ->
+          {:ok, Map.put_new(map, :usage_summary, Pixir.Provider.usage_summary(map[:usage]))}
+
+        other ->
+          other
+      end
+    end
+  end
+
   defmodule RequestCaptureProvider do
     def stream(request, opts) do
       send(Keyword.fetch!(opts, :test_pid), {:provider_request, request})
@@ -152,6 +168,20 @@ defmodule Pixir.TurnTest do
 
     assert_received {:provider_request, request}
     refute Map.has_key?(request, :web_search)
+  end
+
+  test "prompt-cache-key providers do not receive Anthropic pa1 neutral fields", %{ctx: ctx} do
+    assert {:ok, "ok"} =
+             Turn.run(ctx, "openai shape",
+               provider: RequestCaptureProvider,
+               provider_opts: [test_pid: self()]
+             )
+
+    assert_received {:provider_request, request}
+    refute Map.has_key?(request, :prompt_mode)
+    refute Map.has_key?(request, :skills_index)
+    refute Map.has_key?(request, :agent_instructions)
+    refute Map.has_key?(request, :previous_turn_boundary_seq)
   end
 
   test "explicit provider seam wins even for a claude model id", %{ctx: ctx} do
@@ -526,6 +556,53 @@ defmodule Pixir.TurnTest do
     activation = Enum.find(history, &(&1.type == :skill_activation))
     assert activation.data["name"] == "sample"
     assert activation.data["activated_by"] == "model"
+  end
+
+  test "second request replays a real skill_view result before its activation", %{
+    ctx: ctx,
+    ws: ws
+  } do
+    write_skill(Path.join(ws, ".agents/skills/sample"), "sample", "Sample skill", "skill body")
+
+    script = [
+      tool_calls([%{call_id: "c1", name: "skill_view", args: %{"name" => "sample"}}]),
+      stop("Skill loaded.")
+    ]
+
+    {:ok, agent} = Agent.start_link(fn -> script end)
+
+    assert {:ok, "Skill loaded."} =
+             Turn.run(ctx, "load the sample skill",
+               provider: ScriptedRequestCaptureProvider,
+               provider_opts: [agent: agent, test_pid: self()]
+             )
+
+    assert_receive {:scripted_provider_request, _first_request}
+    assert_receive {:scripted_provider_request, second_request}
+    assert {:ok, body} = Pixir.Provider.request_body_preview(second_request)
+
+    output_index =
+      Enum.find_index(body["input"], fn item ->
+        item["type"] == "function_call_output" and item["call_id"] == "c1"
+      end)
+
+    activation_index =
+      Enum.find_index(body["input"], fn item ->
+        item["role"] == "user" and
+          get_in(item, ["content", Access.at(0), "text"]) =~ ~s(<skill name="sample")
+      end)
+
+    assert is_integer(output_index)
+    assert is_integer(activation_index)
+    assert output_index < activation_index
+
+    output = Enum.at(body["input"], output_index)
+    assert output["output"] =~ "skill body"
+
+    refute match?(
+             {:ok, %{"error" => %{"kind" => "orphan_tool_call"}}},
+             Jason.decode(output["output"])
+           )
   end
 
   test "records a reasoning item before its tool call, stamped with the model (ADR 0007)", %{
