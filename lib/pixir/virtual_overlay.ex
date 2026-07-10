@@ -133,6 +133,31 @@ defmodule Pixir.VirtualOverlay do
     end
   end
 
+  @doc "Validate the structural read_set contract without rendering caller error payloads."
+  @spec validate_read_set(term()) :: :ok | {:error, atom() | map()}
+  def validate_read_set(read_set) when is_list(read_set) and read_set != [] do
+    read_set
+    |> Enum.with_index()
+    |> Enum.reduce_while(:ok, fn {entry, index}, :ok ->
+      cond do
+        not is_binary(entry) or String.trim(entry) == "" ->
+          {:halt, {:error, %{kind: :invalid_read_set_entry, index: index}}}
+
+        String.trim(entry) == "**/*" ->
+          {:halt, {:error, %{kind: :unbounded_read_set, index: index}}}
+
+        true ->
+          {:cont, :ok}
+      end
+    end)
+  end
+
+  def validate_read_set(_read_set), do: {:error, :read_set_required}
+
+  @doc "The accepted limit keys, as strings — the single source for spec validators."
+  @spec limit_keys() :: [String.t()]
+  def limit_keys, do: @default_limits |> Map.keys() |> Enum.map(&Atom.to_string/1) |> Enum.sort()
+
   defp default_limits, do: @default_limits
 
   defp normalize_limit_map(nil), do: {:ok, %{}}

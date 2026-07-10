@@ -14,6 +14,17 @@ defmodule Pixir.VirtualOverlayTest do
     %{ws: ws}
   end
 
+  test "validates bounded read_set structure without rendering caller payloads" do
+    assert :ok = VirtualOverlay.validate_read_set(["mix.exs", "lib/pixir/*.ex"])
+    assert {:error, :read_set_required} = VirtualOverlay.validate_read_set([])
+
+    assert {:error, %{kind: :invalid_read_set_entry, index: 1}} =
+             VirtualOverlay.validate_read_set(["mix.exs", " "])
+
+    assert {:error, %{kind: :unbounded_read_set, index: 0}} =
+             VirtualOverlay.validate_read_set(["**/*"])
+  end
+
   test "imports a bounded read_set, runs virtual commands, and emits virtual_diff", %{ws: ws} do
     File.write!(Path.join(ws, "lib/example.txt"), "hello world\n")
     File.write!(Path.join(ws, "data/sample.json"), ~s({"name":"pixir"}))

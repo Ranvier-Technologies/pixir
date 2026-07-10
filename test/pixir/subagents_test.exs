@@ -119,6 +119,51 @@ defmodule Pixir.SubagentsTest do
     end
   end
 
+  defmodule ScriptedRetryProvider do
+    def stream(_request, _opts) do
+      outcome =
+        Agent.get_and_update(:pixir_subagent_retry_script, fn [next | rest] -> {next, rest} end)
+
+      case outcome do
+        :retryable_true ->
+          {:error,
+           %{
+             ok: false,
+             error: %{
+               kind: :provider_http_error,
+               message: "overloaded",
+               details: %{retryable: true, type: "service_unavailable_error"}
+             }
+           }}
+
+        :legacy_server_error ->
+          {:error,
+           %{
+             ok: false,
+             error: %{
+               kind: :provider_http_error,
+               message: "server error",
+               details: %{type: "server_error"}
+             }
+           }}
+
+        :non_retryable ->
+          {:error,
+           %{
+             ok: false,
+             error: %{
+               kind: :provider_http_error,
+               message: "not retryable",
+               details: %{type: "service_unavailable_error"}
+             }
+           }}
+
+        :ok ->
+          {:ok, %{text: "retried", reasoning: "", function_calls: [], finish_reason: :stop}}
+      end
+    end
+  end
+
   setup do
     ws =
       Path.join(
@@ -131,6 +176,10 @@ defmodule Pixir.SubagentsTest do
     {:ok, sid, pid} = SessionSupervisor.start_session(workspace: ws, role: :build)
 
     on_exit(fn ->
+      if script_pid = Process.whereis(:pixir_subagent_retry_script) do
+        Agent.stop(script_pid)
+      end
+
       try do
         if Process.alive?(pid), do: DynamicSupervisor.terminate_child(SessionSupervisor, pid)
       catch
@@ -141,6 +190,70 @@ defmodule Pixir.SubagentsTest do
     end)
 
     %{ws: ws, sid: sid}
+  end
+
+  test "delegate auto-retry accepts provider_http_error retryable details flag", %{
+    sid: sid,
+    ws: ws
+  } do
+    {:ok, _script} =
+      Agent.start_link(fn -> [:retryable_true, :ok] end, name: :pixir_subagent_retry_script)
+
+    {:ok, agent} =
+      Subagents.spawn_agent(
+        sid,
+        %{
+          "task" => "retry flagged provider error",
+          "retry_attempts" => 1,
+          "retry_jitter_ms" => 0
+        },
+        workspace: ws,
+        provider: ScriptedRetryProvider,
+        permission_mode: :read_only
+      )
+
+    assert {:ok, [completed]} = Subagents.wait(sid, [agent["id"]], 10_000, workspace: ws)
+    assert completed["status"] == "completed"
+    assert Agent.get(:pixir_subagent_retry_script, & &1) == []
+  end
+
+  test "delegate auto-retry keeps legacy server_error eligibility", %{sid: sid, ws: ws} do
+    {:ok, _script} =
+      Agent.start_link(fn -> [:legacy_server_error, :ok] end, name: :pixir_subagent_retry_script)
+
+    {:ok, agent} =
+      Subagents.spawn_agent(
+        sid,
+        %{"task" => "retry legacy provider error", "retry_attempts" => 1, "retry_jitter_ms" => 0},
+        workspace: ws,
+        provider: ScriptedRetryProvider,
+        permission_mode: :read_only
+      )
+
+    assert {:ok, [completed]} = Subagents.wait(sid, [agent["id"]], 10_000, workspace: ws)
+    assert completed["status"] == "completed"
+    assert Agent.get(:pixir_subagent_retry_script, & &1) == []
+  end
+
+  test "delegate auto-retry rejects provider_http_error without retryable or legacy type", %{
+    sid: sid,
+    ws: ws
+  } do
+    {:ok, _script} =
+      Agent.start_link(fn -> [:non_retryable, :ok] end, name: :pixir_subagent_retry_script)
+
+    {:ok, agent} =
+      Subagents.spawn_agent(
+        sid,
+        %{"task" => "do not retry provider error", "retry_attempts" => 1, "retry_jitter_ms" => 0},
+        workspace: ws,
+        provider: ScriptedRetryProvider,
+        permission_mode: :read_only
+      )
+
+    assert {:ok, [failed]} = Subagents.wait(sid, [agent["id"]], 10_000, workspace: ws)
+    assert failed["status"] == "failed"
+    assert Agent.get(:pixir_subagent_retry_script, & &1) == [:ok]
   end
 
   test "spawned Subagents expose and durably record task indexes", %{sid: sid, ws: ws} do
@@ -1494,6 +1607,57 @@ defmodule Pixir.SubagentsTest do
              Subagents.send_input(sid, id, "resume", workspace: ws)
 
     assert {:error, %{error: %{kind: :detached}}} = Subagents.close(sid, id, workspace: ws)
+  end
+
+  test "cold restore preserves virtual_diff_ref through reconstruct and restored agents", %{
+    sid: sid,
+    ws: ws
+  } do
+    id = unique_subagent_id("cold-virtual")
+    child_sid = unique_session_id("child-virtual")
+
+    ref = %{
+      "kind" => "virtual_diff",
+      "version" => 1,
+      "sha256" => String.duplicate("ab", 32),
+      "encoded_bytes" => 1651,
+      "changed_files" => 1,
+      "diff_bytes" => 129,
+      "apply_status" => "not_applied",
+      "source_seq" => 10
+    }
+
+    write_subagent_event!(sid, ws, %{
+      "event" => "finished",
+      "subagent_id" => id,
+      "child_session_id" => child_sid,
+      "agent" => "default",
+      "task" => "cold virtual child",
+      "depth" => 1,
+      "max_depth" => 1,
+      "timeout_ms" => 5_000,
+      "status" => "completed",
+      "workspace_mode" => "virtual_overlay",
+      "workspace" => ws,
+      "summary" => "{\"done\":true}",
+      "virtual_diff_ref" => ref,
+      "parent_log_path" => Log.path(sid, workspace: ws),
+      "child_log_path" => Log.path(child_sid, workspace: ws)
+    })
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    # The pure fold projection carries the bounded ref with string keys intact.
+    assert Subagents.reconstruct(history)[id]["virtual_diff_ref"] == ref
+
+    # And the restored (cold) Manager agent exposes the same ref on the
+    # public surface — the resume/fold path, no live spawn involved.
+    restart_subagents_manager()
+
+    assert {:ok, [listed]} = Subagents.list(sid, workspace: ws)
+    assert listed["id"] == id
+    assert listed["workspace_mode"] == "virtual_overlay"
+    assert listed["virtual_diff_ref"] == ref
   end
 
   test "reattaches started-only live subagents after manager restart", %{sid: sid, ws: ws} do

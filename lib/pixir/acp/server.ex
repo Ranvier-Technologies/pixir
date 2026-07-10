@@ -25,14 +25,14 @@ defmodule Pixir.ACP.Server do
   Implements `initialize`, `session/new`, `session/prompt`, `session/cancel`,
   `authenticate` + `logout` (ACP handshake no-ops; Pixir advertises terminal
   auth through `pixir login`, and owns Credential storage outside the stdio channel),
-  `session/set_mode` + `session/set_config_option` (modes and models, D.2),
-  `session/set_model` (legacy Pixir/T3 compatibility), and `session/load` + `session/resume`
+  `session/set_mode` + `session/set_config_option` (modes, models, and reasoning effort,
+  D.2), `session/set_model` (legacy Pixir/T3 compatibility), and `session/load` + `session/resume`
   (lifecycle, A.6); emits `session/update` (incl. `current_mode_update` and
   `plan`) and ORIGINATES `session/request_permission` (interactive permissions,
   A.2 — correlating the client's response against `pending_requests`). Per-turn
   knobs (model, reasoning effort, `permission_mode`) ride on `session/prompt`
-  `_meta`; sticky model selection is exposed through `configOptions`; the legacy
-  model catalog + auth status ride on `initialize._meta.pixir`.
+  `_meta`; sticky model and reasoning-effort selection are exposed through
+  `configOptions`; the legacy model catalog + auth status ride on `initialize._meta.pixir`.
   Other methods get `-32601`. JSON-RPC errors are reserved for protocol faults; a
   failed Turn is reported as content with `stopReason:"end_turn"` (ADR 0009 §5).
   Permission posture follows the session mode (`plan` → read-only) and
@@ -49,10 +49,11 @@ defmodule Pixir.ACP.Server do
   """
 
   use GenServer
+
   require Logger
 
   alias Pixir.ACP.{Protocol, Translate}
-  alias Pixir.Conversation
+  alias Pixir.{Config, Conversation}
   alias Pixir.Providers.Registry
 
   @protocol_version 1
@@ -77,6 +78,11 @@ defmodule Pixir.ACP.Server do
     }
   ]
   @mode_ids ["build", "plan"]
+
+  # `default` means "omit reasoning effort and let the selected provider/model
+  # choose". Both built-in providers omit the wire field when effort is unset;
+  # neither supplies a Pixir-side effort default.
+  @reasoning_effort_ids ~w(default low medium high xhigh)
 
   defp meta_web_search(true), do: %{"enabled" => true}
   defp meta_web_search(%{} = value), do: value
@@ -121,6 +127,7 @@ defmodule Pixir.ACP.Server do
 
     * `:io` — the stdio device (default `:stdio`; inject a `StringIO`/pipe in tests).
     * `:provider`, `:provider_opts` — passed through to each Turn (test seam).
+    * `:prompt_resolve_hook` — test callback at the terminal-status/reply boundary.
     * `:name` — optional registered name.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -195,6 +202,11 @@ defmodule Pixir.ACP.Server do
       # per-turn `_meta.model` is absent. Validated against the catalog at
       # set-time, so it never hits the per-turn `unknown model` rejection.
       session_models: %{},
+      # acp_session_id => sticky reasoning effort. Mirrors `session_models`:
+      # an absent entry defers to Config.reasoning_effort/0, while `"default"`
+      # deliberately suppresses that config fallback so the provider omits its
+      # reasoning-effort field.
+      session_efforts: %{},
       # Stable Pixir subagent presentation items already created on the ACP wire.
       # Subsequent lifecycle events for the same subagent become updates, avoiding
       # duplicate items in clients that treat toolCallId creation as unique.
@@ -211,6 +223,10 @@ defmodule Pixir.ACP.Server do
       pending_requests: %{},
       request_timeout_ms: Keyword.get(opts, :request_timeout_ms, @idle_timeout),
       prompt_idle_timeout_ms: Keyword.get(opts, :prompt_idle_timeout_ms, @idle_timeout),
+      # Test seam at the terminal-status/reply boundary. The callback runs in the
+      # prompt Task immediately before the Server synchronizes the wire reply, so
+      # tests can drive both cancel/terminal orders without timing sleeps.
+      prompt_resolve_hook: Keyword.get(opts, :prompt_resolve_hook, fn _outcome -> :ok end),
       provider: Keyword.get(opts, :provider),
       provider_opts: Keyword.get(opts, :provider_opts, [])
     }
@@ -248,12 +264,6 @@ defmodule Pixir.ACP.Server do
         GenServer.reply(from, {:error, {:request_timed_out, out_id}})
         {:noreply, %{state | pending_requests: rest}}
     end
-  end
-
-  # A prompt Task finished: write its PromptResponse and forget it.
-  def handle_info({:prompt_done, pixir_sid, request_id, stop_reason}, state) do
-    write(state.out, Protocol.result(request_id, %{"stopReason" => stop_reason}))
-    {:noreply, %{state | prompts: Map.delete(state.prompts, pixir_sid)}}
   end
 
   def handle_info(_other, state), do: {:noreply, state}
@@ -379,9 +389,17 @@ defmodule Pixir.ACP.Server do
   # (with current values), not an empty object — hence the distinct reply shape.
   defp handle_request("session/set_config_option", params, id, state) do
     case Map.get(params, "configId") do
-      "mode" -> set_mode(Map.get(params, "value"), params, id, state, :config_response)
-      "model" -> set_model(Map.get(params, "value"), params, id, state, :config_response)
-      other -> unknown_config_option(id, state, other)
+      "mode" ->
+        set_mode(Map.get(params, "value"), params, id, state, :config_response)
+
+      "model" ->
+        set_model(Map.get(params, "value"), params, id, state, :config_response)
+
+      "reasoning_effort" ->
+        set_reasoning_effort(Map.get(params, "value"), params, id, state)
+
+      other ->
+        unknown_config_option(id, state, other)
     end
   end
 
@@ -481,7 +499,14 @@ defmodule Pixir.ACP.Server do
               %{}
 
             :config_response ->
-              %{"configOptions" => config_options(mode_id, current_model(state, acp_sid))}
+              %{
+                "configOptions" =>
+                  config_options(
+                    mode_id,
+                    current_model(state, acp_sid),
+                    current_effort(state, acp_sid)
+                  )
+              }
           end
 
         write(state.out, Protocol.result(id, result))
@@ -525,11 +550,55 @@ defmodule Pixir.ACP.Server do
               %{}
 
             :config_response ->
-              %{"configOptions" => config_options(current_mode(state, params), model_id)}
+              %{
+                "configOptions" =>
+                  config_options(
+                    current_mode(state, params),
+                    model_id,
+                    current_effort(state, acp_sid)
+                  )
+              }
           end
 
         write(state.out, Protocol.result(id, result))
         %{state | session_models: Map.put(state.session_models, acp_sid, model_id)}
+    end
+  end
+
+  # Validate and store a sticky per-session reasoning effort. The `"default"`
+  # value is an honest explicit state: providers omit their effort field and let
+  # the selected model choose, rather than Pixir inventing a default effort.
+  defp set_reasoning_effort(effort_id, params, id, state) do
+    acp_sid = Map.get(params, "sessionId")
+
+    cond do
+      not (is_binary(acp_sid) and Map.has_key?(state.sessions, acp_sid)) ->
+        write(state.out, Protocol.error(id, Protocol.invalid_params(), "unknown session"))
+        state
+
+      effort_id not in @reasoning_effort_ids ->
+        write(
+          state.out,
+          Protocol.error(id, Protocol.invalid_params(), "unknown config option value", %{
+            "configId" => "reasoning_effort",
+            "value" => effort_id
+          })
+        )
+
+        state
+
+      true ->
+        result = %{
+          "configOptions" =>
+            config_options(
+              current_mode(state, params),
+              current_model(state, acp_sid),
+              effort_id
+            )
+        }
+
+        write(state.out, Protocol.result(id, result))
+        %{state | session_efforts: Map.put(state.session_efforts, acp_sid, effort_id)}
     end
   end
 
@@ -549,11 +618,26 @@ defmodule Pixir.ACP.Server do
     Map.get(state.modes, Map.get(params, "sessionId"), @default_mode)
   end
 
-  # The full `configOptions` list (D.2). The model selector is the canonical ACP
-  # surface for sticky model selection; the legacy `models` response field and
-  # `session/set_model` method remain compatibility extensions.
-  defp config_options(current_mode, current_model) do
-    [mode_config_option(current_mode), model_config_option(current_model)]
+  # Current effort uses the per-session sticky selection first, then Pixir's
+  # effective config. With neither set, both providers omit the wire field, so
+  # the truthful ACP value is the explicit `default` option.
+  defp current_effort(state, acp_sid) do
+    case Map.fetch(state.session_efforts, acp_sid) do
+      {:ok, effort} -> effort
+      :error -> Config.reasoning_effort() || "default"
+    end
+  end
+
+  # The full `configOptions` list (D.2). Model and reasoning-effort selectors
+  # are the canonical ACP surfaces for their sticky per-session selections; the
+  # legacy `models` response field and `session/set_model` method remain model
+  # compatibility extensions.
+  defp config_options(current_mode, current_model, current_effort) do
+    [
+      mode_config_option(current_mode),
+      model_config_option(current_model),
+      reasoning_effort_config_option(current_effort)
+    ]
   end
 
   # The `mode` select config option mirrored into `session/new` so the runtime's
@@ -582,6 +666,20 @@ defmodule Pixir.ACP.Server do
       "options" =>
         Enum.map(Registry.models(), fn model ->
           %{"name" => model["name"], "value" => model["id"]}
+        end)
+    }
+  end
+
+  defp reasoning_effort_config_option(current) do
+    %{
+      "id" => "reasoning_effort",
+      "name" => "Reasoning effort",
+      "description" => "Reasoning effort for this session; default lets the provider choose.",
+      "type" => "select",
+      "currentValue" => current,
+      "options" =>
+        Enum.map(@reasoning_effort_ids, fn effort ->
+          %{"name" => effort, "value" => effort}
         end)
     }
   end
@@ -657,7 +755,19 @@ defmodule Pixir.ACP.Server do
       {:ok, pixir_sid} ->
         # 1:1 identity mapping: the ACP sessionId is the Pixir session id.
         acp_sid = pixir_sid
-        write(state.out, Protocol.result(id, session_setup_result(acp_sid, default_model_id())))
+
+        write(
+          state.out,
+          Protocol.result(
+            id,
+            session_setup_result(
+              acp_sid,
+              default_model_id(),
+              current_effort(state, acp_sid)
+            )
+          )
+        )
+
         register_session(state, acp_sid, pixir_sid, cwd)
 
       {:error, error} ->
@@ -667,11 +777,12 @@ defmodule Pixir.ACP.Server do
   end
 
   # The shared setup payload for session/new, session/load, and session/resume:
-  # the sessionId plus advertised modes and config options. `current_model` is
-  # the default at session/new or the sticky model at load/resume when one was
-  # already set on this server. The `models` field is a legacy Pixir/T3
-  # compatibility extension; canonical ACP clients should read `configOptions`.
-  defp session_setup_result(acp_sid, current_model) do
+  # the sessionId plus advertised modes and config options. `current_model` and
+  # `current_effort` are the effective setup values at session/new, load, or
+  # resume. Sticky selections are retained when the same server reattaches.
+  # The `models` field is a legacy Pixir/T3 compatibility extension; canonical
+  # ACP clients should read `configOptions`.
+  defp session_setup_result(acp_sid, current_model, current_effort) do
     %{
       "sessionId" => acp_sid,
       "modes" => %{
@@ -679,7 +790,7 @@ defmodule Pixir.ACP.Server do
         "availableModes" => @available_modes
       },
       "models" => models_state(current_model),
-      "configOptions" => config_options(@default_mode, current_model)
+      "configOptions" => config_options(@default_mode, current_model, current_effort)
     }
   end
 
@@ -751,7 +862,13 @@ defmodule Pixir.ACP.Server do
 
         current_model = current_model(state, acp_sid)
 
-        write(state.out, Protocol.result(id, session_setup_result(acp_sid, current_model)))
+        write(
+          state.out,
+          Protocol.result(
+            id,
+            session_setup_result(acp_sid, current_model, current_effort(state, acp_sid))
+          )
+        )
 
         state
         |> register_session(acp_sid, pixir_sid, cwd)
@@ -779,7 +896,13 @@ defmodule Pixir.ACP.Server do
 
         current_model = current_model(state, acp_sid)
 
-        write(state.out, Protocol.result(id, session_setup_result(acp_sid, current_model)))
+        write(
+          state.out,
+          Protocol.result(
+            id,
+            session_setup_result(acp_sid, current_model, current_effort(state, acp_sid))
+          )
+        )
 
         state
         |> register_session(acp_sid, pixir_sid, cwd)
@@ -928,7 +1051,8 @@ defmodule Pixir.ACP.Server do
               pixir_sid,
               prompt_text,
               turn_opts,
-              state.prompt_idle_timeout_ms
+              state.prompt_idle_timeout_ms,
+              state.prompt_resolve_hook
             )
           end)
 
@@ -1093,7 +1217,7 @@ defmodule Pixir.ACP.Server do
       :provider_opts,
       normalize_provider_opts(
         state.provider_opts,
-        with_sticky_model(state, acp_sid, provider_meta)
+        with_session_config(state, acp_sid, provider_meta)
       )
     )
   end
@@ -1119,16 +1243,48 @@ defmodule Pixir.ACP.Server do
 
   defp build_asker(_mode, _acp_sid), do: fn _ -> :deny end
 
-  # Model precedence (A.3): per-turn `_meta.model` > sticky session model > Pixir's
-  # own resolution. When `meta_opts` already carries a per-turn `:model`, it wins
-  # untouched; otherwise the session's sticky model (if any) is injected as the
-  # provider `:model`. The sticky id was validated at set-time, so it reaches
-  # `Pixir.Provider.do_stream/2` as `opts[:model]` without re-checking.
-  defp with_sticky_model(state, acp_sid, meta_opts) do
-    if Keyword.has_key?(meta_opts, :model) do
-      meta_opts
+  # Prompt-option precedence: explicit per-turn `_meta` > sticky session value >
+  # Pixir config. Explicit entries remain untouched; absent model/effort entries
+  # receive their validated sticky values. Config.merge_provider_opts/2 supplies
+  # the final fallback later inside Turn.
+  defp with_session_config(state, acp_sid, meta_opts) do
+    meta_opts
+    |> put_sticky(:model, Map.get(state.session_models, acp_sid))
+    |> put_sticky(:reasoning_effort, Map.get(state.session_efforts, acp_sid))
+    |> normalize_provider_default_effort(state)
+  end
+
+  defp put_sticky(opts, _key, nil), do: opts
+
+  defp put_sticky(opts, key, value) do
+    if Keyword.has_key?(opts, key), do: opts, else: Keyword.put(opts, key, value)
+  end
+
+  # `default` must suppress a configured effort, not become a provider value.
+  # Anthropic treats an explicit nil as omission and Config.merge_provider_opts/2
+  # preserves that present keyword key. OpenAI re-reads Config internally after a
+  # nil, so its existing normalization receives the non-enum `default` sentinel
+  # and converts it to omission at the request-body boundary.
+  defp normalize_provider_default_effort(meta_opts, state) do
+    if Keyword.get(meta_opts, :reasoning_effort) == "default" do
+      # Classify with the SAME model the turn will actually use: per-turn
+      # _meta/sticky first, then the server's base provider_opts, then the
+      # global default. Classifying before the base opts routed the sentinel
+      # down the wrong provider path (fresh-review major on #290).
+      model =
+        Keyword.get(meta_opts, :model) ||
+          Keyword.get(state.provider_opts, :model) ||
+          default_model_id()
+
+      provider = state.provider || Registry.resolve(model).provider
+
+      if provider == Pixir.Provider do
+        meta_opts
+      else
+        Keyword.put(meta_opts, :reasoning_effort, nil)
+      end
     else
-      maybe_put(meta_opts, :model, Map.get(state.session_models, acp_sid))
+      meta_opts
     end
   end
 
@@ -1173,7 +1329,15 @@ defmodule Pixir.ACP.Server do
   # Runs in the Task: subscribe, send, then own a receive loop (mirroring
   # Conversation.await/2's terminal detection at conversation.ex:113-130) so we can track
   # whether any text streamed and stash the last assistant_message for the fallback.
-  defp run_prompt(server, acp_sid, pixir_sid, prompt_text, turn_opts, prompt_idle_timeout_ms) do
+  defp run_prompt(
+         server,
+         acp_sid,
+         pixir_sid,
+         prompt_text,
+         turn_opts,
+         prompt_idle_timeout_ms,
+         prompt_resolve_hook
+       ) do
     Conversation.subscribe(pixir_sid)
 
     case Conversation.send(pixir_sid, prompt_text, turn_opts) do
@@ -1190,10 +1354,10 @@ defmodule Pixir.ACP.Server do
         maybe_fallback(server, acp_sid, saw_text?, fallback_text)
         # The Server resolves the request id and the cancel flag at this point, so a
         # cancel that raced a terminal status still wins (ADR 0009 §5 cancel race).
-        finish_prompt(server, pixir_sid, outcome)
+        finish_prompt(server, pixir_sid, outcome, prompt_resolve_hook)
 
       {:error, :busy} ->
-        finish_prompt(server, pixir_sid, :error)
+        finish_prompt(server, pixir_sid, :error, prompt_resolve_hook)
     end
   end
 
@@ -1227,9 +1391,9 @@ defmodule Pixir.ACP.Server do
     end
   end
 
-  defp finish_prompt(server, pixir_sid, outcome) do
-    {id, cancel?} = GenServer.call(server, {:resolve_prompt, pixir_sid})
-    send(server, {:prompt_done, pixir_sid, id, Translate.stop_reason(outcome, cancel?)})
+  defp finish_prompt(server, pixir_sid, outcome, prompt_resolve_hook) do
+    prompt_resolve_hook.(outcome)
+    :ok = GenServer.call(server, {:resolve_prompt, pixir_sid, outcome})
   end
 
   # Mirror of Conversation's terminal detection (conversation.ex:113-130), extended to
@@ -1273,10 +1437,13 @@ defmodule Pixir.ACP.Server do
   # Read the request id + cancel flag at resolve time so a cancel that raced a terminal
   # status still wins.
   @impl true
-  def handle_call({:resolve_prompt, pixir_sid}, _from, state) do
+  def handle_call({:resolve_prompt, pixir_sid, outcome}, _from, state) do
     id = get_in(state.prompts, [pixir_sid, :id])
     cancel? = get_in(state.prompts, [pixir_sid, :cancel?]) || false
-    {:reply, {id, cancel?}, state}
+    stop_reason = Translate.stop_reason(outcome, cancel?)
+
+    write(state.out, Protocol.result(id, %{"stopReason" => stop_reason}))
+    {:reply, :ok, %{state | prompts: Map.delete(state.prompts, pixir_sid)}}
   end
 
   # Originate an outbound request: allocate a negative out_id, write it through

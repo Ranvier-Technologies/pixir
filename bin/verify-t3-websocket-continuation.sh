@@ -38,7 +38,7 @@ preflight() {
   cat <<'EOF'
 == T3 dogfood checklist (#16) ==
 
-1. Rebuild grokwtree binaryPath in T3 PixirDriver config (this repo: mix escript.build → ./pixir).
+1. Rebuild this repo's binaryPath in the T3 PixirDriver config (mix escript.build → ./pixir).
 2. Start T3 dev against the dogfood workspace (same long-lived Pixir ACP process per thread).
 3. Pick model gpt-5.5 on the Pixir provider rail.
 4. Send turn A with a stable >1k-token prefix (repeat a paragraph or open a large file context).

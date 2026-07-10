@@ -31,6 +31,7 @@ defmodule Pixir.Workflows do
     Skills,
     Subagents,
     Tool,
+    VirtualDiffApply,
     VirtualOverlay,
     WorkflowRun,
     WorkspaceStrategy
@@ -239,7 +240,8 @@ defmodule Pixir.Workflows do
         positive_integer(
           field(spec, "timeout_ms", Keyword.get(opts, :timeout_ms, @default_timeout_ms)),
           "timeout_ms"
-        )
+        ),
+      write_policy: Keyword.get(opts, :write_policy)
     }
 
     with :ok <- require_steps(steps),
@@ -259,14 +261,15 @@ defmodule Pixir.Workflows do
     steps
     |> Enum.with_index(1)
     |> Enum.reduce_while({:ok, []}, fn {raw, index}, {:ok, acc} ->
-      case normalize_step(raw, index, workspace, agents_opts, opts) do
+      case normalize_step(raw, index, workspace, agents_opts, opts, acc) do
         {:ok, step} -> {:cont, {:ok, acc ++ [step]}}
         {:error, error} -> {:halt, {:error, error}}
       end
     end)
   end
 
-  defp normalize_step(raw, index, workspace, agents_opts, opts) when is_map(raw) do
+  defp normalize_step(raw, index, workspace, agents_opts, opts, previous_steps)
+       when is_map(raw) do
     id = field(raw, "id", "step_#{index}") |> to_string()
     task = field(raw, "task")
     agent_name = field(raw, "agent", "default")
@@ -274,6 +277,9 @@ defmodule Pixir.Workflows do
     cond do
       not safe_id?(id) ->
         {:error, Tool.error(:invalid_args, "workflow step id must be a safe basename", %{id: id})}
+
+      has_field?(raw, "apply_from") ->
+        normalize_apply_step(raw, index, id, opts, previous_steps)
 
       not (is_binary(task) and String.trim(task) != "") ->
         {:error, Tool.error(:invalid_args, "workflow step task is required", %{id: id})}
@@ -301,7 +307,16 @@ defmodule Pixir.Workflows do
                :ok <-
                  validate_knobs_apply(workspace_mode, model, reasoning_effort, attachments, id),
                {:ok, write_policy} <-
-                 step_write_policy(Keyword.get(opts, :write_policy), write_set, read_only?) do
+                 step_write_policy(Keyword.get(opts, :write_policy), write_set, read_only?),
+               :ok <-
+                 validate_step_read_only_agent_gate(
+                   Keyword.get(opts, :write_policy),
+                   workspace_mode,
+                   read_only?,
+                   agent_config,
+                   id,
+                   index
+                 ) do
             {:ok,
              %{
                id: id,
@@ -327,8 +342,165 @@ defmodule Pixir.Workflows do
     end
   end
 
-  defp normalize_step(_raw, index, _workspace, _agents_opts, _opts),
+  defp normalize_step(_raw, index, _workspace, _agents_opts, _opts, _previous_steps),
     do: {:error, Tool.error(:invalid_args, "workflow step must be an object", %{index: index})}
+
+  defp normalize_apply_step(raw, index, id, opts, previous_steps) do
+    with :ok <- validate_apply_from_bounded_write(opts, id, index),
+         {:ok, apply_from} <- validate_apply_from_producer(raw, previous_steps, id, index),
+         :ok <- validate_apply_from_depends_on(raw, apply_from, id, index),
+         :ok <- validate_apply_from_knobs(raw, id, index),
+         {:ok, write_set} <- normalize_apply_write_set(raw, id, index),
+         {:ok, write_policy} <-
+           step_write_policy(Keyword.get(opts, :write_policy), write_set, false) do
+      {:ok,
+       %{
+         id: id,
+         task: String.trim(field(raw, "task", "apply virtual_diff from #{apply_from}") || ""),
+         agent: nil,
+         depends_on: normalize_id_list(field(raw, "depends_on", []), "depends_on", id),
+         posture: "apply",
+         permission_mode: :auto,
+         workspace_mode: "shared",
+         read_set: [],
+         write_set: write_set,
+         write_policy: write_policy,
+         virtual_commands: [],
+         virtual_limits: nil,
+         apply_from: apply_from,
+         model: nil,
+         reasoning_effort: nil,
+         attachments: [],
+         timeout_ms: maybe_positive_integer(field(raw, "timeout_ms"), "timeout_ms", id)
+       }}
+    end
+  end
+
+  defp validate_apply_from_bounded_write(opts, id, index) do
+    if Keyword.get(opts, :write_policy) do
+      :ok
+    else
+      invalid_apply_from(id, index, "apply_from requires bounded_write with write_policy", %{
+        "next_actions" => ["run_with_bounded_write_policy"]
+      })
+    end
+  end
+
+  defp validate_apply_from_producer(raw, previous_steps, id, index) do
+    apply_from = field(raw, "apply_from")
+
+    case Enum.find(previous_steps, &(&1.id == apply_from)) do
+      nil ->
+        invalid_apply_from(
+          id,
+          index,
+          "apply_from must reference a previous virtual_overlay step",
+          %{
+            "apply_from" => apply_from,
+            "next_actions" => ["declare_the_virtual_overlay_producer_before_the_apply_step"]
+          }
+        )
+
+      %{workspace_mode: "virtual_overlay"} ->
+        {:ok, apply_from}
+
+      _producer ->
+        invalid_apply_from(
+          id,
+          index,
+          "apply_from producer must use workspace_mode virtual_overlay",
+          %{
+            "apply_from" => apply_from,
+            "next_actions" => ["point_apply_from_at_a_virtual_overlay_step"]
+          }
+        )
+    end
+  end
+
+  defp validate_apply_from_depends_on(raw, apply_from, id, index) do
+    depends_on = normalize_id_list(field(raw, "depends_on", []), "depends_on", id)
+
+    if apply_from in depends_on do
+      :ok
+    else
+      invalid_apply_from(id, index, "apply_from producer must be listed in depends_on", %{
+        "apply_from" => apply_from,
+        "depends_on" => depends_on,
+        "next_actions" => ["add_the_producer_to_depends_on"]
+      })
+    end
+  end
+
+  defp validate_apply_from_knobs(raw, id, index) do
+    rejected =
+      ~w(agent model reasoning_effort attachments virtual_commands read_set)
+      |> Enum.filter(&has_field?(raw, &1))
+
+    if rejected == [] do
+      :ok
+    else
+      invalid_apply_from(id, index, "apply_from workflow steps do not spawn subagents", %{
+        "rejected_fields" => rejected,
+        "next_actions" => ["remove_apply_step_subagent_fields"]
+      })
+    end
+  end
+
+  defp normalize_apply_write_set(raw, id, index) do
+    if has_field?(raw, "write_set") do
+      write_set = normalize_set(field(raw, "write_set"))
+
+      cond do
+        write_set == [] ->
+          invalid_apply_from(
+            id,
+            index,
+            "apply_from workflow step requires non-empty write_set",
+            %{
+              "field" => "write_set",
+              "next_actions" => ["add_non_empty_write_set"]
+            }
+          )
+
+        # Same glob grammar as the bounded write policy: the runtime bound
+        # delegates to WritePolicy.rules_cover_path?, so the shapes must match.
+        match?({:error, _}, WritePolicy.validate_path_rules(write_set, "write_set")) ->
+          {:error, %{error: %{details: details}}} =
+            WritePolicy.validate_path_rules(write_set, "write_set")
+
+          invalid_apply_from(
+            id,
+            index,
+            "apply_from write_set entries must use the write-policy glob grammar",
+            Map.merge(
+              %{"field" => "write_set"},
+              Map.new(details, fn {key, value} -> {to_string(key), value} end)
+            )
+          )
+
+        true ->
+          {:ok, write_set}
+      end
+    else
+      invalid_apply_from(id, index, "apply_from workflow step requires write_set", %{
+        "field" => "write_set",
+        "next_actions" => ["add_explicit_write_set"]
+      })
+    end
+  end
+
+  defp invalid_apply_from(id, index, message, details) do
+    {:error,
+     Tool.error(
+       :invalid_spec,
+       message,
+       Map.merge(details, %{
+         "id" => id,
+         "field" => "apply_from",
+         "location" => "/steps/#{index}/apply_from"
+       })
+     )}
+  end
 
   defp normalize_optional_model(nil, _id), do: {:ok, nil}
 
@@ -612,8 +784,50 @@ defmodule Pixir.Workflows do
     value =
       field(raw, "permission_mode") || field(raw, "sandbox_mode") || agent_config[:sandbox_mode]
 
-    value in [:read_only, "read_only", "read-only"]
+    read_only_mode?(value)
   end
+
+  defp validate_step_read_only_agent_gate(nil, _workspace_mode, _read_only?, _agent, _id, _index),
+    do: :ok
+
+  defp validate_step_read_only_agent_gate(
+         _policy,
+         workspace_mode,
+         false,
+         %{sandbox_mode: mode, name: role},
+         id,
+         index
+       ) do
+    if workspace_mode != "virtual_overlay" and read_only_mode?(mode) do
+      {:error,
+       Tool.error(
+         :invalid_spec,
+         "bounded_write conflicts with the read-only workflow step agent",
+         %{
+           "id" => id,
+           "role" => role,
+           "role_sandbox_mode" => mode,
+           "mode" => "bounded_write",
+           "location" => "/steps/#{index}/agent",
+           "next_actions" => ["use_a_write_capable_role", "make_the_step_read_only"]
+         }
+       )}
+    else
+      :ok
+    end
+  end
+
+  defp validate_step_read_only_agent_gate(
+         _policy,
+         _workspace_mode,
+         _read_only?,
+         _agent,
+         _id,
+         _index
+       ),
+       do: :ok
+
+  defp read_only_mode?(value), do: value in [:read_only, "read_only", "read-only"]
 
   defp validate_unique_step_ids(steps) do
     ids = Enum.map(steps, & &1.id)
@@ -808,11 +1022,31 @@ defmodule Pixir.Workflows do
     |> then(fn {chosen, rest, _occupied, _slots} -> {chosen, rest} end)
   end
 
+  defp deps_ready?(%{posture: "apply", apply_from: apply_from} = step, completed) do
+    Enum.all?(step.depends_on, fn
+      ^apply_from -> Map.has_key?(completed, apply_from)
+      dep -> get_in(completed, [dep, "checkpoint_status"]) == "checkpoint_ready"
+    end)
+  end
+
   defp deps_ready?(step, completed),
     do:
       Enum.all?(step.depends_on, fn dep ->
         get_in(completed, [dep, "checkpoint_status"]) == "checkpoint_ready"
       end)
+
+  defp start_step(
+         _parent_sid,
+         workflow,
+         %{posture: "apply"} = step,
+         wave,
+         _opts,
+         completed,
+         run_started_at_ms
+       ) do
+    {:ok,
+     {:completed, apply_virtual_diff_step(workflow, step, wave, completed, run_started_at_ms)}}
+  end
 
   defp start_step(
          _parent_sid,
@@ -927,6 +1161,146 @@ defmodule Pixir.Workflows do
          workflow_timeout_ms: workflow.timeout_ms
        }}
     end
+  end
+
+  defp apply_virtual_diff_step(workflow, step, wave, completed, run_started_at_ms) do
+    result =
+      with {:ok, artifact} <- producer_virtual_diff(completed, step.apply_from),
+           :ok <- artifact_paths_within_step_write_set(artifact, step),
+           {:ok, apply_result} <- apply_with_budget(workflow, step, artifact, run_started_at_ms) do
+        apply_result
+      else
+        {:error, reason, details} -> failed_apply_result(reason, details)
+        {:error, error} -> failed_apply_result("failed", %{"error" => error})
+      end
+
+    apply_result_step(workflow, step, wave, result)
+  end
+
+  # The normalized step timeout_ms is a real budget (same contract as
+  # virtual_overlay steps), not an accepted-and-ignored knob.
+  defp apply_with_budget(workflow, step, artifact, run_started_at_ms) do
+    {timeout_ms, timeout_reason} = virtual_timeout_budget(workflow, step, run_started_at_ms)
+
+    if timeout_ms <= 0 do
+      {:error, "timeout", %{"reason" => timeout_reason, "timeout_ms" => timeout_ms}}
+    else
+      task =
+        Task.async(fn ->
+          VirtualDiffApply.apply(artifact, workflow.workspace,
+            write_policy: workflow.write_policy
+          )
+        end)
+
+      case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
+        {:ok, {:ok, apply_result}} -> {:ok, apply_result}
+        {:ok, {:error, error}} -> {:error, error}
+        nil -> {:error, "timeout", %{"reason" => timeout_reason, "timeout_ms" => timeout_ms}}
+      end
+    end
+  end
+
+  defp producer_virtual_diff(completed, apply_from) do
+    case Map.get(completed, apply_from) do
+      %{"checkpoint_status" => "checkpoint_ready", "virtual_diff" => artifact}
+      when is_map(artifact) ->
+        {:ok, artifact}
+
+      _other ->
+        {:error, "producer_did_not_yield_virtual_diff", %{"apply_from" => apply_from}}
+    end
+  end
+
+  defp artifact_paths_within_step_write_set(%{"changes" => changes}, step)
+       when is_list(changes) do
+    outside =
+      changes
+      |> Enum.map(&Map.get(&1, "path"))
+      |> Enum.reject(&write_set_covers_path?(step.write_set, &1))
+
+    if outside == [] do
+      :ok
+    else
+      {:error, "artifact_path_outside_step_write_set",
+       %{"paths" => outside, "write_set" => step.write_set}}
+    end
+  end
+
+  defp artifact_paths_within_step_write_set(_artifact, step),
+    do: {:error, "producer_did_not_yield_virtual_diff", %{"apply_from" => step.apply_from}}
+
+  defp write_set_covers_path?(write_set, path) when is_binary(path) do
+    path = normalize_path_token(path)
+    WritePolicy.rules_cover_path?(write_set, path)
+  end
+
+  defp write_set_covers_path?(_write_set, _path), do: false
+
+  defp failed_apply_result(reason, details) do
+    %{
+      "kind" => "virtual_diff_apply",
+      "version" => 1,
+      "dry_run" => false,
+      "status" => "failed",
+      "reason" => reason,
+      "details" => details,
+      "counts" => %{"files" => 0, "applied" => 0}
+    }
+  end
+
+  defp apply_result_step(workflow, step, wave, result) do
+    applied? = result["status"] == "applied"
+    summary = apply_result_summary(result)
+
+    %{
+      "id" => step.id,
+      "step_id" => step.id,
+      "agent_id" => nil,
+      "child_session_id" => nil,
+      "agent" => nil,
+      "status" => if(applied?, do: "completed", else: "failed"),
+      "subagent_status" => "not_applicable",
+      "checkpoint_status" => if(applied?, do: "checkpoint_ready", else: "failed"),
+      "summary" => summary,
+      "wave" => wave,
+      "posture" => step.posture,
+      "read_set" => step.read_set,
+      "write_set" => step.write_set,
+      "workspace" => workflow.workspace,
+      "workspace_mode" => step.workspace_mode,
+      "apply_from" => step.apply_from,
+      "virtual_diff_apply" => result,
+      "checkpoint" => apply_checkpoint_bundle(step, result, summary, applied?),
+      "safe_next_actions" => if(applied?, do: [], else: ["inspect_virtual_diff_apply"])
+    }
+    |> put_write_policy_metadata(step)
+  end
+
+  defp apply_checkpoint_bundle(step, result, summary, dependent_safe?) do
+    %{
+      "step_id" => step.id,
+      "agent_id" => nil,
+      "child_session_id" => nil,
+      "status" => if(dependent_safe?, do: "checkpoint_ready", else: "failed"),
+      "dependent_safe" => dependent_safe?,
+      "summary" => summary,
+      "known_limitations" => if(dependent_safe?, do: [], else: ["virtual_diff_not_applied"]),
+      "verification" => %{
+        "source" => "virtual_diff_apply_engine",
+        "apply_from" => step.apply_from,
+        "apply_status" => result["status"]
+      },
+      "virtual_diff_apply" => result
+    }
+    |> checkpoint_bundle_v2([artifact_ref(result)])
+  end
+
+  defp apply_result_summary(result) do
+    counts = result["counts"] || %{}
+    file_count = Map.get(counts, "files", length(result["files"] || []))
+
+    "virtual_diff_apply status=#{result["status"]}: " <>
+      "#{Map.get(counts, "applied", 0)} applied of #{file_count} files."
   end
 
   defp virtual_completed_step(workflow, step, wave, artifact) do
@@ -1619,6 +1993,8 @@ defmodule Pixir.Workflows do
     |> Enum.reject(&is_nil/1)
   end
 
+  defp execution_kind(%{posture: "apply"}), do: "virtual_diff_apply"
+  defp execution_kind(%{"posture" => "apply"}), do: "virtual_diff_apply"
   defp execution_kind(%{workspace_mode: "virtual_overlay"}), do: "virtual_overlay"
   defp execution_kind(%{"workspace_mode" => "virtual_overlay"}), do: "virtual_overlay"
   defp execution_kind(_step), do: "subagent"
@@ -1644,6 +2020,7 @@ defmodule Pixir.Workflows do
       "write_set" => step.write_set
     }
     |> put_write_policy_metadata(step)
+    |> maybe_put("apply_from", Map.get(step, :apply_from))
     |> maybe_put("virtual_commands", non_empty(step.virtual_commands))
   end
 
@@ -1732,6 +2109,14 @@ defmodule Pixir.Workflows do
   end
 
   defp conflicts_with_any?(step, occupied), do: Enum.any?(occupied, &conflict?(step, &1))
+
+  defp conflict?(%{posture: "apply"} = left, %{posture: posture} = right)
+       when posture in ["writer", "apply"],
+       do: overlaps?(left.write_set, right.write_set)
+
+  defp conflict?(%{posture: posture} = left, %{posture: "apply"} = right)
+       when posture in ["writer", "apply"],
+       do: overlaps?(left.write_set, right.write_set)
 
   defp conflict?(%{posture: "virtual_scratch"} = reader, %{posture: "writer"} = writer),
     do: writer.workspace_mode == "shared" and overlaps?(reader.read_set, writer.write_set)

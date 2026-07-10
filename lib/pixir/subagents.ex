@@ -48,6 +48,10 @@ defmodule Pixir.Subagents do
   def spawn_agent(parent_session_id, args, opts \\ []),
     do: Manager.spawn_agent(parent_session_id, args, opts)
 
+  @doc "Validate and normalize a Subagent spawn without creating runtime state."
+  def validate_spawn(parent_session_id, args, opts \\ []),
+    do: Manager.validate_spawn(parent_session_id, args, opts)
+
   @doc "Send follow-up input to an idle Subagent."
   def send_input(parent_session_id, subagent_id, prompt, opts \\ []),
     do: Manager.send_input(parent_session_id, subagent_id, prompt, opts)
@@ -169,7 +173,8 @@ defmodule Pixir.Subagents do
       "retry_attempts",
       "retry_max_attempts",
       "current_attempt_index",
-      "retry_history"
+      "retry_history",
+      "virtual_diff_ref"
     ]
   end
 end

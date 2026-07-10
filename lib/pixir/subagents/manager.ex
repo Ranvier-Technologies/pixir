@@ -30,6 +30,7 @@ defmodule Pixir.Subagents.Manager do
   # Process.send_after delay so an oversized accepted value degrades to the
   # ceiling instead of a badarg crash after durable evidence was recorded.
   @erlang_timer_max_ms 4_294_967_295
+  @virtual_diff_max_encoded_bytes 262_144
 
   # TODO(service-lifetime): Delegate service mode needs an owner process that can keep
   # live child handles across CLI invocations. Today the Manager can restore durable
@@ -52,6 +53,14 @@ defmodule Pixir.Subagents.Manager do
 
   def spawn_agent(parent_session_id, args, opts \\ []) do
     GenServer.call(@server, {:spawn_agent, parent_session_id, args, opts}, 30_000)
+  end
+
+  @doc false
+  def validate_spawn(parent_session_id, args, opts \\ []) do
+    with {:ok, normalized} <- normalize_spawn(parent_session_id, args, opts),
+         :ok <- check_depth(normalized) do
+      {:ok, spawn_plan(normalized)}
+    end
   end
 
   def send_input(parent_session_id, subagent_id, prompt, opts \\ []) do
@@ -109,6 +118,59 @@ defmodule Pixir.Subagents.Manager do
   def init(_opts) do
     {:ok, %{parents: %{}, child_to_agent: %{}, waiters: %{}}}
   end
+
+  defp spawn_plan(spec) do
+    workspace =
+      case WorkspaceStrategy.delegation_context(Map.get(spec, :workspace_mode), %{}) do
+        {:ok, context} ->
+          Map.take(context, [
+            "workspace_fidelity",
+            "read_boundary",
+            "write_semantics",
+            "parent_workspace_mutation"
+          ])
+
+        {:error, _error} ->
+          %{}
+      end
+
+    %{
+      "action" => "spawn_agent",
+      "agent" => Map.get(spec, :agent),
+      "task" => Map.get(spec, :task),
+      "depth" => Map.get(spec, :depth),
+      "max_depth" => Map.get(spec, :max_depth),
+      "timeout_ms" => Map.get(spec, :timeout_ms),
+      "max_threads" => Map.get(spec, :max_threads),
+      "limits" => %{
+        "timeout_ms" => Map.get(spec, :timeout_ms),
+        "max_threads" => Map.get(spec, :max_threads),
+        "max_depth" => Map.get(spec, :max_depth),
+        "retry_attempts" => Map.get(spec, :retry_max_attempts),
+        "retry_jitter_ms" => Map.get(spec, :retry_jitter_ms)
+      },
+      "workspace_mode" => Map.get(spec, :workspace_mode),
+      "permission_mode" => plan_permission_mode(Map.get(spec, :permission_mode)),
+      "write_policy" => WritePolicy.metadata(Map.get(spec, :write_policy)),
+      "resources" => [
+        "manager_entry",
+        "workspace_preparation",
+        "child_session",
+        "subagent_lifecycle_evidence"
+      ],
+      "limitations" => [
+        "Validation does not prove workspace snapshot capacity.",
+        "Validation does not prove filesystem writeability.",
+        "Validation does not prove provider authentication.",
+        "Validation does not prove network reachability.",
+        "Validation does not prove future queue position."
+      ]
+    }
+    |> Map.merge(workspace)
+  end
+
+  defp plan_permission_mode(mode) when is_atom(mode), do: Atom.to_string(mode)
+  defp plan_permission_mode(mode), do: mode
 
   @impl true
   def handle_call({:spawn_agent, parent_sid, args, opts}, _from, state) do
@@ -306,16 +368,18 @@ defmodule Pixir.Subagents.Manager do
             updated_at: now()
         }
 
+        agent = maybe_attach_virtual_diff_after_failure(agent)
         state = put_agent(state, agent)
         state = cancel_timer(state, agent)
 
         state =
-          record_parent_event(state, agent, "timed_out", "timed_out", %{
-            "reason" => "timeout",
-            "timeout_ms" => agent.timeout_ms,
-            "elapsed_ms" => elapsed_ms,
-            "next_actions" => next_actions
-          })
+          record_parent_event(
+            state,
+            agent,
+            "timed_out",
+            "timed_out",
+            terminal_event_fields(agent)
+          )
 
         state = maybe_start_queued(state, parent_sid)
         {:noreply, reply_waiters(state)}
@@ -353,7 +417,7 @@ defmodule Pixir.Subagents.Manager do
     with {:ok, agent} <- fetch_agent(state, parent_sid, id),
          true <- transport_retry_event?(event),
          true <- retry_attempt_index(agent) < retry_max_attempts(agent),
-         true <- not write_capable?(agent) do
+         true <- transport_retry_eligible?(agent) do
       old_agent = agent
 
       retry_entry = %{
@@ -411,10 +475,59 @@ defmodule Pixir.Subagents.Manager do
   end
 
   defp retryable_provider_http_error?(%{"error_kind" => "provider_http_error"} = data) do
-    get_in(data, ["details", "type"]) == "server_error"
+    get_in(data, ["details", "retryable"]) == true or
+      get_in(data, ["details", "type"]) == "server_error"
   end
 
   defp retryable_provider_http_error?(_data), do: false
+
+  defp transport_retry_eligible?(%{workspace_mode: "virtual_overlay"} = agent) do
+    not write_capable?(agent) and virtual_retry_log_safe?(agent)
+  end
+
+  defp transport_retry_eligible?(agent), do: not write_capable?(agent)
+
+  # Public seam for the ADR 0036 fail-closed pins: every retry blocker is
+  # exercised against a real child Log without spawning (@doc false precedent).
+  @doc false
+  @spec virtual_retry_log_safe?(map()) :: boolean()
+  def virtual_retry_log_safe?(agent) do
+    child_sid = Map.get(agent, :child_session_id)
+    child_workspace = Map.get(agent, :child_workspace)
+
+    with true <- is_binary(child_sid) and child_sid != "",
+         true <- is_binary(child_workspace) and child_workspace != "",
+         true <- Log.exists?(child_sid, workspace: child_workspace),
+         {:ok, history} <- Log.fold(child_sid, workspace: child_workspace) do
+      not virtual_retry_evidence?(history)
+    else
+      _unreadable_or_missing -> false
+    end
+  end
+
+  defp virtual_retry_evidence?(history) do
+    virtual_call_ids =
+      history
+      |> Enum.filter(fn
+        %{type: :tool_call, data: %{"name" => "run_virtual_commands"}} -> true
+        _event -> false
+      end)
+      |> MapSet.new(& &1.data["call_id"])
+
+    Enum.any?(history, fn
+      %{type: type} when type in [:assistant_message, :provider_usage, :permission_decision] ->
+        true
+
+      %{type: :tool_call, data: %{"name" => "run_virtual_commands"}} ->
+        true
+
+      %{type: :tool_result, data: %{"call_id" => call_id} = data} ->
+        MapSet.member?(virtual_call_ids, call_id) or is_map(data["virtual_diff"])
+
+      _event ->
+        false
+    end)
+  end
 
   defp write_capable?(%{permission_mode: :read_only}), do: false
   defp write_capable?(%{permission_mode: "read_only"}), do: false
@@ -440,7 +553,13 @@ defmodule Pixir.Subagents.Manager do
 
   # ── build/start ──────────────────────────────────────────────────────────
 
-  defp build_spec(parent_sid, %{"task" => task} = args, opts)
+  defp build_spec(parent_sid, args, opts) do
+    with {:ok, normalized} <- normalize_spawn(parent_sid, args, opts) do
+      {:ok, materialize_spawn_spec(normalized)}
+    end
+  end
+
+  defp normalize_spawn(parent_sid, %{"task" => task} = args, opts)
        when is_binary(task) and task != "" do
     workspace = Keyword.fetch!(opts, :workspace)
     agent_name = Map.get(args, "agent", "default")
@@ -466,6 +585,9 @@ defmodule Pixir.Subagents.Manager do
 
       attachments = Keyword.get(opts, :attachments, Map.get(args, "attachments", []))
 
+      requested_permission_mode =
+        child_permission_mode(agent_config, Keyword.get(opts, :permission_mode, :auto))
+
       # Runtime-owned identity and evidence ride opts, never args. The
       # spawn_agent tool strips caller-authored runtime fields as defense in
       # depth, but this builder is the enforcement barrier: forged args values
@@ -474,7 +596,6 @@ defmodule Pixir.Subagents.Manager do
       # opportunistically; new runtime knobs must enter through opts from day
       # one.
       index = Keyword.get(opts, :index)
-      id = gen_id()
 
       with :ok <- validate_optional_non_negative_integer("index", index),
            :ok <- validate_optional_binary("model", provider_model),
@@ -486,21 +607,19 @@ defmodule Pixir.Subagents.Manager do
            :ok <- validate_positive_integer("timeout_ms", timeout_ms),
            :ok <- validate_non_negative_integer("retry_attempts", retry_max_attempts),
            :ok <- validate_non_negative_integer("retry_jitter_ms", retry_jitter_ms),
+           {:ok, virtual_overlay} <-
+             normalize_virtual_overlay_context(Keyword.get(opts, :virtual_overlay)),
            {:ok, workspace_mode} <-
-             WorkspaceStrategy.normalize_runtime_mode(workspace_mode, "subagent") do
+             normalize_subagent_workspace_mode(workspace_mode, virtual_overlay),
+           :ok <- validate_virtual_overlay_permission(workspace_mode, requested_permission_mode) do
         {:ok,
          %{
-           id: id,
            parent_session_id: parent_sid,
            index: index,
-           child_session_id: nil,
-           child_pid: nil,
            task: task,
            prompt: task,
            agent: agent_config.name,
            agent_config: agent_config,
-           status: "queued",
-           summary: nil,
            depth: Keyword.get(opts, :depth, 0) + 1,
            max_threads: max_threads,
            max_depth: max_depth,
@@ -509,43 +628,54 @@ defmodule Pixir.Subagents.Manager do
            retry_jitter_ms: retry_jitter_ms,
            retry_attempt_index: 0,
            retry_history: [],
-           parent_log_path: Log.path(parent_sid, workspace: workspace),
-           child_log_path: nil,
            workspace: workspace,
-           child_workspace: nil,
            workspace_mode: workspace_mode,
+           virtual_overlay: virtual_overlay_for_mode(workspace_mode, virtual_overlay),
            provider_model: provider_model,
            reasoning_effort: reasoning_effort,
            web_search: web_search,
            attachments: attachments,
-           workspace_snapshot: nil,
            workspace_snapshot_opts: Keyword.get(opts, :workspace_snapshot_opts, []),
            provider: Keyword.get(opts, :provider, Pixir.Provider),
            provider_opts: Keyword.get(opts, :provider_opts, []),
            permission_mode:
-             child_permission_mode(agent_config, Keyword.get(opts, :permission_mode, :auto)),
+             virtual_overlay_permission_mode(workspace_mode, requested_permission_mode),
            write_policy: Keyword.get(opts, :write_policy),
            skills_opts: Keyword.get(opts, :skills_opts, []),
            agents_opts: agents_opts,
-           delegation_context: Keyword.get(opts, :delegation_context, %{}),
-           timer_ref: nil,
-           started_at_ms: nil,
-           deadline_at: nil,
-           elapsed_ms: nil,
-           timeout_reason: nil,
-           next_actions: [],
-           last_seen_child_event_seq: nil,
-           last_seen_child_event_type: nil,
-           last_seen_child_event_ts: nil,
-           created_at: now(),
-           updated_at: now()
+           delegation_context: Keyword.get(opts, :delegation_context, %{})
          }}
       end
     end
   end
 
-  defp build_spec(_parent_sid, _args, _opts),
+  defp normalize_spawn(_parent_sid, _args, _opts),
     do: {:error, Tool.error(:invalid_args, "task is required", %{})}
+
+  defp materialize_spawn_spec(normalized) do
+    Map.merge(normalized, %{
+      id: gen_id(),
+      child_session_id: nil,
+      child_pid: nil,
+      status: "queued",
+      summary: nil,
+      parent_log_path: Log.path(normalized.parent_session_id, workspace: normalized.workspace),
+      child_log_path: nil,
+      child_workspace: nil,
+      workspace_snapshot: nil,
+      timer_ref: nil,
+      started_at_ms: nil,
+      deadline_at: nil,
+      elapsed_ms: nil,
+      timeout_reason: nil,
+      next_actions: [],
+      last_seen_child_event_seq: nil,
+      last_seen_child_event_type: nil,
+      last_seen_child_event_ts: nil,
+      created_at: now(),
+      updated_at: now()
+    })
+  end
 
   defp validate_positive_integer(_field, value) when is_integer(value) and value > 0, do: :ok
 
@@ -657,6 +787,74 @@ defmodule Pixir.Subagents.Manager do
        "value" => inspect(value)
      })}
   end
+
+  defp normalize_virtual_overlay_context(nil), do: {:ok, nil}
+
+  defp normalize_virtual_overlay_context(config) when is_map(config) do
+    read_set = manager_virtual_overlay_field(config, :read_set, "read_set")
+    limits = manager_virtual_overlay_field(config, :limits, "limits")
+
+    cond do
+      not (is_list(read_set) and read_set != [] and
+               Enum.all?(read_set, &manager_virtual_read_set_entry?/1)) ->
+        {:error,
+         Tool.error(:invalid_args, "virtual_overlay requires a non-empty read_set", %{
+           "field" => "virtual_overlay.read_set"
+         })}
+
+      not (is_nil(limits) or is_map(limits)) ->
+        {:error,
+         Tool.error(:invalid_args, "virtual_overlay limits must be a map", %{
+           "field" => "virtual_overlay.limits"
+         })}
+
+      true ->
+        {:ok, %{read_set: read_set, limits: limits}}
+    end
+  end
+
+  defp normalize_virtual_overlay_context(_config) do
+    {:error,
+     Tool.error(:invalid_args, "virtual_overlay context must be a map", %{
+       "field" => "virtual_overlay"
+     })}
+  end
+
+  defp manager_virtual_overlay_field(config, atom_key, string_key) do
+    case Map.fetch(config, atom_key) do
+      {:ok, value} -> value
+      :error -> Map.get(config, string_key)
+    end
+  end
+
+  defp manager_virtual_read_set_entry?(value),
+    do: is_binary(value) and String.trim(value) != ""
+
+  defp normalize_subagent_workspace_mode(workspace_mode, nil),
+    do: WorkspaceStrategy.normalize_runtime_mode(workspace_mode, "subagent")
+
+  defp normalize_subagent_workspace_mode(workspace_mode, _virtual_overlay) do
+    WorkspaceStrategy.normalize_runtime_mode(workspace_mode, "subagent", %{},
+      supported_modes: ~w(shared isolated virtual_overlay)
+    )
+  end
+
+  defp validate_virtual_overlay_permission("virtual_overlay", permission_mode)
+       when permission_mode not in [:read_only, "read_only"] do
+    {:error,
+     Tool.error(:permission_denied, "virtual_overlay children must be read-only", %{
+       "workspace_mode" => "virtual_overlay",
+       "permission_mode" => to_string(permission_mode)
+     })}
+  end
+
+  defp validate_virtual_overlay_permission(_workspace_mode, _permission_mode), do: :ok
+
+  defp virtual_overlay_for_mode("virtual_overlay", virtual_overlay), do: virtual_overlay
+  defp virtual_overlay_for_mode(_workspace_mode, _virtual_overlay), do: nil
+
+  defp virtual_overlay_permission_mode("virtual_overlay", _permission_mode), do: :read_only
+  defp virtual_overlay_permission_mode(_workspace_mode, permission_mode), do: permission_mode
 
   defp check_depth(%{depth: depth, max_depth: max_depth}) when depth <= max_depth, do: :ok
 
@@ -805,6 +1003,7 @@ defmodule Pixir.Subagents.Manager do
         skills_opts: agent.skills_opts,
         agents_opts: agent.agents_opts,
         subagent_depth: agent.depth,
+        virtual_overlay: Map.get(agent, :virtual_overlay),
         agent_instructions: instructions,
         delegation_context: DelegationContext.from_agent(agent)
       )
@@ -816,6 +1015,9 @@ defmodule Pixir.Subagents.Manager do
 
   defp subscribe_child_events(child_sid),
     do: Events.subscribe(child_sid, only: @manager_child_event_types)
+
+  defp prepare_workspace(%{workspace_mode: "virtual_overlay", workspace: workspace}),
+    do: {:ok, workspace, nil}
 
   defp prepare_workspace(%{workspace_mode: "shared", workspace: workspace}),
     do: {:ok, workspace, nil}
@@ -899,24 +1101,18 @@ defmodule Pixir.Subagents.Manager do
     {:noreply, put_agent(state, %{agent | summary: summary, updated_at: now()})}
   end
 
-  defp handle_child_event(parent_sid, id, %{type: :status, data: %{"status" => "done"}}, state) do
+  defp handle_child_event(
+         parent_sid,
+         id,
+         %{type: :status, data: %{"status" => "done"}},
+         state
+       ) do
     {:ok, agent} = fetch_agent(state, parent_sid, id)
 
-    if Subagents.terminal?(agent.status) do
-      {:noreply, state}
+    if agent.workspace_mode == "virtual_overlay" do
+      finish_virtual_overlay_agent(parent_sid, agent, state)
     else
-      summary = agent.summary || latest_child_answer(agent)
-      agent = %{agent | status: "completed", summary: summary, updated_at: now()}
-
-      state =
-        state
-        |> put_agent(agent)
-        |> cancel_timer(agent)
-        |> record_parent_event(agent, "finished", "completed")
-        |> maybe_start_queued(parent_sid)
-        |> reply_waiters()
-
-      {:noreply, state}
+      finish_completed_agent(parent_sid, agent, state)
     end
   end
 
@@ -937,6 +1133,8 @@ defmodule Pixir.Subagents.Manager do
           next_actions: evidence.next_actions,
           updated_at: now()
       }
+
+      agent = maybe_attach_virtual_diff_after_failure(agent)
 
       state =
         state
@@ -986,6 +1184,162 @@ defmodule Pixir.Subagents.Manager do
   end
 
   defp handle_child_event(_parent_sid, _id, _event, state), do: {:noreply, state}
+
+  defp finish_completed_agent(_parent_sid, agent, state) do
+    if Subagents.terminal?(agent.status) do
+      {:noreply, state}
+    else
+      summary = agent.summary || latest_child_answer(agent)
+      agent = %{agent | status: "completed", summary: summary, updated_at: now()}
+
+      state =
+        state
+        |> put_agent(agent)
+        |> cancel_timer(agent)
+        |> record_parent_event(agent, "finished", "completed")
+        |> maybe_start_queued(agent.parent_session_id)
+        |> reply_waiters()
+
+      {:noreply, state}
+    end
+  end
+
+  defp finish_virtual_overlay_agent(_parent_sid, agent, state) do
+    if Subagents.terminal?(agent.status) do
+      {:noreply, state}
+    else
+      case select_virtual_diff(agent) do
+        {:ok, artifact, ref} ->
+          summary = agent.summary || latest_child_answer(agent)
+
+          agent =
+            Map.merge(agent, %{
+              status: "completed",
+              summary: summary,
+              virtual_diff: artifact,
+              virtual_diff_ref: ref,
+              updated_at: now()
+            })
+
+          state =
+            state
+            |> put_agent(agent)
+            |> cancel_timer(agent)
+            |> record_parent_event(
+              agent,
+              "finished",
+              "completed",
+              terminal_event_fields(agent)
+            )
+            |> maybe_start_queued(agent.parent_session_id)
+            |> reply_waiters()
+
+          {:noreply, state}
+
+        {:error, "virtual_diff_oversize", ref} ->
+          fail_virtual_overlay_agent(agent, state, "virtual_diff_oversize", ref)
+
+        {:error, "virtual_diff_missing", nil} ->
+          fail_virtual_overlay_agent(agent, state, "virtual_diff_missing", nil)
+      end
+    end
+  end
+
+  defp fail_virtual_overlay_agent(agent, state, reason, ref) do
+    next_actions = ["inspect_child_session_log", "rerun_virtual_overlay_child"]
+
+    agent =
+      Map.merge(agent, %{
+        status: "failed",
+        summary: "Virtual overlay child finished without an exportable virtual_diff artifact.",
+        elapsed_ms: elapsed_ms(agent),
+        timeout_reason: reason,
+        next_actions: next_actions,
+        virtual_diff_ref: ref,
+        updated_at: now()
+      })
+
+    state =
+      state
+      |> put_agent(agent)
+      |> cancel_timer(agent)
+      |> record_parent_event(agent, "failed", "failed", terminal_event_fields(agent))
+      |> maybe_start_queued(agent.parent_session_id)
+      |> reply_waiters()
+
+    {:noreply, state}
+  end
+
+  defp maybe_attach_virtual_diff_after_failure(%{workspace_mode: "virtual_overlay"} = agent) do
+    case select_virtual_diff(agent) do
+      {:ok, artifact, ref} ->
+        Map.merge(agent, %{virtual_diff: artifact, virtual_diff_ref: ref})
+
+      {:error, "virtual_diff_oversize", ref} ->
+        Map.put(agent, :virtual_diff_ref, ref)
+
+      {:error, "virtual_diff_missing", nil} ->
+        agent
+    end
+  end
+
+  defp maybe_attach_virtual_diff_after_failure(agent), do: agent
+
+  defp select_virtual_diff(agent) do
+    with {:ok, history} <- Log.fold(agent.child_session_id, workspace: agent.child_workspace),
+         {%MapSet{} = _call_ids, {artifact, source_seq}} <- find_last_virtual_diff(history) do
+      encoded = Jason.encode!(artifact)
+      ref = virtual_diff_ref(artifact, encoded, source_seq)
+
+      if byte_size(encoded) <= @virtual_diff_max_encoded_bytes do
+        {:ok, artifact, ref}
+      else
+        {:error, "virtual_diff_oversize", ref}
+      end
+    else
+      _other -> {:error, "virtual_diff_missing", nil}
+    end
+  end
+
+  defp find_last_virtual_diff(history) do
+    Enum.reduce(history, {MapSet.new(), nil}, fn
+      %{type: :tool_call, data: %{"name" => "run_virtual_commands", "call_id" => call_id}},
+      {call_ids, selected} ->
+        {MapSet.put(call_ids, call_id), selected}
+
+      %{
+        type: :tool_result,
+        seq: source_seq,
+        data: %{
+          "call_id" => call_id,
+          "ok" => true,
+          "virtual_diff" => %{"kind" => "virtual_diff"} = artifact
+        }
+      },
+      {call_ids, selected} ->
+        if MapSet.member?(call_ids, call_id) do
+          {call_ids, {artifact, source_seq}}
+        else
+          {call_ids, selected}
+        end
+
+      _event, acc ->
+        acc
+    end)
+  end
+
+  defp virtual_diff_ref(artifact, encoded, source_seq) do
+    %{
+      "kind" => artifact["kind"],
+      "version" => artifact["version"],
+      "sha256" => :crypto.hash(:sha256, encoded) |> Base.encode16(case: :lower),
+      "encoded_bytes" => byte_size(encoded),
+      "changed_files" => length(Map.get(artifact, "changes", [])),
+      "diff_bytes" => get_in(artifact, ["summary", "diff_bytes"]),
+      "apply_status" => get_in(artifact, ["apply", "status"]),
+      "source_seq" => source_seq
+    }
+  end
 
   defp latest_child_answer(%{child_session_id: nil}), do: ""
 
@@ -1159,6 +1513,8 @@ defmodule Pixir.Subagents.Manager do
       retry_max_attempts: data["retry_max_attempts"] || Subagents.default_limits().retry_attempts,
       retry_jitter_ms: Subagents.default_limits().retry_jitter_ms,
       retry_history: data["retry_history"] || [],
+      virtual_diff: nil,
+      virtual_diff_ref: data["virtual_diff_ref"],
       provider: nil,
       provider_opts: [],
       permission_mode: nil,
@@ -1793,6 +2149,8 @@ defmodule Pixir.Subagents.Manager do
     agent
     |> public_agent_base()
     |> maybe_put_retry_lineage(agent)
+    |> maybe_put_public("virtual_diff", Map.get(agent, :virtual_diff))
+    |> maybe_put_public("virtual_diff_ref", Map.get(agent, :virtual_diff_ref))
   end
 
   defp public_agent_base(agent) do
@@ -1957,6 +2315,7 @@ defmodule Pixir.Subagents.Manager do
     agent
     |> terminal_event_fields_base()
     |> maybe_put_retry_lineage(agent)
+    |> maybe_put_event("virtual_diff_ref", Map.get(agent, :virtual_diff_ref))
   end
 
   defp terminal_event_fields_base(agent) do

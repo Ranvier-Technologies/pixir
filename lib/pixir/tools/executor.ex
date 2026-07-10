@@ -37,7 +37,8 @@ defmodule Pixir.Tools.Executor do
       result =
         case protect_evidence(name, args, context.workspace) do
           :ok ->
-            with :allow <- authorize_write_policy(name, args, id, context),
+            with :allow <- authorize_virtual_overlay(name, args, id, context),
+                 :allow <- authorize_write_policy(name, args, id, context),
                  :allow <- authorize(name, args, id, context) do
               execute_call(%{name: name, args: args}, context)
             else
@@ -89,6 +90,26 @@ defmodule Pixir.Tools.Executor do
     end
   end
 
+  defp protect_evidence("apply_virtual_diff", %{"artifact" => artifact}, workspace)
+       when is_map(artifact) do
+    artifact
+    |> virtual_diff_change_paths()
+    |> Enum.find_value(:ok, fn path ->
+      case Workspace.confine(workspace, path) do
+        {:ok, abs} ->
+          if protected_state_path?(workspace, abs) do
+            {:error, protected_path_error("apply_virtual_diff", path, workspace, abs)}
+          else
+            false
+          end
+
+        # An escaping path is the tool's own confinement error, not this guard's.
+        {:error, _} ->
+          false
+      end
+    end)
+  end
+
   defp protect_evidence("bash", %{"command" => command}, workspace)
        when is_binary(command) do
     tokens = String.split(command, ~r/\s+/, trim: true)
@@ -113,6 +134,23 @@ defmodule Pixir.Tools.Executor do
   end
 
   defp protect_evidence(_name, _args, _workspace), do: :ok
+
+  defp apply_virtual_diff_change_paths(%{"artifact" => artifact}) when is_map(artifact) do
+    virtual_diff_change_paths(artifact)
+  end
+
+  defp apply_virtual_diff_change_paths(_args), do: []
+
+  defp virtual_diff_change_paths(%{"changes" => changes}) when is_list(changes) do
+    changes
+    |> Enum.map(fn
+      %{"path" => path} when is_binary(path) -> path
+      _change -> nil
+    end)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp virtual_diff_change_paths(_artifact), do: []
 
   defp state_dir_token?(token) do
     token
@@ -365,6 +403,97 @@ defmodule Pixir.Tools.Executor do
     record_decision(context, call_id, :deny, details)
   end
 
+  # ── virtual overlay boundary ─────────────────────────────────────────────
+
+  # A virtual overlay child works exclusively against the imported in-memory
+  # filesystem (ADR 0028: read_boundary "imported_read_set_only"). The
+  # operator context is the switch: when present, host-reaching tools are
+  # denied and real reads are confined to the imported read set — otherwise
+  # the fidelity contract recorded in the parent's delegation evidence lies.
+  # bash gets the non-terminal :bash_disabled kind so the child adapts to
+  # run_virtual_commands (#218 precedent); the rest deny as permission_denied.
+  @virtual_overlay_denied_tools ~w(write edit spawn_agent run_workflow apply_virtual_diff)
+
+  defp authorize_virtual_overlay(name, args, call_id, %{virtual_overlay: overlay} = context)
+       when is_map(overlay) do
+    cond do
+      # Pure validation crosses no host boundary: a virtual child may rehearse
+      # a spawn (validate_only exactly true) even though real spawns are denied.
+      name == "spawn_agent" and args["validate_only"] == true ->
+        :allow
+
+      name == "bash" ->
+        details = virtual_overlay_denial_details(name)
+        record_decision(context, call_id, :deny, details)
+
+        {:error,
+         Tool.error(
+           :bash_disabled,
+           "bash is unavailable in a virtual overlay child; run commands through run_virtual_commands",
+           details
+         )}
+
+      name in @virtual_overlay_denied_tools ->
+        details = virtual_overlay_denial_details(name)
+        record_decision(context, call_id, :deny, details)
+
+        {:error,
+         Tool.error(
+           :permission_denied,
+           "#{name} is unavailable in a virtual overlay child",
+           details
+         )}
+
+      name == "read" ->
+        authorize_virtual_read(args, call_id, overlay, context)
+
+      true ->
+        :allow
+    end
+  end
+
+  defp authorize_virtual_overlay(_name, _args, _call_id, _context), do: :allow
+
+  defp virtual_overlay_denial_details(name) do
+    %{
+      "gate" => "virtual_overlay",
+      "matched_rule" => "virtual_overlay_host_boundary",
+      "tool" => name,
+      "next_actions" => ["use_run_virtual_commands_for_virtual_changes"]
+    }
+  end
+
+  defp authorize_virtual_read(%{"path" => path}, call_id, overlay, context) do
+    # Workspace.confine expands the root internally; expand it here too so the
+    # relative path is derived against the same base even when the stored
+    # workspace is relative (e.g. ".").
+    with {:ok, abs} <- Workspace.confine(context.workspace, path),
+         rel = Path.relative_to(abs, Path.expand(context.workspace)),
+         false <- WritePolicy.rules_cover_path?(overlay.read_set, rel) do
+      details = %{
+        "gate" => "virtual_overlay",
+        "matched_rule" => "virtual_overlay_read_set",
+        "normalized_path" => rel,
+        "next_actions" => [
+          "read_within_imported_read_set",
+          "use_run_virtual_commands_for_virtual_changes"
+        ]
+      }
+
+      record_decision(context, call_id, :deny, details)
+
+      {:error,
+       Tool.error(:permission_denied, "read outside the imported virtual read set", details)}
+    else
+      # Covered paths are allowed; confinement errors fall through to the
+      # read tool's own boundary handling.
+      true -> :allow
+      {:error, _confinement} -> :allow
+    end
+  end
+
+  defp authorize_virtual_read(_args, _call_id, _overlay, _context), do: :allow
+
   # Consult the bounded write policy before permission mode. This is a headless
   # executor guard, not an interactive approval flow: denial is structured and
   # auditable. Write-allowlist denials are terminal for the Turn loop; a
@@ -372,7 +501,7 @@ defmodule Pixir.Tools.Executor do
   defp authorize_write_policy(name, args, call_id, context) do
     policy = get_in(context, [:permission, :policy])
 
-    case WritePolicy.authorize_tool(policy, name, args, context.workspace) do
+    case authorize_write_policy_tool(policy, name, args, context.workspace) do
       :allow ->
         if policy && Permissions.mutating?(name, args) do
           record_decision(context, call_id, :allow, %{
@@ -395,6 +524,43 @@ defmodule Pixir.Tools.Executor do
         error
     end
   end
+
+  defp authorize_write_policy_tool(nil, _name, _args, _workspace), do: :allow
+
+  defp authorize_write_policy_tool(policy, "apply_virtual_diff", args, workspace) do
+    if Permissions.mutating?("apply_virtual_diff", args) do
+      args
+      |> apply_virtual_diff_change_paths()
+      |> Enum.reduce_while(:allow, fn path, :allow ->
+        case WritePolicy.authorize_tool(policy, "write", %{"path" => path}, workspace) do
+          :allow ->
+            {:cont, :allow}
+
+          {:deny, error} ->
+            {:halt, {:deny, apply_virtual_diff_policy_error(error)}}
+
+          {:error, %{error: %{kind: :write_policy_denied}} = error} ->
+            {:halt, {:error, apply_virtual_diff_policy_error(error)}}
+
+          {:error, _error} = error ->
+            {:halt, error}
+        end
+      end)
+    else
+      :allow
+    end
+  end
+
+  defp authorize_write_policy_tool(policy, name, args, workspace) do
+    WritePolicy.authorize_tool(policy, name, args, workspace)
+  end
+
+  defp apply_virtual_diff_policy_error(%{error: %{details: details}} = error)
+       when is_map(details) do
+    put_in(error, [:error, :details], Map.put(details, "tool", "apply_virtual_diff"))
+  end
+
+  defp apply_virtual_diff_policy_error(error), do: error
 
   defp policy_decision_details(details) do
     %{

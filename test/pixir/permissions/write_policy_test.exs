@@ -43,6 +43,130 @@ defmodule Pixir.Permissions.WritePolicyTest do
              )
   end
 
+  test "normalizes operator-declared verify commands and authorizes byte-equal bash", %{ws: ws} do
+    verify = ["mix format --check-formatted", "mix compile --warnings-as-errors"]
+
+    assert {:ok, policy} =
+             WritePolicy.normalize(%{
+               "version" => 1,
+               "metadata" => %{"id" => "verify-task"},
+               "allow_writes" => ["src/**"],
+               "bash" => %{"verify" => verify}
+             })
+
+    assert policy["bash"] == %{"verify" => verify}
+
+    assert %{
+             "id" => "verify-task",
+             "allow_writes" => ["src/**"],
+             "bash" => %{"verify" => ^verify}
+           } = WritePolicy.metadata(policy)
+
+    assert :allow =
+             WritePolicy.authorize_tool(
+               policy,
+               "bash",
+               %{"command" => "mix format --check-formatted"},
+               ws
+             )
+
+    assert {:deny, %{error: %{kind: :bash_disabled, details: details}}} =
+             WritePolicy.authorize_tool(
+               policy,
+               "bash",
+               %{"command" => "mix format --check-formatted --migrate"},
+               ws
+             )
+
+    assert details["matched_rule"] == "bash_disabled"
+    assert details["verify_commands_declared"] == 2
+    assert :allow = WritePolicy.authorize_tool(policy, "bash", %{"command" => "ls src"}, ws)
+  end
+
+  test "rejects verify test commands with the v1 future-work action" do
+    assert {:error, %{error: %{kind: :invalid_args, message: message, details: details}}} =
+             WritePolicy.normalize(%{
+               "version" => 1,
+               "allow_writes" => ["src/**"],
+               "bash" => %{"verify" => ["mix test test/pixir"]}
+             })
+
+    assert message == "verify test commands are not accepted yet (v1 allows format/compile only)"
+    assert details["next_action"] == "keep_test_execution_with_the_orchestrator"
+    assert details["observed"] == "mix test test/pixir"
+  end
+
+  test "rejects unsafe verify command entries" do
+    for command <- [
+          "mix format --check-formatted; rm -rf src",
+          "mix format --check-formatted && rm -rf src",
+          "mix format --check-formatted | cat",
+          "mix format --check-formatted `date`",
+          "mix format --check-formatted $(date)",
+          "mix format --check-formatted ../outside"
+        ] do
+      assert {:error, %{error: %{kind: :invalid_args, details: details}}} =
+               WritePolicy.normalize(%{
+                 "version" => 1,
+                 "allow_writes" => ["src/**"],
+                 "bash" => %{"verify" => [command]}
+               })
+
+      assert details["observed"] == command
+    end
+  end
+
+  test "rejects unknown keys inside bash verify map" do
+    assert {:error, %{error: %{kind: :invalid_args, details: details}}} =
+             WritePolicy.normalize(%{
+               "version" => 1,
+               "allow_writes" => ["src/**"],
+               "bash" => %{"verify" => [], "surprise" => true}
+             })
+
+    assert details["observed"] == ["surprise"]
+    assert details["accepted_keys"] == ["verify"]
+  end
+
+  test "verify commands still hit workspace confinement before authorization", %{ws: ws} do
+    {:ok, policy} =
+      WritePolicy.normalize(%{
+        "version" => 1,
+        "allow_writes" => ["src/**"],
+        "bash" => %{"verify" => ["mix format --check-formatted /etc/passwd"]}
+      })
+
+    assert {:deny, %{error: %{kind: :outside_workspace, details: details}}} =
+             WritePolicy.authorize_tool(
+               policy,
+               "bash",
+               %{"command" => "mix format --check-formatted /etc/passwd"},
+               ws
+             )
+
+    assert details["matched_rule"] == "outside_workspace"
+    assert details["token"] == "/etc/passwd"
+  end
+
+  test "spawn_agent child write_policy override remains denied", %{ws: ws} do
+    {:ok, policy} =
+      WritePolicy.normalize(%{
+        "version" => 1,
+        "allow_writes" => ["src/**"],
+        "bash" => %{"verify" => ["mix compile --warnings-as-errors"]}
+      })
+
+    assert {:deny, %{error: %{kind: :write_policy_denied, details: details}}} =
+             WritePolicy.authorize_tool(
+               policy,
+               "spawn_agent",
+               %{"task" => "try", "write_policy" => %{"allow_writes" => ["**/*"]}},
+               ws
+             )
+
+    assert details["matched_rule"] == "child_policy_override_unsupported"
+  end
+
   test "denies unmatched, explicit-deny, state-dir, and unsafe bash paths", %{ws: ws} do
     {:ok, policy} =
       WritePolicy.normalize(%{

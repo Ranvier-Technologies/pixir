@@ -5,6 +5,12 @@ defmodule Pixir.Doctor do
   `Pixir.Doctor` is intentionally no-network: it checks local runtime readiness,
   configuration shape, auth presence, source-install artifacts, session-log writability,
   and ACP availability. Provider connectivity remains an explicit smoke/probe step.
+
+  The JSON envelope gives orchestrators an explicit delegation decision in `proceed`:
+  `"true"` is ready, `"judge"` requires inspecting the non-passing ids already listed
+  in `judge_checks`, and `"block"` is not safe to proceed. `judge_checks` carries the
+  non-passing ids for `"block"` too (it is never assumed empty there); severity lives
+  in `proceed` and per-check detail in `checks[]`.
   """
 
   alias Pixir.{Auth, Config, Paths}
@@ -21,10 +27,13 @@ defmodule Pixir.Doctor do
     model = model_before_default || entry.default_model
     checks = checks(workspace, opts, config, entry, model)
     failed = Enum.filter(checks, &(&1["status"] == "failed"))
+    status = status(checks)
 
     %{
       "ok" => failed == [],
-      "status" => status(checks),
+      "status" => status,
+      "proceed" => proceed(status),
+      "judge_checks" => non_passing_check_ids(checks),
       "version" => Pixir.version(),
       "workspace" => Path.expand(workspace),
       "config_effective" => config["effective"],
@@ -52,9 +61,16 @@ defmodule Pixir.Doctor do
           "\n\nNext actions:\n" <> Enum.map_join(actions, "\n", &"- #{&1}")
       end
 
+    judgment =
+      case result["judge_checks"] do
+        [] -> ""
+        ids -> "\njudge_checks: #{Enum.join(ids, ", ")}"
+      end
+
     """
     Pixir doctor
     status: #{result["status"]}
+    proceed: #{result["proceed"]}#{judgment}
     version: #{result["version"]}
     workspace: #{result["workspace"]}
 
@@ -279,6 +295,16 @@ defmodule Pixir.Doctor do
       {:ok, %{mode: mode}} -> Bitwise.band(mode, 0o111) != 0
       {:error, _} -> false
     end
+  end
+
+  defp proceed("ready"), do: "true"
+  defp proceed("ready_with_warnings"), do: "judge"
+  defp proceed(_status), do: "block"
+
+  defp non_passing_check_ids(checks) do
+    checks
+    |> Enum.reject(&(&1["status"] == "passed"))
+    |> Enum.map(& &1["id"])
   end
 
   defp status(checks) do

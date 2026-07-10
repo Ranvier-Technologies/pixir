@@ -403,6 +403,127 @@ defmodule Pixir.Tools.ExecutorTest do
     end
   end
 
+  describe "run/2 apply_virtual_diff integration gates" do
+    test "apply_virtual_diff targeting the state dir is denied before mutation", %{
+      ctx: ctx,
+      ws: ws
+    } do
+      artifact = avd_artifact([avd_add_change(".pixir/sessions/evil.ndjson", "evil\n")])
+
+      assert {:error, %{error: %{kind: :protected_path, details: details}}} =
+               Executor.run(
+                 %{
+                   call_id: "apply_evidence",
+                   name: "apply_virtual_diff",
+                   args: %{"artifact" => artifact, "dry_run" => false}
+                 },
+                 ctx
+               )
+
+      assert details.tool == "apply_virtual_diff"
+      refute File.exists?(Path.join(ws, ".pixir/sessions/evil.ndjson"))
+    end
+
+    test "apply_virtual_diff randomized temp path leaves old fixed temp name untouched", %{
+      ctx: ctx,
+      ws: ws
+    } do
+      File.mkdir_p!(Path.join(ws, "lib"))
+      old_fixed_tmp = Path.join(ws, "lib/collide.txt.pixir-apply-tmp")
+      File.write!(old_fixed_tmp, "sentinel\n")
+
+      artifact = avd_artifact([avd_add_change("lib/collide.txt", "new\n")])
+
+      assert {:ok, %{"status" => "applied", "counts" => %{"applied" => 1}}} =
+               Executor.run(
+                 %{
+                   call_id: "apply_temp_collision",
+                   name: "apply_virtual_diff",
+                   args: %{"artifact" => artifact, "dry_run" => false}
+                 },
+                 ctx
+               )
+
+      assert File.read!(Path.join(ws, "lib/collide.txt")) == "new\n"
+      assert File.read!(old_fixed_tmp) == "sentinel\n"
+    end
+
+    test "bounded_write gate denies apply_virtual_diff outside allow_writes and allows inside", %{
+      ctx: ctx,
+      ws: ws
+    } do
+      {:ok, policy} =
+        WritePolicy.normalize(%{
+          "version" => 1,
+          "metadata" => %{"id" => "apply-executor-test"},
+          "allow_writes" => ["allowed/**"]
+        })
+
+      ctx = Map.put(ctx, :permission, %{mode: :auto, policy: policy})
+      denied_artifact = avd_artifact([avd_add_change("denied/out.txt", "no\n")])
+
+      assert {:error, %{error: %{kind: :write_policy_denied, details: details}}} =
+               Executor.run(
+                 %{
+                   call_id: "apply_policy_denied",
+                   name: "apply_virtual_diff",
+                   args: %{"artifact" => denied_artifact, "dry_run" => false}
+                 },
+                 ctx
+               )
+
+      assert details["tool"] == "apply_virtual_diff"
+      assert details["requested_path"] == "denied/out.txt"
+      refute File.exists?(Path.join(ws, "denied/out.txt"))
+
+      allowed_artifact = avd_artifact([avd_add_change("allowed/in.txt", "yes\n")])
+
+      assert {:ok, %{"status" => "applied", "counts" => %{"applied" => 1}}} =
+               Executor.run(
+                 %{
+                   call_id: "apply_policy_allowed",
+                   name: "apply_virtual_diff",
+                   args: %{"artifact" => allowed_artifact, "dry_run" => false}
+                 },
+                 ctx
+               )
+
+      assert File.read!(Path.join(ws, "allowed/in.txt")) == "yes\n"
+    end
+  end
+
+  defp avd_artifact(changes) do
+    %{
+      "kind" => "virtual_diff",
+      "version" => 1,
+      "workspace_strategy" => "virtual_overlay",
+      "workspace_fidelity" => "virtual_shell_no_host_binaries",
+      "parent_workspace" => %{"mutation" => "none"},
+      "import" => %{"read_set" => [], "file_count" => 0, "byte_count" => 0, "truncated" => false},
+      "commands" => [],
+      "summary" => %{},
+      "changes" => changes,
+      "limits" => %{},
+      "caveats" => [],
+      "apply" => %{"status" => "not_applied", "requires_explicit_apply" => true}
+    }
+  end
+
+  defp avd_add_change(path, content) do
+    %{
+      "path" => path,
+      "operation" => "add",
+      "after" => %{
+        "sha256" => avd_sha256(content),
+        "byte_count" => byte_size(content),
+        "content" => content
+      },
+      "diff" => %{"format" => "unified", "text" => "+#{content}", "truncated" => false}
+    }
+  end
+
+  defp avd_sha256(content), do: :crypto.hash(:sha256, content) |> Base.encode16(case: :lower)
+
   describe "run/2 permissions (ADR 0006)" do
     test "default context (:auto) runs writes without asking", %{ctx: ctx, ws: ws} do
       assert {:ok, _} =

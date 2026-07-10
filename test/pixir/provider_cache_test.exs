@@ -6,7 +6,7 @@ defmodule Pixir.Provider.CacheTest do
   test "metadata builds a bounded safe cache-family key" do
     assert {:ok, metadata} =
              Cache.metadata(%{
-               session_id: "session-with-private-path-/Users/bastian/project",
+               session_id: "session-with-private-path-/Users/example/project",
                model: "gpt-5.5",
                mode: :build,
                tools: [%{"name" => "read"}, %{"name" => "bash"}],
@@ -20,7 +20,7 @@ defmodule Pixir.Provider.CacheTest do
     assert key =~ "m_gpt-5.5"
     assert key =~ "r_build"
     refute key =~ "/Users"
-    refute key =~ "bastian"
+    refute key =~ "example"
     refute key =~ "alpha"
     assert byte_size(metadata["toolset_hash"]) == 16
     assert byte_size(metadata["skill_index_hash"]) == 16

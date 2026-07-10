@@ -6,6 +6,7 @@ defmodule Pixir.ToolsTest do
   alias Pixir.Test.WorkspaceFixtures
 
   alias Pixir.Tools.{
+    ApplyVirtualDiff,
     Bash,
     CloseAgent,
     CommandBoundary,
@@ -72,6 +73,19 @@ defmodule Pixir.ToolsTest do
 
       assert :ok = ToolContract.verify!(Bash, %{"command" => "echo hi"}, ctx)
 
+      assert :ok =
+               ToolContract.verify!(
+                 ApplyVirtualDiff,
+                 %{
+                   "artifact" => %{
+                     "kind" => "virtual_diff",
+                     "version" => 1,
+                     "changes" => []
+                   }
+                 },
+                 ctx
+               )
+
       write_skill(Path.join(ws, ".agents/skills/sample"), "sample", "Sample skill", "body")
 
       assert :ok =
@@ -115,7 +129,9 @@ defmodule Pixir.ToolsTest do
       ctx = Map.put(ctx, :permission, %{policy: policy})
 
       assert {:ok, plan} = SpawnAgent.dry_run(%{"task" => "inspect auth"}, ctx)
-      assert plan["write_policy"]["id"] == "spawn-preview"
+      # dry_run now returns the same normalized plan as validate_only (#204
+      # gap 4); the inherited policy rides the plan projection.
+      assert get_in(plan, ["plan", "write_policy", "id"]) == "spawn-preview"
     end
   end
 
@@ -603,6 +619,7 @@ defmodule Pixir.ToolsTest do
   describe "registry" do
     test "resolves known tools and rejects unknown", %{} do
       assert {:ok, Read} = Registry.fetch("read")
+      assert {:ok, ApplyVirtualDiff} = Registry.fetch("apply_virtual_diff")
       assert {:error, %{error: %{kind: :unknown_tool}}} = Registry.fetch("nope")
     end
 
@@ -611,9 +628,23 @@ defmodule Pixir.ToolsTest do
       assert length(specs) == length(Registry.names())
       assert Enum.map(specs, & &1["name"]) == Registry.names()
 
+      assert Enum.any?(specs, &(&1["name"] == "apply_virtual_diff"))
+
       assert Enum.all?(
                specs,
                &match?(%{"type" => "function", "name" => _, "parameters" => _}, &1)
+             )
+    end
+
+    test "anthropic_specs builds input schemas for every tool" do
+      specs = Registry.anthropic_specs()
+      assert length(specs) == length(Registry.names())
+      assert Enum.map(specs, & &1["name"]) == Registry.names()
+      assert Enum.any?(specs, &(&1["name"] == "apply_virtual_diff"))
+
+      assert Enum.all?(
+               specs,
+               &match?(%{"name" => _, "description" => _, "input_schema" => _}, &1)
              )
     end
   end
