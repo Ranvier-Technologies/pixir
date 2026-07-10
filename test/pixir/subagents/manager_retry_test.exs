@@ -7,11 +7,7 @@ defmodule Pixir.Subagents.ManagerRetryTest do
     @script __MODULE__.Script
 
     def start_script(results) do
-      case Process.whereis(@script) do
-        nil -> :ok
-        pid -> Agent.stop(pid)
-      end
-
+      stop_script()
       Agent.start_link(fn -> results end, name: @script)
     end
 

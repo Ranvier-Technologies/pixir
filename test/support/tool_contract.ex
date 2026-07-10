@@ -8,6 +8,15 @@ defmodule Pixir.Support.ToolContract do
 
   import ExUnit.Assertions
 
+  alias Pixir.Tools.Registry
+
+  @doc "Assert a registered Tool is present in the catalogue and satisfies the contract."
+  @spec verify_registered!(module(), map(), map()) :: :ok
+  def verify_registered!(module, sample_args, context) do
+    assert module in Registry.modules(), "#{inspect(module)}: must be registered"
+    verify!(module, sample_args, context)
+  end
+
   @doc "Assert `module` satisfies the Tool ergonomics contract for `sample_args`."
   @spec verify!(module(), map(), map()) :: :ok
   def verify!(module, sample_args, context) do

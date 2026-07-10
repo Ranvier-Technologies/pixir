@@ -57,13 +57,20 @@ defmodule Pixir.Permissions do
   def mutating?("skill_view", _args), do: false
   def mutating?("wait_agent", _args), do: false
   def mutating?("list_agents", _args), do: false
+  def mutating?("run_virtual_commands", _args), do: false
   def mutating?("run_workflow", _args), do: true
+  def mutating?("spawn_agent", %{"validate_only" => true}), do: false
   def mutating?("spawn_agent", _args), do: true
   def mutating?("send_input", _args), do: true
   def mutating?("close_agent", _args), do: true
   # `update_plan` only publishes an ephemeral plan Event (no files, no commands),
   # so it is allowed even in `:read_only`/plan mode — it IS plan mode's tool.
   def mutating?("update_plan", _args), do: false
+
+  def mutating?("apply_virtual_diff", args) do
+    Map.get(args, "dry_run", true) == false
+  end
+
   def mutating?("write", _args), do: true
   def mutating?("bash", %{"command" => command}), do: not safe_command?(command)
   def mutating?(_tool, _args), do: true
@@ -413,6 +420,7 @@ defmodule Pixir.Permissions do
   end
 
   defp reason("write"), do: "write a file"
+  defp reason("apply_virtual_diff"), do: "apply a virtual diff"
   defp reason("bash"), do: "run a shell command"
   defp reason("spawn_agent"), do: "spawn a subagent"
   defp reason("send_input"), do: "send input to a subagent"

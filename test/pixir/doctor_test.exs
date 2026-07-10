@@ -20,10 +20,32 @@ defmodule Pixir.DoctorTest do
 
     assert result["ok"] == true
     assert result["status"] == "ready_with_warnings"
+    assert result["proceed"] == "judge"
+    assert result["judge_checks"] == ["auth"]
     assert check(result, "source_install_binary")["status"] == "passed"
     assert check(result, "workspace")["status"] == "passed"
     assert check(result, "auth")["status"] == "warning"
     assert Enum.any?(result["next_actions"], &String.contains?(&1, "pixir login"))
+  end
+
+  test "ready diagnostics explicitly allow orchestration to proceed" do
+    workspace = tmp_dir("doctor-proceed")
+    binary = Path.join(workspace, "pixir")
+    File.write!(binary, "#!/bin/sh\n")
+    File.chmod!(binary, 0o755)
+
+    result =
+      Doctor.run(
+        workspace: workspace,
+        binary_path: binary,
+        config_path: Path.join(workspace, "missing-config.json"),
+        auth_status: %{authenticated?: true, kind: :api_key},
+        model: "gpt-5.5"
+      )
+
+    assert result["status"] == "ready"
+    assert result["proceed"] == "true"
+    assert result["judge_checks"] == []
   end
 
   test "fails workspace readiness when session logs cannot be written" do
@@ -42,6 +64,9 @@ defmodule Pixir.DoctorTest do
     workspace_check = check(result, "workspace")
 
     assert result["ok"] == false
+    assert result["status"] == "blocked"
+    assert result["proceed"] == "block"
+    assert result["judge_checks"] == ["source_install_binary", "workspace"]
     assert workspace_check["status"] == "failed"
     assert workspace_check["details"]["kind"] == "workspace_not_writable"
   end
@@ -117,6 +142,8 @@ defmodule Pixir.DoctorTest do
 
     assert output =~ "Pixir doctor"
     assert output =~ "status:"
+    assert output =~ "proceed: judge"
+    assert output =~ "judge_checks: source_install_binary, auth"
     assert output =~ "Next actions:"
   end
 

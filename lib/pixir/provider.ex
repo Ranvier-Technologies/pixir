@@ -21,6 +21,7 @@ defmodule Pixir.Provider do
   """
 
   alias Pixir.{BranchSummary, Compaction, Config, Event, Skills}
+  alias Pixir.Providers.ErrBody
   alias Pixir.Provider.{FinchTransport, HostedTools, StreamIdle, TransportPolicy}
 
   @default_base_url "https://chatgpt.com/backend-api"
@@ -105,6 +106,8 @@ defmodule Pixir.Provider do
   defp backoff_ms(n), do: min(8_000, 500 * Integer.pow(2, n))
 
   defp retryable?(%{error: %{kind: kind}}) when kind in [:network, :rate_limited], do: true
+
+  defp retryable?(%{error: %{kind: :provider_http_error, details: %{retryable: true}}}), do: true
 
   defp retryable?(%{error: %{kind: :provider_http_error, details: %{status: status}}})
        when status in [500, 502, 503, 504], do: true
@@ -458,13 +461,16 @@ defmodule Pixir.Provider do
 
     events
     |> Enum.with_index()
-    |> Enum.reduce(%{items: [], pending_calls: %{}}, fn {event, index}, state ->
-      fold_event(event, state, model, workspace,
-        current_user?: latest_user_index == index,
-        active_turn?: is_integer(latest_user_index) and index >= latest_user_index
-      )
-    end)
-    |> close_orphan_tool_calls()
+    |> Enum.reduce(
+      %{items: [], pending_calls: %{}, deferred_skill_activations: %{}},
+      fn {event, index}, state ->
+        fold_event(event, state, model, workspace,
+          current_user?: latest_user_index == index,
+          active_turn?: is_integer(latest_user_index) and index >= latest_user_index
+        )
+      end
+    )
+    |> close_orphan_tool_calls(model, workspace)
     |> Map.fetch!(:items)
   end
 
@@ -475,6 +481,13 @@ defmodule Pixir.Provider do
          workspace,
          _opts
        ) do
+    state =
+      if map_size(state.deferred_skill_activations) > 0 do
+        close_orphan_tool_calls(state, model, workspace)
+      else
+        state
+      end
+
     items = to_input_item(event, model, workspace: workspace)
 
     state
@@ -490,17 +503,36 @@ defmodule Pixir.Provider do
          opts
        ) do
     if Map.has_key?(state.pending_calls, id) do
-      items =
+      result_items =
         to_input_item(event, model,
           workspace: workspace,
           resource_view_rehydrate?: Keyword.get(opts, :active_turn?, false)
         )
 
+      {activations, deferred_skill_activations} =
+        Map.pop(state.deferred_skill_activations, id, [])
+
+      activation_items =
+        Enum.flat_map(activations, &to_input_item(&1, model, workspace: workspace))
+
       state
-      |> Map.update!(:items, &(&1 ++ items))
+      |> Map.update!(:items, &(&1 ++ result_items ++ activation_items))
       |> Map.update!(:pending_calls, &Map.delete(&1, id))
+      |> Map.put(:deferred_skill_activations, deferred_skill_activations)
     else
       state
+    end
+  end
+
+  defp fold_event(%{type: :skill_activation} = event, state, model, workspace, opts) do
+    case pending_skill_view_call_id(event, state.pending_calls) do
+      {:ok, call_id} ->
+        Map.update!(state, :deferred_skill_activations, fn deferred ->
+          Map.update(deferred, call_id, [event], &(&1 ++ [event]))
+        end)
+
+      :error ->
+        fold_non_tool_event(event, state, model, workspace, opts)
     end
   end
 
@@ -513,7 +545,7 @@ defmodule Pixir.Provider do
   end
 
   defp fold_non_tool_event(event, state, model, workspace, opts) do
-    state = close_orphan_tool_calls(state)
+    state = close_orphan_tool_calls(state, model, workspace)
 
     Map.update!(
       state,
@@ -526,39 +558,104 @@ defmodule Pixir.Provider do
     )
   end
 
+  defp pending_skill_view_call_id(
+         %{data: %{"name" => activation_name}},
+         pending_calls
+       )
+       when is_binary(activation_name) and map_size(pending_calls) == 1 do
+    case Map.to_list(pending_calls) do
+      [{call_id, %{data: %{"name" => "skill_view", "args" => args}}}] when is_map(args) ->
+        path = Map.get(args, "path", "SKILL.md")
+
+        if args["name"] == activation_name and is_binary(path) and Skills.main_file?(path) do
+          {:ok, call_id}
+        else
+          :error
+        end
+
+      _other ->
+        :error
+    end
+  end
+
+  defp pending_skill_view_call_id(_event, _pending_calls), do: :error
+
   defp transparent_while_tool_pending?(%{type: type})
        when type in [:permission_decision, :provider_usage, :subagent_event, :workflow_event],
        do: true
 
   defp transparent_while_tool_pending?(_event), do: false
 
-  defp close_orphan_tool_calls(%{pending_calls: pending} = state) when map_size(pending) == 0,
-    do: state
+  defp close_orphan_tool_calls(
+         %{pending_calls: pending, deferred_skill_activations: deferred} = state,
+         model,
+         workspace
+       )
+       when map_size(pending) == 0 do
+    activation_items = deferred_activation_items(deferred, model, workspace)
 
-  defp close_orphan_tool_calls(%{items: items, pending_calls: pending} = state) do
-    fallbacks =
+    %{
+      state
+      | items: state.items ++ activation_items,
+        deferred_skill_activations: %{}
+    }
+  end
+
+  defp close_orphan_tool_calls(
+         %{items: items, pending_calls: pending, deferred_skill_activations: deferred} = state,
+         model,
+         workspace
+       ) do
+    pending_items =
       pending
       |> Enum.sort_by(fn {call_id, _event} -> call_id end)
-      |> Enum.map(fn {call_id, event} ->
-        %{
-          "type" => "function_call_output",
-          "call_id" => call_id,
-          "output" =>
-            Jason.encode!(%{
-              ok: false,
-              error: %{
-                kind: "orphan_tool_call",
-                message: "Pixir replay found a tool_call without a matching tool_result",
-                details: %{
-                  call_id: call_id,
-                  tool: event.data["name"]
-                }
-              }
-            })
-        }
+      |> Enum.flat_map(fn {call_id, event} ->
+        [orphan_tool_call_output(call_id, event)] ++
+          activation_input_items(Map.get(deferred, call_id, []), model, workspace)
       end)
 
-    %{state | items: items ++ fallbacks, pending_calls: %{}}
+    remaining_activations =
+      deferred
+      |> Map.drop(Map.keys(pending))
+      |> deferred_activation_items(model, workspace)
+
+    %{
+      state
+      | items: items ++ pending_items ++ remaining_activations,
+        pending_calls: %{},
+        deferred_skill_activations: %{}
+    }
+  end
+
+  defp orphan_tool_call_output(call_id, event) do
+    %{
+      "type" => "function_call_output",
+      "call_id" => call_id,
+      "output" =>
+        Jason.encode!(%{
+          ok: false,
+          error: %{
+            kind: "orphan_tool_call",
+            message: "Pixir replay found a tool_call without a matching tool_result",
+            details: %{
+              call_id: call_id,
+              tool: event.data["name"]
+            }
+          }
+        })
+    }
+  end
+
+  defp deferred_activation_items(deferred, model, workspace) do
+    deferred
+    |> Enum.sort_by(fn {call_id, _events} -> call_id end)
+    |> Enum.flat_map(fn {_call_id, events} ->
+      activation_input_items(events, model, workspace)
+    end)
+  end
+
+  defp activation_input_items(events, model, workspace) do
+    Enum.flat_map(events, &to_input_item(&1, model, workspace: workspace))
   end
 
   defp latest_user_index(events) do
@@ -841,7 +938,7 @@ defmodule Pixir.Provider do
   defp handle_chunk({:data, data}, %{status: status} = acc) when status in 200..299,
     do: feed_sse(acc, data)
 
-  defp handle_chunk({:data, data}, acc), do: %{acc | err_body: acc.err_body <> data}
+  defp handle_chunk({:data, data}, acc), do: %{acc | err_body: ErrBody.append(acc.err_body, data)}
 
   defp feed_sse(acc, data) do
     buffer = acc.buffer <> data
@@ -966,13 +1063,15 @@ defmodule Pixir.Provider do
 
   defp put_stream_error(%{stream_error: nil, status: status} = acc, event_type, error) do
     message = error["message"] || "Responses stream failed."
+    type = error["type"] || ""
+    code = error["code"] || ""
 
     # ADR 0020: in-band stream errors (e.g. `response.failed` over a 200 SSE
     # stream or the WebSocket transport) carry overflow rejections too. Unlike
     # HTTP classification, this path has no status guard, so message-only matches
     # are accepted only for provider/context-shaped error families.
     kind =
-      if stream_context_overflow?(error["type"] || "", error["code"] || "", error["message"]) do
+      if stream_context_overflow?(type, code, error["message"]) do
         :context_overflow
       else
         :provider_http_error
@@ -981,17 +1080,39 @@ defmodule Pixir.Provider do
     %{
       acc
       | stream_error:
-          err(kind, message, %{
-            status: status,
-            event_type: event_type,
-            code: error["code"],
-            type: error["type"],
-            param: error["param"]
-          })
+          err(
+            kind,
+            message,
+            maybe_retryable_stream_error_details(kind, type, code, %{
+              status: status,
+              event_type: event_type,
+              code: error["code"],
+              type: error["type"],
+              param: error["param"]
+            })
+          )
     }
   end
 
   defp put_stream_error(acc, _event_type, _error), do: acc
+
+  defp maybe_retryable_stream_error_details(:provider_http_error, type, code, details) do
+    if transient_stream_error?(type, code) do
+      Map.put(details, :retryable, true)
+    else
+      details
+    end
+  end
+
+  defp maybe_retryable_stream_error_details(_kind, _type, _code, details), do: details
+
+  # #278: mirror the Anthropic in-band classifier precedent by stamping retryable
+  # once at the stream-error source; retry layers only read this classification.
+  @transient_stream_errors ~w(server_is_overloaded service_unavailable_error server_error
+                              overloaded rate_limit_exceeded too_many_requests)
+  defp transient_stream_error?(type, code) do
+    type in @transient_stream_errors or code in @transient_stream_errors
+  end
 
   defp decode_args(json) when is_binary(json) do
     case Jason.decode(json) do
@@ -1298,6 +1419,16 @@ defmodule Pixir.Provider do
   # Parse the error body and assign a stable `kind` (ADR 0005), mirroring Pi's
   # handling of usage/rate limits and unsupported models.
   defp classify_http_error(status, body) do
+    error = do_classify_http_error(status, body)
+
+    if ErrBody.truncated?(body) do
+      update_in(error, [:error, :details], &Map.put(&1, :err_body_truncated, true))
+    else
+      error
+    end
+  end
+
+  defp do_classify_http_error(status, body) do
     error = parse_error_body(body)
     type = error["type"] || ""
     code = error["code"] || ""

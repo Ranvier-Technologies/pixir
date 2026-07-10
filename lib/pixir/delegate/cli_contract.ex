@@ -46,11 +46,13 @@ defmodule Pixir.Delegate.CLIContract do
   alias Pixir.Permissions.WritePolicy
 
   @contract_version 1
+  # Revision 4: additive virtual-overlay child artifact/apply projection and
+  # dry-run bounded-overlay planning evidence (#284).
   # Revision 3: additive dry-run children[].attachment_count (#250).
   # Revision 2: additive children[].index + children_order envelope keys
   # (#227). The pixir.delegate.envelope.v1 family name is reserved for
   # breaking shape changes; additive keys bump this revision instead.
-  @envelope_schema_version 3
+  @envelope_schema_version 4
   @max_spec_bytes 1_000_000
   @supported_strategies ~w(subagents workflow)
   @supported_modes [nil, "read_only", "bounded_write"]
@@ -71,8 +73,9 @@ defmodule Pixir.Delegate.CLIContract do
   )
   @known_subagents_keys ~w(
     role agent count max_threads max_depth timeout_ms transport workspace_mode model
-    reasoning_effort web_search
+    reasoning_effort web_search read_set limits
   )
+  @virtual_overlay_limit_keys Pixir.VirtualOverlay.limit_keys()
   @valid_reasoning_efforts Pixir.Config.valid_reasoning_efforts()
   @web_search_config_fields ~w(
     enabled
@@ -122,7 +125,7 @@ defmodule Pixir.Delegate.CLIContract do
           {:ok, spec, spec_meta} ->
             if request.dry_run? do
               dry_run_result(request, spec, spec_meta)
-              |> maybe_put_dry_run_attachment_counts(spec)
+              |> maybe_put_dry_run_counts(spec)
             else
               runtime_result(runner, request, spec, spec_meta, runtime_opts)
             end
@@ -172,6 +175,65 @@ defmodule Pixir.Delegate.CLIContract do
   @doc "Return the supported Delegate contract version."
   @spec contract_version() :: pos_integer()
   def contract_version, do: @contract_version
+
+  defp maybe_put_dry_run_counts(result, spec) do
+    result
+    |> maybe_put_dry_run_attachment_counts(spec)
+    |> maybe_put_dry_run_virtual_overlay(spec)
+    |> maybe_put_dry_run_verify_command_count(spec)
+  end
+
+  defp maybe_put_dry_run_virtual_overlay(
+         {:ok, %{payload: %{"children" => children} = payload} = rendered},
+         %{"subagents" => %{"workspace_mode" => "virtual_overlay"} = subagents}
+       )
+       when is_list(children) do
+    read_set_count = subagents |> Map.fetch!("read_set") |> length()
+
+    children =
+      Enum.map(children, fn child ->
+        child
+        |> Map.put("workspace_mode", "virtual_overlay")
+        |> Map.put("read_set_count", read_set_count)
+        |> put_if_present("limits", Map.get(subagents, "limits"))
+      end)
+
+    {:ok, %{rendered | payload: Map.put(payload, "children", children)}}
+  end
+
+  defp maybe_put_dry_run_virtual_overlay(result, _spec), do: result
+
+  defp maybe_put_dry_run_verify_command_count(
+         {:ok, %{payload: payload} = rendered},
+         %{"mode" => "bounded_write"} = spec
+       ) do
+    count = write_policy_verify_command_count(spec)
+
+    payload =
+      payload
+      |> Map.put("verify_command_count", count)
+      |> maybe_put_child_verify_command_counts(count)
+
+    {:ok, %{rendered | payload: payload}}
+  end
+
+  defp maybe_put_dry_run_verify_command_count(result, _spec), do: result
+
+  defp maybe_put_child_verify_command_counts(%{"children" => children} = payload, count)
+       when is_list(children) do
+    children = Enum.map(children, &Map.put(&1, "verify_command_count", count))
+    Map.put(payload, "children", children)
+  end
+
+  defp maybe_put_child_verify_command_counts(payload, _count), do: payload
+
+  defp write_policy_verify_command_count(%{
+         "write_policy" => %{"bash" => %{"verify" => commands}}
+       })
+       when is_list(commands),
+       do: length(commands)
+
+  defp write_policy_verify_command_count(_spec), do: 0
 
   defp maybe_put_dry_run_attachment_counts(
          {:ok, %{payload: %{"children" => children} = payload} = rendered},
@@ -331,16 +393,311 @@ defmodule Pixir.Delegate.CLIContract do
   end
 
   # decode_spec/1 guarantees a JSON object, so a map is the only input shape.
-  defp validate_strict_spec_keys(%{} = spec) do
+  defp validate_strict_spec_keys(%{} = spec, workspace, opts) do
     with :ok <- reject_unknown_keys(spec, @known_spec_keys, [], %{}),
          :ok <- validate_subagents_shape_for_strict_keys(spec),
          :ok <- validate_task_entries_for_strict_keys(spec),
+         :ok <- validate_virtual_overlay_contract(spec),
          :ok <- validate_subagent_model(spec),
          :ok <- validate_subagent_reasoning_effort(spec),
-         :ok <- validate_subagent_web_search(spec) do
+         :ok <- validate_subagent_web_search(spec),
+         :ok <- validate_bounded_write_read_only_role(spec, workspace, opts) do
       :ok
     end
   end
+
+  defp validate_virtual_overlay_contract(%{"strategy" => "subagents"} = spec) do
+    subagents = Map.get(spec, "subagents", %{})
+    workspace_mode = Map.get(subagents, "workspace_mode", "shared")
+
+    with :ok <- validate_subagent_workspace_mode(workspace_mode),
+         :ok <- validate_virtual_only_fields(subagents, workspace_mode),
+         :ok <- validate_virtual_overlay_mode(spec, workspace_mode),
+         :ok <- validate_virtual_overlay_read_set(subagents, workspace_mode),
+         :ok <- validate_virtual_overlay_limits(subagents, workspace_mode),
+         :ok <- validate_virtual_overlay_attachments(spec, workspace_mode) do
+      :ok
+    end
+  end
+
+  defp validate_virtual_overlay_contract(%{"subagents" => subagents})
+       when is_map(subagents) do
+    case Enum.find(["read_set", "limits"], &Map.has_key?(subagents, &1)) do
+      nil ->
+        :ok
+
+      field ->
+        {:error,
+         invalid_spec(
+           "subagents.#{field} is only valid for virtual_overlay subagent strategy specs",
+           %{
+             "next_actions" => ["remove_virtual_overlay_only_field", "use_subagents_strategy"]
+           }
+           |> Map.merge(object_location_details(["subagents", field]))
+         )}
+    end
+  end
+
+  defp validate_virtual_overlay_contract(_spec), do: :ok
+
+  defp validate_subagent_workspace_mode(mode)
+       when mode in ["shared", "isolated", "virtual_overlay"],
+       do: :ok
+
+  defp validate_subagent_workspace_mode(mode) do
+    {:error,
+     invalid_spec(
+       "subagents.workspace_mode is unsupported",
+       %{
+         "observed" => mode,
+         "accepted_values" => ["shared", "isolated", "virtual_overlay"],
+         "next_actions" => ["set_workspace_mode_to_shared_isolated_or_virtual_overlay"]
+       }
+       |> Map.merge(object_location_details(["subagents", "workspace_mode"]))
+     )}
+  end
+
+  defp validate_virtual_only_fields(_subagents, "virtual_overlay"), do: :ok
+
+  defp validate_virtual_only_fields(subagents, _workspace_mode) do
+    case Enum.find(["read_set", "limits"], &Map.has_key?(subagents, &1)) do
+      nil ->
+        :ok
+
+      field ->
+        {:error,
+         invalid_spec(
+           "subagents.#{field} is only valid for virtual_overlay",
+           %{
+             "workspace_mode" => Map.get(subagents, "workspace_mode", "shared"),
+             "next_actions" => [
+               "set_workspace_mode_to_virtual_overlay",
+               "remove_virtual_overlay_only_field"
+             ]
+           }
+           |> Map.merge(object_location_details(["subagents", field]))
+         )}
+    end
+  end
+
+  defp validate_virtual_overlay_mode(spec, "virtual_overlay") do
+    cond do
+      Map.has_key?(spec, "write_policy") ->
+        {:error,
+         invalid_spec(
+           "virtual_overlay delegate specs cannot include write_policy",
+           %{
+             "workspace_mode" => "virtual_overlay",
+             "next_actions" => ["remove_write_policy", "apply_the_artifact_explicitly_later"]
+           }
+           |> Map.merge(object_location_details(["write_policy"]))
+         )}
+
+      Map.get(spec, "mode") not in [nil, "read_only"] ->
+        {:error,
+         invalid_spec(
+           "virtual_overlay delegate specs must be read_only",
+           %{
+             "observed" => Map.get(spec, "mode"),
+             "accepted_values" => ["read_only"],
+             "next_actions" => ["set_mode_to_read_only", "remove_mode"]
+           }
+           |> Map.merge(object_location_details(["mode"]))
+         )}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_virtual_overlay_mode(_spec, _workspace_mode), do: :ok
+
+  defp validate_virtual_overlay_read_set(subagents, "virtual_overlay") do
+    read_set = Map.get(subagents, "read_set")
+
+    case Pixir.VirtualOverlay.validate_read_set(read_set) do
+      :ok ->
+        :ok
+
+      {:error, %{kind: :invalid_read_set_entry, index: index}} ->
+        {:error,
+         invalid_spec(
+           "subagents.read_set entries must be non-empty strings",
+           %{
+             "observed" => Enum.at(read_set, index),
+             "next_actions" => ["replace_read_set_entry_with_a_bounded_path"]
+           }
+           |> Map.merge(read_set_location_details(index))
+         )}
+
+      {:error, %{kind: :unbounded_read_set, index: index}} ->
+        {:error,
+         invalid_spec(
+           "subagents.read_set cannot import an unbounded workspace",
+           %{
+             "observed" => Enum.at(read_set, index),
+             "matched_rule" => "unbounded_read_set",
+             "next_actions" => ["replace_unbounded_glob_with_bounded_paths"]
+           }
+           |> Map.merge(read_set_location_details(index))
+         )}
+
+      {:error, _reason} ->
+        {:error,
+         invalid_spec(
+           "virtual_overlay delegate specs require a non-empty subagents.read_set",
+           %{
+             "observed" => read_set,
+             "missing" => ["subagents.read_set"],
+             "next_actions" => ["add_a_non_empty_bounded_read_set"]
+           }
+           |> Map.merge(object_location_details(["subagents", "read_set"]))
+         )}
+    end
+  end
+
+  defp validate_virtual_overlay_read_set(_subagents, _workspace_mode), do: :ok
+
+  defp validate_virtual_overlay_limits(subagents, "virtual_overlay") do
+    case Map.fetch(subagents, "limits") do
+      :error ->
+        :ok
+
+      {:ok, limits} when is_map(limits) ->
+        limits
+        |> Enum.sort_by(fn {key, _value} -> to_string(key) end)
+        |> Enum.reduce_while(:ok, fn {key, value}, :ok ->
+          cond do
+            key not in @virtual_overlay_limit_keys ->
+              {:halt,
+               {:error,
+                invalid_spec(
+                  "subagents.limits contains an unknown key",
+                  %{
+                    "unknown_key" => key,
+                    "accepted_keys" => @virtual_overlay_limit_keys,
+                    "next_actions" => ["remove_unknown_limit", "check_virtual_overlay_limits"]
+                  }
+                  |> Map.merge(object_location_details(["subagents", "limits", key]))
+                )}}
+
+            not is_integer(value) or value < 0 ->
+              {:halt,
+               {:error,
+                invalid_spec(
+                  "virtual_overlay limits must be non-negative integers",
+                  %{
+                    "observed" => value,
+                    "next_actions" => ["set_limit_to_a_non_negative_integer"]
+                  }
+                  |> Map.merge(object_location_details(["subagents", "limits", key]))
+                )}}
+
+            true ->
+              {:cont, :ok}
+          end
+        end)
+
+      {:ok, value} ->
+        {:error,
+         invalid_spec(
+           "subagents.limits must be an object",
+           %{
+             "observed" => value,
+             "next_actions" => ["set_limits_to_an_object_or_remove_it"]
+           }
+           |> Map.merge(object_location_details(["subagents", "limits"]))
+         )}
+    end
+  end
+
+  defp validate_virtual_overlay_limits(_subagents, _workspace_mode), do: :ok
+
+  defp validate_virtual_overlay_attachments(spec, "virtual_overlay") do
+    case Runner.virtual_overlay_attachment_index(spec) do
+      nil ->
+        :ok
+
+      index ->
+        {:error,
+         invalid_spec(
+           "virtual_overlay delegate tasks cannot include attachments",
+           %{
+             "next_actions" => ["remove_attachments", "add_required_files_to_read_set"]
+           }
+           |> Map.merge(task_attachment_location_details(index))
+         )}
+    end
+  end
+
+  defp validate_virtual_overlay_attachments(_spec, _workspace_mode), do: :ok
+
+  defp validate_bounded_write_read_only_role(
+         %{"mode" => "bounded_write", "strategy" => "workflow"},
+         _workspace,
+         _opts
+       ),
+       do: :ok
+
+  defp validate_bounded_write_read_only_role(
+         %{"mode" => "bounded_write"} = spec,
+         workspace,
+         opts
+       ) do
+    role = effective_subagent_role(spec)
+    workspace = effective_spec_workspace(spec, workspace)
+    agents_opts = Keyword.get(opts, :agents_opts, [])
+
+    case Agents.get(role, workspace, agents_opts) do
+      # read_only_mode?/1 normalizes the config spellings ("read-only",
+      # "read_only", :read_only) — a raw-spelled role must not bypass the gate.
+      {:ok, %{sandbox_mode: mode}} ->
+        if read_only_mode?(mode) do
+          {:error,
+           invalid_spec(
+             "bounded_write conflicts with the read-only role #{role}",
+             %{
+               "role" => role,
+               "role_sandbox_mode" => mode,
+               "mode" => "bounded_write",
+               "next_actions" => ["use_a_write_capable_role", "set_mode_to_read_only"]
+             }
+             |> Map.merge(object_location_details(["subagents", "role"]))
+           )}
+        else
+          :ok
+        end
+
+      {:ok, _agent} ->
+        :ok
+
+      {:error, _error} ->
+        :ok
+    end
+  end
+
+  defp validate_bounded_write_read_only_role(_spec, _workspace, _opts), do: :ok
+
+  defp effective_subagent_role(spec) do
+    get_in(spec, ["subagents", "role"]) ||
+      get_in(spec, ["subagents", "agent"]) ||
+      Map.get(spec, "agent") ||
+      "default"
+  end
+
+  # Agent discovery must never be laxer than the runner's confinement
+  # (runner normalize_workspace rejects escapes): an unconfined spec workspace
+  # falls back to the caller workspace for the lookup, and the runner keeps
+  # owning the honest rejection of the escape itself.
+  defp effective_spec_workspace(%{"workspace" => spec_workspace}, caller_workspace)
+       when is_binary(spec_workspace) and is_binary(caller_workspace) do
+    case Pixir.Tools.Workspace.confine(caller_workspace, spec_workspace) do
+      {:ok, confined} -> confined
+      {:error, _outside} -> Path.expand(caller_workspace)
+    end
+  end
+
+  defp effective_spec_workspace(_spec, caller_workspace), do: caller_workspace
 
   defp validate_subagents_shape_for_strict_keys(%{"subagents" => %{} = subagents}) do
     reject_unknown_keys(subagents, @known_subagents_keys, ["subagents"], %{
@@ -550,6 +907,14 @@ defmodule Pixir.Delegate.CLIContract do
        }
        |> Map.merge(task_attachment_location_details(task_index, attachment_index))
      )}
+  end
+
+  defp read_set_location_details(index) do
+    %{
+      "field" => "subagents.read_set[#{index + 1}]",
+      "json_pointer" => "/subagents/read_set/#{index}",
+      "path" => ["subagents", "read_set", index]
+    }
   end
 
   defp task_entry_location_details(index) do
@@ -1368,7 +1733,7 @@ defmodule Pixir.Delegate.CLIContract do
     # must not wait on (or be masked by) filesystem-backed role discovery.
     with {:ok, raw, source_meta} <- read_spec(request.spec_source, read_stdin),
          {:ok, spec} <- decode_spec(raw),
-         :ok <- validate_strict_spec_keys(spec),
+         :ok <- validate_strict_spec_keys(spec, request.workspace, runtime_opts),
          {:ok, spec_meta} <- validate_spec(spec, request.workspace, runtime_opts) do
       {:ok, spec, Map.merge(source_meta, spec_meta)}
     end
@@ -1652,7 +2017,7 @@ defmodule Pixir.Delegate.CLIContract do
        ) do
     with {:ok, policy} <- normalize_contract_write_policy(spec),
          :ok <- validate_workflow_bounded_write_contract(spec, policy),
-         :ok <- rehearse_workflow_contract(spec, "bounded_write", workspace, runtime_opts) do
+         :ok <- rehearse_workflow_contract(spec, "bounded_write", workspace, runtime_opts, policy) do
       {:ok,
        %{
          "workflow_write_validation" => %{
@@ -1671,7 +2036,8 @@ defmodule Pixir.Delegate.CLIContract do
              spec,
              Map.get(spec, "mode") || "read_only",
              workspace,
-             runtime_opts
+             runtime_opts,
+             nil
            ) do
       {:ok,
        %{
@@ -2355,8 +2721,9 @@ defmodule Pixir.Delegate.CLIContract do
   defp invalid_args(message, details), do: error_payload("invalid_args", message, details)
   defp invalid_json(message, details), do: error_payload("invalid_json", message, details)
 
-  defp rehearse_workflow_contract(spec, mode, workspace, runtime_opts) do
+  defp rehearse_workflow_contract(spec, mode, workspace, runtime_opts, policy) do
     opts = Keyword.put(runtime_opts, :workspace, workspace)
+    opts = if is_nil(policy), do: opts, else: Keyword.put(opts, :write_policy, policy)
 
     case Runner.rehearse_workflow_spec(spec, mode, opts) do
       {:ok, _plan} ->

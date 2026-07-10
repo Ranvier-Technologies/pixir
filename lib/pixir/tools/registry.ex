@@ -8,12 +8,14 @@ defmodule Pixir.Tools.Registry do
   alias Pixir.Provider
 
   alias Pixir.Tools.{
+    ApplyVirtualDiff,
     Bash,
     CloseAgent,
     Edit,
     ListAgents,
     Read,
     ResourceView,
+    RunVirtualCommands,
     RunWorkflow,
     SendInput,
     SkillView,
@@ -25,6 +27,7 @@ defmodule Pixir.Tools.Registry do
   }
 
   @tools %{
+    "apply_virtual_diff" => ApplyVirtualDiff,
     "read" => Read,
     "resource_view" => ResourceView,
     "write" => Write,
@@ -36,6 +39,7 @@ defmodule Pixir.Tools.Registry do
     "send_input" => SendInput,
     "close_agent" => CloseAgent,
     "list_agents" => ListAgents,
+    "run_virtual_commands" => RunVirtualCommands,
     "run_workflow" => RunWorkflow,
     "bash" => Bash,
     # Always available (benign); plan mode's system prompt + `:read_only` posture

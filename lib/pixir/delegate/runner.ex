@@ -37,6 +37,13 @@ defmodule Pixir.Delegate.Runner do
   @supported_modes [nil, "read_only", "bounded_write"]
   @supported_transports ["auto", "websocket", "http_sse"]
   @incomplete_statuses ~w(partial timed_out failed cancelled)
+  @guided_resume_statuses ~w(failed timed_out cancelled detached closed)
+  @websocket_transport_error_kinds ~w(
+    websocket_read_failed websocket_failed websocket_closed websocket_timeout
+  )
+  @in_band_transport_error_kinds ~w(
+    service_unavailable_error server_is_overloaded overloaded server_error
+  )
 
   @doc "Run a validated Delegate spec through the attached runtime path."
   @spec run(map(), map(), map(), keyword()) :: {:ok, map()} | {:error, map()}
@@ -160,6 +167,7 @@ defmodule Pixir.Delegate.Runner do
          {:ok, reasoning_effort} <- normalize_reasoning_effort(spec),
          {:ok, web_search} <- normalize_web_search(spec),
          {:ok, workspace_mode} <- normalize_workspace_mode(spec),
+         {:ok, virtual_overlay} <- normalize_virtual_overlay(spec, workspace_mode, mode),
          {:ok, agent} <- normalize_agent(spec),
          :ok <- ensure_child_count(tasks, spec_meta) do
       {:ok,
@@ -179,6 +187,7 @@ defmodule Pixir.Delegate.Runner do
          reasoning_effort: reasoning_effort,
          web_search: web_search,
          workspace_mode: workspace_mode,
+         virtual_overlay: virtual_overlay,
          agent: agent,
          planned_child_count: length(tasks)
        }}
@@ -735,15 +744,108 @@ defmodule Pixir.Delegate.Runner do
         get_in(spec, ["subagents", "workspace_mode"]) ||
         "shared"
 
-    if value in ["shared", "isolated"] do
+    if value in ["shared", "isolated", "virtual_overlay"] do
       {:ok, value}
     else
       {:error,
        error_payload("invalid_spec", "subagents workspace_mode is unsupported", %{
          "observed" => value,
-         "accepted_values" => ["shared", "isolated"],
-         "next_actions" => ["set_workspace_mode_to_shared_or_isolated"]
+         "accepted_values" => ["shared", "isolated", "virtual_overlay"],
+         "next_actions" => ["set_workspace_mode_to_shared_isolated_or_virtual_overlay"]
        })}
+    end
+  end
+
+  defp normalize_virtual_overlay(spec, "virtual_overlay", mode) do
+    subagents = Map.get(spec, "subagents", %{})
+    read_set = Map.get(subagents, "read_set")
+    limits = Map.get(subagents, "limits", %{})
+    read_set_validation = Pixir.VirtualOverlay.validate_read_set(read_set)
+    attachment_index = virtual_overlay_attachment_index(spec)
+
+    cond do
+      mode != "read_only" or Map.has_key?(spec, "write_policy") ->
+        {:error,
+         error_payload("invalid_spec", "virtual_overlay delegate specs must be read_only", %{
+           "workspace_mode" => "virtual_overlay",
+           "mode" => mode,
+           "json_pointer" => "/mode",
+           "path" => ["mode"],
+           "next_actions" => ["set_mode_to_read_only", "remove_write_policy"]
+         })}
+
+      read_set_validation != :ok ->
+        {:error,
+         error_payload("invalid_spec", "virtual_overlay requires a bounded read_set", %{
+           "json_pointer" => "/subagents/read_set",
+           "path" => ["subagents", "read_set"],
+           "next_actions" => ["add_a_non_empty_bounded_read_set"]
+         })}
+
+      not is_map(limits) ->
+        {:error,
+         error_payload("invalid_spec", "virtual_overlay limits must be a map", %{
+           "json_pointer" => "/subagents/limits",
+           "path" => ["subagents", "limits"],
+           "next_actions" => ["set_limits_to_a_map_or_remove_it"]
+         })}
+
+      not is_nil(attachment_index) ->
+        {:error,
+         error_payload("invalid_spec", "virtual_overlay tasks cannot include attachments", %{
+           "next_actions" => ["remove_attachments", "add_required_files_to_read_set"]
+         })}
+
+      true ->
+        with :ok <- normalize_virtual_overlay_limits(limits) do
+          {:ok, %{read_set: read_set, limits: limits}}
+        end
+    end
+  end
+
+  defp normalize_virtual_overlay(spec, _workspace_mode, _mode) do
+    subagents = Map.get(spec, "subagents", %{})
+
+    if Map.has_key?(subagents, "read_set") or Map.has_key?(subagents, "limits") do
+      {:error,
+       error_payload("invalid_spec", "virtual_overlay fields require virtual_overlay mode", %{
+         "next_actions" => ["set_workspace_mode_to_virtual_overlay", "remove_virtual_fields"]
+       })}
+    else
+      {:ok, nil}
+    end
+  end
+
+  @doc false
+  @spec virtual_overlay_attachment_index(map()) :: non_neg_integer() | nil
+  def virtual_overlay_attachment_index(%{"tasks" => tasks}) when is_list(tasks) do
+    Enum.find_index(tasks, fn
+      %{"attachments" => attachments} when is_list(attachments) -> attachments != []
+      _entry -> false
+    end)
+  end
+
+  def virtual_overlay_attachment_index(_spec), do: nil
+
+  defp normalize_virtual_overlay_limits(limits) do
+    known = Pixir.VirtualOverlay.limit_keys()
+
+    case Enum.find(limits, fn {key, value} ->
+           key not in known or not is_integer(value) or value < 0
+         end) do
+      nil ->
+        :ok
+
+      {key, value} ->
+        {:error,
+         error_payload("invalid_spec", "virtual_overlay limit is invalid", %{
+           "field" => "subagents.limits.#{key}",
+           "json_pointer" => "/subagents/limits/#{key}",
+           "path" => ["subagents", "limits", key],
+           "observed" => value,
+           "accepted_keys" => known,
+           "next_actions" => ["use_a_known_non_negative_integer_limit"]
+         })}
     end
   end
 
@@ -891,6 +993,7 @@ defmodule Pixir.Delegate.Runner do
         |> maybe_put_opt(:index, task_index(task))
         |> Keyword.put(:permission_mode, runtime_permission_mode(runtime))
         |> Keyword.put(:write_policy, runtime.write_policy)
+        |> maybe_put_opt(:virtual_overlay, runtime.virtual_overlay)
 
       case spawn_agent.(
              parent_session_id,
@@ -1553,8 +1656,32 @@ defmodule Pixir.Delegate.Runner do
     agent
     |> child_result_base()
     |> maybe_put_child_retry_lineage(agent)
+    |> maybe_put_virtual_overlay_result(agent)
     |> maybe_put_child_recovery(context)
+    |> maybe_put_guided_resume(agent)
   end
+
+  defp maybe_put_virtual_overlay_result(result, %{"workspace_mode" => "virtual_overlay"} = agent) do
+    result = maybe_copy_child_field(result, agent, "virtual_diff_ref")
+
+    case Map.get(agent, "virtual_diff") do
+      %{} = artifact ->
+        result
+        |> Map.put("virtual_diff", artifact)
+        |> Map.put("apply", %{
+          "status" => "not_applied",
+          "requires_explicit_apply" => true,
+          "tool" => "apply_virtual_diff",
+          "dry_run_default" => true,
+          "workflow_apply_from_compatible" => false
+        })
+
+      _other ->
+        result
+    end
+  end
+
+  defp maybe_put_virtual_overlay_result(result, _agent), do: result
 
   # Parity with one-shot envelopes: a non-completed child ships the same
   # ready-made recovery commands the one-shot contract puts at .resume_command,
@@ -1576,11 +1703,12 @@ defmodule Pixir.Delegate.Runner do
        when is_binary(sid) and sid != "" and
               (status in @recoverable_child_statuses or
                  (context == :delegate_result and status != "completed")) do
-    case RecoveryCommands.commands(sid) do
+    case RecoveryCommands.commands(sid, workspace_mode: result["workspace_mode"]) do
       {:ok, commands} ->
         result
         |> Map.put("resume_command", commands["resume_command"])
         |> Map.put("diagnose_command", commands["diagnose_command"])
+        |> maybe_put_virtual_recovery(commands)
 
       {:error, _details} ->
         result
@@ -1588,6 +1716,186 @@ defmodule Pixir.Delegate.Runner do
   end
 
   defp maybe_put_child_recovery(result, _context), do: result
+
+  defp maybe_put_guided_resume(
+         %{"status" => status, "child_session_id" => sid} = result,
+         agent
+       )
+       when status in @guided_resume_statuses and is_binary(sid) and sid != "" do
+    case transport_error_kind(agent) do
+      nil ->
+        result
+
+      error_kind ->
+        opts = [
+          workspace_mode: result["workspace_mode"],
+          write_capable: write_capable_child?(agent)
+        ]
+
+        case RecoveryCommands.commands(sid, opts) do
+          {:ok, commands} ->
+            recovery =
+              result
+              |> Map.get("recovery", %{})
+              |> normalize_recovery()
+              |> Map.merge(%{
+                "kind" => "resume_suggested",
+                "reason" => "terminal transport error: #{error_kind}"
+              })
+              |> maybe_merge_recovery_notes(commands["notes"])
+
+            Map.put(result, "recovery", recovery)
+
+          {:error, _error} ->
+            result
+        end
+    end
+  end
+
+  defp maybe_put_guided_resume(result, _agent), do: result
+
+  defp normalize_recovery(recovery) when is_map(recovery), do: recovery
+  defp normalize_recovery(_recovery), do: %{}
+
+  defp maybe_merge_recovery_notes(recovery, notes) when is_list(notes) and notes != [] do
+    Map.update(recovery, "notes", notes, fn
+      existing when is_list(existing) -> Enum.uniq(existing ++ notes)
+      _existing -> notes
+    end)
+  end
+
+  defp maybe_merge_recovery_notes(recovery, _notes), do: recovery
+
+  defp transport_error_kind(agent) when is_map(agent) do
+    transport_error_kind_from_evidence(agent) || transport_error_kind_from_child_log(agent)
+  end
+
+  defp transport_error_kind(_agent), do: nil
+
+  defp transport_error_kind_from_evidence(evidence) when is_map(evidence) do
+    candidates = transport_error_candidates(evidence)
+
+    Enum.find(candidates, &specific_transport_error_kind?/1) ||
+      if("provider_http_error" in candidates and retryable_provider_http_evidence?(evidence),
+        do: "provider_http_error"
+      )
+  end
+
+  defp transport_error_kind_from_evidence(_evidence), do: nil
+
+  defp transport_error_kind_from_child_log(agent) do
+    sid = map_value(agent, "child_session_id", :child_session_id)
+    workspace = map_value(agent, "workspace", :workspace)
+
+    with true <- is_binary(sid) and sid != "",
+         true <- is_binary(workspace) and workspace != "",
+         {:ok, history} <- Log.fold(sid, workspace: workspace),
+         %{type: :turn_failed, data: failure} <-
+           Enum.find(Enum.reverse(history), &(&1.type == :turn_failed)) do
+      transport_error_kind_from_evidence(failure)
+    else
+      _missing_or_unreadable -> nil
+    end
+  end
+
+  defp transport_error_candidates(value) when is_binary(value), do: [value]
+  defp transport_error_candidates(value) when is_atom(value), do: [Atom.to_string(value)]
+
+  defp transport_error_candidates(value) when is_map(value) do
+    direct =
+      [
+        map_value(value, "error_kind", :error_kind),
+        map_value(value, "kind", :kind),
+        map_value(value, "type", :type)
+      ]
+      |> Enum.flat_map(&transport_error_candidates/1)
+
+    nested =
+      [
+        map_value(value, "reason", :reason),
+        map_value(value, "error", :error),
+        map_value(value, "failure", :failure),
+        map_value(value, "terminal_error", :terminal_error),
+        map_value(value, "details", :details)
+      ]
+      |> Enum.flat_map(&transport_error_candidates/1)
+
+    direct ++ nested
+  end
+
+  defp transport_error_candidates(_value), do: []
+
+  defp specific_transport_error_kind?(kind) do
+    kind in @websocket_transport_error_kinds or
+      kind in @in_band_transport_error_kinds or
+      kind in ["network", "rate_limited"] or rate_limit_error_kind?(kind)
+  end
+
+  defp rate_limit_error_kind?(kind) when is_binary(kind) do
+    String.contains?(kind, "rate_limit") or String.contains?(kind, "rate-limit")
+  end
+
+  defp retryable_provider_http_evidence?(value) when is_map(value) do
+    retryable = map_value(value, "retryable", :retryable)
+    status = map_value(value, "status", :status)
+    type = map_value(value, "type", :type)
+
+    retryable == true or status in [500, 502, 503, 504] or type == "server_error" or
+      Enum.any?(
+        [
+          map_value(value, "reason", :reason),
+          map_value(value, "error", :error),
+          map_value(value, "failure", :failure),
+          map_value(value, "terminal_error", :terminal_error),
+          map_value(value, "details", :details)
+        ],
+        &retryable_provider_http_evidence?/1
+      )
+  end
+
+  defp retryable_provider_http_evidence?(_value), do: false
+
+  defp write_capable_child?(agent) do
+    permission_mode = map_value(agent, "permission_mode", :permission_mode)
+    write_policy = map_value(agent, "write_policy", :write_policy)
+    mode = map_value(agent, "mode", :mode)
+    role = map_value(agent, "agent", :agent)
+
+    cond do
+      permission_mode in ["read_only", :read_only] -> false
+      permission_mode in ["auto", :auto] -> true
+      mode in ["bounded_write", :bounded_write] -> true
+      is_map(write_policy) -> true
+      role in ["worker", :worker] -> true
+      true -> false
+    end
+  end
+
+  defp map_value(map, string_key, atom_key) do
+    case Map.fetch(map, string_key) do
+      {:ok, value} -> value
+      :error -> Map.get(map, atom_key)
+    end
+  end
+
+  defp maybe_put_virtual_recovery(
+         %{"workspace_mode" => "virtual_overlay"} = result,
+         %{"notes" => notes}
+       ) do
+    recovery =
+      %{
+        "workspace_mode" => "virtual_overlay",
+        "notes" => notes,
+        "virtual_diff_preserved" => is_map(result["virtual_diff"]),
+        "apply_tool" => "apply_virtual_diff",
+        "apply_is_separate_explicit_decision" => true
+      }
+      |> maybe_put("virtual_diff_ref", result["virtual_diff_ref"])
+
+    Map.put(result, "recovery", recovery)
+  end
+
+  defp maybe_put_virtual_recovery(result, _commands), do: result
 
   defp child_result_base(agent) do
     %{

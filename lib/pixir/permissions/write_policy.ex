@@ -18,6 +18,8 @@ defmodule Pixir.Permissions.WritePolicy do
   @safe_bash_commands ~w(ls cat pwd echo grep rg ripgrep head tail wc which whoami date true
                          tree stat file dirname basename realpath sort uniq diff)
   @shell_metachars ["\n", "\r", "&&", "||", ";", "|", "&", ">", "<", "`", "$(", ">>"]
+  @accepted_verify_prefixes [["mix", "format"], ["mix", "compile"]]
+  @max_verify_commands 8
 
   @doc "Load and normalize a bounded write policy JSON file."
   @spec from_file(String.t(), String.t()) :: {:ok, map()} | {:error, map()}
@@ -41,7 +43,7 @@ defmodule Pixir.Permissions.WritePolicy do
          {:ok, metadata} <- normalize_metadata(Map.get(policy, "metadata", %{})),
          {:ok, allow_writes} <- normalize_rule_list(policy, "allow_writes", required?: true),
          {:ok, deny_writes} <- normalize_rule_list(policy, "deny_writes", required?: false),
-         :ok <- validate_bash(Map.get(policy, "bash", "disabled")),
+         {:ok, bash} <- normalize_bash(Map.get(policy, "bash", "disabled")),
          {:ok, active_policy_rule} <- active_policy_rule(opts) do
       deny_writes =
         (@implicit_denies ++ deny_writes ++ List.wrap(active_policy_rule))
@@ -53,7 +55,7 @@ defmodule Pixir.Permissions.WritePolicy do
         "id" => Map.get(metadata, "id", "bounded-write"),
         "allow_writes" => allow_writes,
         "deny_writes" => deny_writes,
-        "bash" => "disabled"
+        "bash" => bash
       }
 
       {:ok, Map.put(normalized, "hash", "sha256:" <> sha256(canonical_json(normalized)))}
@@ -96,7 +98,7 @@ defmodule Pixir.Permissions.WritePolicy do
          {:ok, hash} <- require_metadata_string(policy, "hash"),
          {:ok, allow_writes} <- restore_rule_list(policy, "allow_writes"),
          {:ok, deny_writes} <- restore_rule_list(policy, "deny_writes"),
-         :ok <- validate_bash(Map.get(policy, "bash", "disabled")) do
+         {:ok, bash} <- normalize_bash(Map.get(policy, "bash", "disabled")) do
       {:ok,
        %{
          "version" => @version,
@@ -104,7 +106,7 @@ defmodule Pixir.Permissions.WritePolicy do
          "hash" => hash,
          "allow_writes" => allow_writes,
          "deny_writes" => deny_writes,
-         "bash" => "disabled"
+         "bash" => bash
        }}
     end
   end
@@ -131,10 +133,15 @@ defmodule Pixir.Permissions.WritePolicy do
         {:deny, outside_workspace_denial(policy, command, token)}
 
       {:ok, nil} ->
-        if bounded_safe_command?(command) do
-          :allow
-        else
-          {:deny, bash_disabled_denial(policy, command)}
+        cond do
+          bounded_safe_command?(command) ->
+            :allow
+
+          declared_verify_command?(policy, command) ->
+            :allow
+
+          true ->
+            {:deny, bash_disabled_denial(policy, command)}
         end
     end
   end
@@ -285,6 +292,7 @@ defmodule Pixir.Permissions.WritePolicy do
         "policy_version" => policy["version"],
         "rule" => "bash_disabled",
         "matched_rule" => "bash_disabled",
+        "verify_commands_declared" => verify_command_count(policy),
         "next_actions" => ["use_native_read_tools", "use_edit_or_write_within_allowed_globs"]
       }
     )
@@ -311,6 +319,180 @@ defmodule Pixir.Permissions.WritePolicy do
     )
   end
 
+  defp normalize_bash("disabled") do
+    _ = validate_bash("disabled")
+    {:ok, "disabled"}
+  end
+
+  defp normalize_bash(%{} = bash) do
+    bash = stringify(bash)
+
+    with :ok <- reject_unknown_bash_keys(bash),
+         :ok <- require_bash_verify_key(bash),
+         {:ok, verify} <- normalize_verify_commands(Map.get(bash, "verify")) do
+      {:ok, %{"verify" => verify}}
+    end
+  end
+
+  defp normalize_bash(other) do
+    {:error,
+     Tool.error(
+       :invalid_args,
+       "write_policy bash must be disabled or a verify command map",
+       %{
+         "observed" => other,
+         "accepted_values" => ["disabled", %{"verify" => accepted_verify_prefixes()}]
+       }
+     )}
+  end
+
+  defp reject_unknown_bash_keys(bash) do
+    case Map.keys(bash) -- ["verify"] do
+      [] ->
+        :ok
+
+      unknown ->
+        {:error,
+         Tool.error(:invalid_args, "write_policy bash verify map has unsupported keys", %{
+           "observed" => unknown,
+           "accepted_keys" => ["verify"]
+         })}
+    end
+  end
+
+  defp require_bash_verify_key(%{"verify" => _verify}), do: :ok
+
+  defp require_bash_verify_key(_bash) do
+    {:error,
+     Tool.error(:invalid_args, "write_policy bash map requires verify", %{
+       "missing" => ["verify"],
+       "accepted_keys" => ["verify"]
+     })}
+  end
+
+  defp normalize_verify_commands(commands) when is_list(commands) do
+    if length(commands) > @max_verify_commands do
+      {:error,
+       Tool.error(:invalid_args, "write_policy bash verify command list is too large", %{
+         "observed_count" => length(commands),
+         "accepted_max" => @max_verify_commands
+       })}
+    else
+      commands
+      |> Enum.reduce_while({:ok, []}, fn command, {:ok, acc} ->
+        case normalize_verify_command(command) do
+          {:ok, normalized} -> {:cont, {:ok, [normalized | acc]}}
+          {:error, _} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, normalized} -> {:ok, Enum.reverse(normalized)}
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  defp normalize_verify_commands(other) do
+    {:error,
+     Tool.error(:invalid_args, "write_policy bash verify must be a list", %{
+       "observed" => other,
+       "accepted_type" => "list"
+     })}
+  end
+
+  defp normalize_verify_command(command) when is_binary(command) do
+    command = String.trim(command)
+
+    cond do
+      command == "" ->
+        {:error,
+         Tool.error(
+           :invalid_args,
+           "write_policy bash verify entries must be non-empty strings",
+           %{
+             "observed" => command,
+             "accepted_prefixes" => accepted_verify_prefixes()
+           }
+         )}
+
+      metachar = Enum.find(@shell_metachars, &String.contains?(command, &1)) ->
+        {:error,
+         Tool.error(
+           :invalid_args,
+           "write_policy bash verify entries may not contain shell metacharacters",
+           %{
+             "observed" => command,
+             "metachar" => metachar,
+             "accepted_prefixes" => accepted_verify_prefixes()
+           }
+         )}
+
+      command
+      |> String.split(~r/\s+/, trim: true)
+      |> Enum.any?(&parent_directory_token?/1) ->
+        {:error,
+         Tool.error(
+           :invalid_args,
+           "write_policy bash verify entries may not contain parent-directory tokens",
+           %{
+             "observed" => command,
+             "accepted_prefixes" => accepted_verify_prefixes()
+           }
+         )}
+
+      verify_prefix(command) == ["mix", "test"] ->
+        {:error,
+         Tool.error(
+           :invalid_args,
+           "verify test commands are not accepted yet (v1 allows format/compile only)",
+           %{
+             "observed" => command,
+             "accepted_prefixes" => accepted_verify_prefixes(),
+             "next_action" => "keep_test_execution_with_the_orchestrator"
+           }
+         )}
+
+      verify_prefix(command) in @accepted_verify_prefixes ->
+        {:ok, command}
+
+      true ->
+        {:error,
+         Tool.error(
+           :invalid_args,
+           "write_policy bash verify entries must start with an accepted command prefix",
+           %{
+             "observed" => command,
+             "accepted_prefixes" => accepted_verify_prefixes()
+           }
+         )}
+    end
+  end
+
+  defp normalize_verify_command(other) do
+    {:error,
+     Tool.error(
+       :invalid_args,
+       "write_policy bash verify entries must be non-empty strings",
+       %{
+         "observed" => other,
+         "accepted_prefixes" => accepted_verify_prefixes()
+       }
+     )}
+  end
+
+  defp verify_prefix(command), do: command |> String.split(~r/\s+/, trim: true) |> Enum.take(2)
+
+  defp accepted_verify_prefixes, do: Enum.map(@accepted_verify_prefixes, &Enum.join(&1, " "))
+
+  defp declared_verify_command?(policy, command) do
+    String.trim(command) in verify_commands(policy)
+  end
+
+  defp verify_command_count(policy), do: length(verify_commands(policy))
+
+  defp verify_commands(%{"bash" => %{"verify" => commands}}) when is_list(commands), do: commands
+  defp verify_commands(_policy), do: []
+
   # ── path matching ───────────────────────────────────────────────────────
 
   defp protected_path_rule(rel) do
@@ -323,6 +505,28 @@ defmodule Pixir.Permissions.WritePolicy do
       "secrets" in segments -> "**/secrets/**"
       true -> nil
     end
+  end
+
+  @doc """
+  Whether a workspace-relative path is covered by one of the given allow-style
+  rules. Public single source for the policy glob semantics (#284 F2: the
+  workflow apply step's write_set bound delegates here instead of hand-rolling
+  a second matcher).
+  """
+  @spec rules_cover_path?([String.t()], String.t()) :: boolean()
+  def rules_cover_path?(rules, rel) when is_list(rules) and is_binary(rel) do
+    Enum.any?(rules, &allow_matches?(normalize_rule(&1), rel))
+  end
+
+  @doc "Validate a list of allow-style rules against the policy glob grammar."
+  @spec validate_path_rules([String.t()], String.t()) :: :ok | {:error, map()}
+  def validate_path_rules(rules, field) when is_list(rules) do
+    Enum.reduce_while(rules, :ok, fn rule, :ok ->
+      case validate_rule(rule, field) do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
   end
 
   defp deny_matches?(pattern, rel) do
@@ -676,7 +880,7 @@ defmodule Pixir.Permissions.WritePolicy do
     end
   end
 
-  defp validate_bash("disabled"), do: :ok
+  # legacy validate_bash/1 was replaced by normalize_bash/1.
 
   defp validate_bash(value) do
     {:error,
