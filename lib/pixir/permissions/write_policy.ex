@@ -58,7 +58,7 @@ defmodule Pixir.Permissions.WritePolicy do
         "bash" => bash
       }
 
-      {:ok, Map.put(normalized, "hash", "sha256:" <> sha256(canonical_json(normalized)))}
+      {:ok, Map.put(normalized, "hash", policy_hash(normalized))}
     end
   end
 
@@ -83,9 +83,9 @@ defmodule Pixir.Permissions.WritePolicy do
   @doc """
   Rehydrate a runtime policy from safe metadata previously written to the Log.
 
-  The recorded metadata is intentionally enough for later diagnostics or live-handle
-  reattachment without trusting a prompt or model-supplied override. It preserves the
-  original hash instead of recomputing it from a lossy projection.
+  The hash is recomputed from the canonical durable fields before the metadata is
+  trusted. A mismatch means the Log projection was altered or came from an incompatible
+  hash format and therefore fails closed.
   """
   @spec from_metadata(map() | nil) :: {:ok, map() | nil} | {:error, map()}
   def from_metadata(nil), do: {:ok, nil}
@@ -95,19 +95,30 @@ defmodule Pixir.Permissions.WritePolicy do
 
     with :ok <- require_version(policy),
          {:ok, id} <- require_metadata_string(policy, "id"),
-         {:ok, hash} <- require_metadata_string(policy, "hash"),
+         {:ok, stored_hash} <- require_metadata_string(policy, "hash"),
          {:ok, allow_writes} <- restore_rule_list(policy, "allow_writes"),
          {:ok, deny_writes} <- restore_rule_list(policy, "deny_writes"),
          {:ok, bash} <- normalize_bash(Map.get(policy, "bash", "disabled")) do
-      {:ok,
-       %{
-         "version" => @version,
-         "id" => id,
-         "hash" => hash,
-         "allow_writes" => allow_writes,
-         "deny_writes" => deny_writes,
-         "bash" => bash
-       }}
+      restored = %{
+        "version" => @version,
+        "id" => id,
+        "allow_writes" => allow_writes,
+        "deny_writes" => deny_writes,
+        "bash" => bash
+      }
+
+      computed_hash = policy_hash(restored)
+
+      if stored_hash == computed_hash do
+        {:ok, Map.put(restored, "hash", computed_hash)}
+      else
+        {:error,
+         Tool.error(:invalid_args, "write policy metadata hash does not match its content", %{
+           "stored_hash" => stored_hash,
+           "computed_hash" => computed_hash,
+           "matched_rule" => "metadata_hash_mismatch"
+         })}
+      end
     end
   end
 
@@ -184,7 +195,11 @@ defmodule Pixir.Permissions.WritePolicy do
         |> Map.put("allow_writes", rules)
         |> Map.delete("hash")
 
-      narrowed = Map.put(narrowed, "hash", "sha256:" <> sha256(canonical_json(narrowed)))
+      # Hash only the durable fields, exactly like policy_hash/1 and
+      # from_metadata/1 — a narrowed policy persisted as posture metadata must
+      # verify on cold resume, and hashing the full map (metadata included)
+      # would fail closed with metadata_hash_mismatch on honest data.
+      narrowed = Map.put(narrowed, "hash", policy_hash(narrowed))
 
       {:ok, narrowed}
     end
@@ -995,6 +1010,18 @@ defmodule Pixir.Permissions.WritePolicy do
 
   defp stringify(list) when is_list(list), do: Enum.map(list, &stringify/1)
   defp stringify(value), do: value
+
+  defp policy_hash(policy) do
+    durable = %{
+      "version" => policy["version"],
+      "id" => policy["id"],
+      "allow_writes" => policy["allow_writes"],
+      "deny_writes" => policy["deny_writes"],
+      "bash" => policy["bash"]
+    }
+
+    "sha256:" <> sha256(canonical_json(durable))
+  end
 
   defp sha256(data), do: :crypto.hash(:sha256, data) |> Base.encode16(case: :lower)
 

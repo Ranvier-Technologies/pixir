@@ -132,6 +132,37 @@ defmodule Pixir.Log do
     end
   end
 
+  @doc """
+  Fold the Log in physical append order.
+
+  This is a narrow evidence accessor for checks whose trust boundary must not depend on
+  caller-authored `seq` values. Normal History consumers should keep using `fold/2`,
+  which preserves the canonical seq-ordered replay contract.
+  """
+  @spec fold_append_order(String.t(), keyword()) :: {:ok, history()} | {:error, map()}
+  def fold_append_order(session_id, opts \\ []) do
+    file = path(session_id, opts)
+
+    case File.read(file) do
+      {:error, :enoent} ->
+        {:ok, []}
+
+      {:error, posix} ->
+        {:error,
+         %{
+           ok: false,
+           error: %{
+             kind: :log_read_failed,
+             message: "could not read session log",
+             details: %{reason: posix, path: file}
+           }
+         }}
+
+      {:ok, contents} ->
+        decode_all(contents, file, :append_order)
+    end
+  end
+
   # ── internals ─────────────────────────────────────────────────────────────
 
   defp encode_lines(events, opts) do
@@ -209,7 +240,7 @@ defmodule Pixir.Log do
        }}
   end
 
-  defp decode_all(contents, file) do
+  defp decode_all(contents, file, order \\ :seq_order) do
     contents
     |> String.split("\n", trim: true)
     |> Enum.reduce_while([], fn line, acc ->
@@ -220,9 +251,12 @@ defmodule Pixir.Log do
     end)
     |> case do
       {:error, _} = err -> err
-      events -> {:ok, events |> Enum.reverse() |> sort_history()}
+      events -> {:ok, order_decoded_events(Enum.reverse(events), order)}
     end
   end
+
+  defp order_decoded_events(events, :append_order), do: events
+  defp order_decoded_events(events, :seq_order), do: sort_history(events)
 
   defp decode_line(line) do
     with {:ok, map} when is_map(map) <- Jason.decode(line),

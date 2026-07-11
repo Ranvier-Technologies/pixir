@@ -42,6 +42,9 @@ defmodule Pixir.Workflows do
   @default_poll_ms 50
   @default_timeout_ms 120_000
   @safe_id ~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
+  # Virtual/apply runners use a short-lived linked Task.Supervisor per invocation.
+  # That preserves task crash isolation while coupling the runner's lifetime to
+  # the interruptible workflow process; see yield_interrupt_coupled_task/2.
 
   @proof_states ~w(
     intent_declared
@@ -450,36 +453,34 @@ defmodule Pixir.Workflows do
     if has_field?(raw, "write_set") do
       write_set = normalize_set(field(raw, "write_set"))
 
-      cond do
-        write_set == [] ->
-          invalid_apply_from(
-            id,
-            index,
-            "apply_from workflow step requires non-empty write_set",
-            %{
-              "field" => "write_set",
-              "next_actions" => ["add_non_empty_write_set"]
-            }
-          )
-
+      if write_set == [] do
+        invalid_apply_from(
+          id,
+          index,
+          "apply_from workflow step requires non-empty write_set",
+          %{
+            "field" => "write_set",
+            "next_actions" => ["add_non_empty_write_set"]
+          }
+        )
+      else
         # Same glob grammar as the bounded write policy: the runtime bound
         # delegates to WritePolicy.rules_cover_path?, so the shapes must match.
-        match?({:error, _}, WritePolicy.validate_path_rules(write_set, "write_set")) ->
-          {:error, %{error: %{details: details}}} =
-            WritePolicy.validate_path_rules(write_set, "write_set")
+        case WritePolicy.validate_path_rules(write_set, "write_set") do
+          :ok ->
+            {:ok, write_set}
 
-          invalid_apply_from(
-            id,
-            index,
-            "apply_from write_set entries must use the write-policy glob grammar",
-            Map.merge(
-              %{"field" => "write_set"},
-              Map.new(details, fn {key, value} -> {to_string(key), value} end)
+          {:error, %{error: %{details: details}}} ->
+            invalid_apply_from(
+              id,
+              index,
+              "apply_from write_set entries must use the write-policy glob grammar",
+              Map.merge(
+                %{"field" => "write_set"},
+                Map.new(details, fn {key, value} -> {to_string(key), value} end)
+              )
             )
-          )
-
-        true ->
-          {:ok, write_set}
+        end
       end
     else
       invalid_apply_from(id, index, "apply_from workflow step requires write_set", %{
@@ -1043,12 +1044,13 @@ defmodule Pixir.Workflows do
          workflow,
          %{posture: "apply"} = step,
          wave,
-         _opts,
+         opts,
          completed,
          run_started_at_ms
        ) do
     {:ok,
-     {:completed, apply_virtual_diff_step(workflow, step, wave, completed, run_started_at_ms)}}
+     {:completed,
+      apply_virtual_diff_step(workflow, step, wave, completed, run_started_at_ms, opts)}}
   end
 
   defp start_step(
@@ -1095,14 +1097,26 @@ defmodule Pixir.Workflows do
       {:timeout, timeout_reason, timeout_ms, 0}
     else
       started_at = now_ms()
-      task = Task.async(fn -> runner.(workflow.workspace, params, []) end)
 
-      case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      result =
+        yield_interrupt_coupled_task(
+          fn -> runner.(workflow.workspace, params, []) end,
+          timeout_ms
+        )
+
+      case result do
         {:ok, {:ok, artifact}} ->
           {:ok, artifact}
 
         {:ok, {:error, error}} ->
           {:error, error}
+
+        {:exit, reason} ->
+          {:error,
+           Tool.error(:command_failed, "virtual_overlay runner task exited", %{
+             "reason" => "virtual_overlay_runner_task_exit",
+             "exit_reason" => bounded_task_exit_reason(reason)
+           })}
 
         nil ->
           {:timeout, timeout_reason, timeout_ms, max(now_ms() - started_at, 0)}
@@ -1166,11 +1180,12 @@ defmodule Pixir.Workflows do
     end
   end
 
-  defp apply_virtual_diff_step(workflow, step, wave, completed, run_started_at_ms) do
+  defp apply_virtual_diff_step(workflow, step, wave, completed, run_started_at_ms, opts) do
     result =
       with {:ok, artifact} <- producer_virtual_diff(completed, step.apply_from),
            :ok <- artifact_paths_within_step_write_set(artifact, step),
-           {:ok, apply_result} <- apply_with_budget(workflow, step, artifact, run_started_at_ms) do
+           {:ok, apply_result} <-
+             apply_with_budget(workflow, step, artifact, run_started_at_ms, opts) do
         apply_result
       else
         {:error, reason, details} -> failed_apply_result(reason, details)
@@ -1182,24 +1197,61 @@ defmodule Pixir.Workflows do
 
   # The normalized step timeout_ms is a real budget (same contract as
   # virtual_overlay steps), not an accepted-and-ignored knob.
-  defp apply_with_budget(workflow, step, artifact, run_started_at_ms) do
+  defp apply_with_budget(workflow, step, artifact, run_started_at_ms, opts) do
     {timeout_ms, timeout_reason} = virtual_timeout_budget(workflow, step, run_started_at_ms)
 
     if timeout_ms <= 0 do
       {:error, "timeout", %{"reason" => timeout_reason, "timeout_ms" => timeout_ms}}
     else
-      task =
-        Task.async(fn ->
-          VirtualDiffApply.apply(artifact, workflow.workspace,
-            write_policy: workflow.write_policy
-          )
-        end)
+      runner = Keyword.get(opts, :virtual_diff_apply_runner, &VirtualDiffApply.apply/3)
 
-      case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
-        {:ok, {:ok, apply_result}} -> {:ok, apply_result}
-        {:ok, {:error, error}} -> {:error, error}
-        nil -> {:error, "timeout", %{"reason" => timeout_reason, "timeout_ms" => timeout_ms}}
+      result =
+        yield_interrupt_coupled_task(
+          fn ->
+            runner.(artifact, workflow.workspace, write_policy: workflow.write_policy)
+          end,
+          timeout_ms
+        )
+
+      case result do
+        {:ok, {:ok, apply_result}} ->
+          {:ok, apply_result}
+
+        {:ok, {:error, error}} ->
+          {:error, error}
+
+        {:exit, reason} ->
+          {:error, "virtual_diff_apply_task_exit",
+           %{
+             "reason" => "virtual_diff_apply_task_exit",
+             "exit_reason" => bounded_task_exit_reason(reason)
+           }}
+
+        nil ->
+          {:error, "timeout", %{"reason" => timeout_reason, "timeout_ms" => timeout_ms}}
       end
+    end
+  end
+
+  # A dedicated supervisor gives these tasks the two lifecycle properties they
+  # need at the same time:
+  #
+  #   * the task is not linked to the workflow process, so Task.yield/2 reports
+  #     a runner crash as {:exit, reason};
+  #   * the supervisor is linked to the workflow process and owns the task, so
+  #     killing an interruptible Turn tears the supervisor and its task down.
+  #
+  # The latter does not depend on an `after` block running in the killed Turn.
+  # `shutdown: :brutal_kill` also prevents an exit-trapping runner from delaying
+  # teardown after its owning Turn is interrupted.
+  defp yield_interrupt_coupled_task(fun, timeout_ms) do
+    {:ok, supervisor} = Task.Supervisor.start_link(shutdown: :brutal_kill)
+
+    try do
+      task = Task.Supervisor.async_nolink(supervisor, fun)
+      Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill)
+    after
+      if Process.alive?(supervisor), do: Supervisor.stop(supervisor, :normal)
     end
   end
 
@@ -2281,6 +2333,12 @@ defmodule Pixir.Workflows do
   defp deadline_exceeded?(workflow, state) do
     {:ok, exceeded?} = WorkflowRun.deadline_exceeded?(workflow, state)
     exceeded?
+  end
+
+  defp bounded_task_exit_reason(reason) do
+    reason
+    |> inspect(limit: 20, printable_limit: 2_000)
+    |> Tool.truncate(4_000)
   end
 
   defp now_ms, do: System.monotonic_time(:millisecond)

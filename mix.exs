@@ -1,7 +1,7 @@
 defmodule Pixir.MixProject do
   use Mix.Project
 
-  @version "0.1.9"
+  @version "0.1.10"
   @source_url "https://github.com/Ranvier-Technologies/pixir"
 
   def project do

@@ -554,33 +554,26 @@ defmodule Pixir.Providers.Anthropic do
   defp fold_history_tool_result(event, state, model) do
     call_id = get_field(event_data(event), :call_id)
 
-    cond do
-      Map.has_key?(state.deferred_skill_activations, call_id) ->
-        messages = flush_assistant_items(state.messages, state.assistant_items, model)
-        messages = flush_results(messages, state.results ++ [tool_result_block(event)])
+    if Map.has_key?(state.deferred_skill_activations, call_id) do
+      messages = flush_assistant_items(state.messages, state.assistant_items, model)
+      messages = flush_results(messages, state.results ++ [tool_result_block(event)])
 
-        messages =
-          append_activation_messages(
-            messages,
-            Map.fetch!(state.deferred_skill_activations, call_id)
-          )
+      messages =
+        append_activation_messages(
+          messages,
+          Map.fetch!(state.deferred_skill_activations, call_id)
+        )
 
-        %{
-          state
-          | messages: messages,
-            assistant_items: [],
-            results: [],
-            pending_calls: Map.delete(state.pending_calls, call_id),
-            deferred_skill_activations: Map.delete(state.deferred_skill_activations, call_id)
-        }
-
-      map_size(state.deferred_skill_activations) > 0 ->
+      %{
         state
-        |> close_deferred_skill_activations(model)
-        |> queue_tool_result(event, model)
-
-      true ->
-        queue_tool_result(state, event, model)
+        | messages: messages,
+          assistant_items: [],
+          results: [],
+          pending_calls: Map.delete(state.pending_calls, call_id),
+          deferred_skill_activations: Map.delete(state.deferred_skill_activations, call_id)
+      }
+    else
+      queue_tool_result(state, event, model)
     end
   end
 
@@ -691,29 +684,33 @@ defmodule Pixir.Providers.Anthropic do
       end)
   end
 
-  defp pending_skill_view_call_id(event, pending_calls) when map_size(pending_calls) == 1 do
+  defp pending_skill_view_call_id(event, pending_calls) do
     activation_name = get_field(event_data(event), :name)
 
-    case Map.to_list(pending_calls) do
-      [{call_id, call}] when is_binary(activation_name) ->
-        call_data = event_data(call)
-        args = get_field(call_data, :args)
-        path = if is_map(args), do: get_field(args, :path) || "SKILL.md", else: nil
+    matching_call_ids =
+      if is_binary(activation_name) do
+        Enum.reduce(pending_calls, [], fn {call_id, call}, matches ->
+          call_data = event_data(call)
+          args = get_field(call_data, :args)
+          path = if is_map(args), do: get_field(args, :path) || "SKILL.md", else: nil
 
-        if get_field(call_data, :name) == "skill_view" and is_map(args) and
-             get_field(args, :name) == activation_name and is_binary(path) and
-             Pixir.Skills.main_file?(path) do
-          {:ok, call_id}
-        else
-          :error
-        end
+          if get_field(call_data, :name) == "skill_view" and is_map(args) and
+               get_field(args, :name) == activation_name and is_binary(path) and
+               Pixir.Skills.main_file?(path) do
+            [call_id | matches]
+          else
+            matches
+          end
+        end)
+      else
+        []
+      end
 
-      _other ->
-        :error
+    case matching_call_ids do
+      [call_id] -> {:ok, call_id}
+      _zero_or_ambiguous -> :error
     end
   end
-
-  defp pending_skill_view_call_id(_event, _pending_calls), do: :error
 
   defp flush_pending(messages, assistant_items, results, model) do
     messages

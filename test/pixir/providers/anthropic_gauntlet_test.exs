@@ -273,7 +273,13 @@ defmodule Pixir.Providers.AnthropicGauntletTest do
     assert body["model"] == "claude-fable-5"
     assert [layer0 | _] = body["system"]
     assert layer0["text"] =~ "You are Pixir"
+    refute layer0["text"] =~ "repo-skill"
+    refute layer0["text"] =~ "Use when testing the Anthropic gauntlet skill routing seam."
 
+    # B1 is the metadata-only routing index (name/when_to_use/location); the
+    # skill's body text is never rendered here (progressive disclosure). F13's
+    # meaningful check is the refute above: the skill name must not reach the
+    # byte-stable layer0, while the routing metadata lives in the cacheable B1.
     system_b1 = List.last(body["system"])
     assert system_b1["text"] =~ "repo-skill"
     assert system_b1["cache_control"] == %{"type" => "ephemeral"}

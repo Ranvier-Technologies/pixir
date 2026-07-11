@@ -1600,6 +1600,22 @@ defmodule Pixir.CLITest do
           assert payload["outcome"] == "completed"
           assert payload["reason_code"] == "completed"
 
+          # The delegate parent's durable root posture records the delegate's
+          # own ceiling (bounded policy), never a default unbounded auto — a
+          # cold resume of this parent must restore exactly this sandbox.
+          {:ok, parent_history} = Log.fold(payload["session_id"], workspace: ws)
+
+          parent_posture =
+            Enum.find(parent_history, fn event ->
+              event.type == :subagent_event and
+                event.data["event"] == "permission_posture"
+            end)
+
+          assert parent_posture.seq == 0
+          assert parent_posture.data["lineage"] == "root"
+          assert parent_posture.data["permission_mode"] == "auto"
+          assert parent_posture.data["write_policy"]["allow_writes"] == ["src/**"]
+
           assert %{
                    "source_of_truth" => "session_log",
                    "workspace_log_path" => workspace_log_path,
@@ -2637,6 +2653,45 @@ defmodule Pixir.CLITest do
     assert out =~ "continue a persisted Session"
   end
 
+  test "mutation-free legacy resume is read-only and denies a live write" do
+    with_cli_provider(
+      [
+        tool_calls([
+          %{
+            call_id: "legacy-write",
+            name: "write",
+            args: %{"path" => "blocked.txt", "content" => "must not write"}
+          }
+        ]),
+        stop("turn completes after the denied write")
+      ],
+      fn ->
+        in_tmp_workspace("pixir-cli-legacy-resume-read-only", fn ws ->
+          sid = "legacy-mutation-free"
+          old = Event.user_message(sid, "legacy prompt") |> Event.with_seq(0)
+          assert {:ok, ^old} = Log.append(old, workspace: ws)
+
+          # The resume turn completes (the model adapts after the denied tool
+          # call), but the mutation-free legacy Log resumes read-only: the write
+          # is denied at the mode gate and no file lands.
+          capture_io(fn ->
+            assert :ok = CLI.route(["--json", "resume", sid, "attempt a write"])
+          end)
+
+          refute File.exists?(Path.join(ws, "blocked.txt"))
+
+          {:ok, history} = Log.fold(sid, workspace: ws)
+
+          assert Enum.any?(history, fn event ->
+                   event.type == :permission_decision and
+                     event.data["call_id"] == "legacy-write" and
+                     event.data["decision"] == "deny"
+                 end)
+        end)
+      end
+    )
+  end
+
   test "resume with no id is a usage error (exit code 2)" do
     err = capture_io(:stderr, fn -> assert {:error, 2} = CLI.route(["resume"]) end)
     assert err =~ "usage: pixir resume"
@@ -3343,6 +3398,75 @@ defmodule Pixir.CLITest do
         assert Enum.any?(history, &(&1.type == :turn_failed))
       end)
     end)
+  end
+
+  test "models reports source honesty without network and refresh emits one JSON envelope" do
+    with_pixir_home("pixir-cli-models", fn home ->
+      config_path = Path.join(home, "config.json")
+
+      File.write!(
+        config_path,
+        Jason.encode!(%{
+          "anthropic_models" => ["claude-cli-config"],
+          "models_refreshed_at" => "2026-01-02T03:04:05Z"
+        })
+      )
+
+      catalog_output = capture_io(fn -> assert :ok = CLI.route(["models", "--json"]) end)
+      catalog = Jason.decode!(catalog_output)
+      assert catalog["kind"] == "models_catalog"
+      assert catalog["providers"]["openai"]["source"] == "built_in"
+      assert catalog["providers"]["anthropic"]["source"] == "config_override"
+      assert catalog["models_refreshed_at"] == "2026-01-02T03:04:05Z"
+
+      auth_name = :"cli_models_auth_#{System.unique_integer([:positive])}"
+
+      {:ok, _pid} =
+        Pixir.Auth.start_link(
+          name: auth_name,
+          store_path: Path.join(home, "isolated-auth.json"),
+          env_api_key: "sk-cli"
+        )
+
+      http = fn request ->
+        send(self(), {:models_http, request.url})
+        {:ok, %{status: 200, body: Jason.encode!(%{"data" => [%{"id" => "gpt-cli"}]})}}
+      end
+
+      with_cli_turn_opts(
+        [
+          models_refresh_opts: [
+            config_path: config_path,
+            auth: auth_name,
+            env: fn _ -> nil end,
+            http: http,
+            now: ~U[2026-03-10 00:00:00Z]
+          ]
+        ],
+        fn ->
+          refresh_output =
+            capture_io(fn -> assert :ok = CLI.route(["models", "refresh", "--json"]) end)
+
+          refresh = Jason.decode!(refresh_output)
+          assert refresh["kind"] == "models_refresh"
+          assert refresh["providers"]["openai"]["status"] == "refreshed"
+          assert refresh["providers"]["anthropic"]["reason"] == "no_credential"
+          assert refresh["wrote_config"] == true
+          assert_received {:models_http, "https://api.openai.com/v1/models"}
+        end
+      )
+    end)
+  end
+
+  test "models rejects unknown arguments with exit 2" do
+    assert {:error, 2} = CLI.route(["models", "surprise"])
+
+    output =
+      capture_io(fn -> assert {:error, 2} = CLI.route(["models", "surprise", "--json"]) end)
+
+    envelope = Jason.decode!(output)
+    assert envelope["status"] == "invalid_args"
+    assert envelope["next_actions"] == ["remove_unsupported_models_arguments"]
   end
 
   test "one-shot exits nonzero even when failed provider stream preserved partial text" do

@@ -38,12 +38,12 @@ defmodule Pixir.VirtualOverlayTest do
 
     assert {:error, %{ok: false, error: %{kind: :invalid_args, details: details}}} =
              VirtualOverlay.run(ws, %{
-               "read_set" => ["lib/example.txt", "./**/*"],
+               "read_set" => ["lib/example.txt", " ", "./**/*"],
                "commands" => ["true"]
              })
 
     assert details["field"] == "read_set"
-    assert details["index"] == 1
+    assert details["index"] == 2
     assert details["value"] == "./**/*"
   end
 

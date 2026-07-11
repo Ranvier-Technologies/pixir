@@ -96,7 +96,20 @@ defmodule Pixir.ConversationTest do
     assert :done = send_and_await(sid, "hello", [stop("hi there")])
 
     assert {:ok, history} = Conversation.history(sid)
-    assert Enum.map(history, & &1.type) == [:user_message, :provider_usage, :assistant_message]
+
+    assert Enum.map(history, & &1.type) == [
+             :subagent_event,
+             :user_message,
+             :provider_usage,
+             :assistant_message
+           ]
+
+    # A minted root records its permission posture as the Log's first event.
+    assert [posture | _rest] = history
+    assert posture.seq == 0
+    assert posture.data["event"] == "permission_posture"
+    assert posture.data["lineage"] == "root"
+    assert posture.data["source"] == "root_session_start"
 
     usage = Enum.find(history, &(&1.type == :provider_usage))
     assert usage.data["usage_available"] == true
@@ -114,6 +127,7 @@ defmodule Pixir.ConversationTest do
     assert {:ok, history} = Conversation.history(sid)
 
     assert Enum.map(history, & &1.type) == [
+             :subagent_event,
              :user_message,
              :provider_usage,
              :assistant_message,

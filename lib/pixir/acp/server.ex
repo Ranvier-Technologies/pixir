@@ -53,7 +53,7 @@ defmodule Pixir.ACP.Server do
   require Logger
 
   alias Pixir.ACP.{Protocol, Translate}
-  alias Pixir.{Config, Conversation}
+  alias Pixir.{Config, Conversation, SessionSupervisor, Subagents}
   alias Pixir.Providers.Registry
 
   @protocol_version 1
@@ -196,6 +196,10 @@ defmodule Pixir.ACP.Server do
       # acp_session_id => current mode id ("build" | "plan"), epic D.2. A parallel
       # map (not enriching `sessions` values) to keep existing lookups untouched.
       modes: %{},
+      # Durable permission posture restored by session/load or session/resume.
+      # Absent entries are ordinary ACP-created sessions; present entries are
+      # restrict-never-widen pins for every later prompt.
+      resume_postures: %{},
       # acp_session_id => sticky model id (epic A.3). A parallel map like `modes`.
       # An ABSENT entry means "use Pixir's own resolution" (config/env/default);
       # a present entry is the per-session fallback when `session/prompt`'s
@@ -823,13 +827,19 @@ defmodule Pixir.ACP.Server do
     end
   end
 
-  defp register_session(state, acp_sid, pixir_sid, cwd) do
-    %{
+  defp register_session(state, acp_sid, pixir_sid, cwd, posture \\ nil) do
+    state = %{
       state
       | sessions: Map.put(state.sessions, acp_sid, pixir_sid),
         workspaces: Map.put(state.workspaces, acp_sid, cwd),
         modes: Map.put(state.modes, acp_sid, @default_mode)
     }
+
+    if posture do
+      %{state | resume_postures: Map.put(state.resume_postures, acp_sid, posture)}
+    else
+      %{state | resume_postures: Map.delete(state.resume_postures, acp_sid)}
+    end
   end
 
   defp write_start_error(out, id, %{error: %{kind: kind, message: message}}) do
@@ -856,24 +866,26 @@ defmodule Pixir.ACP.Server do
   # session/update notifications (so the client repopulates the transcript)
   # before returning the LoadSessionResponse. A missing session is `-32602`.
   defp load_session(acp_sid, cwd, id, state) do
-    case Conversation.start(id: acp_sid, workspace: cwd) do
-      {:ok, pixir_sid} ->
-        replayed_subagents = replay_history(state.out, acp_sid, pixir_sid, cwd)
+    # Existence check first: Conversation.start yields the :not_found -> -32602
+    # contract for an unknown session. Restore the posture only after, so a
+    # missing session never surfaces as an internal -32603 from the Log fold.
+    with {:ok, pixir_sid} <- Conversation.start(id: acp_sid, workspace: cwd),
+         {:ok, posture} <- restore_reattach_posture(acp_sid, cwd, pixir_sid) do
+      replayed_subagents = replay_history(state.out, acp_sid, pixir_sid, cwd)
+      current_model = current_model(state, acp_sid)
 
-        current_model = current_model(state, acp_sid)
-
-        write(
-          state.out,
-          Protocol.result(
-            id,
-            session_setup_result(acp_sid, current_model, current_effort(state, acp_sid))
-          )
+      write(
+        state.out,
+        Protocol.result(
+          id,
+          session_setup_result(acp_sid, current_model, current_effort(state, acp_sid))
         )
+      )
 
-        state
-        |> register_session(acp_sid, pixir_sid, cwd)
-        |> remember_presented_subagents(replayed_subagents)
-
+      state
+      |> register_session(acp_sid, pixir_sid, cwd, posture)
+      |> remember_presented_subagents(replayed_subagents)
+    else
       {:error, %{error: %{kind: :not_found, message: message}}} ->
         write(
           state.out,
@@ -890,24 +902,25 @@ defmodule Pixir.ACP.Server do
 
   # session/resume: the lighter cousin — reattach WITHOUT replaying History.
   defp resume_session(acp_sid, cwd, id, state) do
-    case Conversation.start(id: acp_sid, workspace: cwd) do
-      {:ok, pixir_sid} ->
-        historical_subagents = presented_subagents_from_history(acp_sid, pixir_sid)
+    # Existence check first (see load_session): unknown session -> -32602, not
+    # an internal -32603 from folding a nonexistent Log.
+    with {:ok, pixir_sid} <- Conversation.start(id: acp_sid, workspace: cwd),
+         {:ok, posture} <- restore_reattach_posture(acp_sid, cwd, pixir_sid) do
+      historical_subagents = presented_subagents_from_history(acp_sid, pixir_sid)
+      current_model = current_model(state, acp_sid)
 
-        current_model = current_model(state, acp_sid)
-
-        write(
-          state.out,
-          Protocol.result(
-            id,
-            session_setup_result(acp_sid, current_model, current_effort(state, acp_sid))
-          )
+      write(
+        state.out,
+        Protocol.result(
+          id,
+          session_setup_result(acp_sid, current_model, current_effort(state, acp_sid))
         )
+      )
 
-        state
-        |> register_session(acp_sid, pixir_sid, cwd)
-        |> remember_presented_subagents(historical_subagents)
-
+      state
+      |> register_session(acp_sid, pixir_sid, cwd, posture)
+      |> remember_presented_subagents(historical_subagents)
+    else
       {:error, %{error: %{kind: :not_found, message: message}}} ->
         write(
           state.out,
@@ -919,6 +932,23 @@ defmodule Pixir.ACP.Server do
       {:error, error} ->
         write_start_error(state.out, id, error)
         state
+    end
+  end
+
+  # Posture restore runs AFTER Conversation.start on purpose (unknown session ->
+  # -32602 from the existence check, never -32603 from folding a missing Log).
+  # The cost of that order is that a posture failure happens with a Session
+  # already live, so this helper stops it before propagating the error: the
+  # fail-closed path must not leave an untracked write-capable Session (and its
+  # writer lease) behind.
+  defp restore_reattach_posture(acp_sid, cwd, pixir_sid) do
+    with {:ok, durable_posture} <- Subagents.resume_posture(acp_sid, workspace: cwd),
+         {:ok, posture} <- Subagents.restrict_resume_posture(durable_posture, :auto, nil) do
+      {:ok, posture}
+    else
+      {:error, error} ->
+        SessionSupervisor.stop_session(pixir_sid)
+        {:error, error}
     end
   end
 
@@ -1201,7 +1231,19 @@ defmodule Pixir.ACP.Server do
     # Permission posture (D.3 + A.2): plan mode is always `:read_only`; otherwise
     # `_meta.permission_mode: "ask"` (T3's approval-required) selects `:ask`,
     # else `:auto`. The Turn re-forces `:read_only` for plan regardless.
-    permission_mode = resolve_permission_mode(mode, requested_perm)
+    requested_permission_mode = resolve_permission_mode(mode, requested_perm)
+
+    {permission_mode, write_policy} =
+      case Map.get(state.resume_postures, acp_sid) do
+        nil ->
+          {requested_permission_mode, nil}
+
+        posture ->
+          {:ok, effective_posture} =
+            Subagents.restrict_resume_posture(posture, requested_permission_mode, nil)
+
+          {effective_posture.permission_mode, effective_posture.write_policy}
+      end
 
     base =
       [
@@ -1209,6 +1251,7 @@ defmodule Pixir.ACP.Server do
         permission_mode: permission_mode,
         asker: build_asker(permission_mode, acp_sid)
       ]
+      |> maybe_put(:write_policy, write_policy)
       |> maybe_put(:presenter_context, presenter_context)
 
     base

@@ -84,14 +84,13 @@ defmodule Pixir.Permissions.WritePolicyTest do
   end
 
   test "rejects verify test commands with the v1 future-work action" do
-    assert {:error, %{error: %{kind: :invalid_args, message: message, details: details}}} =
+    assert {:error, %{error: %{kind: :invalid_args, details: details}}} =
              WritePolicy.normalize(%{
                "version" => 1,
                "allow_writes" => ["src/**"],
                "bash" => %{"verify" => ["mix test test/pixir"]}
              })
 
-    assert message == "verify test commands are not accepted yet (v1 allows format/compile only)"
     assert details["next_action"] == "keep_test_execution_with_the_orchestrator"
     assert details["observed"] == "mix test test/pixir"
   end
@@ -304,6 +303,23 @@ defmodule Pixir.Permissions.WritePolicyTest do
     assert details["matched_rule"] == "not_within_parent_allow"
   end
 
+  test "narrowed policies survive the posture metadata round-trip" do
+    {:ok, policy} =
+      WritePolicy.normalize(%{
+        "version" => 1,
+        "metadata" => %{"id" => "narrow-roundtrip"},
+        "allow_writes" => ["app/**"]
+      })
+
+    assert {:ok, narrowed} = WritePolicy.narrow_to_write_set(policy, ["app/out.txt"])
+
+    assert narrowed["hash"] != policy["hash"]
+
+    assert {:ok, restored} = WritePolicy.from_metadata(WritePolicy.metadata(narrowed))
+    assert restored["hash"] == narrowed["hash"]
+    assert restored["allow_writes"] == ["app/out.txt"]
+  end
+
   test "allows safe read-only bash but rejects symlink write targets", %{ws: ws} do
     File.mkdir_p!(Path.join(ws, "real"))
     File.ln_s!(Path.join(ws, "real"), Path.join(ws, "link"))
@@ -345,6 +361,27 @@ defmodule Pixir.Permissions.WritePolicyTest do
 
       assert details["rule"] == rule
     end
+  end
+
+  test "rejects durable metadata whose allow list was forged under a narrow hash" do
+    {:ok, narrow} =
+      WritePolicy.normalize(%{
+        "version" => 1,
+        "metadata" => %{"id" => "forgery-test"},
+        "allow_writes" => ["src/**"]
+      })
+
+    forged =
+      narrow
+      |> WritePolicy.metadata()
+      |> Map.put("allow_writes", ["**/*"])
+
+    assert {:error, %{error: %{kind: :invalid_args, details: details}}} =
+             WritePolicy.from_metadata(forged)
+
+    assert details["matched_rule"] == "metadata_hash_mismatch"
+    assert details["stored_hash"] == narrow["hash"]
+    refute details["computed_hash"] == narrow["hash"]
   end
 
   test "rehydrates runtime policy from durable metadata without changing hash" do

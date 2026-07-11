@@ -37,6 +37,40 @@ defmodule Pixir.Providers.RegistryTest do
     refute Registry.model_supported?(nil)
   end
 
+  test "anthropic_models config overrides built-ins without claiming the picker default" do
+    home = Path.join(System.tmp_dir!(), "pixir-registry-#{System.unique_integer([:positive])}")
+    previous_home = System.get_env("PIXIR_HOME")
+
+    try do
+      File.mkdir_p!(home)
+      System.put_env("PIXIR_HOME", home)
+
+      File.write!(
+        Path.join(home, "config.json"),
+        Jason.encode!(%{"anthropic_models" => ["claude-refreshed-test"]})
+      )
+
+      anthropic = Registry.entry_for(Pixir.Providers.Anthropic)
+
+      assert Enum.map(anthropic.models, & &1["id"]) == [
+               "claude-fable-5",
+               "claude-refreshed-test"
+             ]
+
+      # Routing default (entry.default_model) is claude-fable-5, but catalog
+      # entries never claim the ACP picker default: the merged catalog
+      # advertises exactly one, the OpenAI session default.
+      assert anthropic.default_model == "claude-fable-5"
+      refute Enum.any?(anthropic.models, & &1["default"])
+    after
+      if previous_home,
+        do: System.put_env("PIXIR_HOME", previous_home),
+        else: System.delete_env("PIXIR_HOME")
+
+      File.rm_rf!(home)
+    end
+  end
+
   test "capabilities expose provider dialect metadata" do
     openai = Registry.entry_for(Pixir.Provider)
     anthropic = Registry.entry_for(Pixir.Providers.Anthropic)

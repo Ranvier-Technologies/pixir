@@ -939,7 +939,9 @@ defmodule Pixir.Compaction do
         &(&1.type in [:history_compaction, :user_message, :assistant_message, :subagent_event])
       )
       |> Enum.take(-6)
-      |> Enum.map_join("\n", &("- " <> event_excerpt(&1)))
+      |> Enum.map(&event_excerpt/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.map_join("\n", &("- " <> &1))
 
     """
     Compacted #{length(events)} events (#{counts}).
@@ -954,6 +956,11 @@ defmodule Pixir.Compaction do
 
   defp event_excerpt(%{type: :assistant_message, data: %{"text" => text}}),
     do: "assistant: " <> excerpt(text)
+
+  # Session-scoped posture evidence is not conversational material: excerpting
+  # it would persist "subagent unknown: permission_posture" noise into
+  # compaction summaries (and branch summaries) for every root Session.
+  defp event_excerpt(%{type: :subagent_event, data: %{"event" => "permission_posture"}}), do: ""
 
   defp event_excerpt(%{type: :subagent_event, data: data}) do
     summary = data["summary"] || data["status"] || data["event"] || ""

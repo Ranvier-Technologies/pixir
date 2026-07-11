@@ -59,6 +59,12 @@ defmodule Pixir.LogTest do
     assert {:ok, [a, b]} = Log.fold(sid, workspace: ws)
     assert a.data["text"] == "first"
     assert b.data["text"] == "second"
+
+    assert {:ok, [appended_first, appended_second]} =
+             Log.fold_append_order(sid, workspace: ws)
+
+    assert appended_first.data["text"] == "second"
+    assert appended_second.data["text"] == "first"
   end
 
   test "appending an ephemeral event is refused with a structured error", %{ws: ws, sid: sid} do

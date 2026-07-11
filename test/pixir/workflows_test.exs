@@ -1,7 +1,7 @@
 defmodule Pixir.WorkflowsTest do
   use ExUnit.Case, async: false
 
-  alias Pixir.{Log, SessionSupervisor, Subagents, Workflows}
+  alias Pixir.{Log, Session, SessionSupervisor, Subagents, Workflows}
   alias Pixir.Permissions.WritePolicy
 
   defmodule EchoProvider do
@@ -480,27 +480,25 @@ defmodule Pixir.WorkflowsTest do
       }
     ]
 
-    # Each negative spec must fail for ITS OWN reason: expected
-    # {location, message-fragment} per case, in order. Locations are
-    # zero-based JSON pointers into the spec.
+    # Each negative spec must fail for ITS OWN structured reason: expected
+    # {location, next_actions} per case, in order. Locations are zero-based
+    # JSON pointers into the spec.
     expectations = [
-      {"/steps/0/apply_from", "must reference a previous virtual_overlay step"},
-      {"/steps/1/apply_from", "must use workspace_mode virtual_overlay"},
-      {"/steps/1/apply_from", "must be listed in depends_on"},
-      {"/steps/1/apply_from", "requires write_set"},
-      {"/steps/1/apply_from", "do not spawn subagents"}
+      {"/steps/0/apply_from", ["declare_the_virtual_overlay_producer_before_the_apply_step"]},
+      {"/steps/1/apply_from", ["point_apply_from_at_a_virtual_overlay_step"]},
+      {"/steps/1/apply_from", ["add_the_producer_to_depends_on"]},
+      {"/steps/1/apply_from", ["add_explicit_write_set"]},
+      {"/steps/1/apply_from", ["remove_apply_step_subagent_fields"]}
     ]
 
-    for {spec, {location, fragment}} <- Enum.zip(specs, expectations) do
-      assert {:error, %{error: %{kind: :invalid_spec, message: message, details: details}}} =
+    for {spec, {location, next_actions}} <- Enum.zip(specs, expectations) do
+      assert {:error, %{error: %{kind: :invalid_spec, details: details}}} =
                Workflows.dry_run(spec, workspace: ws, write_policy: policy)
 
-      assert details["location"] == location,
-             "expected #{location} for fragment #{fragment}, got #{details["location"]}"
+      assert details["location"] == location
+      assert details["next_actions"] == next_actions
 
-      assert message =~ fragment
-
-      assert {:error, %{error: %{kind: :invalid_spec, message: ^message}}} =
+      assert {:error, %{error: %{kind: :invalid_spec, details: ^details}}} =
                Workflows.run(sid, spec, workspace: ws, write_policy: policy)
     end
 
@@ -1358,6 +1356,137 @@ defmodule Pixir.WorkflowsTest do
       assert details["id"] == step["id"]
       assert details["field"] == field
     end
+  end
+
+  test "abnormal virtual_overlay runner exits return a structured workflow error", %{
+    sid: sid,
+    ws: ws
+  } do
+    spec = %{
+      "steps" => [
+        %{
+          "id" => "crashing_virtual",
+          "task" => "exercise runner exit handling",
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["source.txt"],
+          "virtual_commands" => ["true"]
+        }
+      ]
+    }
+
+    assert {:error, %{error: %{kind: :command_failed, details: details}}} =
+             Workflows.run(sid, spec,
+               workspace: ws,
+               virtual_overlay_runner: fn _workspace, _params, _opts -> exit(:runner_boom) end,
+               timeout_ms: 5_000
+             )
+
+    assert details["reason"] == "virtual_overlay_runner_task_exit"
+    assert details["exit_reason"] =~ "runner_boom"
+  end
+
+  test "abnormal virtual_diff apply task exits complete as a failed apply step", %{
+    sid: sid,
+    ws: ws
+  } do
+    {:ok, policy} = workflow_policy(["applied.txt"])
+    artifact = add_artifact("applied.txt", "not applied\n")
+
+    assert {:ok, result} =
+             Workflows.run(sid, apply_workflow("applied.txt"),
+               workspace: ws,
+               write_policy: policy,
+               virtual_overlay_runner: fn _workspace, _params, _opts -> {:ok, artifact} end,
+               virtual_diff_apply_runner: fn _artifact, _workspace, _opts ->
+                 exit(:apply_boom)
+               end,
+               timeout_ms: 5_000
+             )
+
+    assert [_producer, apply] = result["steps"]
+    assert apply["status"] == "failed"
+    assert apply["virtual_diff_apply"]["reason"] == "virtual_diff_apply_task_exit"
+    assert apply["virtual_diff_apply"]["details"]["exit_reason"] =~ "apply_boom"
+    refute File.exists?(Path.join(ws, "applied.txt"))
+  end
+
+  test "interrupt tears down a blocked write-capable apply task", %{sid: sid, ws: ws} do
+    {:ok, policy} = workflow_policy(["applied.txt"])
+    artifact = add_artifact("applied.txt", "must not land after interrupt\n")
+    test_pid = self()
+
+    assert {:ok, _turn_ref} =
+             Session.start_turn(sid, fn _ctx ->
+               Workflows.run(sid, apply_workflow("applied.txt"),
+                 workspace: ws,
+                 write_policy: policy,
+                 virtual_overlay_runner: fn _workspace, _params, _opts -> {:ok, artifact} end,
+                 virtual_diff_apply_runner: fn _artifact, workspace, _opts ->
+                   send(test_pid, {:blocked_apply_started, self()})
+
+                   receive do
+                     :mutate_after_interrupt ->
+                       File.write!(Path.join(workspace, "applied.txt"), "late mutation\n")
+                       {:ok, %{"status" => "applied"}}
+                   end
+                 end,
+                 timeout_ms: 5_000
+               )
+             end)
+
+    assert_receive {:blocked_apply_started, apply_pid}, 1_000
+    apply_ref = Process.monitor(apply_pid)
+
+    on_exit(fn ->
+      if Process.alive?(apply_pid), do: Process.exit(apply_pid, :kill)
+    end)
+
+    assert Process.alive?(apply_pid)
+    assert :ok = Session.interrupt(sid)
+    assert_receive {:DOWN, ^apply_ref, :process, ^apply_pid, _reason}, 1_000
+    refute Process.alive?(apply_pid)
+
+    # A sibling async_nolink task would still receive this and mutate the parent
+    # workspace. The interrupt-coupled task is already dead, so the write cannot land.
+    send(apply_pid, :mutate_after_interrupt)
+    Process.sleep(20)
+    refute File.exists?(Path.join(ws, "applied.txt"))
+  end
+
+  test "apply_from handles a final symlink artifact path without raising", %{sid: sid, ws: ws} do
+    outside = Path.join(System.tmp_dir!(), "pixir-workflow-final-link-#{System.unique_integer()}")
+    File.write!(outside, "outside\n")
+    File.ln_s!(outside, Path.join(ws, "link.txt"))
+    on_exit(fn -> File.rm(outside) end)
+
+    {:ok, policy} = workflow_policy(["link.txt"])
+
+    artifact = %{
+      "kind" => "virtual_diff",
+      "version" => 1,
+      "changes" => [
+        %{
+          "path" => "link.txt",
+          "operation" => "delete",
+          "before" => %{"sha256" => sha256("outside\n")},
+          "diff" => %{"truncated" => false}
+        }
+      ]
+    }
+
+    assert {:ok, result} =
+             Workflows.run(sid, apply_workflow("link.txt"),
+               workspace: ws,
+               write_policy: policy,
+               virtual_overlay_runner: fn _workspace, _params, _opts -> {:ok, artifact} end,
+               timeout_ms: 5_000
+             )
+
+    assert [_producer, apply] = result["steps"]
+    assert apply["status"] == "failed"
+    assert apply["virtual_diff_apply"]["status"] == "not_applied"
+    assert [%{"status" => "outside_workspace"}] = apply["virtual_diff_apply"]["files"]
+    assert File.read!(outside) == "outside\n"
   end
 
   test "workflow virtual path does not introduce host-boundary calls" do

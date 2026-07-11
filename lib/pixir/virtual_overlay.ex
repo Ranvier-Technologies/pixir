@@ -36,8 +36,7 @@ defmodule Pixir.VirtualOverlay do
 
   def run(workspace, params, opts) when is_binary(workspace) and is_map(params) do
     with {:ok, limits} <- limits(Map.get(params, "limits", Keyword.get(opts, :limits, %{}))),
-         {:ok, read_set} <- string_list(params, "read_set"),
-         :ok <- reject_unbounded_entries(read_set),
+         {:ok, read_set} <- read_set(params),
          {:ok, commands} <- string_list(params, "commands"),
          :ok <- enforce_command_limit(commands, limits),
          {:ok, imported, import_meta, caveats} <- import_read_set(workspace, read_set, limits) do
@@ -84,6 +83,22 @@ defmodule Pixir.VirtualOverlay do
        "apply" => %{"status" => "not_applied", "requires_explicit_apply" => true},
        "elapsed_ms" => monotonic_ms() - started_at
      }}
+  end
+
+  defp read_set(params) do
+    case Map.get(params, "read_set", []) do
+      values when is_list(values) ->
+        if Enum.all?(values, &is_binary/1) do
+          with :ok <- reject_unbounded_entries(values) do
+            {:ok, Enum.reject(values, &(String.trim(&1) == ""))}
+          end
+        else
+          invalid_string_list("read_set", values)
+        end
+
+      value ->
+        invalid_string_list("read_set", value)
+    end
   end
 
   defp string_list(params, key) do
@@ -155,8 +170,11 @@ defmodule Pixir.VirtualOverlay do
 
   def validate_read_set(_read_set), do: {:error, :read_set_required}
 
-  # Canonical spellings of the whole-workspace glob. Directory- and
-  # extension-bounded patterns ("lib/**/*", "**/*.ex") stay legal.
+  # Canonical whole-workspace glob detection. Directory- and extension-bounded
+  # patterns ("lib/**/*", "**/*.ex") stay legal. This rejects only the exact
+  # spellings listed below. Robust normalized rejection (repeated `**`, `.`/`..`
+  # collapse, `../<ws>/**` round-trip) is
+  # deferred to the read_set-confinement hardening issue. Same-UID threat model.
   defp unbounded_glob?(entry) do
     entry
     |> String.trim()

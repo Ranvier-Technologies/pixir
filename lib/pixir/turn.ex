@@ -290,9 +290,11 @@ defmodule Pixir.Turn do
   the model is promised a message that never arrives and has no workspace root at all.
   """
   @spec system_prompt(ctx(), :build | :plan, keyword()) :: String.t()
-  def system_prompt(ctx, mode \\ :build, skills_opts \\ [])
+  def system_prompt(ctx, mode \\ :build, skills_opts \\ []) do
+    build_system_prompt(ctx, mode, skills_opts, nil)
+  end
 
-  def system_prompt(ctx, :plan, skills_opts) do
+  defp build_system_prompt(ctx, :plan, skills_opts, rendered_skills_index) do
     base = """
     You are Pixir, a terminal coding agent.
     You are in PLAN MODE: investigate with read-only tools (read, and safe shell
@@ -306,10 +308,10 @@ defmodule Pixir.Turn do
     #{@layer0_tail}
     """
 
-    append_skills_index(base, ctx, skills_opts)
+    append_skills_index(base, ctx, skills_opts, rendered_skills_index)
   end
 
-  def system_prompt(ctx, _build, skills_opts) do
+  defp build_system_prompt(ctx, _build, skills_opts, rendered_skills_index) do
     base = """
     You are Pixir, a terminal coding agent.
     Use the tools (read, write, bash) to inspect and change files and run commands.
@@ -320,7 +322,7 @@ defmodule Pixir.Turn do
     #{@layer0_tail}
     """
 
-    append_skills_index(base, ctx, skills_opts)
+    append_skills_index(base, ctx, skills_opts, rendered_skills_index)
   end
 
   @doc """
@@ -386,7 +388,16 @@ defmodule Pixir.Turn do
     history = maybe_preflight_critical_compaction(ctx, history)
 
     tools = provider_tool_specs(state.provider)
-    system_prompt = system_prompt(ctx, state.mode, state.skills_opts, state.agent_instructions)
+
+    system_prompt =
+      system_prompt(
+        ctx,
+        state.mode,
+        state.skills_opts,
+        state.agent_instructions,
+        state.rendered_skills_index
+      )
+
     cache_metadata = cache_metadata(ctx, state, tools) |> provider_cache_metadata(state.provider)
 
     request =
@@ -937,6 +948,8 @@ defmodule Pixir.Turn do
            model: state.model,
            mode: state.mode,
            tools: tools,
+           # Design boundary: keep this render independent from the Turn snapshot.
+           # Its timing feeds skill_index_hash and prompt_cache_key derivation.
            skill_index: Skills.render_index(ctx.workspace, state.skills_opts)
          }) do
       {:ok, metadata} ->
@@ -1313,15 +1326,27 @@ defmodule Pixir.Turn do
 
   defp useful_partial_text(_text), do: :none
 
-  defp system_prompt(ctx, mode, skills_opts, agent_instructions) do
+  defp system_prompt(
+         ctx,
+         mode,
+         skills_opts,
+         agent_instructions,
+         rendered_skills_index
+       ) do
     ctx
-    |> system_prompt(mode, skills_opts)
+    |> build_system_prompt(mode, skills_opts, rendered_skills_index)
     |> append_agent_instructions(agent_instructions)
   end
 
-  defp append_skills_index(base, ctx, skills_opts) do
-    base = String.trim(base)
-    base <> "\n\n" <> Skills.render_index(ctx.workspace, skills_opts)
+  defp append_skills_index(base, ctx, skills_opts, rendered_skills_index) do
+    index =
+      if is_binary(rendered_skills_index) do
+        rendered_skills_index
+      else
+        Skills.render_index(ctx.workspace, skills_opts)
+      end
+
+    String.trim(base) <> "\n\n" <> index
   end
 
   defp append_agent_instructions(base, nil), do: base

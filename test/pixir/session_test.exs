@@ -22,6 +22,11 @@ defmodule Pixir.SessionTest do
     %{ws: ws, sid: sid}
   end
 
+  test "stop_session reports stopped versus already not running", %{sid: sid} do
+    assert {:ok, :stopped} = SessionSupervisor.stop_session(sid)
+    assert {:ok, :not_running} = SessionSupervisor.stop_session(sid)
+  end
+
   test "records canonical events with monotonic seq and persists to the Log", %{ws: ws, sid: sid} do
     assert {:ok, %{seq: 0, type: :user_message}} =
              Session.record(sid, Event.user_message(sid, "hello"))

@@ -218,7 +218,47 @@ defmodule Pixir.SubagentsTest do
 
     assert {:ok, [completed]} = Subagents.wait(sid, [agent["id"]], 10_000, workspace: ws)
     assert completed["status"] == "completed"
+    assert completed["retry_attempts"] == 1
+    assert completed["retry_max_attempts"] == 1
+    assert [retry_entry] = completed["retry_history"]
+    assert retry_entry["attempt_index"] == 0
+    assert retry_entry["error_kind"] == "provider_http_error"
+    assert is_binary(retry_entry["failed_child_session_id"])
+    assert is_binary(retry_entry["timestamp"])
     assert Agent.get(:pixir_subagent_retry_script, & &1) == []
+
+    # Re-fold the real append-only parent Log: cold restoration must consume
+    # durable NDJSON evidence, not rebuild equivalent Events via constructors.
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    assert [finished] =
+             Enum.filter(
+               history,
+               &(&1.type == :subagent_event and &1.data["subagent_id"] == agent["id"] and
+                   &1.data["event"] == "finished")
+             )
+
+    assert finished.data["retry_attempts"] == 1
+    assert finished.data["retry_max_attempts"] == 1
+    assert finished.data["retry_history"] == completed["retry_history"]
+    # a successful completion records its duration too (parity with the
+    # failed/timeout/cancelled terminal paths), surviving into the durable Log
+    assert is_integer(finished.data["elapsed_ms"])
+    assert finished.data["elapsed_ms"] >= 0
+
+    reconstructed = Subagents.reconstruct(history)[agent["id"]]
+    assert reconstructed["status"] == "completed"
+    assert reconstructed["retry_attempts"] == 1
+    assert reconstructed["retry_history"] == completed["retry_history"]
+
+    restart_subagents_manager()
+
+    assert {:ok, [restored]} = Subagents.list(sid, workspace: ws)
+    assert restored["id"] == agent["id"]
+    assert restored["status"] == "completed"
+    assert restored["retry_attempts"] == 1
+    assert restored["retry_max_attempts"] == 1
+    assert restored["retry_history"] == completed["retry_history"]
   end
 
   test "delegate auto-retry keeps legacy server_error eligibility", %{sid: sid, ws: ws} do
@@ -1664,6 +1704,55 @@ defmodule Pixir.SubagentsTest do
     assert listed["virtual_diff_ref"] == ref
   end
 
+  test "cold restored legacy agent without permission_mode can record a later lifecycle event", %{
+    sid: sid,
+    ws: ws
+  } do
+    id = unique_subagent_id("legacy-no-permission-mode")
+    child_sid = unique_session_id("legacy-child")
+
+    # Raw NDJSON, not the Session.record constructor path: this is a cold-read
+    # regression (a legacy event that omits permission_mode), and constructing
+    # it in-VM would mask a decode-side gap (the test/CLAUDE.md rule).
+    write_raw_history!(sid, ws, [
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "finished",
+          "subagent_id" => id,
+          "child_session_id" => child_sid,
+          "agent" => "default",
+          "task" => "legacy child",
+          "depth" => 1,
+          "max_depth" => 1,
+          "timeout_ms" => 5_000,
+          "status" => "completed",
+          "workspace_mode" => "shared",
+          "workspace" => ws,
+          "summary" => "legacy completed"
+        }
+      }
+    ])
+
+    restart_subagents_manager()
+
+    assert {:ok, [restored]} = Subagents.list(sid, workspace: ws)
+    assert restored["id"] == id
+    refute Map.has_key?(restored, "permission_mode")
+
+    assert {:ok, closed} = Subagents.close(sid, id, workspace: ws)
+    assert closed["status"] == "closed"
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    assert Enum.any?(history, fn event ->
+             event.type == :subagent_event and event.data["subagent_id"] == id and
+               event.data["event"] == "closed" and event.data["status"] == "closed"
+           end)
+
+    assert Process.alive?(Process.whereis(Pixir.Subagents.Manager))
+  end
+
   test "reattaches started-only live subagents after manager restart", %{sid: sid, ws: ws} do
     {:ok, agent} =
       Subagents.spawn_agent(
@@ -1850,6 +1939,569 @@ defmodule Pixir.SubagentsTest do
     assert "increase_max_depth_to_2" in details["next_actions"]
   end
 
+  test "resume posture canonicalizes symlinked workspace spellings", %{ws: ws} do
+    cold_sid = unique_session_id("symlinked-workspace")
+    symlinked_ws = ws <> "-symlink"
+
+    assert :ok = File.ln_s(ws, symlinked_ws)
+    on_exit(fn -> File.rm(symlinked_ws) end)
+
+    {:ok, policy} =
+      WritePolicy.normalize(%{
+        "version" => 1,
+        "metadata" => %{"id" => "symlinked-resume"},
+        "allow_writes" => ["allowed.txt"],
+        "deny_writes" => [],
+        "bash" => "disabled"
+      })
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "permission_mode" => "auto",
+          "write_policy" => WritePolicy.metadata(policy),
+          "workspace_mode" => "shared",
+          "workspace" => ws
+        }
+      }
+    ])
+
+    assert {:ok, posture} = Subagents.resume_posture(cold_sid, workspace: symlinked_ws)
+    assert posture.workspace == ws
+    assert posture.write_policy["hash"] == policy["hash"]
+  end
+
+  test "cold resume distinguishes a missing Log from an unreadable Log", %{ws: ws} do
+    missing_sid = unique_session_id("missing-log")
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: missing}}} =
+             Subagents.resume_posture(missing_sid, workspace: ws)
+
+    assert missing["reason"] == "log_missing"
+
+    corrupt_sid = unique_session_id("corrupt-log")
+    Pixir.Paths.ensure_sessions_dir(ws)
+    File.write!(Log.path(corrupt_sid, workspace: ws), "not-json\n")
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: unreadable}}} =
+             Subagents.resume_posture(corrupt_sid, workspace: ws)
+
+    assert unreadable["reason"] == "log_unreadable"
+    assert get_in(unreadable, ["log_error", :error, :kind]) == :corrupt_log_line
+  end
+
+  test "mutation-free legacy Log without posture restores an explicit read-only ceiling", %{
+    ws: ws
+  } do
+    cold_sid = unique_session_id("legacy-read-only")
+
+    write_raw_history!(cold_sid, ws, [
+      %{"type" => "user_message", "data" => %{"text" => "legacy prompt"}}
+    ])
+
+    assert {:ok, posture} = Subagents.resume_posture(cold_sid, workspace: ws)
+    assert posture.permission_mode == :read_only
+    assert posture.write_policy == nil
+    assert posture.workspace_mode == "shared"
+    # Synthesized posture carries the canonical workspace (/private/var on
+    # macOS); compare through symlink resolution, not raw string equality.
+    assert File.cd!(posture.workspace, &File.cwd!/0) == File.cd!(ws, &File.cwd!/0)
+    assert posture.lineage == :legacy_unknown
+
+    assert {:ok, restricted} = Subagents.restrict_resume_posture(posture, :auto, nil)
+    assert restricted.permission_mode == :read_only
+    assert restricted.write_policy == nil
+  end
+
+  test "cold resume rejects a shared posture whose recorded workspace is absent", %{ws: ws} do
+    cold_sid = unique_session_id("shared-workspace-absent")
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "permission_mode" => "read_only",
+          "write_policy" => nil,
+          "workspace_mode" => "shared",
+          "workspace" => nil
+        }
+      }
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(cold_sid, workspace: ws)
+
+    assert details["reason"] == "workspace_unavailable"
+  end
+
+  test "cold resume rejects a null write policy after mutating history", %{ws: ws} do
+    cold_sid = unique_session_id("null-policy")
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "permission_mode" => "auto",
+          "write_policy" => nil,
+          "workspace_mode" => "shared",
+          "workspace" => ws
+        }
+      },
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "write-1",
+          "name" => "write",
+          "args" => %{"path" => "owned.txt", "content" => "owned"}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{"call_id" => "write-1", "ok" => true, "output" => "written"}
+      }
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(cold_sid, workspace: ws)
+
+    assert details["reason"] == "unbounded_write_policy"
+  end
+
+  test "cold resume refuses an auto+nil child posture even with the write evidence deleted",
+       %{ws: ws} do
+    # Grok round: nulling a bounded child's write_policy AND deleting its
+    # write tool_call/result (so write_capable_evidence? is false) must not
+    # elevate it to unbounded auto. Cheaper than fabricating the trusted-root
+    # shape; the fail-closed rule now rejects auto+nil for non-root lineage.
+    cold_sid = unique_session_id("child-auto-nil-no-evidence")
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "lineage" => "child",
+          "source" => "subagent_spawn",
+          "subagent_id" => "child-1",
+          "parent_session_id" => "parent-1",
+          "permission_mode" => "auto",
+          "write_policy" => nil,
+          "workspace_mode" => "shared",
+          "workspace" => ws
+        }
+      },
+      %{"type" => "user_message", "data" => %{"text" => "resume me unbounded"}}
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(cold_sid, workspace: ws)
+
+    assert details["reason"] == "unbounded_write_policy"
+  end
+
+  test "cold resume refuses an isolated posture under a different workspace", %{ws: ws} do
+    cold_sid = unique_session_id("workspace-mismatch")
+    recorded_workspace = Path.join(ws, "isolated-child")
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "permission_mode" => "read_only",
+          "write_policy" => nil,
+          "workspace_mode" => "isolated",
+          "workspace" => recorded_workspace
+        }
+      }
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(cold_sid, workspace: ws)
+
+    assert details["reason"] == "workspace_mismatch"
+  end
+
+  test "cold resume treats denied write-policy decisions as write-capable evidence", %{ws: ws} do
+    cold_sid = unique_session_id("denied-policy")
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "permission_decision",
+        "data" => %{
+          "call_id" => "write-denied",
+          "tool" => "write",
+          "decision" => "deny",
+          "gate" => "write_policy"
+        }
+      }
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(cold_sid, workspace: ws)
+
+    assert details["reason"] == "missing"
+  end
+
+  test "a seq-0 root marker restores unbounded auto despite write evidence", %{ws: ws} do
+    cold_sid = unique_session_id("root-marker")
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "lineage" => "root",
+          "source" => "root_session_start",
+          "permission_mode" => "auto",
+          "write_policy" => nil,
+          "workspace_mode" => "shared",
+          "workspace" => ws
+        }
+      },
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "root-write",
+          "name" => "write",
+          "args" => %{"path" => "owned.txt", "content" => "owned"}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{"call_id" => "root-write", "ok" => true, "output" => "written"}
+      }
+    ])
+
+    assert {:ok, posture} = Subagents.resume_posture(cold_sid, workspace: ws)
+    assert posture.lineage == :root
+    assert posture.permission_mode == :auto
+    assert posture.write_policy == nil
+  end
+
+  test "a root marker appended after seq 0 is not trusted", %{ws: ws} do
+    cold_sid = unique_session_id("forged-root")
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "write-1",
+          "name" => "write",
+          "args" => %{"path" => "owned.txt", "content" => "owned"}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{"call_id" => "write-1", "ok" => true, "output" => "written"}
+      },
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "lineage" => "root",
+          "source" => "root_session_start",
+          "permission_mode" => "auto",
+          "write_policy" => nil,
+          "workspace_mode" => "shared",
+          "workspace" => ws
+        }
+      }
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(cold_sid, workspace: ws)
+
+    assert details["reason"] == "unreadable"
+  end
+
+  test "a forged seq zero cannot move a late root marker into append-root position", %{ws: ws} do
+    forged_sid = unique_session_id("forged-root-seq-zero")
+
+    root_posture = %{
+      "event" => "permission_posture",
+      "scope" => "session",
+      "lineage" => "root",
+      "source" => "root_session_start",
+      "permission_mode" => "auto",
+      "write_policy" => nil,
+      "workspace_mode" => "shared",
+      "workspace" => ws
+    }
+
+    write_raw_history!(forged_sid, ws, [
+      %{
+        "type" => "session_fork",
+        "seq" => 0,
+        "data" => %{"parent_session_id" => "parent-root"}
+      },
+      %{
+        "type" => "tool_call",
+        "seq" => 1,
+        "data" => %{
+          "call_id" => "write-before-marker",
+          "name" => "write",
+          "args" => %{"path" => "owned.txt", "content" => "owned"}
+        }
+      },
+      %{"type" => "subagent_event", "seq" => 0, "data" => root_posture}
+    ])
+
+    # Seq sorting places the forged marker beside the seq-0 fork and ahead of
+    # the seq-1 write. Physical append order is authoritative: after ignoring
+    # the fork, the write call still precedes the marker.
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(forged_sid, workspace: ws)
+
+    assert details["reason"] == "unreadable"
+
+    genuine_sid = unique_session_id("genuine-root-append-first")
+
+    write_raw_history!(genuine_sid, ws, [
+      %{"type" => "subagent_event", "seq" => 99, "data" => root_posture},
+      %{"type" => "user_message", "seq" => 0, "data" => %{"text" => "later append"}}
+    ])
+
+    assert {:ok, genuine} = Subagents.resume_posture(genuine_sid, workspace: ws)
+    assert genuine.lineage == :root
+    assert genuine.permission_mode == :auto
+  end
+
+  test "a forked root Log keeps a trusted root posture", %{ws: ws} do
+    {:ok, sid} = Pixir.Conversation.start(workspace: ws)
+    on_exit(fn -> cleanup_session(sid) end)
+
+    assert {:ok, fork} = Pixir.Fork.fork(sid, workspace: ws)
+    child_sid = fork["child_session_id"]
+
+    # Fork writes session_fork at seq 0 and renumbers the replayed prefix, so
+    # the copied root marker is no longer at seq 0 — root position (nothing
+    # before it except fork lineage metadata) must still be trusted.
+    assert {:ok, posture} = Subagents.resume_posture(child_sid, workspace: ws)
+    assert posture.lineage == :root
+    assert posture.permission_mode == :auto
+  end
+
+  test "a late root marker cannot ride an event-id collision into root position", %{ws: ws} do
+    forged_sid = unique_session_id("id-collision")
+
+    root_posture = %{
+      "event" => "permission_posture",
+      "scope" => "session",
+      "lineage" => "root",
+      "source" => "root_session_start",
+      "permission_mode" => "auto",
+      "write_policy" => nil,
+      "workspace_mode" => "shared",
+      "workspace" => ws
+    }
+
+    # The forged posture reuses the tool_call's id; position, not id, must
+    # decide root trust, so the intervening write still disqualifies it.
+    write_raw_history!(forged_sid, ws, [
+      %{"type" => "session_fork", "data" => %{"parent_session_id" => "parent-123"}, "id" => "sf"},
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "w1",
+          "name" => "write",
+          "args" => %{"path" => "owned.txt", "content" => "owned"}
+        },
+        "id" => "dup"
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{"call_id" => "w1", "ok" => true, "output" => "written"},
+        "id" => "r1"
+      },
+      %{"type" => "subagent_event", "data" => root_posture, "id" => "dup"}
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(forged_sid, workspace: ws)
+
+    assert details["reason"] == "unreadable"
+
+    # Colliding with the session_fork id must not empty the prefix either.
+    forged_sid2 = unique_session_id("id-collision-fork")
+
+    write_raw_history!(forged_sid2, ws, [
+      %{"type" => "session_fork", "data" => %{"parent_session_id" => "parent-123"}, "id" => "sf"},
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "w1",
+          "name" => "write",
+          "args" => %{"path" => "owned.txt", "content" => "owned"}
+        },
+        "id" => "w"
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{"call_id" => "w1", "ok" => true, "output" => "written"},
+        "id" => "r1"
+      },
+      %{"type" => "subagent_event", "data" => root_posture, "id" => "sf"}
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details2}}} =
+             Subagents.resume_posture(forged_sid2, workspace: ws)
+
+    assert details2["reason"] == "unreadable"
+  end
+
+  test "a fork-shaped child posture stripped of spawn fields is still refused", %{ws: ws} do
+    forged_sid = unique_session_id("fork-strip-elevation")
+
+    # The shape a partial edit of a forked bounded child produces: session_fork
+    # first, then the copied Manager posture with lineage flipped to root and
+    # the spawn fields deleted — but source is still subagent_spawn, which no
+    # runtime root ever writes.
+    write_raw_history!(forged_sid, ws, [
+      %{"type" => "session_fork", "data" => %{"parent_session_id" => "parent-123"}},
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "lineage" => "root",
+          "source" => "subagent_spawn",
+          "permission_mode" => "auto",
+          "write_policy" => nil,
+          "workspace_mode" => "shared",
+          "workspace" => ws
+        }
+      },
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "w1",
+          "name" => "write",
+          "args" => %{"path" => "owned.txt", "content" => "owned"}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{"call_id" => "w1", "ok" => true, "output" => "written"}
+      }
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(forged_sid, workspace: ws)
+
+    assert details["reason"] == "unreadable"
+  end
+
+  test "a root marker carrying child spawn fields is refused", %{ws: ws} do
+    forged_sid = unique_session_id("root-with-child-fields")
+
+    write_raw_history!(forged_sid, ws, [
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "lineage" => "root",
+          "source" => "root_session_start",
+          "subagent_id" => "sub_forged",
+          "parent_session_id" => "parent-123",
+          "permission_mode" => "auto",
+          "write_policy" => nil,
+          "workspace_mode" => "shared",
+          "workspace" => ws
+        }
+      }
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(forged_sid, workspace: ws)
+
+    assert details["reason"] == "unreadable"
+  end
+
+  test "an operator attestation restores at any seq but never as unbounded auto", %{ws: ws} do
+    attested_sid = unique_session_id("attested-root")
+
+    mutation = [
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "write-1",
+          "name" => "write",
+          "args" => %{"path" => "owned.txt", "content" => "owned"}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{"call_id" => "write-1", "ok" => true, "output" => "written"}
+      }
+    ]
+
+    attestation = fn mode ->
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "lineage" => "root",
+          "source" => "operator_attested_legacy_root",
+          "attestation_reason" => "this is my legacy root session",
+          "prior_classification" => "missing",
+          "permission_mode" => mode,
+          "write_policy" => nil,
+          "workspace_mode" => "shared",
+          "workspace" => ws
+        }
+      }
+    end
+
+    write_raw_history!(attested_sid, ws, mutation ++ [attestation.("read_only")])
+
+    assert {:ok, posture} = Subagents.resume_posture(attested_sid, workspace: ws)
+    assert posture.lineage == :attested_root
+    assert posture.permission_mode == :read_only
+
+    forged_sid = unique_session_id("attested-auto")
+    write_raw_history!(forged_sid, ws, mutation ++ [attestation.("auto")])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(forged_sid, workspace: ws)
+
+    assert details["reason"] == "unbounded_write_policy"
+  end
+
+  defp write_raw_history!(sid, ws, entries) do
+    Pixir.Paths.ensure_sessions_dir(ws)
+    timestamp = "2026-07-10T00:00:00Z"
+
+    body =
+      entries
+      |> Enum.with_index()
+      |> Enum.map_join("\n", fn {entry, seq} ->
+        Jason.encode!(%{
+          "id" => entry["id"] || "raw-#{sid}-#{seq}",
+          "session_id" => sid,
+          "seq" => Map.get(entry, "seq", seq),
+          "ts" => timestamp,
+          "type" => entry["type"],
+          "data" => entry["data"]
+        })
+      end)
+
+    File.write!(Log.path(sid, workspace: ws), body <> "\n")
+  end
+
   defp restart_subagents_manager do
     old = Process.whereis(Pixir.Subagents.Manager)
 
@@ -1947,6 +2599,99 @@ defmodule Pixir.SubagentsTest do
   end
 
   defp sse(map), do: "data: " <> Jason.encode!(map) <> "\n\n"
+
+  describe "restrict_resume_posture/3 (no-widen contract)" do
+    test "durable read_only survives a requested auto" do
+      posture = posture_fixture(:read_only, nil)
+
+      assert {:ok, restricted} = Subagents.restrict_resume_posture(posture, :auto, nil)
+      assert restricted.permission_mode == :read_only
+      assert restricted.write_policy == nil
+    end
+
+    test "requested read_only narrows a durable auto and drops the policy" do
+      posture = posture_fixture(:auto, policy_fixture(["app/**"]))
+
+      assert {:ok, restricted} = Subagents.restrict_resume_posture(posture, :read_only, nil)
+      assert restricted.permission_mode == :read_only
+      assert restricted.write_policy == nil
+    end
+
+    test "a wider requested policy cannot widen the durable allow list" do
+      posture = posture_fixture(:auto, policy_fixture(["app/**"]))
+
+      assert {:ok, restricted} =
+               Subagents.restrict_resume_posture(posture, :auto, policy_fixture(["**/*"]))
+
+      assert restricted.write_policy["allow_writes"] == ["app/**"]
+    end
+
+    test "a narrower requested policy narrows the durable allow list" do
+      posture = posture_fixture(:auto, policy_fixture(["app/**"]))
+
+      assert {:ok, restricted} =
+               Subagents.restrict_resume_posture(posture, :auto, policy_fixture(["app/sub/**"]))
+
+      assert restricted.write_policy["allow_writes"] == ["app/sub/**"]
+    end
+
+    test "disjoint policies fail closed with empty_policy_intersection" do
+      posture = posture_fixture(:auto, policy_fixture(["app/**"]))
+
+      assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+               Subagents.restrict_resume_posture(posture, :auto, policy_fixture(["docs/**"]))
+
+      assert details["reason"] == "empty_policy_intersection"
+    end
+
+    test "deny lists union and durable bash: disabled beats a requested verify" do
+      durable = policy_fixture(["app/**"], deny_writes: ["app/secrets/**"], bash: "disabled")
+
+      requested =
+        policy_fixture(["app/**"],
+          deny_writes: ["app/vendor/**"],
+          bash: %{"verify" => ["mix format --check-formatted"]}
+        )
+
+      posture = posture_fixture(:auto, durable)
+
+      assert {:ok, restricted} = Subagents.restrict_resume_posture(posture, :auto, requested)
+
+      assert "app/secrets/**" in restricted.write_policy["deny_writes"]
+      assert "app/vendor/**" in restricted.write_policy["deny_writes"]
+      assert restricted.write_policy["bash"] == "disabled"
+    end
+
+    test "absent requested policy keeps the durable policy verbatim" do
+      durable = policy_fixture(["app/**"])
+      posture = posture_fixture(:auto, durable)
+
+      assert {:ok, restricted} = Subagents.restrict_resume_posture(posture, :auto, nil)
+      assert restricted.write_policy == durable
+    end
+  end
+
+  defp posture_fixture(mode, write_policy) do
+    %{
+      permission_mode: mode,
+      write_policy: write_policy,
+      workspace_mode: "shared",
+      workspace: File.cwd!()
+    }
+  end
+
+  defp policy_fixture(allow_writes, opts \\ []) do
+    {:ok, policy} =
+      WritePolicy.normalize(%{
+        "version" => 1,
+        "metadata" => %{"id" => "restrict-fixture"},
+        "allow_writes" => allow_writes,
+        "deny_writes" => Keyword.get(opts, :deny_writes, []),
+        "bash" => Keyword.get(opts, :bash, "disabled")
+      })
+
+    policy
+  end
 
   defp unique_subagent_id(label) do
     "sub_#{label}_#{System.unique_integer([:positive])}"
