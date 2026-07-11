@@ -85,6 +85,7 @@ defmodule Pixir.Doctor do
       workspace_check(workspace),
       auth_check(opts, entry, model),
       config_check(opts, config, entry, model),
+      catalog_check(config, opts),
       acp_check()
     ]
   end
@@ -282,6 +283,48 @@ defmodule Pixir.Doctor do
         passed("config", "config.json is readable.", base_details)
     end
   end
+
+  defp catalog_check(config, opts) do
+    effective = config["effective"] || %{}
+    refreshed_at = effective["models_refreshed_at"]
+    stale? = stale_catalog?(refreshed_at, Keyword.get(opts, :now, DateTime.utc_now()))
+
+    details = %{
+      "source" =>
+        if(effective["models"] || effective["anthropic_models"],
+          do: "config_override",
+          else: "built_in_only"
+        ),
+      "providers" => %{
+        "openai" => if(effective["models"], do: "config_override", else: "built_in_only"),
+        "anthropic" =>
+          if(effective["anthropic_models"], do: "config_override", else: "built_in_only")
+      },
+      "stale" => stale?
+    }
+
+    details =
+      details
+      |> put_some("models_refreshed_at", refreshed_at)
+      |> put_some(
+        "hint",
+        if(stale?, do: "model catalog is older than 30 days; run `pixir models refresh`")
+      )
+
+    passed("model_catalog", "Model catalog source is #{details["source"]}.", details)
+  end
+
+  defp stale_catalog?(stamp, now) when is_binary(stamp) do
+    case DateTime.from_iso8601(stamp) do
+      {:ok, refreshed_at, _offset} -> DateTime.diff(now, refreshed_at, :second) > 30 * 86_400
+      _ -> false
+    end
+  end
+
+  defp stale_catalog?(_stamp, _now), do: false
+
+  defp put_some(map, _key, nil), do: map
+  defp put_some(map, key, value), do: Map.put(map, key, value)
 
   defp acp_check do
     passed("acp", "ACP stdio command is available.", %{

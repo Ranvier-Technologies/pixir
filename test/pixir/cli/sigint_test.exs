@@ -37,7 +37,10 @@ defmodule Pixir.CLI.SigintTest do
   test "on_interrupt when idle exits without spurious Log events", %{sid: sid, ws: ws} do
     refute Session.turn_running?(sid)
     assert :exit_idle = Sigint.on_interrupt(sid)
-    assert {:ok, []} = Log.fold(sid, workspace: ws)
+
+    # The root posture is creation-time evidence, not an interrupt artifact:
+    # the Log must hold exactly that and nothing else.
+    assert {:ok, [%{data: %{"event" => "permission_posture"}}]} = Log.fold(sid, workspace: ws)
   end
 
   test "interrupt during Turn records status interrupted and reconciles tool_calls", %{
@@ -61,7 +64,7 @@ defmodule Pixir.CLI.SigintTest do
     assert :interrupt_turn = Sigint.on_interrupt(sid)
 
     assert {:ok, history} = Log.fold(sid, workspace: ws)
-    assert Enum.map(history, & &1.type) == [:tool_call, :tool_result]
+    assert Enum.map(history, & &1.type) == [:subagent_event, :tool_call, :tool_result]
 
     assert %{
              data: %{
@@ -89,6 +92,8 @@ defmodule Pixir.CLI.SigintTest do
       end)
 
     assert :interrupted = Conversation.await(sid, idle_timeout: 2_000)
-    assert {:ok, []} = Log.fold(sid, workspace: ws)
+
+    # Only the creation-time root posture: the interrupted status was ephemeral.
+    assert {:ok, [%{data: %{"event" => "permission_posture"}}]} = Log.fold(sid, workspace: ws)
   end
 end

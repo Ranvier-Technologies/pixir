@@ -27,7 +27,8 @@ defmodule Pixir.Conversation do
   socket).
   """
 
-  alias Pixir.{Events, Log, Session, SessionSupervisor, Turn}
+  alias Pixir.{Event, Events, Log, Session, SessionSupervisor, Turn}
+  alias Pixir.Permissions.WritePolicy
 
   @type session_id :: String.t()
 
@@ -40,7 +41,9 @@ defmodule Pixir.Conversation do
       as a structured error rather than crashing the caller.
 
   Options: `:id`, `:workspace` (default cwd), `:role` (default `:build`),
-  `:force_release_writer_lease?`, and `:force_release_reason`.
+  `:permission_mode` (default `:auto`) and `:write_policy` (default nil) — recorded as
+  the new root Session's durable permission posture — plus
+  `:force_release_writer_lease?` and `:force_release_reason`.
   """
   @spec start(keyword()) :: {:ok, session_id()} | {:error, map()}
   def start(opts \\ []) do
@@ -49,8 +52,55 @@ defmodule Pixir.Conversation do
     start_opts = writer_lease_opts(opts)
 
     case Keyword.get(opts, :id) do
-      nil -> do_start([workspace: workspace, role: role] ++ start_opts, nil)
+      nil -> start_new(workspace, role, start_opts, opts)
       id -> resume(id, workspace, role, start_opts)
+    end
+  end
+
+  defp start_new(workspace, role, start_opts, opts) do
+    case do_start([workspace: workspace, role: role] ++ start_opts, nil) do
+      {:ok, id} ->
+        case persist_root_posture(id, workspace, opts) do
+          :ok ->
+            {:ok, id}
+
+          {:error, error} ->
+            # A root whose posture failed to persist must not survive: it would
+            # be exactly the unresumable no-posture write-capable Log this
+            # evidence exists to prevent.
+            SessionSupervisor.stop_session(id)
+            {:error, unwrap_start_error(error)}
+        end
+
+      other ->
+        other
+    end
+  end
+
+  # Every operator-owned root Session records its permission posture as its
+  # first durable event (seq 0, lineage "root") so a cold resume restores the
+  # recorded capability ceiling instead of failing closed on write-capable
+  # history. Spawned children record theirs in the Subagent Manager with
+  # lineage "child"; `Subagents.resume_posture/2` only trusts a root marker in
+  # root position (nothing before it except fork lineage metadata), so this
+  # event cannot be retrofitted onto a legacy child Log.
+  defp persist_root_posture(session_id, workspace, opts) do
+    mode = Keyword.get(opts, :permission_mode, :auto)
+
+    data = %{
+      "event" => "permission_posture",
+      "scope" => "session",
+      "lineage" => "root",
+      "source" => "root_session_start",
+      "permission_mode" => Atom.to_string(mode),
+      "write_policy" => WritePolicy.metadata(Keyword.get(opts, :write_policy)),
+      "workspace_mode" => "shared",
+      "workspace" => workspace
+    }
+
+    case Session.record(session_id, Event.subagent_event(session_id, data)) do
+      {:ok, _event} -> :ok
+      {:error, _error} = error -> error
     end
   end
 

@@ -178,7 +178,7 @@ defmodule Pixir.Delegate.RunnerTest do
     end)
   end
 
-  test "transport-dead read-only child projects guided resume after retries exhaust" do
+  test "transport-dead read-only worker without capability signal omits writer guidance" do
     with_pixir_home("pixir-delegate-reader-resume-home", fn ->
       ws = tmp_workspace("pixir-delegate-reader-resume")
       child_session_id = "20260710T000002-reader"
@@ -194,13 +194,12 @@ defmodule Pixir.Delegate.RunnerTest do
       child = %{
         "id" => "subagent_reader",
         "child_session_id" => child_session_id,
-        "agent" => "explorer",
+        "agent" => "worker",
         "status" => "failed",
         "summary" => "websocket closed",
         "task" => "inspect notes",
         "workspace_mode" => "shared",
         "workspace" => ws,
-        "permission_mode" => "read_only",
         "reason" => "provider_error",
         "retry_attempts" => 2,
         "retry_max_attempts" => 2,

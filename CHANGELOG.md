@@ -9,6 +9,120 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-07-11
+
+Hardening cut: the resume-sandbox security arc (#311) plus the five majors
+from the public-mirror review adjudication wave, and explicit model-catalog
+discovery.
+
+### Security
+- Resuming a delegated writer no longer discards its sandbox (#311). Spawn
+  records a durable `permission_posture` event in the child Log before its
+  first Turn (`permission_mode`, write-policy metadata with an integrity
+  hash, `workspace_mode`), and `pixir resume` cold-folds that evidence and
+  rehydrates the posture: the same `write_policy` gate that ran before the
+  interruption denies out-of-policy writes after the resume. Resume flags
+  may restrict but never widen (`read_only` wins, `bash: disabled` wins,
+  a requested `write_policy` narrows to the intersection of the durable and
+  requested allow sets); the no-widen matrix is pinned.
+- Every new root session records a durable posture marker at sequence 0
+  (`lineage=root`) at creation, through the single seam all product
+  surfaces share (CLI one-shot, ACP `session/new`, delegate runner). A
+  failed posture append stops the Session rather than delivering an
+  unmarked one. The delegate runner records the run's real ceiling
+  (read-only, or auto bounded by the spec's write policy), never an
+  unbounded default.
+- Fail closed on missing evidence: a history containing a successful
+  mutating tool call with no readable, unambiguous posture refuses to
+  resume write-capable (`resume_policy_unavailable`, with `next_actions`);
+  mutation-free legacy logs still resume read-only. Unbounded `auto`
+  without a write policy is restorable only when the root marker itself
+  declared it.
+- Legacy escape hatch, explicit and durable: `pixir resume
+  --assume-legacy-root --legacy-root-reason <text>` recovers a pre-0.1.10
+  write-capable root Log only when posture evidence is missing (unreadable
+  or malformed shapes stay closed), only into read-only, ask, or
+  policy-bounded auto (never unbounded `auto`), and records an
+  `operator_attested_legacy_root` attestation so later plain resumes
+  restore the attested ceiling without the flag.
+- The trust rules survived five adversarial review rounds (seven confirmed
+  majors from reviewers of different model families, two of them against
+  intermediate versions of this fix): a root marker is trusted only at
+  root position in physical append order (the first event that is not a
+  `session_fork`, resolved from raw NDJSON line order rather than
+  seq-sorted fold order, so neither a forged id nor a forged seq can move
+  the boundary), only with source `root_session_start`, and never when it
+  carries spawn fields. An unbounded `auto` ceiling with no write policy is
+  refused for any non-root lineage even when the write evidence is deleted,
+  so a bounded child cannot be surgically elevated. A forked root stays resumable, and a partially
+  edited child Log does not elevate; the exact attack shapes are pinned as
+  regressions. Accepted residue, documented: a same-UID rewrite of the
+  entire session NDJSON can fabricate the trusted shape (local filesystem
+  threat model, unchanged by this arc).
+- ACP `session/load` and reattach restore the same posture, and the
+  fail-closed paths stop the live Session (no lingering writer lease).
+  Provider folds and `reconstruct` treat the posture marker as evidence
+  only: it never reaches the model context and never fabricates a phantom
+  child.
+
+### Added
+- `pixir models` and `pixir models refresh [--json]` (#288): the model
+  catalog is operator-configurable and discovery is explicit, never
+  implicit network. Refresh is per-provider fail-closed: OpenAI only with
+  an API-key credential, Anthropic only with `ANTHROPIC_API_KEY`;
+  subscription auth is confessed as unsupported for the models endpoint
+  rather than guessed. The refresh path is the first config writer: atomic
+  tmp+rename preserving foreign keys, owning exactly `models`,
+  `anthropic_models`, and `models_refreshed_at`; if every provider skips
+  or fails, `config.json` stays byte-identical.
+  `config.json["anthropic_models"]` now overrides the static Anthropic
+  list (mirroring the OpenAI pattern), doctor gains an informational
+  `model_catalog` check with a 30-day stale hint, and the built-in catalog
+  gains `gpt-5.6-sol` / `gpt-5.6`.
+
+### Fixed
+- Replay skill-view pairing no longer fabricates orphan outputs when
+  unrelated tool calls are pending (a hole in the 0.1.9 pairing fix): both
+  provider folds pair a skill activation iff exactly one pending candidate
+  matches the activation name and a skills main-file path; zero or several
+  candidates keep the conservative refusal, and an unrelated `tool_result`
+  queues without disturbing a deferred activation. Provider parity is
+  pinned with mirrored regressions; the original incident fixture is
+  unchanged and green.
+- Two crash classes in virtual/workflow execution: symlink resolution
+  crashed on `Path.join([])` when a symlink was the final path segment;
+  and virtual-step/apply-step tasks now run under a supervisor
+  (`Task.Supervisor.async_nolink`) with an explicit `{:exit, reason}`
+  clause, so an abnormal task exit returns a structured step failure
+  instead of crashing the workflow (and an interrupted workflow no longer
+  leaves a write-capable apply task running unsupervised). Also:
+  unbounded-glob validation reports the original list position, and apply
+  write-set validation runs once instead of twice.
+- Completed delegate children keep their retry lineage across a cold
+  Manager restore: the completed terminal event records the same terminal
+  fields as every other terminal path (`retry_history`, `virtual_diff_ref`,
+  `elapsed_ms`), and recovery guidance no longer treats a read-only role as
+  write-capable.
+- Virtual-overlay and workflow hardening from the public-mirror review of
+  the 0.1.9 release diff: `run_virtual_commands` sanitizes the echoed
+  command line like any other model-channel output; the canonical
+  whole-workspace `read_set` spellings are rejected (robust normalized
+  rejection of every equivalent spelling is tracked as follow-up hardening);
+  an `apply` step serializes against
+  readers with overlapping footprints in either argument order; and
+  workflow validation errors emit real 0-based JSON pointers (the emitter
+  interpolated 1-based indices).
+
+### Changed
+- New sessions carry the posture marker at sequence 0, so every subsequent
+  event seq shifts by one; consumers that pin history shapes should expect
+  the posture `subagent_event` first. Compaction excludes the posture
+  marker from durable summaries.
+- System-prompt construction reuses the per-Turn rendered skills index
+  snapshot for cache-control providers instead of re-rendering it on every
+  loop iteration (other providers keep their own render; public signatures
+  unchanged; the cache-key timing design pass remains open).
+
 ## [0.1.9] - 2026-07-10
 
 ### Added

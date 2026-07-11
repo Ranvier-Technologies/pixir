@@ -111,6 +111,37 @@ defmodule Pixir.VirtualDiffApplyTest do
     assert hd(plan["files"])["status"] == "outside_workspace"
   end
 
+  test "final symlink artifact paths resolve without raising", %{ws: ws} do
+    target = Path.join(ws, "lib/target.txt")
+    File.write!(target, "target\n")
+    File.ln_s!("lib/target.txt", Path.join(ws, "link.txt"))
+
+    assert {:ok, plan} =
+             VirtualDiffApply.plan(artifact([delete_change("link.txt", "target\n")]), ws)
+
+    assert plan["status"] == "planned"
+    assert [%{"status" => "applicable", "normalized_path" => "lib/target.txt"}] = plan["files"]
+  end
+
+  test "final symlink artifact paths escaping the workspace return structured evidence", %{ws: ws} do
+    outside =
+      Path.join(System.tmp_dir!(), "pixir-vdiff-final-outside-#{System.unique_integer()}.txt")
+
+    File.write!(outside, "outside\n")
+    File.ln_s!(outside, Path.join(ws, "outside-link.txt"))
+    on_exit(fn -> File.rm(outside) end)
+
+    assert {:ok, plan} =
+             VirtualDiffApply.plan(
+               artifact([delete_change("outside-link.txt", "outside\n")]),
+               ws
+             )
+
+    assert plan["status"] == "not_applied"
+    assert [%{"status" => "outside_workspace", "applicability" => details}] = plan["files"]
+    assert details["reason"] == "path_escapes_workspace"
+  end
+
   test "truncated or unsupported changes are not applicable", %{ws: ws} do
     truncated = put_in(add_change("lib/truncated.txt", "x\n"), ["diff", "truncated"], true)
     unsupported = %{"path" => "lib/blob.bin", "operation" => "unsupported"}

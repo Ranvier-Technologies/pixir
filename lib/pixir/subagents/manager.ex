@@ -891,6 +891,7 @@ defmodule Pixir.Subagents.Manager do
       }
 
       with :ok <- subscribe_child_events(child_sid),
+           :ok <- persist_child_permission_posture(turn_agent, child_sid),
            {:ok, _ref} <- start_child_turn(turn_agent, child_sid, child_workspace) do
         timer =
           Process.send_after(
@@ -918,6 +919,23 @@ defmodule Pixir.Subagents.Manager do
           |> record_parent_event(started, "started", "running")
 
         {:ok, started, state}
+      else
+        # The child Session is already live here: a setup failure (subscription,
+        # posture persistence, Turn start) must stop it and drop the subscription,
+        # or a write-capable Session survives untracked. This branch also keeps
+        # start_agent's contract: callers match 3-tuples only.
+        {:error, error} ->
+          Events.unsubscribe(child_sid)
+          SessionSupervisor.stop_session(child_sid)
+
+          failed = %{turn_agent | status: "failed", summary: inspect(error), updated_at: now()}
+
+          state =
+            state
+            |> put_agent(failed)
+            |> record_parent_event(failed, "failed", "failed")
+
+          {:error, error, state}
       end
     else
       {:error, error} ->
@@ -980,6 +998,30 @@ defmodule Pixir.Subagents.Manager do
 
   defp restart_agent(_agent, _prompt, _opts, _state),
     do: {:error, Tool.error(:invalid_args, "prompt is required", %{})}
+
+  defp persist_child_permission_posture(agent, child_sid) do
+    data = %{
+      "event" => "permission_posture",
+      "scope" => "session",
+      "lineage" => "child",
+      "source" => "subagent_spawn",
+      "subagent_id" => agent.id,
+      "parent_session_id" => agent.parent_session_id,
+      "permission_mode" => permission_mode_string(agent.permission_mode),
+      "write_policy" => WritePolicy.metadata(agent.write_policy),
+      "workspace_mode" => agent.workspace_mode,
+      "workspace" => agent.child_workspace
+    }
+
+    case Session.record(child_sid, Event.subagent_event(child_sid, data)) do
+      {:ok, _event} -> :ok
+      {:error, _error} = error -> error
+    end
+  end
+
+  defp permission_mode_string(nil), do: nil
+  defp permission_mode_string(mode) when is_atom(mode), do: Atom.to_string(mode)
+  defp permission_mode_string(mode) when is_binary(mode), do: mode
 
   defp start_child_turn(agent, child_sid, child_workspace, turn_overrides \\ []) do
     instructions = agent.agent_config.developer_instructions
@@ -1190,13 +1232,27 @@ defmodule Pixir.Subagents.Manager do
       {:noreply, state}
     else
       summary = agent.summary || latest_child_answer(agent)
-      agent = %{agent | status: "completed", summary: summary, updated_at: now()}
+      # elapsed_ms alongside status, like the failed/timeout/cancelled paths:
+      # terminal_event_fields drops it otherwise, and a successful completion
+      # would lose its duration in the parent Log and after cold restore.
+      agent = %{
+        agent
+        | status: "completed",
+          summary: summary,
+          elapsed_ms: elapsed_ms(agent),
+          updated_at: now()
+      }
 
       state =
         state
         |> put_agent(agent)
         |> cancel_timer(agent)
-        |> record_parent_event(agent, "finished", "completed")
+        |> record_parent_event(
+          agent,
+          "finished",
+          "completed",
+          terminal_event_fields(agent)
+        )
         |> maybe_start_queued(agent.parent_session_id)
         |> reply_waiters()
 
@@ -1216,6 +1272,7 @@ defmodule Pixir.Subagents.Manager do
             Map.merge(agent, %{
               status: "completed",
               summary: summary,
+              elapsed_ms: elapsed_ms(agent),
               virtual_diff: artifact,
               virtual_diff_ref: ref,
               updated_at: now()
@@ -1517,7 +1574,7 @@ defmodule Pixir.Subagents.Manager do
       virtual_diff_ref: data["virtual_diff_ref"],
       provider: nil,
       provider_opts: [],
-      permission_mode: nil,
+      permission_mode: restored_permission_mode(data["permission_mode"]),
       write_policy: restored_write_policy(data["write_policy"]),
       skills_opts: [],
       agents_opts: [],
@@ -1549,6 +1606,11 @@ defmodule Pixir.Subagents.Manager do
       {:error, _error} -> nil
     end
   end
+
+  defp restored_permission_mode("auto"), do: :auto
+  defp restored_permission_mode("ask"), do: :ask
+  defp restored_permission_mode("read_only"), do: :read_only
+  defp restored_permission_mode(_mode), do: nil
 
   defp detached_summary(data) do
     status = data["status"] || data["event"] || "unknown"
@@ -2000,6 +2062,7 @@ defmodule Pixir.Subagents.Manager do
       |> maybe_put_event("model", Map.get(agent, :provider_model))
       |> maybe_put_event("reasoning_effort", Map.get(agent, :reasoning_effort))
       |> maybe_put_event("web_search", Map.get(agent, :web_search))
+      |> maybe_put_event("permission_mode", permission_mode_string(agent.permission_mode))
       |> maybe_put_event("deadline_at", agent.deadline_at)
       |> maybe_put_event("child_log_path", child_log_path(agent))
       |> maybe_put_event("workspace_snapshot", agent.workspace_snapshot)

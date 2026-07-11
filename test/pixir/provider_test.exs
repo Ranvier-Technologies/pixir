@@ -70,6 +70,17 @@ defmodule Pixir.ProviderTest do
     path
   end
 
+  defp fold_raw_history!(session_id, raw_ndjson) do
+    workspace = tmp_workspace()
+    log_path = Pixir.Log.path(session_id, workspace: workspace)
+    File.mkdir_p!(Path.dirname(log_path))
+    File.write!(log_path, raw_ndjson)
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    assert {:ok, history} = Pixir.Log.fold(session_id, workspace: workspace)
+    {history, workspace}
+  end
+
   test "assembles streamed text and reports a stop finish", %{auth: auth} do
     parent = self()
 
@@ -1097,7 +1108,58 @@ defmodule Pixir.ProviderTest do
     end
   end
 
-  test "ambiguous pending calls fail through ordinary orphan repair" do
+  test "pairs one matching skill_view while an unrelated call remains pending" do
+    activation = %{
+      "name" => "diagnose",
+      "source" => "repo",
+      "scope" => "repo",
+      "path" => "/skills/diagnose/SKILL.md",
+      "content_hash" => "concurrent-hash",
+      "content" => "# Concurrent activation"
+    }
+
+    raw_ndjson =
+      ~S({"id":"e1","session_id":"raw-concurrent-skill","seq":1,"ts":"2026-07-05T00:00:01Z","type":"tool_call","data":{"call_id":"call_read","name":"read","args":{"path":"README.md"}}}) <>
+        "\n" <>
+        ~S({"id":"e2","session_id":"raw-concurrent-skill","seq":2,"ts":"2026-07-05T00:00:02Z","type":"tool_call","data":{"call_id":"call_skill","name":"skill_view","args":{"name":"diagnose","path":"SKILL.md"}}}) <>
+        "\n" <>
+        ~S({"id":"e3","session_id":"raw-concurrent-skill","seq":3,"ts":"2026-07-05T00:00:03Z","type":"skill_activation","data":{"name":"diagnose","source":"repo","scope":"repo","path":"/skills/diagnose/SKILL.md","content_hash":"concurrent-hash","content":"# Concurrent activation"}}) <>
+        "\n" <>
+        ~S({"id":"e4","session_id":"raw-concurrent-skill","seq":4,"ts":"2026-07-05T00:00:04Z","type":"tool_result","data":{"call_id":"call_read","ok":true,"output":"read body"}}) <>
+        "\n" <>
+        ~S({"id":"e5","session_id":"raw-concurrent-skill","seq":5,"ts":"2026-07-05T00:00:05Z","type":"tool_result","data":{"call_id":"call_skill","ok":true,"output":"skill body"}}) <>
+        "\n"
+
+    {history, workspace} = fold_raw_history!("raw-concurrent-skill", raw_ndjson)
+
+    assert {:ok, body} =
+             Provider.request_body_preview(%{history: history, workspace: workspace})
+
+    assert [read_call, skill_call, read_result, skill_result, projected_activation] =
+             body["input"]
+
+    assert read_call["call_id"] == "call_read"
+    assert skill_call["call_id"] == "call_skill"
+
+    assert read_result == %{
+             "type" => "function_call_output",
+             "call_id" => "call_read",
+             "output" => "read body"
+           }
+
+    assert skill_result == %{
+             "type" => "function_call_output",
+             "call_id" => "call_skill",
+             "output" => "skill body"
+           }
+
+    assert get_in(projected_activation, ["content", Access.at(0), "text"]) ==
+             Pixir.Skills.render_activation(activation)
+
+    refute inspect(body["input"]) =~ "orphan_tool_call"
+  end
+
+  test "two matching skill_view calls remain ambiguous and use orphan repair" do
     activation = %{
       "name" => "diagnose",
       "source" => "repo",
@@ -1107,28 +1169,37 @@ defmodule Pixir.ProviderTest do
       "content" => "# Ambiguous activation"
     }
 
-    history = [
-      Event.tool_call("s", "call_read", "read", %{"path" => "README.md"}),
-      Event.tool_call("s", "call_skill", "skill_view", %{"name" => "diagnose"}),
-      Event.skill_activation("s", activation),
-      Event.tool_result("s", "call_read", %{"ok" => true, "output" => "read body"}),
-      Event.tool_result("s", "call_skill", %{"ok" => true, "output" => "skill body"})
-    ]
+    raw_ndjson =
+      ~S({"id":"e1","session_id":"raw-ambiguous-skill","seq":1,"ts":"2026-07-05T00:00:01Z","type":"tool_call","data":{"call_id":"call_skill_a","name":"skill_view","args":{"name":"diagnose","path":"SKILL.md"}}}) <>
+        "\n" <>
+        ~S({"id":"e2","session_id":"raw-ambiguous-skill","seq":2,"ts":"2026-07-05T00:00:02Z","type":"tool_call","data":{"call_id":"call_skill_b","name":"skill_view","args":{"name":"diagnose","path":"SKILL.md"}}}) <>
+        "\n" <>
+        ~S({"id":"e3","session_id":"raw-ambiguous-skill","seq":3,"ts":"2026-07-05T00:00:03Z","type":"skill_activation","data":{"name":"diagnose","source":"repo","scope":"repo","path":"/skills/diagnose/SKILL.md","content_hash":"ambiguous-hash","content":"# Ambiguous activation"}}) <>
+        "\n" <>
+        ~S({"id":"e4","session_id":"raw-ambiguous-skill","seq":4,"ts":"2026-07-05T00:00:04Z","type":"tool_result","data":{"call_id":"call_skill_a","ok":true,"output":"skill a body"}}) <>
+        "\n" <>
+        ~S({"id":"e5","session_id":"raw-ambiguous-skill","seq":5,"ts":"2026-07-05T00:00:05Z","type":"tool_result","data":{"call_id":"call_skill_b","ok":true,"output":"skill b body"}}) <>
+        "\n"
 
-    assert {:ok, body} = Provider.request_body_preview(%{history: history})
+    {history, workspace} = fold_raw_history!("raw-ambiguous-skill", raw_ndjson)
 
-    assert [read_call, skill_call, read_repair, skill_repair, projected_activation] =
+    assert {:ok, body} =
+             Provider.request_body_preview(%{history: history, workspace: workspace})
+
+    assert [skill_call_a, skill_call_b, repair_a, repair_b, projected_activation] =
              body["input"]
 
-    assert read_call["call_id"] == "call_read"
-    assert skill_call["call_id"] == "call_skill"
-
-    assert Enum.map([read_repair, skill_repair], & &1["call_id"]) == [
-             "call_read",
-             "call_skill"
+    assert Enum.map([skill_call_a, skill_call_b], & &1["call_id"]) == [
+             "call_skill_a",
+             "call_skill_b"
            ]
 
-    assert Enum.all?([read_repair, skill_repair], fn output ->
+    assert Enum.map([repair_a, repair_b], & &1["call_id"]) == [
+             "call_skill_a",
+             "call_skill_b"
+           ]
+
+    assert Enum.all?([repair_a, repair_b], fn output ->
              match?(
                %{"ok" => false, "error" => %{"kind" => "orphan_tool_call"}},
                Jason.decode!(output["output"])

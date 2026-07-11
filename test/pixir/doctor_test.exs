@@ -239,6 +239,43 @@ defmodule Pixir.DoctorTest do
     assert check(anthropic_result, "config")["details"]["provider"] == "anthropic"
   end
 
+  test "catalog note reports config source and stale refresh without changing proceed semantics" do
+    workspace = tmp_dir("doctor-model-catalog")
+    binary = Path.join(workspace, "pixir")
+    config_path = Path.join(workspace, "config.json")
+    File.write!(binary, "#!/bin/sh\n")
+    File.chmod!(binary, 0o755)
+
+    File.write!(
+      config_path,
+      Jason.encode!(%{
+        "models" => ["gpt-refreshed"],
+        "models_refreshed_at" => "2025-12-01T00:00:00Z"
+      })
+    )
+
+    result =
+      Doctor.run(
+        workspace: workspace,
+        binary_path: binary,
+        config_path: config_path,
+        auth_status: %{authenticated?: true, kind: :api_key},
+        model: "gpt-refreshed",
+        now: ~U[2026-02-01 00:00:01Z]
+      )
+
+    catalog = check(result, "model_catalog")
+    assert catalog["status"] == "passed"
+    assert catalog["details"]["source"] == "config_override"
+    assert catalog["details"]["providers"]["openai"] == "config_override"
+    assert catalog["details"]["providers"]["anthropic"] == "built_in_only"
+    assert catalog["details"]["models_refreshed_at"] == "2025-12-01T00:00:00Z"
+    assert catalog["details"]["stale"] == true
+    assert catalog["details"]["hint"] =~ "pixir models refresh"
+    assert result["status"] == "ready"
+    assert result["proceed"] == "true"
+  end
+
   defp check(result, id), do: Enum.find(result["checks"], &(&1["id"] == id))
 
   defp tmp_dir(name) do

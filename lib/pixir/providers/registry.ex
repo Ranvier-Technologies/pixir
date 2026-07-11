@@ -3,6 +3,7 @@ defmodule Pixir.Providers.Registry do
   Provider catalog and routing metadata for Pixir provider dialects.
   """
 
+  alias Pixir.Config
   alias Pixir.Providers.Anthropic
 
   @type entry :: %{
@@ -46,8 +47,14 @@ defmodule Pixir.Providers.Registry do
   def entry_for(_provider), do: openai_entry()
 
   @doc "Merged provider model catalog advertised by ACP."
-  @spec models() :: [map()]
-  def models, do: openai_entry().models ++ anthropic_entry().models
+  @spec models(keyword()) :: [map()]
+  def models(opts \\ []), do: openai_entry(opts).models ++ anthropic_entry(opts).models
+
+  # Raw built-in Anthropic slugs, without the default insertion the entry's
+  # catalog shaping applies. The refresh diff base needs the unshaped source.
+  @doc false
+  @spec anthropic_built_in_models() :: [String.t()]
+  def anthropic_built_in_models, do: Enum.map(@anthropic_models, & &1["id"])
 
   @doc "Whether `model_id` is in the merged provider catalog."
   @spec model_supported?(String.t()) :: boolean()
@@ -57,11 +64,13 @@ defmodule Pixir.Providers.Registry do
 
   def model_supported?(_model_id), do: false
 
-  defp openai_entry do
+  defp openai_entry, do: openai_entry([])
+
+  defp openai_entry(opts) do
     %{
       provider: Pixir.Provider,
       default_model: Pixir.Provider.default_model(),
-      models: Pixir.Provider.models(),
+      models: Pixir.Provider.models(opts),
       auth: %{
         env_var: "OPENAI_API_KEY",
         scheme: :oauth_or_api_key,
@@ -77,11 +86,25 @@ defmodule Pixir.Providers.Registry do
     }
   end
 
-  defp anthropic_entry do
+  defp anthropic_entry, do: anthropic_entry([])
+
+  defp anthropic_entry(opts) do
+    default = "claude-fable-5"
+
+    models =
+      opts
+      |> Config.file_anthropic_models()
+      |> Kernel.||(Enum.map(@anthropic_models, & &1["id"]))
+      |> List.insert_at(0, default)
+      |> Enum.uniq()
+      # Never flagged as the picker default: the merged ACP catalog advertises
+      # exactly one default, the OpenAI entry's session default model.
+      |> Enum.map(fn slug -> %{"id" => slug, "name" => slug, "default" => false} end)
+
     %{
       provider: Anthropic,
-      default_model: "claude-fable-5",
-      models: @anthropic_models,
+      default_model: default,
+      models: models,
       auth: %{
         env_var: "ANTHROPIC_API_KEY",
         scheme: :api_key_header,

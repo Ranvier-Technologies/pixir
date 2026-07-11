@@ -39,6 +39,28 @@ defmodule Pixir.SessionSupervisor do
   end
 
   @doc """
+  Stop one live Session by id.
+
+  Presenter/Manager cleanup for fail-closed error paths that started a Session and
+  then refused it (e.g. a failed resume-posture restore): the process must not
+  survive its own rejection as an untracked live writer. A Session that is not
+  running is a no-op success.
+  """
+  @spec stop_session(String.t()) :: {:ok, :stopped | :not_running}
+  def stop_session(session_id) when is_binary(session_id) do
+    case Registry.lookup(Pixir.Sessions.Registry, session_id) do
+      [{pid, _value}] ->
+        case DynamicSupervisor.terminate_child(__MODULE__, pid) do
+          :ok -> {:ok, :stopped}
+          {:error, :not_found} -> {:ok, :not_running}
+        end
+
+      [] ->
+        {:ok, :not_running}
+    end
+  end
+
+  @doc """
   Stop every live Session owned by this runtime.
 
   This is a CLI shutdown helper, not a stale-writer recovery path: it only terminates

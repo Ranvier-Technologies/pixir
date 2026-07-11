@@ -391,6 +391,8 @@ defmodule Pixir.Subagents.ManagerTest do
                Subagents.wait(session_id, [agent["id"]], 10_000, workspace: workspace)
 
       assert completed["status"] == "completed"
+      assert is_integer(completed["elapsed_ms"])
+      assert completed["elapsed_ms"] >= 0
       assert completed["virtual_diff"]["kind"] == "virtual_diff"
       assert completed["virtual_diff_ref"]["kind"] == "virtual_diff"
       assert completed["virtual_diff_ref"]["encoded_bytes"] > 0
@@ -437,6 +439,8 @@ defmodule Pixir.Subagents.ManagerTest do
                completed["virtual_diff_ref"]["sha256"]
 
       assert finished.data["virtual_diff_ref"]["source_seq"] > 0
+      assert is_integer(finished.data["elapsed_ms"])
+      assert finished.data["elapsed_ms"] >= 0
       refute Map.has_key?(finished.data, "virtual_diff")
     end
 

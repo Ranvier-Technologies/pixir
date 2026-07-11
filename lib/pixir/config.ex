@@ -159,6 +159,21 @@ defmodule Pixir.Config do
     end
   end
 
+  @doc "Anthropic models list from config.json only, or `nil` when absent/invalid."
+  @spec file_anthropic_models(keyword()) :: [String.t()] | nil
+  def file_anthropic_models(opts \\ []) do
+    case get_in(load(opts), ["effective", "anthropic_models"]) do
+      [_ | _] = models -> models
+      _ -> nil
+    end
+  end
+
+  @doc "UTC timestamp written by the last explicit model-catalog refresh, if present."
+  @spec models_refreshed_at(keyword()) :: String.t() | nil
+  def models_refreshed_at(opts \\ []) do
+    get_in(load(opts), ["effective", "models_refreshed_at"])
+  end
+
   @doc "Context-window overrides from config.json (model => positive integer)."
   @spec file_context_windows(keyword()) :: %{String.t() => pos_integer()}
   def file_context_windows(opts \\ []) do
@@ -233,7 +248,9 @@ defmodule Pixir.Config do
         "model_assisted" => resolve_model_assisted(raw, ignored)
       },
       "model" => resolve_model(raw),
-      "models" => resolve_models(raw, ignored),
+      "models" => resolve_models(raw, "models", ignored),
+      "anthropic_models" => resolve_models(raw, "anthropic_models", ignored),
+      "models_refreshed_at" => resolve_models_refreshed_at(raw),
       "context_windows" => resolve_context_windows(raw, ignored)
     }
   end
@@ -472,11 +489,11 @@ defmodule Pixir.Config do
       end || @default_model
   end
 
-  defp resolve_models(raw, ignored) do
-    if MapSet.member?(ignored, "models") do
+  defp resolve_models(raw, field, ignored) do
+    if MapSet.member?(ignored, field) do
       nil
     else
-      case Map.get(raw, "models") do
+      case Map.get(raw, field) do
         list when is_list(list) ->
           slugs = Enum.filter(list, &is_binary/1)
           if slugs == [], do: nil, else: slugs
@@ -489,6 +506,11 @@ defmodule Pixir.Config do
       end
     end
   end
+
+  defp resolve_models_refreshed_at(%{"models_refreshed_at" => stamp}) when is_binary(stamp),
+    do: stamp
+
+  defp resolve_models_refreshed_at(_raw), do: nil
 
   defp resolve_context_windows(raw, ignored) do
     if MapSet.member?(ignored, "context_windows") do
@@ -524,7 +546,8 @@ defmodule Pixir.Config do
     |> maybe_warn_tail_events(raw)
     |> maybe_warn_model_assisted(raw)
     |> maybe_warn_model(raw)
-    |> maybe_warn_models(raw)
+    |> maybe_warn_models(raw, "models")
+    |> maybe_warn_models(raw, "anthropic_models")
     |> maybe_warn_context_windows(raw)
   end
 
@@ -685,8 +708,8 @@ defmodule Pixir.Config do
     end
   end
 
-  defp maybe_warn_models(warnings, raw) do
-    case Map.get(raw, "models") do
+  defp maybe_warn_models(warnings, raw, field) do
+    case Map.get(raw, field) do
       nil ->
         warnings
 
@@ -694,11 +717,11 @@ defmodule Pixir.Config do
         if valid_models_list?(list) do
           warnings
         else
-          [warning("models", "must be an array of model id strings; ignoring") | warnings]
+          [warning(field, "must be an array of model id strings; ignoring") | warnings]
         end
 
       _ ->
-        [warning("models", "must be an array of model id strings; ignoring") | warnings]
+        [warning(field, "must be an array of model id strings; ignoring") | warnings]
     end
   end
 

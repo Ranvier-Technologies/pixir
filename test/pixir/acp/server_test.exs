@@ -1123,6 +1123,97 @@ defmodule Pixir.ACP.ServerTest do
     assert resp["result"]["sessionId"] == sid
   end
 
+  test "session/load and session/resume preserve bounded child write policy", %{ws: ws} do
+    {:ok, policy} =
+      Pixir.Permissions.WritePolicy.normalize(%{
+        "version" => 1,
+        "metadata" => %{"id" => "acp-resume-bound"},
+        "allow_writes" => ["allowed/**"]
+      })
+
+    for {method, suffix} <- [{"session/load", "load"}, {"session/resume", "resume"}] do
+      sid = "bounded-acp-#{suffix}-#{System.unique_integer([:positive])}"
+
+      Pixir.Paths.ensure_sessions_dir(ws)
+
+      raw_posture = %{
+        "id" => "raw-posture-#{suffix}",
+        "session_id" => sid,
+        "seq" => 0,
+        "ts" => "2026-07-10T00:00:00Z",
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "source" => "raw_adversarial_fixture",
+          "permission_mode" => "auto",
+          "write_policy" => Pixir.Permissions.WritePolicy.metadata(policy),
+          "workspace_mode" => "shared",
+          "workspace" => ws
+        }
+      }
+
+      File.write!(Pixir.Log.path(sid, workspace: ws), Jason.encode!(raw_posture) <> "\n")
+
+      {:ok, script} =
+        Agent.start_link(fn ->
+          [
+            tool_calls([
+              %{
+                call_id: "outside-#{suffix}",
+                name: "write",
+                args: %{"path" => "outside-#{suffix}.txt", "content" => "pwned"}
+              }
+            ]),
+            stop("write was bounded")
+          ]
+        end)
+
+      {:ok, capture} = StringIO.open("")
+
+      server =
+        start_server(capture,
+          id: {:bounded_resume, suffix},
+          provider: StubProvider,
+          provider_opts: [agent: script]
+        )
+
+      Server.feed(server, request(40, method, %{"sessionId" => sid, "cwd" => ws}))
+      assert await_id(capture, 40)["result"]["sessionId"] == sid
+
+      restored = :sys.get_state(server).resume_postures[sid]
+      assert restored.permission_mode == :auto
+      assert restored.workspace_mode == "shared"
+      assert restored.workspace == ws
+      assert restored.write_policy["hash"] == policy["hash"]
+      assert restored.write_policy["allow_writes"] == ["allowed/**"]
+
+      Server.feed(
+        server,
+        request(41, "session/prompt", %{
+          "sessionId" => sid,
+          "prompt" => [%{"type" => "text", "text" => "write outside the bound"}]
+        })
+      )
+
+      assert await_id(capture, 41)["result"]["stopReason"] == "end_turn"
+      refute File.exists?(Path.join(ws, "outside-#{suffix}.txt"))
+
+      assert {:ok, history} = Pixir.Log.fold(sid, workspace: ws)
+
+      assert Enum.any?(history, fn
+               %{
+                 type: :permission_decision,
+                 data: %{"gate" => "write_policy", "decision" => "deny"}
+               } ->
+                 true
+
+               _event ->
+                 false
+             end)
+    end
+  end
+
   test "session/load of an unknown session is invalid params (A.6)", %{out: out, ws: ws} do
     server = start_server(out)
 
@@ -1381,7 +1472,10 @@ defmodule Pixir.ACP.ServerTest do
     assert captured.request.developer_context =~ "Presenter-supplied UX context"
     refute captured.request.developer_context =~ encoded
 
-    assert [event] = captured.request.history
+    assert [posture, event] = captured.request.history
+    assert posture.type == :subagent_event
+    assert posture.data["event"] == "permission_posture"
+    assert posture.data["lineage"] == "root"
     assert event.type == :user_message
     assert [%{"kind" => "image"} = descriptor] = event.data["resources"]
     assert descriptor["name"] == "screen.png"
@@ -1435,7 +1529,8 @@ defmodule Pixir.ACP.ServerTest do
     assert await_id(out, 3)["result"]["stopReason"] == "end_turn"
 
     captured = Agent.get(sink, & &1)
-    assert [event] = captured.request.history
+    assert [posture, event] = captured.request.history
+    assert posture.data["event"] == "permission_posture"
     assert event.type == :user_message
     assert [%{"kind" => "image"} = descriptor] = event.data["resources"]
     assert descriptor["name"] == "linked.png"
@@ -2323,6 +2418,33 @@ defmodule Pixir.ACP.ServerTest do
     assert pixir_meta["model"] == "gpt-5.3-codex-spark"
     assert pixir_meta["remainingTokens"] == 559
     assert_in_delta pixir_meta["ratio"], 0.9956, 0.0001
+  end
+
+  test "ACP model projection observes refreshed config through Registry without server restart",
+       %{
+         out: out,
+         ws: ws
+       } do
+    home = Path.join(ws, "models-home")
+    config_path = Path.join(home, "config.json")
+    previous_home = System.get_env("PIXIR_HOME")
+
+    try do
+      File.mkdir_p!(home)
+      System.put_env("PIXIR_HOME", home)
+      server = start_server(out)
+
+      File.write!(config_path, Jason.encode!(%{"models" => ["gpt-acp-refreshed"]}))
+      Server.feed(server, request(99, "initialize", %{}))
+
+      response = await_id(out, 99)
+      models = get_in(response, ["result", "_meta", "pixir", "models"])
+      assert Enum.any?(models, &(&1["id"] == "gpt-acp-refreshed"))
+    after
+      if previous_home,
+        do: System.put_env("PIXIR_HOME", previous_home),
+        else: System.delete_env("PIXIR_HOME")
+    end
   end
 
   # ── helpers ──────────────────────────────────────────────────────────────────

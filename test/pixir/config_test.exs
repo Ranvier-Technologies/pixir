@@ -93,6 +93,8 @@ defmodule Pixir.ConfigTest do
              "compaction" => %{"tail_events" => 40, "model_assisted" => false},
              "model" => "gpt-5.5",
              "models" => nil,
+             "anthropic_models" => nil,
+             "models_refreshed_at" => nil,
              "context_windows" => %{}
            }
   end

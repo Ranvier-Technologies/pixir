@@ -4,6 +4,8 @@ defmodule Pixir.CLI do
 
       pixir login              Browser OAuth (device-code fallback) → ~/.pixir/auth.json
       pixir doctor             Run local first-run diagnostics (no network)
+      pixir models             Show local provider model catalogs (no network)
+      pixir models refresh     Explicitly refresh supported provider catalogs
       pixir gc                 Plan isolated Subagent workspace reclamation
       pixir tree <id>          Project a Session/Subagent tree from local Logs
       pixir compact <id>       Record a durable History compaction checkpoint
@@ -35,8 +37,10 @@ defmodule Pixir.CLI do
     Conversation,
     Delegate,
     Doctor,
+    Event,
     Fork,
     Log,
+    ModelsRefresh,
     Permissions,
     Permissions.WritePolicy,
     ReplayInspector,
@@ -44,14 +48,16 @@ defmodule Pixir.CLI do
     Renderer,
     SessionDiagnostics,
     SessionSupervisor,
-    SessionTree
+    SessionTree,
+    Session,
+    Subagents
   }
 
   alias Pixir.CLI.Sigint
   alias Pixir.Subagents.GC
 
   @write_policy_unsupported_commands ~w(
-    login doctor gc diagnose tree compact fork inspect-replay delegate acp help version --version -v -h --help
+    login doctor models gc diagnose tree compact fork inspect-replay delegate acp help version --version -v -h --help
   )
   @bash_timeout_unsupported_commands @write_policy_unsupported_commands
   @attach_unsupported_commands @write_policy_unsupported_commands
@@ -148,6 +154,10 @@ defmodule Pixir.CLI do
       invalid_doctor_args?(rest) -> print_error_return("usage: pixir doctor [--json]", 2)
       true -> doctor("--json" in rest)
     end
+  end
+
+  defp route_command(["models" | rest], _mode, runtime) do
+    if help?(rest), do: models_help(), else: models(rest, runtime.json?)
   end
 
   defp route_command(["gc" | rest], _mode, runtime) do
@@ -431,6 +441,123 @@ defmodule Pixir.CLI do
     {exe, args} = cmd
     _ = System.cmd(exe, args, stderr_to_stdout: true)
     :ok
+  end
+
+  defp models_help do
+    IO.puts("""
+    Inspect or explicitly refresh provider model catalogs.
+
+    Usage:
+      pixir models [--json]
+      pixir models refresh [--json]
+
+    `pixir models` is local-only and never calls the network. It prints each provider's
+    effective catalog, whether it came from built-ins or config.json, and the last
+    refresh timestamp when available. `refresh` calls only model-list endpoints whose
+    active authentication kind Pixir supports, preserves failed/skipped provider lists,
+    and atomically updates ~/.pixir/config.json for successful providers.
+    """)
+
+    :ok
+  end
+
+  # The global runtime parser already consumed --json into `json?`; strip the
+  # literal flag before matching subcommand shapes (same fix as `gc`).
+  defp models(rest, json?) when is_list(rest) do
+    case Enum.reject(rest, &(&1 == "--json")) do
+      [] -> show_models(json?)
+      ["refresh"] -> refresh_models(json?)
+      args -> invalid_models_args(args, json?)
+    end
+  end
+
+  defp invalid_models_args(args, true) do
+    IO.puts(
+      Jason.encode!(%{
+        "ok" => false,
+        "status" => "invalid_args",
+        "kind" => "models_invalid_args",
+        "details" => %{
+          "args" => args,
+          "usage" => "pixir models [refresh] [--json]"
+        },
+        "next_actions" => ["remove_unsupported_models_arguments"]
+      })
+    )
+
+    {:error, 2}
+  end
+
+  defp invalid_models_args(_args, false),
+    do: print_error_return("usage: pixir models [refresh] [--json]", 2)
+
+  defp show_models(json?) do
+    case ModelsRefresh.catalog(models_refresh_opts()) do
+      {:ok, catalog} ->
+        envelope =
+          Map.merge(catalog, %{"ok" => true, "status" => "ok", "kind" => "models_catalog"})
+
+        if json?, do: IO.puts(Jason.encode!(envelope)), else: render_models_catalog(catalog)
+        :ok
+
+      {:error, error} ->
+        print_runtime_error(error, json?)
+        {:error, 1}
+    end
+  end
+
+  defp refresh_models(json?) do
+    case ModelsRefresh.refresh(models_refresh_opts()) do
+      {:ok, result} ->
+        envelope =
+          Map.merge(result, %{"ok" => true, "status" => "completed", "kind" => "models_refresh"})
+
+        if json?, do: IO.puts(Jason.encode!(envelope)), else: render_models_refresh(result)
+        :ok
+
+      {:error, error} ->
+        print_runtime_error(error, json?)
+        {:error, 1}
+    end
+  end
+
+  defp render_models_catalog(catalog) do
+    IO.puts("Pixir models")
+
+    Enum.each(["openai", "anthropic"], fn provider ->
+      entry = catalog["providers"][provider]
+      IO.puts("#{provider} (source: #{entry["source"]})")
+      Enum.each(entry["models"], &IO.puts("  #{&1}"))
+    end)
+
+    if stamp = catalog["models_refreshed_at"], do: IO.puts("refreshed at: #{stamp}")
+  end
+
+  defp render_models_refresh(result) do
+    IO.puts("Pixir models refresh")
+
+    Enum.each(["openai", "anthropic"], fn provider ->
+      entry = result["providers"][provider]
+
+      case entry["status"] do
+        "refreshed" ->
+          IO.puts("#{provider}: refreshed")
+          IO.puts("  added: #{Enum.join(entry["added"], ", ")}")
+          IO.puts("  removed: #{Enum.join(entry["removed"], ", ")}")
+
+        status ->
+          reason = entry["reason"] || entry["kind"] || "unknown"
+          IO.puts("#{provider}: #{status} (#{reason})")
+      end
+    end)
+
+    IO.puts("config written: #{result["wrote_config"]}")
+    IO.puts("refreshed at: #{result["refreshed_at"]}")
+  end
+
+  defp models_refresh_opts do
+    cli_turn_opts()
+    |> Keyword.get(:models_refresh_opts, [])
   end
 
   defp gc_help do
@@ -991,7 +1118,7 @@ defmodule Pixir.CLI do
          :ok <- ensure_policy_mode(mode, policy_opts, runtime),
          :ok <- ensure_interactive_ask(mode),
          :ok <- require_auth(turn_opts),
-         {:ok, sid} <- start_session([], mode) do
+         {:ok, sid} <- start_session([], mode, policy_opts) do
       run_turn(
         sid,
         prompt,
@@ -1014,10 +1141,14 @@ defmodule Pixir.CLI do
          :ok <- ensure_policy_mode(mode, policy_opts, runtime),
          :ok <- ensure_interactive_ask(mode),
          {:ok, resume_opts} <- parse_resume_args(args),
+         {:ok, mode, policy_opts, attestation} <-
+           restore_resume_posture(resume_opts, mode, policy_opts),
+         :ok <- ensure_interactive_ask(mode),
          :ok <- require_auth(turn_opts),
          {:ok, prompt} <- read_prompt(resume_opts.prompt_args),
-         {:ok, started_id} <- start_session(resume_start_opts(resume_opts), mode),
-         :ok <- ensure_resume_id(started_id, resume_opts.id) do
+         {:ok, started_id} <- start_session(resume_start_opts(resume_opts), mode, policy_opts),
+         :ok <- ensure_resume_id(started_id, resume_opts.id),
+         :ok <- persist_legacy_root_attestation(attestation, resume_opts.id) do
       run_turn(
         resume_opts.id,
         prompt,
@@ -1036,7 +1167,9 @@ defmodule Pixir.CLI do
   defp parse_resume_args(args) do
     parse_resume_args(args, %{
       force_release_writer_lease?: false,
-      force_release_reason: nil
+      force_release_reason: nil,
+      assume_legacy_root?: false,
+      legacy_root_reason: nil
     })
   end
 
@@ -1058,12 +1191,42 @@ defmodule Pixir.CLI do
            "pixir resume [--force-release-writer-lease] [--force-release-reason TEXT] <id> \"prompt\""
        })}
 
+  defp parse_resume_args(["--assume-legacy-root" | rest], acc),
+    do: parse_resume_args(rest, %{acc | assume_legacy_root?: true})
+
+  # The reason is a durable confession: whitespace is not a reason. The trimmed
+  # text is what the attestation persists.
+  defp parse_resume_args(["--legacy-root-reason", reason | rest], acc) when is_binary(reason) do
+    case String.trim(reason) do
+      "" ->
+        {:error,
+         Pixir.Tool.error(:invalid_args, "--legacy-root-reason requires text", %{
+           usage: "pixir resume --assume-legacy-root --legacy-root-reason TEXT <id> \"prompt\""
+         })}
+
+      trimmed ->
+        parse_resume_args(rest, %{acc | legacy_root_reason: trimmed})
+    end
+  end
+
+  defp parse_resume_args(["--legacy-root-reason" | _rest], _acc),
+    do:
+      {:error,
+       Pixir.Tool.error(:invalid_args, "--legacy-root-reason requires text", %{
+         usage: "pixir resume --assume-legacy-root --legacy-root-reason TEXT <id> \"prompt\""
+       })}
+
   defp parse_resume_args([arg | prompt_args], acc) when is_binary(arg) do
     if String.starts_with?(arg, "-") do
       {:error,
        Pixir.Tool.error(:invalid_args, "unsupported resume option", %{
          option: arg,
-         accepted_options: ["--force-release-writer-lease", "--force-release-reason"]
+         accepted_options: [
+           "--force-release-writer-lease",
+           "--force-release-reason",
+           "--assume-legacy-root",
+           "--legacy-root-reason"
+         ]
        })}
     else
       validate_resume_args(
@@ -1082,6 +1245,31 @@ defmodule Pixir.CLI do
        "--force-release-reason requires --force-release-writer-lease",
        %{
          next_actions: ["add_--force-release-writer-lease", "remove_--force-release-reason"]
+       }
+     )}
+  end
+
+  # The attestation is a durable confession: a nonempty operator reason is part
+  # of the contract, not decoration — the flag pair travels together.
+  defp validate_resume_args(%{assume_legacy_root?: true, legacy_root_reason: nil}) do
+    {:error,
+     Pixir.Tool.error(
+       :invalid_args,
+       "--assume-legacy-root requires --legacy-root-reason TEXT",
+       %{
+         next_actions: ["add_--legacy-root-reason_with_why_this_log_is_yours"]
+       }
+     )}
+  end
+
+  defp validate_resume_args(%{assume_legacy_root?: false, legacy_root_reason: reason})
+       when is_binary(reason) do
+    {:error,
+     Pixir.Tool.error(
+       :invalid_args,
+       "--legacy-root-reason requires --assume-legacy-root",
+       %{
+         next_actions: ["add_--assume-legacy-root", "remove_--legacy-root-reason"]
        }
      )}
   end
@@ -1108,8 +1296,16 @@ defmodule Pixir.CLI do
 
   # Start (or resume) via the driver, which centralizes the resume robustness
   # (session-exists guard, corrupt-log-as-structured-error). `:not_found` exits 2.
-  defp start_session(opts, _mode) do
-    case Conversation.start(Keyword.put(opts, :workspace, File.cwd!())) do
+  # New root Sessions record mode + write policy as their durable posture; on a
+  # resume (`:id` present) the driver ignores these and the durable posture wins.
+  defp start_session(opts, mode, policy_opts) do
+    start_opts =
+      opts
+      |> Keyword.put(:workspace, File.cwd!())
+      |> Keyword.put(:permission_mode, mode)
+      |> Keyword.put(:write_policy, Keyword.get(policy_opts, :write_policy))
+
+    case Conversation.start(start_opts) do
       {:ok, _id} = ok -> ok
       {:error, %{error: %{kind: :not_found}} = err} -> print_error_return(err, 2)
       {:error, _} = err -> err
@@ -1377,6 +1573,97 @@ defmodule Pixir.CLI do
     case WritePolicy.from_file(path, File.cwd!()) do
       {:ok, policy} -> {:ok, [write_policy: policy]}
       {:error, error} -> {:error, error}
+    end
+  end
+
+  defp restore_resume_posture(resume_opts, requested_mode, policy_opts) do
+    requested_policy = Keyword.get(policy_opts, :write_policy)
+
+    case Subagents.resume_posture(resume_opts.id, workspace: File.cwd!()) do
+      {:ok, _durable_posture} when resume_opts.assume_legacy_root? ->
+        {:error,
+         Pixir.Tool.error(
+           :invalid_args,
+           "--assume-legacy-root does not apply: this Log resumes without an override",
+           %{"next_actions" => ["resume_without_--assume-legacy-root"]}
+         )}
+
+      {:ok, durable_posture} ->
+        with {:ok, effective_posture} <-
+               Subagents.restrict_resume_posture(
+                 durable_posture,
+                 requested_mode,
+                 requested_policy
+               ) do
+          opts =
+            if effective_posture.write_policy,
+              do: [write_policy: effective_posture.write_policy],
+              else: []
+
+          {:ok, effective_posture.permission_mode, opts, nil}
+        end
+
+      {:error, %{error: %{kind: :resume_policy_unavailable, details: %{"reason" => "missing"}}}} =
+          missing_error ->
+        attest_legacy_root(
+          resume_opts,
+          requested_mode,
+          requested_policy,
+          policy_opts,
+          missing_error
+        )
+
+      {:error, _error} = error ->
+        error
+    end
+  end
+
+  # `missing` is the ONE overrideable posture failure (a readable Log that
+  # predates posture evidence). Lineage is unprovable from the Log alone — this
+  # could be a legacy bounded child — so the attestation can never grant
+  # unbounded auto: read_only, ask, or auto with an explicit bounded policy.
+  defp attest_legacy_root(%{assume_legacy_root?: false}, _mode, _policy, _opts, missing_error),
+    do: missing_error
+
+  defp attest_legacy_root(_resume_opts, :auto, nil, _policy_opts, _missing_error) do
+    {:error,
+     Pixir.Tool.error(
+       :invalid_args,
+       "--assume-legacy-root cannot grant unbounded auto: legacy lineage is ambiguous and the Log could be a bounded child",
+       %{"next_actions" => ["add_--read-only_or_--ask_or_an_explicit_bounded_--write-policy"]}
+     )}
+  end
+
+  defp attest_legacy_root(resume_opts, mode, policy, policy_opts, _missing_error) do
+    attestation = %{
+      "event" => "permission_posture",
+      "scope" => "session",
+      "lineage" => "root",
+      "source" => "operator_attested_legacy_root",
+      "attestation_reason" => resume_opts.legacy_root_reason,
+      "prior_classification" => "missing",
+      "permission_mode" => Atom.to_string(mode),
+      "write_policy" => WritePolicy.metadata(policy),
+      "workspace_mode" => "shared",
+      "workspace" => File.cwd!()
+    }
+
+    {:ok, mode, policy_opts, attestation}
+  end
+
+  defp persist_legacy_root_attestation(nil, _session_id), do: :ok
+
+  defp persist_legacy_root_attestation(attestation, session_id) do
+    case Session.record(session_id, Event.subagent_event(session_id, attestation)) do
+      {:ok, _event} ->
+        :ok
+
+      {:error, _error} = error ->
+        # The Session started before this append; a failed attestation must not
+        # leave a live writer behind (same contract as the ACP fail-closed path
+        # and Conversation.start_new's posture failure).
+        SessionSupervisor.stop_session(session_id)
+        error
     end
   end
 
@@ -1648,10 +1935,15 @@ defmodule Pixir.CLI do
       pixir resume <id> "..."   Continue a persisted Session
       pixir resume --force-release-writer-lease <id> "..."
                                 Resume after explicitly releasing stale writer evidence
+      pixir resume --assume-legacy-root --legacy-root-reason TEXT <id> "..."
+                                Recover a pre-posture Log (never as unbounded auto)
       pixir [--json] [--bash-timeout-ms N] --write-policy <policy.json> resume <id> "..."
                                 Continue with the same bounded-write guard
       pixir login               Sign in (browser OAuth; device-code fallback)
       pixir doctor [--json]     Run local first-run diagnostics (no network)
+      pixir models [--json]     Show current provider catalogs (no network)
+      pixir models refresh [--json]
+                                Explicitly refresh supported provider catalogs
       pixir gc [--apply] [--json]
                                 Plan or apply isolated Subagent reclamation
       pixir diagnose session <id> [--json]
@@ -1678,7 +1970,7 @@ defmodule Pixir.CLI do
                                 bash in v1
 
     Runtime output:
-      --json                    Emit machine-readable output for gc; for one-shot/resume,
+      --json                    Emit machine-readable output for models, gc; for one-shot/resume,
                                 suppress streaming presenter output and emit one final
                                 JSON envelope on stdout
       --bash-timeout-ms <ms>    Override bash tool timeout for this one-shot/resume
@@ -1828,7 +2120,8 @@ defmodule Pixir.CLI do
 
   defp resume_help do
     IO.puts("""
-    pixir resume [--force-release-writer-lease] [--force-release-reason TEXT] <id> "prompt"
+    pixir resume [--force-release-writer-lease] [--force-release-reason TEXT]
+                 [--assume-legacy-root --legacy-root-reason TEXT] <id> "prompt"
     — continue a persisted Session.
 
     The Session id is printed (on stderr) at the end of each run. Sessions live in
@@ -1837,6 +2130,13 @@ defmodule Pixir.CLI do
     --force-release-writer-lease is a break-glass option for stale or ambiguous Session
     writer lease evidence. Active leases are refused. A diagnostic release record is
     written under .pixir/session_leases/releases/ before Pixir starts a new writer.
+
+    --assume-legacy-root recovers a Log that predates permission-posture evidence and
+    fails closed with reason "missing" (write-capable history, no posture). It requires
+    a nonempty --legacy-root-reason and an explicit posture: --read-only, --ask, or
+    --write-policy FILE. It can never grant unbounded auto — from the Log alone a
+    legacy root and a legacy bounded child are indistinguishable. The attestation is
+    persisted to the Log, so later resumes need no override.
     """)
 
     :ok

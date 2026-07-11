@@ -33,6 +33,8 @@ defmodule Pixir.Provider do
   # so the client's picker can mark it. Used to advertise the catalog over ACP
   # and to reject an unknown per-turn `_meta.model` early (`-32602`).
   @built_in_models ~w(
+    gpt-5.6-sol
+    gpt-5.6
     gpt-5.5
     gpt-5.4
     gpt-5.4-mini
@@ -214,11 +216,11 @@ defmodule Pixir.Provider do
   `default: true` (so the client's picker has a default even if config narrows
   the list).
   """
-  @spec models() :: [%{required(String.t()) => String.t() | boolean()}]
-  def models do
+  @spec models(keyword()) :: [%{required(String.t()) => String.t() | boolean()}]
+  def models(opts \\ []) do
     default = default_model()
 
-    config_models()
+    config_models(opts)
     |> Kernel.||(@built_in_models)
     |> List.insert_at(0, default)
     |> Enum.uniq()
@@ -277,7 +279,13 @@ defmodule Pixir.Provider do
   # A `"models"` array of slug strings from `~/.pixir/config.json`, or nil when
   # absent/malformed (falls back to the built-in list). Non-string entries are
   # dropped; an empty/invalid array yields nil so the built-in list stands.
-  defp config_models, do: Config.file_models()
+  defp config_models(opts), do: Config.file_models(opts)
+
+  # Raw built-in slugs, without the default-model insertion `models/1` applies.
+  # The refresh diff base needs the unshaped source list.
+  @doc false
+  @spec built_in_models() :: [String.t()]
+  def built_in_models, do: @built_in_models
 
   @doc """
   Cheaply validate connectivity and the model id: a minimal streamed call (tiny
@@ -562,19 +570,26 @@ defmodule Pixir.Provider do
          %{data: %{"name" => activation_name}},
          pending_calls
        )
-       when is_binary(activation_name) and map_size(pending_calls) == 1 do
-    case Map.to_list(pending_calls) do
-      [{call_id, %{data: %{"name" => "skill_view", "args" => args}}}] when is_map(args) ->
-        path = Map.get(args, "path", "SKILL.md")
+       when is_binary(activation_name) do
+    matching_call_ids =
+      Enum.reduce(pending_calls, [], fn
+        {call_id, %{data: %{"name" => "skill_view", "args" => args}}}, matches
+        when is_map(args) ->
+          path = Map.get(args, "path", "SKILL.md")
 
-        if args["name"] == activation_name and is_binary(path) and Skills.main_file?(path) do
-          {:ok, call_id}
-        else
-          :error
-        end
+          if args["name"] == activation_name and is_binary(path) and Skills.main_file?(path) do
+            [call_id | matches]
+          else
+            matches
+          end
 
-      _other ->
-        :error
+        _pending_call, matches ->
+          matches
+      end)
+
+    case matching_call_ids do
+      [call_id] -> {:ok, call_id}
+      _zero_or_ambiguous -> :error
     end
   end
 

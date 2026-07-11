@@ -365,8 +365,8 @@ defmodule Pixir.VirtualDiffApply do
               _relative -> Path.expand(link, Path.dirname(candidate))
             end
 
-          target
-          |> Path.join(Path.join(rest))
+          [target | rest]
+          |> Path.join()
           |> canonical_path_allow_missing(depth + 1)
         end
 

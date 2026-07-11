@@ -28,6 +28,25 @@ defmodule Pixir.Providers.AnthropicTest do
     )
   end
 
+  defp fold_raw_history!(session_id, raw_ndjson) do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "pixir-anthropic-history-" <>
+          Base.encode16(:crypto.strong_rand_bytes(6), case: :lower)
+      )
+
+    log_path = Pixir.Log.path(session_id, workspace: workspace)
+    File.mkdir_p!(Path.dirname(log_path))
+    File.write!(log_path, raw_ndjson)
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    assert {:ok, history} = Pixir.Log.fold(session_id, workspace: workspace)
+    history
+  end
+
+  defp flat_blocks(messages), do: Enum.flat_map(messages, &List.wrap(&1["content"]))
+
   test "pa1 request path emits cache-controlled system, breakpoints, and fenced late context" do
     chunks = [sse(%{type: "message_delta", delta: %{stop_reason: "end_turn"}})]
 
@@ -172,6 +191,160 @@ defmodule Pixir.Providers.AnthropicTest do
     assert result_block["tool_use_id"] == "call_skill"
     assert result_block["content"] == "# Anthropic activation"
     refute result_block["is_error"]
+  end
+
+  test "pairs one matching skill_view while an unrelated call remains pending" do
+    chunks = [sse(%{type: "message_delta", delta: %{stop_reason: "end_turn"}})]
+
+    activation = %{
+      "name" => "diagnose",
+      "source" => "repo",
+      "scope" => "repo",
+      "path" => "/skills/diagnose/SKILL.md",
+      "content_hash" => "anthropic-concurrent-hash",
+      "content" => "# Anthropic concurrent activation"
+    }
+
+    raw_ndjson =
+      ~S({"id":"e1","session_id":"anthropic-raw-concurrent","seq":1,"ts":"2026-07-05T00:00:01Z","type":"tool_call","data":{"call_id":"call_read","name":"read","args":{"path":"README.md"}}}) <>
+        "\n" <>
+        ~S({"id":"e2","session_id":"anthropic-raw-concurrent","seq":2,"ts":"2026-07-05T00:00:02Z","type":"tool_call","data":{"call_id":"call_skill","name":"skill_view","args":{"name":"diagnose","path":"SKILL.md"}}}) <>
+        "\n" <>
+        ~S({"id":"e3","session_id":"anthropic-raw-concurrent","seq":3,"ts":"2026-07-05T00:00:03Z","type":"skill_activation","data":{"name":"diagnose","source":"repo","scope":"repo","path":"/skills/diagnose/SKILL.md","content_hash":"anthropic-concurrent-hash","content":"# Anthropic concurrent activation"}}) <>
+        "\n" <>
+        ~S({"id":"e4","session_id":"anthropic-raw-concurrent","seq":4,"ts":"2026-07-05T00:00:04Z","type":"tool_result","data":{"call_id":"call_read","ok":true,"output":"read body"}}) <>
+        "\n" <>
+        ~S({"id":"e5","session_id":"anthropic-raw-concurrent","seq":5,"ts":"2026-07-05T00:00:05Z","type":"tool_result","data":{"call_id":"call_skill","ok":true,"output":"skill body"}}) <>
+        "\n"
+
+    history = fold_raw_history!("anthropic-raw-concurrent", raw_ndjson)
+
+    assert {:ok, _result} =
+             Anthropic.stream(
+               request(%{history: history}) |> Map.delete(:messages),
+               api_key: "sk-ant-test",
+               transport: canned(chunks)
+             )
+
+    assert_received {:request, http_request}
+    blocks = http_request.body |> Jason.decode!() |> Map.fetch!("messages") |> flat_blocks()
+
+    assert Enum.map(Enum.filter(blocks, &(&1["type"] == "tool_use")), & &1["id"]) == [
+             "call_read",
+             "call_skill"
+           ]
+
+    assert Enum.filter(blocks, &(&1["type"] == "tool_result")) == [
+             %{"type" => "tool_result", "tool_use_id" => "call_read", "content" => "read body"},
+             %{
+               "type" => "tool_result",
+               "tool_use_id" => "call_skill",
+               "content" => "skill body"
+             }
+           ]
+
+    assert Enum.any?(blocks, fn block ->
+             block["type"] == "text" and
+               block["text"] == Pixir.Skills.render_activation(activation)
+           end)
+
+    refute inspect(blocks) =~ "orphan_tool_call"
+  end
+
+  test "two matching skill_view calls remain ambiguous and use orphan repair" do
+    chunks = [sse(%{type: "message_delta", delta: %{stop_reason: "end_turn"}})]
+
+    raw_ndjson =
+      ~S({"id":"e1","session_id":"anthropic-raw-ambiguous","seq":1,"ts":"2026-07-05T00:00:01Z","type":"tool_call","data":{"call_id":"call_skill_a","name":"skill_view","args":{"name":"diagnose","path":"SKILL.md"}}}) <>
+        "\n" <>
+        ~S({"id":"e2","session_id":"anthropic-raw-ambiguous","seq":2,"ts":"2026-07-05T00:00:02Z","type":"tool_call","data":{"call_id":"call_skill_b","name":"skill_view","args":{"name":"diagnose","path":"SKILL.md"}}}) <>
+        "\n" <>
+        ~S({"id":"e3","session_id":"anthropic-raw-ambiguous","seq":3,"ts":"2026-07-05T00:00:03Z","type":"skill_activation","data":{"name":"diagnose","source":"repo","scope":"repo","path":"/skills/diagnose/SKILL.md","content_hash":"anthropic-ambiguous-hash","content":"# Anthropic ambiguous activation"}}) <>
+        "\n" <>
+        ~S({"id":"e4","session_id":"anthropic-raw-ambiguous","seq":4,"ts":"2026-07-05T00:00:04Z","type":"tool_result","data":{"call_id":"call_skill_a","ok":true,"output":"skill a body"}}) <>
+        "\n" <>
+        ~S({"id":"e5","session_id":"anthropic-raw-ambiguous","seq":5,"ts":"2026-07-05T00:00:05Z","type":"tool_result","data":{"call_id":"call_skill_b","ok":true,"output":"skill b body"}}) <>
+        "\n"
+
+    history = fold_raw_history!("anthropic-raw-ambiguous", raw_ndjson)
+
+    assert {:ok, _result} =
+             Anthropic.stream(
+               request(%{history: history}) |> Map.delete(:messages),
+               api_key: "sk-ant-test",
+               transport: canned(chunks)
+             )
+
+    assert_received {:request, http_request}
+    blocks = http_request.body |> Jason.decode!() |> Map.fetch!("messages") |> flat_blocks()
+
+    orphan_results =
+      Enum.filter(blocks, fn block ->
+        block["type"] == "tool_result" and block["is_error"] == true and
+          match?(
+            %{"error" => %{"kind" => "orphan_tool_call"}},
+            Jason.decode!(block["content"])
+          )
+      end)
+
+    assert Enum.map(orphan_results, & &1["tool_use_id"]) == ["call_skill_a", "call_skill_b"]
+  end
+
+  test "an unrelated result does not close a deferred skill activation early" do
+    chunks = [sse(%{type: "message_delta", delta: %{stop_reason: "end_turn"}})]
+
+    activation = %{
+      "name" => "diagnose",
+      "source" => "repo",
+      "scope" => "repo",
+      "path" => "/skills/diagnose/SKILL.md",
+      "content_hash" => "anthropic-deferred-hash",
+      "content" => "# Anthropic deferred activation"
+    }
+
+    raw_ndjson =
+      ~S({"id":"e1","session_id":"anthropic-raw-deferred","seq":1,"ts":"2026-07-05T00:00:01Z","type":"tool_call","data":{"call_id":"call_read","name":"read","args":{"path":"README.md"}}}) <>
+        "\n" <>
+        ~S({"id":"e2","session_id":"anthropic-raw-deferred","seq":2,"ts":"2026-07-05T00:00:02Z","type":"tool_call","data":{"call_id":"call_skill","name":"skill_view","args":{"name":"diagnose","path":"SKILL.md"}}}) <>
+        "\n" <>
+        ~S({"id":"e3","session_id":"anthropic-raw-deferred","seq":3,"ts":"2026-07-05T00:00:03Z","type":"skill_activation","data":{"name":"diagnose","source":"repo","scope":"repo","path":"/skills/diagnose/SKILL.md","content_hash":"anthropic-deferred-hash","content":"# Anthropic deferred activation"}}) <>
+        "\n" <>
+        ~S({"id":"e4","session_id":"anthropic-raw-deferred","seq":4,"ts":"2026-07-05T00:00:04Z","type":"tool_result","data":{"call_id":"call_read","ok":true,"output":"read body"}}) <>
+        "\n"
+
+    history = fold_raw_history!("anthropic-raw-deferred", raw_ndjson)
+
+    assert {:ok, _result} =
+             Anthropic.stream(
+               request(%{history: history}) |> Map.delete(:messages),
+               api_key: "sk-ant-test",
+               transport: canned(chunks)
+             )
+
+    assert_received {:request, http_request}
+    blocks = http_request.body |> Jason.decode!() |> Map.fetch!("messages") |> flat_blocks()
+
+    read_result_index =
+      Enum.find_index(blocks, &(&1["type"] == "tool_result" and &1["tool_use_id"] == "call_read"))
+
+    skill_orphan_index =
+      Enum.find_index(blocks, fn block ->
+        block["type"] == "tool_result" and block["tool_use_id"] == "call_skill" and
+          block["is_error"] == true
+      end)
+
+    activation_index =
+      Enum.find_index(blocks, fn block ->
+        block["type"] == "text" and
+          block["text"] == Pixir.Skills.render_activation(activation)
+      end)
+
+    assert is_integer(read_result_index)
+    assert is_integer(skill_orphan_index)
+    assert is_integer(activation_index)
+    assert read_result_index < skill_orphan_index
+    assert skill_orphan_index < activation_index
+    refute Enum.at(blocks, read_result_index)["is_error"]
   end
 
   test "pa1 provider_metadata carries prompt contract evidence" do

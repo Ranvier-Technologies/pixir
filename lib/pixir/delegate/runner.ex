@@ -51,7 +51,7 @@ defmodule Pixir.Delegate.Runner do
 
   def run(request, spec, %{"strategy" => "subagents"} = spec_meta, opts) do
     with {:ok, runtime} <- normalize_subagents_runtime(request, spec, spec_meta),
-         {:ok, parent_session_id} <- start_parent_session(runtime.workspace) do
+         {:ok, parent_session_id} <- start_parent_session(runtime) do
       refresh_lifecycle_evidence(parent_session_id, runtime, [])
 
       case spawn_subagents(parent_session_id, runtime, opts) do
@@ -81,7 +81,7 @@ defmodule Pixir.Delegate.Runner do
 
   def run(request, spec, %{"strategy" => "workflow"} = spec_meta, opts) do
     with {:ok, runtime} <- normalize_workflow_runtime(request, spec, spec_meta),
-         {:ok, parent_session_id} <- start_parent_session(runtime.workspace),
+         {:ok, parent_session_id} <- start_parent_session(runtime),
          {:ok, result} <- run_workflow(parent_session_id, runtime, opts) do
       {:ok,
        workflow_result_payload(parent_session_id, runtime, result)
@@ -116,7 +116,7 @@ defmodule Pixir.Delegate.Runner do
 
   def start(request, spec, %{"strategy" => "subagents"} = spec_meta, opts) do
     with {:ok, runtime} <- normalize_subagents_runtime(request, spec, spec_meta),
-         {:ok, parent_session_id} <- start_parent_session(runtime.workspace) do
+         {:ok, parent_session_id} <- start_parent_session(runtime) do
       refresh_lifecycle_evidence(parent_session_id, runtime, [])
 
       case spawn_subagents(parent_session_id, runtime, opts) do
@@ -960,12 +960,27 @@ defmodule Pixir.Delegate.Runner do
 
   defp ensure_workflow_child_count(_workflow_spec, _spec_meta), do: :ok
 
-  defp start_parent_session(workspace) do
-    case Conversation.start(workspace: workspace, role: :delegate) do
+  # The parent Session's durable root posture must record the delegate's OWN
+  # ceiling, never a default unbounded auto: a cold `pixir resume` of a
+  # bounded_write delegate parent restores exactly the spec's policy, and a
+  # read_only delegate parent stays read-only.
+  defp start_parent_session(runtime) do
+    case Conversation.start(
+           workspace: runtime.workspace,
+           role: :delegate,
+           permission_mode: parent_permission_mode(runtime.mode),
+           write_policy: runtime.write_policy
+         ) do
       {:ok, session_id} -> {:ok, session_id}
       {:error, error} -> {:error, normalize_error(error)}
     end
   end
+
+  # Explicit clauses only: normalize_mode/1 admits exactly these two today, and
+  # a future mode must decide its ceiling deliberately — a catch-all defaulting
+  # to :auto would silently record an unbounded-capable posture.
+  defp parent_permission_mode("read_only"), do: :read_only
+  defp parent_permission_mode("bounded_write"), do: :auto
 
   defp spawn_subagents(parent_session_id, runtime, opts) do
     spawn_agent = Keyword.get(opts, :spawn_agent, &Subagents.spawn_agent/3)
@@ -1859,14 +1874,12 @@ defmodule Pixir.Delegate.Runner do
     permission_mode = map_value(agent, "permission_mode", :permission_mode)
     write_policy = map_value(agent, "write_policy", :write_policy)
     mode = map_value(agent, "mode", :mode)
-    role = map_value(agent, "agent", :agent)
 
     cond do
       permission_mode in ["read_only", :read_only] -> false
       permission_mode in ["auto", :auto] -> true
       mode in ["bounded_write", :bounded_write] -> true
       is_map(write_policy) -> true
-      role in ["worker", :worker] -> true
       true -> false
     end
   end

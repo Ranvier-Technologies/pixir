@@ -63,3 +63,7 @@ node_modules/
 /.claude/*
 !/.claude/skills/
 .orchestrator/
+
+# Untracked local artifacts (never ship to the release/mirror)
+bin/codex-subagents-smoke
+site/outputs/
