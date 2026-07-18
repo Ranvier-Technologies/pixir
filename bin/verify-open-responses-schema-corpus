@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Independently oracle Pixir's Open Responses corpus with jsonschema 2020-12."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import sys
+import warnings
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)
+    from jsonschema import Draft202012Validator, RefResolver
+
+
+OPENAPI_SHA256 = "b445f548d7d13da7768c06cab4317c59928a46a35847d4a515b94c75b8294c87"
+DISPOSITIONS = {"invalid", "portable", "ignored-safe", "unsupported", "local-limit"}
+
+
+def parser() -> argparse.ArgumentParser:
+    root = Path(__file__).resolve().parents[1]
+    fixtures = root / "test/fixtures/provider/open_responses"
+    result = argparse.ArgumentParser(
+        description="Verify the differential corpus against the exact pinned full OpenAPI."
+    )
+    result.add_argument("--input", required=True, type=Path, help="Exact pinned OpenAPI JSON.")
+    result.add_argument("--corpus", type=Path, default=fixtures / "schema_corpus.jsonl")
+    result.add_argument("--bases", type=Path, default=fixtures / "schema_corpus_bases.json")
+    result.add_argument("--manifest", type=Path, default=fixtures / "schema_manifest.json")
+    result.add_argument("--json", action="store_true", help="Emit one structured JSON result.")
+    return result
+
+
+def emit(payload: dict[str, Any], as_json: bool, stream: Any = sys.stdout) -> None:
+    if as_json:
+        stream.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    elif payload["ok"]:
+        stream.write(
+            f"open-responses-corpus: pass; rows={payload['row_count']}; mismatches=0\n"
+        )
+    else:
+        error = payload["error"]
+        stream.write(f"{error['kind']}: {error['message']} Next: {error['next_action']}\n")
+
+
+def failure(kind: str, message: str, details: dict[str, Any], next_action: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": {
+            "kind": kind,
+            "message": message,
+            "details": details,
+            "next_action": next_action,
+        },
+    }
+
+
+def put_path(value: Any, path: list[str], replacement: Any) -> Any:
+    if not path:
+        return copy.deepcopy(replacement)
+    if not isinstance(value, dict):
+        raise ValueError("set parent is not an object")
+    result = copy.deepcopy(value)
+    key = path[0]
+    if len(path) == 1:
+        result[key] = copy.deepcopy(replacement)
+    else:
+        if key not in result:
+            raise ValueError("set path parent is missing")
+        result[key] = put_path(result[key], path[1:], replacement)
+    return result
+
+
+def delete_path(value: Any, path: list[str]) -> Any:
+    if not path or not isinstance(value, dict):
+        raise ValueError("invalid delete path")
+    result = copy.deepcopy(value)
+    key = path[0]
+    if key not in result:
+        raise ValueError("delete path is missing")
+    if len(path) == 1:
+        del result[key]
+    else:
+        result[key] = delete_path(result[key], path[1:])
+    return result
+
+
+def expand_recipe(row: dict[str, Any], bases: dict[str, Any]) -> dict[str, Any]:
+    event = copy.deepcopy(bases[row["base"]])
+    for operation in row["ops"]:
+        if operation["op"] == "replace-root":
+            event = copy.deepcopy(operation["value"])
+        elif operation["op"] == "set":
+            event = put_path(event, operation["path"], operation["value"])
+        elif operation["op"] == "delete":
+            event = delete_path(event, operation["path"])
+        else:
+            raise ValueError("unknown recipe operation")
+    return {
+        "id": row["id"],
+        "label": row["label"],
+        "schema": row["schema"],
+        "openapi_valid": row["openapi_valid"],
+        "disposition": row["disposition"],
+        "event": event,
+    }
+
+
+def canonical(value: Any) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        openapi_bytes = args.input.read_bytes()
+        actual_sha = hashlib.sha256(openapi_bytes).hexdigest()
+        if actual_sha != OPENAPI_SHA256:
+            payload = failure(
+                "authority_mismatch",
+                "The oracle input does not match the frozen OpenAPI bytes.",
+                {"expected_sha256": OPENAPI_SHA256, "actual_sha256": actual_sha},
+                "Use public/openapi/openapi.json from the pinned upstream commit.",
+            )
+            emit(payload, args.json, sys.stderr)
+            return 2
+
+        document = json.loads(openapi_bytes)
+        resolver = RefResolver.from_schema(document)
+        corpus_bytes = args.corpus.read_bytes()
+        bases_bytes = args.bases.read_bytes()
+        manifest = json.loads(args.manifest.read_text())
+        bases = json.loads(bases_bytes)
+        recipe_rows = [json.loads(line) for line in corpus_bytes.splitlines() if line]
+        rows = [expand_recipe(row, bases) for row in recipe_rows]
+        mismatches: list[dict[str, Any]] = []
+        counts: Counter[str] = Counter()
+        seen_ids: set[str] = set()
+        seen_identities: set[bytes] = set()
+
+        for row in rows:
+            disposition = row.get("disposition")
+            counts[disposition] += 1
+            row_id = row.get("id")
+            exact_disposition = disposition in DISPOSITIONS
+            unique_id = isinstance(row_id, str) and row_id not in seen_ids
+            identity = canonical([disposition, row["event"]])
+            unique_identity = identity not in seen_identities
+            if isinstance(row_id, str):
+                seen_ids.add(row_id)
+            seen_identities.add(identity)
+
+            validator = Draft202012Validator({"$ref": row["schema"]}, resolver=resolver)
+            oracle_valid = not any(validator.iter_errors(row["event"]))
+            expected_valid = row.get("openapi_valid") is True
+
+            if (
+                not exact_disposition
+                or not unique_id
+                or not unique_identity
+                or oracle_valid != expected_valid
+            ):
+                mismatches.append(
+                    {
+                        "id": row_id if isinstance(row_id, str) else "invalid-id",
+                        "disposition_valid": exact_disposition,
+                        "id_unique": unique_id,
+                        "expanded_identity_unique": unique_identity,
+                        "expected_valid": expected_valid,
+                        "oracle_valid": oracle_valid,
+                    }
+                )
+
+        artifact_digests = {
+            "corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(),
+            "corpus_bases_sha256": hashlib.sha256(bases_bytes).hexdigest(),
+            "expanded_corpus_sha256": hashlib.sha256(b"".join(map(canonical, rows))).hexdigest(),
+        }
+        expected_digests = manifest["digests"]
+        digest_mismatches = sorted(
+            name for name, actual in artifact_digests.items() if actual != expected_digests[name]
+        )
+        row_count_matches = len(rows) == manifest["corpus"]["row_count"]
+
+        payload = {
+            "ok": not mismatches and not digest_mismatches and row_count_matches,
+            "validator": "jsonschema Draft 2020-12",
+            "network": False,
+            "writes": False,
+            "row_count": len(rows),
+            "counts": dict(sorted(counts.items())),
+            "mismatch_count": len(mismatches),
+            "duplicate_expanded_identity_count": len(rows) - len(seen_identities),
+            "mismatches": mismatches[:20],
+            "artifact_digests": artifact_digests,
+            "digest_mismatches": digest_mismatches,
+            "row_count_matches": row_count_matches,
+        }
+        if not payload["ok"]:
+            payload["error"] = {
+                "kind": "oracle_mismatch",
+                "message": "The reconstructed differential corpus disagrees with its oracle or manifest.",
+                "details": {
+                    "mismatch_count": len(mismatches),
+                    "duplicate_expanded_identity_count": len(rows) - len(seen_identities),
+                    "digest_mismatches": digest_mismatches,
+                    "row_count_matches": row_count_matches,
+                },
+                "next_action": "Regenerate only after correcting corpus construction or authority.",
+            }
+            emit(payload, args.json, sys.stderr)
+            return 1
+
+        emit(payload, args.json)
+        return 0
+    except (FileNotFoundError, PermissionError):
+        payload = failure(
+            "filesystem_error",
+            "The oracle could not read a required local artifact.",
+            {"operation": "read"},
+            "Check --input and --corpus paths and local permissions.",
+        )
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        payload = failure(
+            "invalid_artifact",
+            "The OpenAPI or corpus artifact is malformed.",
+            {"reason": type(error).__name__},
+            "Regenerate from the exact pinned OpenAPI and retry.",
+        )
+    emit(payload, args.json, sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

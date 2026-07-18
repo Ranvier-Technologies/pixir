@@ -12,7 +12,7 @@ defmodule Pixir.Subagents do
   when the configured cap is at least `2`.
   """
 
-  alias Pixir.{Log, Permissions, Tool}
+  alias Pixir.{Log, Permissions, SessionId, Tool}
   alias Pixir.Permissions.WritePolicy
   alias Pixir.Subagents.Manager
 
@@ -120,10 +120,11 @@ defmodule Pixir.Subagents do
   attestation (never as unbounded auto).
   """
   @spec resume_posture(String.t(), keyword()) :: {:ok, map()} | {:error, map()}
-  def resume_posture(session_id, opts \\ []) when is_binary(session_id) do
+  def resume_posture(session_id, opts \\ []) do
     workspace = Keyword.get(opts, :workspace, File.cwd!())
 
-    with {:ok, workspace} <- canonical_resume_workspace(session_id, workspace),
+    with :ok <- SessionId.validate(session_id),
+         {:ok, workspace} <- canonical_resume_workspace(session_id, workspace),
          {:ok, history} <- fold_resume_history(session_id, workspace) do
       evidence? = write_capable_evidence?(history)
 
@@ -181,32 +182,22 @@ defmodule Pixir.Subagents do
   defp fold_resume_history(session_id, workspace) do
     path = Log.path(session_id, workspace: workspace)
 
-    case File.stat(path) do
-      {:ok, %File.Stat{type: :regular}} ->
+    case Log.exists(session_id, workspace: workspace) do
+      {:ok, true} ->
         case Log.fold_append_order(session_id, workspace: workspace) do
           {:ok, history} -> {:ok, history}
+          {:error, %{error: %{kind: :unsafe_state_path}} = error} -> {:error, error}
           {:error, error} -> {:error, resume_log_error(session_id, path, error)}
         end
 
-      {:ok, %File.Stat{type: type}} ->
-        {:error,
-         resume_posture_error(session_id, "log_unreadable", %{
-           "log_path" => path,
-           "filesystem_reason" => "not_a_regular_file:#{type}"
-         })}
-
-      {:error, :enoent} ->
+      {:ok, false} ->
         {:error,
          resume_posture_error(session_id, "log_missing", %{
            "log_path" => path
          })}
 
-      {:error, reason} ->
-        {:error,
-         resume_posture_error(session_id, "log_unreadable", %{
-           "log_path" => path,
-           "filesystem_reason" => inspect(reason)
-         })}
+      {:error, error} ->
+        {:error, error}
     end
   end
 
@@ -637,7 +628,12 @@ defmodule Pixir.Subagents do
       "retry_max_attempts",
       "current_attempt_index",
       "retry_history",
-      "virtual_diff_ref"
+      "virtual_diff_ref",
+      "output_truncation",
+      "output_warning_count",
+      "output_warnings",
+      "output_warning_reasons",
+      "output_warnings_truncated"
     ]
   end
 end

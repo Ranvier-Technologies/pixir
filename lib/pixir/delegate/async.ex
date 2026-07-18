@@ -28,6 +28,7 @@ defmodule Pixir.Delegate.Async do
 
   alias Pixir.{Log, SessionTree, Subagents}
   alias Pixir.Delegate.{Handle, Owner, OwnerSupervisor}
+  alias Pixir.Provider.OutputTruncationSummary
 
   @active_statuses ~w(queued running)
   @completed_status "completed"
@@ -55,6 +56,8 @@ defmodule Pixir.Delegate.Async do
          {:ok, snapshot} <- durable_snapshot(handle["parent_session_id"], workspace, opts),
          {:ok, owner} <- owner_or_snapshot(handle) do
       {:ok, status_payload(handle, snapshot, owner)}
+    else
+      {:error, error} -> {:error, normalize_error(error)}
     end
   end
 
@@ -93,6 +96,8 @@ defmodule Pixir.Delegate.Async do
           {:ok, owner_error} = Owner.owner_unavailable_error(handle, error)
           {:ok, cancel_owner_unavailable_payload(handle, snapshot, owner_error)}
       end
+    else
+      {:error, error} -> {:error, normalize_error(error)}
     end
   end
 
@@ -115,6 +120,8 @@ defmodule Pixir.Delegate.Async do
          {:ok, snapshot} <- durable_snapshot(handle["parent_session_id"], workspace, opts),
          {:ok, owner} <- owner_or_snapshot(handle) do
       {:ok, attach_payload(handle, snapshot, owner)}
+    else
+      {:error, error} -> {:error, normalize_error(error)}
     end
   end
 
@@ -127,42 +134,59 @@ defmodule Pixir.Delegate.Async do
        })}
 
   defp durable_snapshot(session_id, workspace, opts) do
-    if Log.exists?(session_id, workspace: workspace) do
-      with {:ok, history} <- Log.fold(session_id, workspace: workspace),
-           {:ok, tree} <-
-             SessionTree.project(session_id,
-               workspace: workspace,
-               max_depth: Keyword.get(opts, :max_depth, 2)
-             ) do
-        children =
-          history
-          |> Subagents.reconstruct()
-          |> Map.values()
-          |> Enum.map(&child_payload/1)
-          |> Enum.sort_by(&(&1["subagent_id"] || ""))
+    case Log.exists(session_id, workspace: workspace) do
+      {:ok, true} ->
+        with {:ok, history} <- Log.fold(session_id, workspace: workspace),
+             {:ok, tree} <-
+               SessionTree.project(session_id,
+                 workspace: workspace,
+                 max_depth: Keyword.get(opts, :max_depth, 2)
+               ) do
+          positions = child_envelope_positions(history)
 
-        {:ok,
-         %{
-           session_id: session_id,
-           workspace: workspace,
-           history: history,
-           tree: tree,
-           children: children
-         }}
-      else
-        {:error, error} -> {:error, normalize_error(error)}
-      end
-    else
-      {:error,
-       error_payload("not_found", "session log was not found", %{
-         "session_id" => session_id,
-         "workspace" => workspace,
-         "log_path" => Log.path(session_id, workspace: workspace),
-         "next_actions" => [
-           "check_the_session_id",
-           "run_from_the_workspace_that_owns_the_session_log"
-         ]
-       })}
+          children =
+            history
+            |> Subagents.reconstruct()
+            |> Map.values()
+            |> Enum.map(&child_payload/1)
+            |> Enum.sort_by(fn child ->
+              position = Map.get(positions, child["subagent_id"], 2_147_483_647)
+
+              case child["index"] do
+                index when is_integer(index) and index >= 0 ->
+                  {0, index, child["child_session_id"] || "", position}
+
+                _invalid_or_missing ->
+                  {1, position, "", position}
+              end
+            end)
+
+          {:ok,
+           %{
+             session_id: session_id,
+             workspace: workspace,
+             history: history,
+             tree: tree,
+             children: children
+           }}
+        else
+          {:error, error} -> {:error, normalize_error(error)}
+        end
+
+      {:ok, false} ->
+        {:error,
+         error_payload("not_found", "session log was not found", %{
+           "session_id" => session_id,
+           "workspace" => workspace,
+           "log_path" => Log.path(session_id, workspace: workspace),
+           "next_actions" => [
+             "check_the_session_id",
+             "run_from_the_workspace_that_owns_the_session_log"
+           ]
+         })}
+
+      {:error, error} ->
+        {:error, normalize_error(error)}
     end
   end
 
@@ -440,18 +464,40 @@ defmodule Pixir.Delegate.Async do
   end
 
   defp child_payload(child) when is_map(child) do
+    status = child_status(child)
+    normalized = OutputTruncationSummary.normalize_child_output(child)
+
+    output_truncation =
+      normalized["output_truncation"] ||
+        historical_child_output_truncation(status)
+
     %{
       "subagent_id" => child["subagent_id"] || child["id"] || child[:subagent_id] || child[:id],
       "child_session_id" => child["child_session_id"] || child[:child_session_id],
       "agent" => child["agent"] || child[:agent],
-      "status" => child_status(child),
+      "status" => status,
       "summary" => child["summary"] || child[:summary],
       "task" => child["task"] || child[:task],
       "workspace_mode" => child["workspace_mode"] || child[:workspace_mode],
       "child_log_path" => child["child_log_path"] || child[:child_log_path],
-      "next_actions" => child["next_actions"] || child[:next_actions] || []
+      "next_actions" => child["next_actions"] || child[:next_actions] || [],
+      "output_truncation" => output_truncation,
+      "output_warning_count" => normalized["output_warning_count"],
+      "output_warnings" => normalized["output_warnings"],
+      "output_warning_reasons" => normalized["output_warning_reasons"],
+      "output_warnings_truncated" => normalized["output_warnings_truncated"]
     }
     |> maybe_put_child_index(child["index"] || child[:index])
+  end
+
+  defp child_envelope_positions(history) do
+    history
+    |> Enum.filter(&(&1.type == :subagent_event))
+    |> Enum.map(& &1.data["subagent_id"])
+    |> Enum.filter(&is_binary/1)
+    |> Enum.uniq()
+    |> Enum.with_index()
+    |> Map.new()
   end
 
   defp maybe_put_child_index(payload, index) when is_integer(index),
@@ -460,6 +506,13 @@ defmodule Pixir.Delegate.Async do
   defp maybe_put_child_index(payload, _index), do: payload
 
   defp child_status(child), do: child["status"] || child[:status] || "unknown"
+
+  defp historical_child_output_truncation("completed") do
+    Pixir.Provider.OutputTruncation.unknown(:historical_evidence_absent)
+    |> Pixir.Provider.OutputTruncation.to_event_data()
+  end
+
+  defp historical_child_output_truncation(_status), do: nil
 
   defp counts(children) do
     by_status = Enum.frequencies_by(children, &child_status/1)

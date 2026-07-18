@@ -7,7 +7,7 @@ defmodule Pixir.SessionTree do
   relationships for presenters and diagnostics.
   """
 
-  alias Pixir.{Log, Paths, Tool}
+  alias Pixir.{Log, Paths, SessionId, Tool}
 
   @default_max_depth 4
 
@@ -26,19 +26,26 @@ defmodule Pixir.SessionTree do
     workspace = opts |> Keyword.get(:workspace, File.cwd!()) |> Path.expand()
     max_depth = Keyword.get(opts, :max_depth, @default_max_depth)
 
-    if Log.exists?(session_id, workspace: workspace) do
-      build_node(session_id, workspace, 0, max_depth, MapSet.new())
-    else
-      {:error,
-       Tool.error(:not_found, "session log was not found", %{
-         session_id: session_id,
-         workspace: workspace,
-         log_path: Log.path(session_id, workspace: workspace),
-         next_actions: [
-           "check the session id",
-           "run pixir tree from the workspace that owns the session log"
-         ]
-       })}
+    with :ok <- SessionId.validate(session_id) do
+      case Log.exists(session_id, workspace: workspace) do
+        {:ok, true} ->
+          build_node(session_id, workspace, 0, max_depth, MapSet.new())
+
+        {:ok, false} ->
+          {:error,
+           Tool.error(:not_found, "session log was not found", %{
+             session_id: session_id,
+             workspace: workspace,
+             log_path: Log.path(session_id, workspace: workspace),
+             next_actions: [
+               "check the session id",
+               "run pixir tree from the workspace that owns the session log"
+             ]
+           })}
+
+        {:error, _error} = error ->
+          error
+      end
     end
   end
 
@@ -56,6 +63,13 @@ defmodule Pixir.SessionTree do
   end
 
   defp build_node(session_id, workspace, depth, max_depth, seen) do
+    with :ok <- SessionId.validate(session_id),
+         {:ok, log_exists?} <- Log.exists(session_id, workspace: workspace) do
+      do_build_node(session_id, workspace, depth, max_depth, seen, log_exists?)
+    end
+  end
+
+  defp do_build_node(session_id, workspace, depth, max_depth, seen, log_exists?) do
     key = {session_id, workspace}
     log_path = Log.path(session_id, workspace: workspace)
 
@@ -68,11 +82,11 @@ defmodule Pixir.SessionTree do
 
       depth > max_depth ->
         {:ok,
-         base_node(session_id, workspace, log_path, File.exists?(log_path))
+         base_node(session_id, workspace, log_path, log_exists?)
          |> Map.put("truncated", true)
          |> Map.put("truncated_reason", "max_depth")}
 
-      not File.exists?(log_path) ->
+      not log_exists? ->
         {:ok, base_node(session_id, workspace, log_path, false)}
 
       true ->

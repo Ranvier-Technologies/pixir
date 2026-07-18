@@ -69,4 +69,110 @@ defmodule Mix.Tasks.Pixir.Smoke.WebSearchTest do
     assert [next | _] = payload["next_steps"]
     assert next =~ "--help"
   end
+
+  test "real path lets Provider profile preflight govern before Auth" do
+    for {profile, kind} <- profile_cases() do
+      with_profile(profile, fn ->
+        payload =
+          capture_io(fn ->
+            assert catch_exit(SmokeTask.run(["--json"])) == {:shutdown, 1}
+          end)
+          |> Jason.decode!()
+
+        assert payload["ok"] == false
+        assert payload["schema_version"] == 1
+        assert payload["command"] == "mix pixir.smoke.web_search"
+        assert payload["error"]["kind"] == kind
+        assert payload["next_steps"] != []
+      end)
+    end
+  end
+
+  test "dry-run projects malformed and staged-open preflight errors without crashing" do
+    for {profile, kind} <- profile_cases() do
+      with_profile(profile, fn ->
+        payload =
+          capture_io(fn ->
+            assert catch_exit(SmokeTask.run(["--dry-run", "--json"])) == {:shutdown, 1}
+          end)
+          |> Jason.decode!()
+
+        assert payload["ok"] == false
+        assert payload["schema_version"] == 1
+        assert payload["command"] == "mix pixir.smoke.web_search"
+        assert payload["error"]["kind"] == kind
+        assert payload["error"]["message"] != ""
+        assert map_size(payload["error"]["details"]) == 2
+        assert payload["next_steps"] != []
+        refute inspect(payload) =~ "KeyError"
+      end)
+    end
+  end
+
+  test "dry-run without --json keeps malformed and staged-open errors human-readable" do
+    for {profile, kind} <- profile_cases() do
+      with_profile(profile, fn ->
+        test = self()
+
+        stderr =
+          capture_io(:stderr, fn ->
+            stdout =
+              capture_io(fn ->
+                assert catch_exit(SmokeTask.run(["--dry-run"])) == {:shutdown, 1}
+              end)
+
+            send(test, {:human_dry_run_stdout, stdout})
+          end)
+
+        assert_receive {:human_dry_run_stdout, ""}
+        assert stderr =~ kind
+        assert stderr =~ "next:"
+        refute stderr =~ ~s({"ok":false)
+        refute stderr =~ "KeyError"
+      end)
+    end
+  end
+
+  test "preview error normalization accepts canonical nested and flat forms" do
+    error = %{
+      kind: :invalid_config,
+      message: "invalid preview",
+      details: %{field: :responses_backend, reason: :invalid_type}
+    }
+
+    assert {:ok, ^error} = SmokeTask.normalize_preview_error({:error, %{error: error}})
+    assert {:ok, ^error} = SmokeTask.normalize_preview_error({:error, error})
+    assert :error = SmokeTask.normalize_preview_error({:error, %{kind: :invalid_config}})
+  end
+
+  defp profile_cases do
+    [
+      {%{"mode" => "future"}, "invalid_config"},
+      {%{
+         "mode" => "open_responses",
+         "responses_url" => "https://vendor.example/v1/responses",
+         "auth" => %{"policy" => "none"}
+       }, "unsupported_backend_capability"}
+    ]
+  end
+
+  defp with_profile(profile, fun) do
+    home =
+      Path.join(System.tmp_dir!(), "pixir-search-profile-#{System.unique_integer([:positive])}")
+
+    prior_home = System.get_env("PIXIR_HOME")
+    File.mkdir_p!(home)
+    File.write!(Path.join(home, "config.json"), Jason.encode!(%{"responses_backend" => profile}))
+    System.put_env("PIXIR_HOME", home)
+
+    try do
+      fun.()
+    after
+      if prior_home,
+        do: System.put_env("PIXIR_HOME", prior_home),
+        else: System.delete_env("PIXIR_HOME")
+
+      File.rm_rf!(home)
+    end
+  end
 end

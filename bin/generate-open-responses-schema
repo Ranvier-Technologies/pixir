@@ -1,0 +1,1645 @@
+#!/usr/bin/env python3
+"""Generate Pixir's offline Open Responses SSE schema validator artifacts.
+
+The command consumes one explicitly supplied local OpenAPI document. It never fetches
+network resources. Identical input produces byte-identical Elixir, subset, corpus, and
+manifest files.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from collections import Counter
+from pathlib import Path
+from typing import Any, Iterable
+
+
+UPSTREAM_COMMIT = "cd31bc2060a27ee87a05ec97f49c84027eb6c3ba"
+UPSTREAM_TREE = "d9c5969e195f1b1b8cd57df37f51e88079ed28ab"
+OPENAPI_BLOB = "f8a773dd0a754d01975d6730af4f8ec50b63d593"
+OPENAPI_SHA256 = "b445f548d7d13da7768c06cab4317c59928a46a35847d4a515b94c75b8294c87"
+MAX_DEPTH = 64
+MAX_EVALUATIONS = 250_000
+
+EVENT_ROOTS = {
+    "error": "ErrorStreamingEvent",
+    "response.completed": "ResponseCompletedStreamingEvent",
+    "response.content_part.added": "ResponseContentPartAddedStreamingEvent",
+    "response.content_part.done": "ResponseContentPartDoneStreamingEvent",
+    "response.created": "ResponseCreatedStreamingEvent",
+    "response.failed": "ResponseFailedStreamingEvent",
+    "response.function_call_arguments.delta": "ResponseFunctionCallArgumentsDeltaStreamingEvent",
+    "response.function_call_arguments.done": "ResponseFunctionCallArgumentsDoneStreamingEvent",
+    "response.in_progress": "ResponseInProgressStreamingEvent",
+    "response.incomplete": "ResponseIncompleteStreamingEvent",
+    "response.output_item.added": "ResponseOutputItemAddedStreamingEvent",
+    "response.output_item.done": "ResponseOutputItemDoneStreamingEvent",
+    "response.output_text.annotation.added": "ResponseOutputTextAnnotationAddedStreamingEvent",
+    "response.output_text.delta": "ResponseOutputTextDeltaStreamingEvent",
+    "response.output_text.done": "ResponseOutputTextDoneStreamingEvent",
+    "response.queued": "ResponseQueuedStreamingEvent",
+    "response.reasoning.delta": "ResponseReasoningDeltaStreamingEvent",
+    "response.reasoning.done": "ResponseReasoningDoneStreamingEvent",
+    "response.reasoning_summary_part.added": "ResponseReasoningSummaryPartAddedStreamingEvent",
+    "response.reasoning_summary_part.done": "ResponseReasoningSummaryPartDoneStreamingEvent",
+    "response.reasoning_summary_text.delta": "ResponseReasoningSummaryDeltaStreamingEvent",
+    "response.reasoning_summary_text.done": "ResponseReasoningSummaryDoneStreamingEvent",
+    "response.refusal.delta": "ResponseRefusalDeltaStreamingEvent",
+    "response.refusal.done": "ResponseRefusalDoneStreamingEvent",
+}
+
+VALIDATION_KEYS = {
+    "$ref",
+    "additionalProperties",
+    "allOf",
+    "anyOf",
+    "enum",
+    "items",
+    "oneOf",
+    "properties",
+    "required",
+    "type",
+}
+ANNOTATION_KEYS = {
+    "default",
+    "description",
+    "discriminator",
+    "example",
+    "title",
+    "x-enumDescriptions",
+}
+LOCAL_ALLOWLIST = [
+    "event.sequence_number:nonnegative_integer",
+    "event.output_index:nonnegative_integer",
+    "event.content_index:nonnegative_integer",
+    "event.item_id:nonempty_string",
+    "Message.id:nonempty_string",
+    "FunctionCall.id:nonempty_string",
+    "FunctionCall.call_id:nonempty_string",
+    "FunctionCall.name:nonempty_string",
+]
+
+
+class GenerationError(Exception):
+    def __init__(self, kind: str, message: str, details: dict[str, Any], next_action: str):
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+        self.details = details
+        self.next_action = next_action
+
+
+def canonical(value: Any) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+
+
+def pretty(value: Any) -> bytes:
+    return (json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode()
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def local_ref_name(ref: str) -> str:
+    prefix = "#/components/schemas/"
+    if not isinstance(ref, str) or not ref.startswith(prefix) or "/" in ref[len(prefix) :]:
+        raise GenerationError(
+            "unsupported_ref",
+            "The selected schema closure contains a non-local or malformed reference.",
+            {"ref_kind": "non_local_or_malformed"},
+            "Pin a local components/schemas reference or extend the generator explicitly.",
+        )
+    return ref[len(prefix) :]
+
+
+def refs(value: Any) -> Iterable[str]:
+    if isinstance(value, dict):
+        if "$ref" in value:
+            yield local_ref_name(value["$ref"])
+        for child in value.values():
+            yield from refs(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from refs(child)
+
+
+def collect_closure(all_schemas: dict[str, Any]) -> list[str]:
+    missing_roots = sorted(set(EVENT_ROOTS.values()) - set(all_schemas))
+    if missing_roots:
+        raise GenerationError(
+            "missing_root",
+            "The pinned HTTP/SSE root set is not present in the supplied OpenAPI.",
+            {"missing_root_count": len(missing_roots)},
+            "Use the exact pinned OpenAPI blob.",
+        )
+
+    pending = list(EVENT_ROOTS.values())
+    found: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in found:
+            continue
+        if name not in all_schemas:
+            raise GenerationError(
+                "unresolved_ref",
+                "A local schema reference cannot be resolved.",
+                {"schema": name},
+                "Repair the pinned schema or update the frozen authority contract.",
+            )
+        found.add(name)
+        pending.extend(set(refs(all_schemas[name])) - found)
+    return sorted(found)
+
+
+def schema_keyword_inventory(schema: Any, validation: set[str], annotations: set[str]) -> None:
+    if not isinstance(schema, dict):
+        raise GenerationError(
+            "invalid_schema",
+            "A schema node is not an object.",
+            {"node_type": type(schema).__name__},
+            "Use the exact pinned OpenAPI blob.",
+        )
+    unknown = set(schema) - VALIDATION_KEYS - ANNOTATION_KEYS
+    if unknown:
+        raise GenerationError(
+            "unsupported_keyword",
+            "The selected closure contains an unimplemented schema keyword.",
+            {"keywords": sorted(unknown)},
+            "Implement the keyword before regenerating the validator.",
+        )
+    validation.update(set(schema) & VALIDATION_KEYS)
+    annotations.update(set(schema) & ANNOTATION_KEYS)
+    for key in ("allOf", "anyOf", "oneOf"):
+        for child in schema.get(key, []):
+            schema_keyword_inventory(child, validation, annotations)
+    if isinstance(schema.get("items"), dict):
+        schema_keyword_inventory(schema["items"], validation, annotations)
+    if isinstance(schema.get("additionalProperties"), dict):
+        schema_keyword_inventory(schema["additionalProperties"], validation, annotations)
+    for child in schema.get("properties", {}).values():
+        schema_keyword_inventory(child, validation, annotations)
+
+
+def literal_values(
+    schema: dict[str, Any], property_name: str, schemas: dict[str, Any], seen: set[str] | None = None
+) -> set[str]:
+    seen = set() if seen is None else seen
+    values: set[str] = set()
+    prop = schema.get("properties", {}).get(property_name)
+    if isinstance(prop, dict):
+        values.update(value for value in prop.get("enum", []) if isinstance(value, str))
+    if "$ref" in schema:
+        name = local_ref_name(schema["$ref"])
+        if name not in seen:
+            values.update(literal_values(schemas[name], property_name, schemas, seen | {name}))
+    for child in schema.get("allOf", []):
+        values.update(literal_values(child, property_name, schemas, seen))
+    return values
+
+
+def normalize_schema(schema: dict[str, Any], schemas: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for key in sorted(set(schema) & VALIDATION_KEYS):
+        value = schema[key]
+        if key == "$ref":
+            normalized[key] = local_ref_name(value)
+        elif key in ("allOf", "anyOf", "oneOf"):
+            normalized[key] = [normalize_schema(child, schemas) for child in value]
+        elif key in ("items", "additionalProperties") and isinstance(value, dict):
+            normalized[key] = normalize_schema(value, schemas)
+        elif key == "properties":
+            normalized[key] = {
+                name: normalize_schema(child, schemas) for name, child in sorted(value.items())
+            }
+        else:
+            normalized[key] = value
+
+    discriminator = schema.get("discriminator")
+    if discriminator is not None:
+        if not isinstance(discriminator, dict) or set(discriminator) != {"propertyName"}:
+            raise GenerationError(
+                "ambiguous_discriminator",
+                "A discriminator cannot be compiled unambiguously.",
+                {"reason": "unsupported_shape"},
+                "Extend the generator only with an exact discriminator rule.",
+            )
+        property_name = discriminator["propertyName"]
+        branches = schema.get("oneOf")
+        if not isinstance(property_name, str) or not isinstance(branches, list):
+            raise GenerationError(
+                "ambiguous_discriminator",
+                "A discriminator is not attached to oneOf branches.",
+                {"reason": "missing_one_of"},
+                "Repair the pinned schema or the explicit generator rule.",
+            )
+        index: dict[str, int] = {}
+        for branch_index, branch in enumerate(branches):
+            values = literal_values(branch, property_name, schemas)
+            if not values:
+                raise GenerationError(
+                    "ambiguous_discriminator",
+                    "A discriminator branch has no literal value.",
+                    {"branch_index": branch_index},
+                    "Add a unique literal enum to every branch before optimizing.",
+                )
+            for value in values:
+                if value in index:
+                    raise GenerationError(
+                        "ambiguous_discriminator",
+                        "Two discriminator branches share a literal value.",
+                        {"literal": value},
+                        "Remove the ambiguity before generating optimized dispatch.",
+                    )
+                index[value] = branch_index
+        normalized["x-pixir-discriminator"] = {
+            "property": property_name,
+            "index": dict(sorted(index.items())),
+        }
+    return normalized
+
+
+def seed(schema: dict[str, Any], schemas: dict[str, Any], depth: int = 0) -> Any:
+    if depth > MAX_DEPTH:
+        raise GenerationError(
+            "schema_cycle",
+            "The schema seed builder exceeded the frozen depth bound.",
+            {"max_depth": MAX_DEPTH},
+            "Inspect the pinned closure for a cycle requiring an explicit finite seed.",
+        )
+    if "$ref" in schema:
+        return seed(schemas[local_ref_name(schema["$ref"])], schemas, depth + 1)
+    if "allOf" in schema:
+        values = [seed(child, schemas, depth + 1) for child in schema["allOf"]]
+        if all(isinstance(value, dict) for value in values):
+            merged: dict[str, Any] = {}
+            for value in values:
+                merged.update(value)
+            return merged
+        return values[0] if values else None
+    if "oneOf" in schema:
+        return seed(schema["oneOf"][0], schemas, depth + 1)
+    if "anyOf" in schema:
+        return seed(schema["anyOf"][0], schemas, depth + 1)
+    if "enum" in schema:
+        return copy.deepcopy(schema["enum"][0])
+    kind = schema.get("type")
+    if kind == "object" or "properties" in schema or "required" in schema:
+        properties = schema.get("properties", {})
+        return {
+            key: seed(properties[key], schemas, depth + 1)
+            for key in schema.get("required", [])
+        }
+    if kind == "array":
+        return []
+    if kind == "string":
+        return "fixture"
+    if kind == "integer":
+        return 0
+    if kind == "number":
+        return 0
+    if kind == "boolean":
+        return False
+    if kind == "null":
+        return None
+    return None
+
+
+def set_path(value: Any, path: tuple[Any, ...], replacement: Any) -> Any:
+    result = copy.deepcopy(value)
+    current = result
+    for part in path[:-1]:
+        current = current[part]
+    current[path[-1]] = replacement
+    return result
+
+
+def delete_path(value: Any, path: tuple[Any, ...]) -> Any:
+    result = copy.deepcopy(value)
+    current = result
+    for part in path[:-1]:
+        current = current[part]
+    del current[path[-1]]
+    return result
+
+
+JSON_KIND_VALUES = {
+    "null": None,
+    "boolean": True,
+    "integer": 7,
+    "number": 1.5,
+    "string": "__pixir_string__",
+    "array": [],
+    "object": {},
+}
+JSON_KINDS = tuple(JSON_KIND_VALUES)
+
+
+def json_kind(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    raise TypeError(type(value))
+
+
+def schema_node_id(schema: dict[str, Any]) -> str:
+    return digest(canonical(schema))[:16]
+
+
+def json_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    return type(left) is type(right) and left == right
+
+
+def exact_type(kind: str, value: Any) -> bool:
+    return (
+        kind == "integer"
+        and not isinstance(value, bool)
+        and (
+            isinstance(value, int)
+            or (isinstance(value, float) and value.is_integer())
+        )
+    ) or (
+        kind == "number" and isinstance(value, (int, float)) and not isinstance(value, bool)
+    ) or (kind == "object" and isinstance(value, dict)) or (
+        kind == "array" and isinstance(value, list)
+    ) or (kind == "string" and isinstance(value, str)) or (
+        kind == "boolean" and isinstance(value, bool)
+    ) or (kind == "null" and value is None)
+
+
+def schema_valid(
+    schema: dict[str, Any], value: Any, schemas: dict[str, Any], depth: int = 0
+) -> bool:
+    if depth > MAX_DEPTH:
+        return False
+    if "$ref" in schema and not schema_valid(
+        schemas[local_ref_name(schema["$ref"])], value, schemas, depth + 1
+    ):
+        return False
+    if "type" in schema and not exact_type(schema["type"], value):
+        return False
+    if "enum" in schema and not any(json_equal(allowed, value) for allowed in schema["enum"]):
+        return False
+    if isinstance(value, dict):
+        if any(key not in value for key in schema.get("required", [])):
+            return False
+        properties = schema.get("properties", {})
+        for name, child in properties.items():
+            if name in value and not schema_valid(child, value[name], schemas, depth + 1):
+                return False
+        extras = set(value) - set(properties)
+        additional = schema.get("additionalProperties", True)
+        if additional is False and extras:
+            return False
+        if isinstance(additional, dict) and any(
+            not schema_valid(additional, value[name], schemas, depth + 1) for name in extras
+        ):
+            return False
+    if isinstance(value, list) and isinstance(schema.get("items"), dict):
+        if any(not schema_valid(schema["items"], item, schemas, depth + 1) for item in value):
+            return False
+    if "allOf" in schema and not all(
+        schema_valid(branch, value, schemas, depth + 1) for branch in schema["allOf"]
+    ):
+        return False
+    if "oneOf" in schema and sum(
+        schema_valid(branch, value, schemas, depth + 1) for branch in schema["oneOf"]
+    ) != 1:
+        return False
+    if "anyOf" in schema and not any(
+        schema_valid(branch, value, schemas, depth + 1) for branch in schema["anyOf"]
+    ):
+        return False
+    return True
+
+
+def union_item_branches(schema: dict[str, Any], schemas: dict[str, Any]) -> list[dict[str, Any]]:
+    if "$ref" in schema:
+        return union_item_branches(schemas[local_ref_name(schema["$ref"])], schemas)
+    for key in ("oneOf", "anyOf"):
+        if key in schema:
+            return schema[key]
+    return [schema]
+
+
+def mutated_values(
+    schema: dict[str, Any],
+    instance: Any,
+    schemas: dict[str, Any],
+    depth: int = 0,
+) -> Iterable[tuple[str, Any, frozenset[str]]]:
+    """Yield one-location mutations/seeds with explicit completeness tokens."""
+    if depth > MAX_DEPTH:
+        return
+    node = schema_node_id(schema)
+
+    if "$ref" in schema:
+        name = local_ref_name(schema["$ref"])
+        family = f"family:{name}"
+        yield (f"ref:{name}:seed", copy.deepcopy(instance), frozenset({family}))
+        for label, value, coverage in mutated_values(
+            schemas[name], instance, schemas, depth + 1
+        ):
+            yield (f"ref:{name}:{label}", value, coverage | {family})
+        return
+
+    expected_type = schema.get("type")
+    if expected_type in JSON_KINDS:
+        valid_kinds = {expected_type}
+        if expected_type == "number":
+            valid_kinds.add("integer")
+        for kind in JSON_KINDS:
+            if kind not in valid_kinds:
+                token = f"type:{node}:{kind}"
+                yield (
+                    f"incompatible_kind:{kind}",
+                    copy.deepcopy(JSON_KIND_VALUES[kind]),
+                    frozenset({token}),
+                )
+
+    if expected_type == "integer":
+        integral_value = float(instance) if isinstance(instance, int) else 0.0
+        for label, value in (
+            ("integral_float", integral_value),
+            ("negative_zero", -0.0),
+        ):
+            yield (
+                label,
+                value,
+                frozenset({f"integer-representation:{node}:{label}"}),
+            )
+
+    if "enum" in schema:
+        enum_kind = json_kind(schema["enum"][0])
+        replacement = copy.deepcopy(JSON_KIND_VALUES[enum_kind])
+        if any(json_equal(replacement, allowed) for allowed in schema["enum"]):
+            replacement = "__pixir_outside_enum__" if enum_kind == "string" else -9_876_543
+        yield ("outside_enum", replacement, frozenset({f"enum:{node}"}))
+
+    if "allOf" in schema:
+        for branch_index, child in enumerate(schema["allOf"]):
+            token = f"union:{node}:allOf:{branch_index}"
+            for label, value, coverage in mutated_values(child, instance, schemas, depth + 1):
+                yield (
+                    f"allOf:{branch_index}:{label}",
+                    value,
+                    coverage | {token},
+                )
+
+    for union_key in ("oneOf", "anyOf"):
+        if union_key in schema:
+            for branch_index, branch in enumerate(schema[union_key]):
+                branch_seed = seed(branch, schemas, depth + 1)
+                token = f"union:{node}:{union_key}:{branch_index}"
+                yield (
+                    f"{union_key}:{branch_index}:seed",
+                    branch_seed,
+                    frozenset({token}),
+                )
+                for label, value, coverage in mutated_values(
+                    branch, branch_seed, schemas, depth + 1
+                ):
+                    yield (
+                        f"{union_key}:{branch_index}:{label}",
+                        value,
+                        coverage | {token},
+                    )
+            return
+
+    if isinstance(instance, dict):
+        properties = schema.get("properties", {})
+        for key in schema.get("required", []):
+            if key in instance:
+                value = copy.deepcopy(instance)
+                del value[key]
+                yield (
+                    f"delete_required:{key}",
+                    value,
+                    frozenset({f"required:{node}:{key}"}),
+                )
+        for key, child in sorted(properties.items()):
+            child_seed = copy.deepcopy(instance.get(key, seed(child, schemas, depth + 1)))
+            yield (
+                f"property:{key}:seed",
+                copy.deepcopy(instance),
+                frozenset({f"property:{node}:{key}"}),
+            )
+            if key not in instance:
+                value = copy.deepcopy(instance)
+                value[key] = child_seed
+                yield (
+                    f"optional_property:{key}:seed",
+                    value,
+                    frozenset({f"property:{node}:{key}"}),
+                )
+            for label, replacement, coverage in mutated_values(
+                child, child_seed, schemas, depth + 1
+            ):
+                value = copy.deepcopy(instance)
+                value[key] = replacement
+                yield (
+                    f"property:{key}:{label}",
+                    value,
+                    coverage | {f"property:{node}:{key}"},
+                )
+
+        additional = schema.get("additionalProperties")
+        if isinstance(additional, dict):
+            extra_key = "__pixir_additional_property__"
+            extra_seed = seed(additional, schemas, depth + 1)
+            seeded = copy.deepcopy(instance)
+            seeded[extra_key] = copy.deepcopy(extra_seed)
+            yield (
+                "additional_property:seed",
+                seeded,
+                frozenset(),
+            )
+            for label, replacement, coverage in mutated_values(
+                additional, extra_seed, schemas, depth + 1
+            ):
+                value = copy.deepcopy(instance)
+                value[extra_key] = replacement
+                yield (
+                    f"additional_property:{label}",
+                    value,
+                    coverage,
+                )
+
+    if isinstance(instance, list) and isinstance(schema.get("items"), dict):
+        item_schema = schema["items"]
+        branches = union_item_branches(item_schema, schemas)
+        family_coverage: set[str] = set()
+        ref_cursor = item_schema
+        while "$ref" in ref_cursor:
+            ref_name = local_ref_name(ref_cursor["$ref"])
+            family_coverage.add(f"family:{ref_name}")
+            ref_cursor = schemas[ref_name]
+        union_key = next(
+            (key for key in ("oneOf", "anyOf") if key in ref_cursor),
+            None,
+        )
+        for branch_index, branch in enumerate(branches):
+            item_seed = seed(branch, schemas, depth + 1)
+            token = f"array:{node}:branch:{branch_index}"
+            union_coverage = (
+                {f"union:{schema_node_id(ref_cursor)}:{union_key}:{branch_index}"}
+                if union_key
+                else set()
+            )
+            yield (
+                f"array_item_branch:{branch_index}:seed",
+                [item_seed],
+                frozenset({token} | family_coverage | union_coverage),
+            )
+            for label, replacement, coverage in mutated_values(
+                branch, item_seed, schemas, depth + 1
+            ):
+                yield (
+                    f"array_item_branch:{branch_index}:{label}",
+                    [replacement],
+                    coverage | {token} | family_coverage | union_coverage,
+                )
+        for kind, replacement in JSON_KIND_VALUES.items():
+            token = f"array:{node}:item_kind:{kind}"
+            yield (
+                f"array_item_kind:{kind}",
+                [copy.deepcopy(replacement)],
+                frozenset({token}),
+            )
+
+
+def expected_coverage(
+    closure: list[str], schemas: dict[str, Any]
+) -> set[str]:
+    expected = {f"family:{name}" for name in closure}
+
+    def visit(schema: dict[str, Any], depth: int = 0) -> None:
+        if depth > MAX_DEPTH:
+            return
+        if "$ref" in schema:
+            return
+        node = schema_node_id(schema)
+        expected_type = schema.get("type")
+        if expected_type in JSON_KINDS:
+            valid_kinds = {expected_type}
+            if expected_type == "number":
+                valid_kinds.add("integer")
+            expected.update(
+                f"type:{node}:{kind}" for kind in JSON_KINDS if kind not in valid_kinds
+            )
+        if expected_type == "integer":
+            expected.update(
+                f"integer-representation:{node}:{label}"
+                for label in ("integral_float", "negative_zero")
+            )
+        if "enum" in schema:
+            expected.add(f"enum:{node}")
+        for union_key in ("oneOf", "anyOf"):
+            for branch_index, branch in enumerate(schema.get(union_key, [])):
+                expected.add(f"union:{node}:{union_key}:{branch_index}")
+                visit(branch, depth + 1)
+        for child in schema.get("allOf", []):
+            visit(child, depth + 1)
+        for key, child in schema.get("properties", {}).items():
+            expected.add(f"property:{node}:{key}")
+            if key in schema.get("required", []):
+                expected.add(f"required:{node}:{key}")
+            visit(child, depth + 1)
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for branch_index, _branch in enumerate(union_item_branches(item_schema, schemas)):
+                expected.add(f"array:{node}:branch:{branch_index}")
+            expected.update(f"array:{node}:item_kind:{kind}" for kind in JSON_KINDS)
+            visit(item_schema, depth + 1)
+        additional = schema.get("additionalProperties")
+        if isinstance(additional, dict):
+            visit(additional, depth + 1)
+
+    for name in closure:
+        visit(schemas[name])
+
+    # The outer event discriminator is the known/unknown dispatch boundary. Mutating
+    # it creates an opaque unknown event rather than a malformed known-event row.
+    for root in EVENT_ROOTS.values():
+        root_schema = schemas[root]
+        type_schema = root_schema.get("properties", {}).get("type", {})
+        node = schema_node_id(type_schema)
+        root_node = schema_node_id(root_schema)
+        expected.discard(f"enum:{node}")
+        expected.difference_update(f"type:{node}:{kind}" for kind in JSON_KINDS)
+        expected.discard(f"property:{root_node}:type")
+        expected.discard(f"required:{root_node}:type")
+    return expected
+
+
+def coverage_report(
+    expected: set[str],
+    observed: set[str],
+    wrapper_counts: Counter[str],
+) -> dict[str, Any]:
+    missing = sorted(expected - observed)
+    wrapper_values = list(wrapper_counts.values())
+    wrapper_complete = (
+        set(wrapper_counts) == set(RESOURCE_WRAPPERS)
+        and bool(wrapper_values)
+        and min(wrapper_values) > 0
+        and len(set(wrapper_values)) == 1
+    )
+    if missing or not wrapper_complete:
+        raise GenerationError(
+            "coverage_incomplete",
+            "The generated mutation corpus is missing a required completeness family.",
+            {
+                "missing_count": len(missing),
+                "missing_sample": missing[:20],
+                "wrapper_complete": wrapper_complete,
+            },
+            "Repair local recursive mutation generation before updating artifacts.",
+        )
+
+    def aggregate(prefix: str, tokens: set[str]) -> dict[str, int]:
+        counts: Counter[str] = Counter()
+        for token in tokens:
+            if token.startswith(prefix):
+                counts[token.rsplit(":", 1)[-1]] += 1
+        return dict(sorted(counts.items()))
+
+    return {
+        "expected_token_count": len(expected),
+        "observed_token_count": len(observed & expected),
+        "missing_token_count": 0,
+        "expected_token_sha256": digest(canonical(sorted(expected))),
+        "observed_token_sha256": digest(canonical(sorted(observed & expected))),
+        "json_incompatible_kinds": {
+            "expected": aggregate("type:", expected),
+            "observed": aggregate("type:", observed & expected),
+        },
+        "json_integer_representations": {
+            "expected": aggregate("integer-representation:", expected),
+            "observed": aggregate("integer-representation:", observed & expected),
+        },
+        "union_branches": {
+            "oneOf_expected": sum(":oneOf:" in token for token in expected),
+            "oneOf_observed": sum(":oneOf:" in token for token in observed),
+            "anyOf_expected": sum(":anyOf:" in token for token in expected),
+            "anyOf_observed": sum(":anyOf:" in token for token in observed),
+        },
+        "array_branches": {
+            "expected": sum(token.startswith("array:") for token in expected),
+            "observed": sum(token.startswith("array:") for token in observed & expected),
+        },
+        "schema_families": {
+            "expected": sum(token.startswith("family:") for token in expected),
+            "observed": sum(token.startswith("family:") for token in observed & expected),
+            "missing": [],
+        },
+        "response_wrapper_fanout": dict(sorted(wrapper_counts.items())),
+        "response_wrapper_equal": wrapper_complete,
+    }
+
+
+def output_item_disposition(item: Any) -> str:
+    if item is None:
+        return "ignored-safe"
+    item_type = item.get("type") if isinstance(item, dict) else None
+    if item_type == "reasoning":
+        return "unsupported"
+    if item_type in {"function_call_output", "compaction"}:
+        return "unsupported"
+    if item_type == "message":
+        for part in item.get("content", []):
+            part_type = part.get("type") if isinstance(part, dict) else None
+            if part_type in {"reasoning_text", "summary_text"}:
+                return "unsupported"
+            if part_type in {"refusal", "input_image", "input_file", "input_video"}:
+                return "unsupported"
+    return "portable"
+
+
+def event_disposition(event: dict[str, Any]) -> str:
+    event_type = event["type"]
+    if event_type.startswith("response.reasoning"):
+        return "unsupported"
+    if event_type.startswith("response.refusal"):
+        return "unsupported"
+    if "response" in event:
+        output_dispositions = [
+            output_item_disposition(item) for item in event["response"].get("output", [])
+        ]
+        if "unsupported" in output_dispositions:
+            return "unsupported"
+    if event_type in {
+        "response.created",
+        "response.in_progress",
+        "response.queued",
+        "response.output_text.annotation.added",
+    }:
+        return "ignored-safe"
+    if event_type in {"response.output_item.added", "response.output_item.done"}:
+        return output_item_disposition(event.get("item"))
+    if event_type in {"response.content_part.added", "response.content_part.done"}:
+        if event.get("part", {}).get("type") in {
+            "refusal",
+            "input_image",
+            "input_file",
+            "input_video",
+            "reasoning_text",
+            "summary_text",
+        }:
+            return "unsupported"
+    return "portable"
+
+
+def response_event(event_type: str, response: dict[str, Any]) -> dict[str, Any]:
+    return {"type": event_type, "sequence_number": 0, "response": copy.deepcopy(response)}
+
+
+RESOURCE_WRAPPERS = {
+    "response.created": "ResponseCreatedStreamingEvent",
+    "response.in_progress": "ResponseInProgressStreamingEvent",
+    "response.queued": "ResponseQueuedStreamingEvent",
+    "response.completed": "ResponseCompletedStreamingEvent",
+    "response.incomplete": "ResponseIncompleteStreamingEvent",
+    "response.failed": "ResponseFailedStreamingEvent",
+}
+
+
+def corpus_rows(
+    all_schemas: dict[str, Any], closure: list[str]
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: dict[bytes, int] = {}
+    row_coverages: list[set[str]] = []
+    wrapper_counts: Counter[str] = Counter()
+
+    def forced_unique_event(label: str, event: Any) -> Any:
+        """Keep a curated row distinct without changing its schema/policy target."""
+        candidate = copy.deepcopy(event)
+        if not isinstance(candidate, dict):
+            return candidate
+        response = candidate.get("response")
+        if isinstance(response, dict) and (
+            "metadata" not in response or isinstance(response.get("metadata"), dict)
+        ):
+            metadata = copy.deepcopy(response.get("metadata", {}))
+            metadata["__pixir_corpus_case__"] = label
+            response["metadata"] = metadata
+        else:
+            candidate["__pixir_corpus_case__"] = label
+        return candidate
+
+    def add(
+        label: str,
+        event: Any,
+        disposition: str,
+        schema: str,
+        force: bool = False,
+        coverage: Iterable[str] = (),
+    ) -> bool:
+        identity = canonical([disposition, event])
+        if identity in seen:
+            if not force:
+                row_coverages[seen[identity]].update(coverage)
+                return False
+            event = forced_unique_event(label, event)
+            identity = canonical([disposition, event])
+            expected_valid = disposition != "invalid"
+            actual_valid = schema_valid(all_schemas[schema], event, all_schemas)
+            if identity in seen or actual_valid != expected_valid:
+                raise GenerationError(
+                    "duplicate_corpus_identity",
+                    "A forced curated row could not retain a unique schema-equivalent event.",
+                    {"label": label, "schema": schema},
+                    "Give the curated case a schema-valid distinguishing value.",
+                )
+        seen[identity] = len(rows)
+        row_coverages.append(set(coverage))
+        rows.append(
+            {
+                "id": "",
+                "label": label,
+                "schema": f"#/components/schemas/{schema}",
+                # Expected label only. The separate jsonschema Draft 2020-12 verifier
+                # is the independent authority and must agree before artifacts land.
+                "openapi_valid": disposition != "invalid",
+                "disposition": disposition,
+                "event": event,
+            }
+        )
+        return True
+
+    def add_candidate(
+        label: str,
+        event: Any,
+        root: str,
+        coverage: Iterable[str] = (),
+        force: bool = False,
+    ) -> bool:
+        valid = schema_valid(all_schemas[root], event, all_schemas)
+        disposition = event_disposition(event) if valid else "invalid"
+        return add(label, event, disposition, root, force, coverage)
+
+    # One canonical valid event for every HTTP/SSE root.
+    root_seeds: dict[str, dict[str, Any]] = {}
+    for event_type, root in sorted(EVENT_ROOTS.items()):
+        event = seed(all_schemas[root], all_schemas)
+        root_seeds[event_type] = event
+        add(
+            f"root:{event_type}",
+            event,
+            event_disposition(event),
+            root,
+            coverage={f"family:{root}"},
+        )
+
+        for label, mutated, coverage in mutated_values(
+            all_schemas[root], event, all_schemas
+        ):
+            # Removing or changing the outer discriminator creates an opaque unknown
+            # event, not a malformed known event. The corpus only classifies known roots.
+            if isinstance(mutated, dict) and mutated.get("type") != event_type:
+                continue
+            add_candidate(
+                f"generated:{event_type}:{label}",
+                mutated,
+                root,
+                coverage | {f"family:{root}"},
+            )
+
+    response = seed(all_schemas["ResponseResource"], all_schemas)
+
+    # Every local Resource mutation and alternative branch fans through all wrappers.
+    for label, mutated_response, coverage in mutated_values(
+        all_schemas["ResponseResource"], response, all_schemas
+    ):
+        for event_type, root in RESOURCE_WRAPPERS.items():
+            add_candidate(
+                f"resource:{event_type}:{label}",
+                response_event(event_type, mutated_response),
+                root,
+                coverage
+                | {"family:ResponseResource", f"wrapper:{event_type}"},
+            )
+
+    def resource_case(
+        label: str, overrides: dict[str, Any], disposition: str, force: bool = False
+    ) -> None:
+        value = copy.deepcopy(response)
+        value.update(copy.deepcopy(overrides))
+        for event_type, root in RESOURCE_WRAPPERS.items():
+            event = response_event(event_type, value)
+            actual = event_disposition(event) if schema_valid(all_schemas[root], event, all_schemas) else "invalid"
+            expected = disposition
+            if disposition == "portable" and event_type in {
+                "response.created",
+                "response.in_progress",
+                "response.queued",
+            }:
+                expected = "ignored-safe"
+            if actual != expected:
+                raise GenerationError(
+                    "corpus_classification_error",
+                    "A curated Resource case has an unexpected schema disposition.",
+                    {"label": label, "event_type": event_type, "expected": expected, "actual": actual},
+                    "Correct the curated case before regenerating artifacts.",
+                )
+            add(f"{label}:{event_type}", event, actual, root, force)
+
+    # Frozen unusual rules and every portable/ignored/unsupported family.
+    resource_case("golden:metadata_unconstrained", {"metadata": ["any", 7]}, "portable", True)
+    resource_case(
+        "golden:json_schema_format_schema_null",
+        {
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "fixture",
+                    "description": None,
+                    "schema": None,
+                    "strict": True,
+                }
+            }
+        },
+        "portable",
+        True,
+    )
+    resource_case(
+        "golden:function_tool_choice_name_optional",
+        {"tool_choice": {"type": "function"}},
+        "portable",
+        True,
+    )
+    resource_case(
+        "golden:reasoning_summary_required_content_optional",
+        {"output": [{"type": "reasoning", "id": "r", "summary": []}]},
+        "unsupported",
+        True,
+    )
+    resource_case(
+        "golden:input_file_only_type",
+        {
+            "output": [
+                {
+                    "type": "message",
+                    "id": "m",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "input_file"}],
+                }
+            ]
+        },
+        "unsupported",
+        True,
+    )
+
+    resource_case("valid:truncation_auto", {"truncation": "auto"}, "portable")
+    resource_case("valid:tool_choice_none", {"tool_choice": "none"}, "portable")
+    resource_case("valid:tool_choice_required", {"tool_choice": "required"}, "portable")
+    resource_case("valid:tool_choice_function_object", {"tool_choice": {"type": "function"}}, "portable")
+    resource_case(
+        "valid:function_tool",
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "f",
+                    "description": None,
+                    "parameters": None,
+                    "strict": True,
+                }
+            ]
+        },
+        "portable",
+    )
+    resource_case(
+        "valid:json_object_format",
+        {"text": {"format": {"type": "json_object"}}},
+        "portable",
+    )
+    resource_case(
+        "valid:reasoning_metadata",
+        {"reasoning": {"effort": None, "summary": None}},
+        "portable",
+    )
+    resource_case(
+        "unsupported:function_call_output",
+        {
+            "output": [
+                {
+                    "type": "function_call_output",
+                    "id": "o",
+                    "call_id": "c",
+                    "output": "x",
+                    "status": "completed",
+                }
+            ]
+        },
+        "unsupported",
+    )
+    resource_case(
+        "unsupported:compaction",
+        {"output": [{"type": "compaction", "id": "c", "encrypted_content": "x"}]},
+        "unsupported",
+    )
+    resource_case(
+        "unsupported:refusal_content",
+        {
+            "output": [
+                {
+                    "type": "message",
+                    "id": "m",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "refusal", "refusal": "no"}],
+                }
+            ]
+        },
+        "unsupported",
+    )
+
+    def message_item(content: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "id": "message-item",
+            "status": "completed",
+            "role": "assistant",
+            "content": content,
+        }
+
+    for schema_name in (
+        "InputImageContent",
+        "InputFileContent",
+        "InputVideoContent",
+        "RefusalContent",
+    ):
+        resource_case(
+            f"unsupported:content:{schema_name}",
+            {"output": [message_item([seed(all_schemas[schema_name], all_schemas)])]},
+            "unsupported",
+        )
+
+    for schema_name in ("SummaryTextContent", "ReasoningTextContent"):
+        resource_case(
+            f"unsupported:reasoning_content:{schema_name}",
+            {"output": [message_item([seed(all_schemas[schema_name], all_schemas)])]},
+            "unsupported",
+        )
+
+    resource_case(
+        "valid:function_call_item",
+        {"output": [seed(all_schemas["FunctionCall"], all_schemas)]},
+        "portable",
+    )
+
+    def invalid_terminal(label: str, overrides: dict[str, Any]) -> None:
+        resource_case(f"invalid:family:{label}", overrides, "invalid", True)
+
+    # Cross-family invalid seeds ensure every large Resource family and union branch
+    # has a full known-event oracle row, independent of the active seed branch.
+    invalid_terminal("IncompleteDetails", {"incomplete_details": {}})
+    invalid_terminal("Tool", {"tools": [{}]})
+    invalid_terminal("ToolChoice.FunctionToolChoice", {"tool_choice": {}})
+    invalid_terminal("ToolChoice.ToolChoiceValueEnum", {"tool_choice": "vendor"})
+    invalid_terminal(
+        "ToolChoice.AllowedToolChoice",
+        {"tool_choice": {"type": "allowed_tools"}},
+    )
+    invalid_terminal("Truncation", {"truncation": "vendor"})
+    invalid_terminal("TextField", {"text": {}})
+    invalid_terminal("TextResponseFormat", {"text": {"format": {}}})
+    invalid_terminal(
+        "JsonObjectResponseFormat",
+        {"text": {"format": {"type": "json_object_invalid"}}},
+    )
+    invalid_terminal(
+        "JsonSchemaResponseFormat",
+        {
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "fixture",
+                    "description": None,
+                    "strict": True,
+                }
+            }
+        },
+    )
+    invalid_terminal("Reasoning", {"reasoning": {}})
+    invalid_terminal("Usage", {"usage": {}})
+    invalid_terminal("Error", {"error": {}})
+    invalid_terminal(
+        "MessageContent",
+        {"output": [message_item([{"type": "input_text"}])]},
+    )
+    function_call = seed(all_schemas["FunctionCall"], all_schemas)
+    function_call.pop("arguments")
+    invalid_terminal("FunctionCall", {"output": [function_call]})
+
+    annotation_event = seed(
+        all_schemas["ResponseOutputTextAnnotationAddedStreamingEvent"], all_schemas
+    )
+    annotation_event["annotation"] = {
+        "type": "url_citation",
+        "url": "https://example.invalid",
+        "start_index": 0,
+        "end_index": 1,
+    }
+    add(
+        "invalid:family:Annotation",
+        annotation_event,
+        "invalid",
+        "ResponseOutputTextAnnotationAddedStreamingEvent",
+        True,
+    )
+
+    logprob_event = seed(all_schemas["ResponseOutputTextDoneStreamingEvent"], all_schemas)
+    logprob_event["logprobs"] = [{}]
+    add(
+        "invalid:family:LogProb",
+        logprob_event,
+        "invalid",
+        "ResponseOutputTextDoneStreamingEvent",
+        True,
+    )
+
+    # Exact owner-scoped local limits and schema-valid non-owner controls.
+    local_cases: list[tuple[str, dict[str, Any]]] = []
+    output_owners = {
+        "response.content_part.added",
+        "response.content_part.done",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.output_text.annotation.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+    }
+    content_owners = {
+        "response.content_part.added",
+        "response.content_part.done",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.output_text.annotation.added",
+    }
+
+    for event_type, event in sorted(root_seeds.items()):
+        local_cases.append(
+            (f"sequence_number_negative:{event_type}", set_path(event, ("sequence_number",), -1))
+        )
+        for field, owners, replacement in (
+            ("output_index", output_owners, -1),
+            ("content_index", content_owners, -1),
+            ("item_id", output_owners, ""),
+        ):
+            mutated = copy.deepcopy(event)
+            mutated[field] = replacement
+            if event_type in owners:
+                local_cases.append((f"{field}_owner:{event_type}", mutated))
+            else:
+                disposition = event_disposition(mutated)
+                add(
+                    f"nonowner:{field}:{event_type}",
+                    mutated,
+                    disposition,
+                    EVENT_ROOTS[event_type],
+                    True,
+                )
+
+    local_cases.append(
+        (
+            "message_id_empty:response.output_item.done",
+            set_path(root_seeds["response.output_item.done"], ("item", "id"), ""),
+        )
+    )
+    function_call_event = {
+        "type": "response.output_item.done",
+        "sequence_number": 0,
+        "output_index": 0,
+        "item": {
+            "type": "function_call",
+            "id": "function-item",
+            "call_id": "call-id",
+            "name": "function-name",
+            "arguments": "{}",
+            "status": "completed",
+        },
+    }
+    for field in ("id", "call_id", "name"):
+        local_cases.append(
+            (
+                f"function_call_{field}_empty",
+                set_path(function_call_event, ("item", field), ""),
+            )
+        )
+    for label, event in local_cases:
+        add(f"local-limit:{label}", event, "local-limit", EVENT_ROOTS[event["type"]])
+
+    # Deterministic identifiers are hashes of the complete row excluding id.
+    rows.sort(key=lambda row: (row["disposition"], row["label"], canonical(row["event"])))
+    for row in rows:
+        row["id"] = digest(canonical({key: value for key, value in row.items() if key != "id"}))[:20]
+    observed = set().union(*row_coverages) if row_coverages else set()
+    wrapper_counts = Counter(
+        row["event"].get("type")
+        for row in rows
+        if isinstance(row["event"], dict) and row["event"].get("type") in RESOURCE_WRAPPERS
+    )
+    report = coverage_report(expected_coverage(closure, all_schemas), observed, wrapper_counts)
+    return rows, report
+
+
+def mutation_recipe(base: Any, target: Any, path: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+    """Describe target as deterministic set/delete operations over one canonical base."""
+    # Recipe encoding must preserve decoded numeric representation. JSON Schema treats
+    # `1` and `1.0` as equal, but the runtime must still receive the float to prove its
+    # Draft 2020-12 integer semantics.
+    if canonical(base) == canonical(target):
+        return []
+    if path == () and not isinstance(target, dict):
+        return [{"op": "replace-root", "value": copy.deepcopy(target)}]
+    if isinstance(base, dict) and isinstance(target, dict):
+        operations: list[dict[str, Any]] = []
+        for key in sorted(set(base) - set(target)):
+            operations.append({"op": "delete", "path": [*path, key]})
+        for key in sorted(target):
+            child_path = (*path, key)
+            if key not in base:
+                operations.append(
+                    {
+                        "op": "set",
+                        "path": list(child_path),
+                        "value": copy.deepcopy(target[key]),
+                    }
+                )
+            else:
+                operations.extend(mutation_recipe(base[key], target[key], child_path))
+        return operations
+    return [
+        {
+            "op": "set",
+            "path": list(path),
+            "value": copy.deepcopy(target),
+        }
+    ]
+
+
+def compact_corpus(
+    rows: list[dict[str, Any]], all_schemas: dict[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Deduplicate full root events while retaining independently reconstructable rows."""
+    root_to_type = {root: event_type for event_type, root in EVENT_ROOTS.items()}
+    bases = {
+        event_type: seed(all_schemas[root], all_schemas)
+        for event_type, root in sorted(EVENT_ROOTS.items())
+    }
+    recipes: list[dict[str, Any]] = []
+    for row in rows:
+        root = row["schema"].rsplit("/", 1)[-1]
+        base_name = root_to_type[root]
+        recipe = {key: copy.deepcopy(value) for key, value in row.items() if key != "event"}
+        recipe["base"] = base_name
+        recipe["ops"] = mutation_recipe(bases[base_name], row["event"])
+        recipes.append(recipe)
+    return recipes, bases
+
+
+def elixir(value: Any, indent: int = 0) -> str:
+    if value is None:
+        return "nil"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, str):
+        # JSON strings are valid Elixir double-quoted strings for this ASCII-heavy pin.
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        pad = " " * indent
+        child_pad = " " * (indent + 2)
+        return "[\n" + child_pad + (",\n" + child_pad).join(elixir(v, indent + 2) for v in value) + "\n" + pad + "]"
+    if isinstance(value, dict):
+        if not value:
+            return "%{}"
+        pad = " " * indent
+        child_pad = " " * (indent + 2)
+        pairs = [f"{elixir(k)} => {elixir(value[k], indent + 2)}" for k in sorted(value)]
+        return "%{\n" + child_pad + (",\n" + child_pad).join(pairs) + "\n" + pad + "}"
+    raise TypeError(type(value))
+
+
+def generated_module(subset: dict[str, Any], manifest: dict[str, Any]) -> bytes:
+    source = f'''defmodule Pixir.Provider.OpenResponsesSchema.Generated do
+  @moduledoc """
+  Generated, pinned Open Responses HTTP/SSE schema subset.
+
+  Do not edit this module by hand. Regenerate it with
+  `uv run python bin/generate-open-responses-schema`. The runtime performs no schema
+  parsing, filesystem access, reference resolution outside this module, or network I/O.
+  """
+
+  @event_roots {elixir(subset["event_roots"], 2)}
+  @schemas {elixir(subset["schemas"], 2)}
+  @manifest {elixir(manifest, 2)}
+
+  @doc "Return the generated root schema name for one known HTTP/SSE event type."
+  @spec event_root(String.t()) :: {{:ok, String.t()}} | :error
+  def event_root(type) when is_binary(type), do: Map.fetch(@event_roots, type)
+  def event_root(_type), do: :error
+
+  @doc "Return one generated local schema by normalized component name."
+  @spec schema(String.t()) :: {{:ok, map()}} | :error
+  def schema(name) when is_binary(name), do: Map.fetch(@schemas, name)
+  def schema(_name), do: :error
+
+  @doc "Return fixed authority, closure, budget, and digest metadata."
+  @spec manifest() :: map()
+  def manifest, do: @manifest
+
+  @doc "Return the sorted known event types compiled into this pin."
+  @spec known_event_types() :: [String.t()]
+  def known_event_types, do: {elixir(sorted(EVENT_ROOTS), 2)}
+end
+'''
+    try:
+        formatted = subprocess.run(
+            ["mix", "format", "-"],
+            cwd=Path(__file__).resolve().parents[1],
+            input=source.encode(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as error:
+        raise GenerationError(
+            "formatter_unavailable",
+            "The generated Elixir module could not be formatted.",
+            {"reason": type(error).__name__},
+            "Install the repository Elixir toolchain and rerun the generator.",
+        ) from error
+    if formatted.returncode != 0:
+        raise GenerationError(
+            "formatter_failed",
+            "The generated Elixir module did not pass the repository formatter.",
+            {"exit_code": formatted.returncode},
+            "Run mix format locally to diagnose the generated syntax.",
+        )
+    return formatted.stdout
+
+
+def build(openapi_bytes: bytes) -> dict[str, bytes]:
+    if digest(openapi_bytes) != OPENAPI_SHA256:
+        raise GenerationError(
+            "authority_mismatch",
+            "The supplied OpenAPI bytes do not match the frozen authority.",
+            {"expected_sha256": OPENAPI_SHA256, "actual_sha256": digest(openapi_bytes)},
+            "Use public/openapi/openapi.json from the pinned upstream commit.",
+        )
+    try:
+        document = json.loads(openapi_bytes)
+        all_schemas = document["components"]["schemas"]
+    except (json.JSONDecodeError, KeyError, TypeError) as error:
+        raise GenerationError(
+            "invalid_openapi",
+            "The supplied file is not the expected OpenAPI document.",
+            {"reason": type(error).__name__},
+            "Supply the exact pinned public/openapi/openapi.json file.",
+        ) from error
+
+    closure = collect_closure(all_schemas)
+    validation: set[str] = set()
+    annotations: set[str] = set()
+    for name in closure:
+        schema_keyword_inventory(all_schemas[name], validation, annotations)
+
+    normalized_schemas = {
+        name: normalize_schema(all_schemas[name], all_schemas) for name in closure
+    }
+    subset = {
+        "schema_version": 1,
+        "authority": {
+            "repository": "openresponses/openresponses",
+            "commit": UPSTREAM_COMMIT,
+            "tree": UPSTREAM_TREE,
+            "openapi_blob": OPENAPI_BLOB,
+            "openapi_sha256": OPENAPI_SHA256,
+        },
+        "event_roots": dict(sorted(EVENT_ROOTS.items())),
+        "schemas": normalized_schemas,
+    }
+    subset_bytes = pretty(subset)
+    rows, coverage = corpus_rows(all_schemas, closure)
+    expanded_corpus_bytes = b"".join(canonical(row) for row in rows)
+    recipe_rows, corpus_bases = compact_corpus(rows, all_schemas)
+    corpus_bytes = b"".join(canonical(row) for row in recipe_rows)
+    corpus_bases_bytes = pretty(corpus_bases)
+    dispositions = Counter(row["disposition"] for row in rows)
+    allowlist_digest = digest(canonical(LOCAL_ALLOWLIST))
+
+    manifest = {
+        "schema_version": 1,
+        "authority": subset["authority"],
+        "root_count": len(EVENT_ROOTS),
+        "roots": dict(sorted(EVENT_ROOTS.items())),
+        "reachable_schema_count": len(closure),
+        "reachable_schemas": closure,
+        "response_resource_required_property_count": len(
+            all_schemas["ResponseResource"]["required"]
+        ),
+        "response_resource_required_properties": sorted(
+            all_schemas["ResponseResource"]["required"]
+        ),
+        "validation_keywords": sorted(validation),
+        "annotation_keywords": sorted(annotations),
+        "limits": {"max_depth": MAX_DEPTH, "max_evaluations": MAX_EVALUATIONS},
+        "local_allowlist": LOCAL_ALLOWLIST,
+        "digests": {
+            "canonical_subset_sha256": digest(subset_bytes),
+            "corpus_sha256": digest(corpus_bytes),
+            "corpus_bases_sha256": digest(corpus_bases_bytes),
+            "expanded_corpus_sha256": digest(expanded_corpus_bytes),
+            "local_allowlist_sha256": allowlist_digest,
+        },
+        "corpus": {
+            "encoding": "base-event-recipe-v1",
+            "bases_path": "schema_corpus_bases.json",
+            "oracle": "jsonschema Draft 2020-12 via bin/verify-open-responses-schema-corpus",
+            "row_count": len(rows),
+            "counts": dict(sorted(dispositions.items())),
+            "coverage": coverage,
+            "zero_conditions": {
+                "openapi_invalid_accepted": 0,
+                "unallowlisted_openapi_valid_rejections": 0,
+                "rows_without_exactly_one_disposition": 0,
+                "duplicate_expanded_identity_rows": 0,
+                "invalid_full_task_success_artifacts": 0,
+            },
+        },
+    }
+    manifest_bytes = pretty(manifest)
+    return {
+        "output": generated_module(subset, manifest),
+        "subset": subset_bytes,
+        "corpus": corpus_bytes,
+        "bases": corpus_bases_bytes,
+        "manifest": manifest_bytes,
+    }
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def parser() -> argparse.ArgumentParser:
+    root = Path(__file__).resolve().parents[1]
+    fixtures = root / "test/fixtures/provider/open_responses"
+    result = argparse.ArgumentParser(
+        description="Generate the deterministic offline Open Responses SSE schema validator artifacts."
+    )
+    result.add_argument("--input", required=True, type=Path, help="Exact local pinned OpenAPI JSON file.")
+    result.add_argument(
+        "--output",
+        type=Path,
+        default=root / "lib/pixir/provider/open_responses_schema/generated.ex",
+        help="Generated Elixir module path.",
+    )
+    result.add_argument("--subset", type=Path, default=fixtures / "schema_subset.json")
+    result.add_argument("--corpus", type=Path, default=fixtures / "schema_corpus.jsonl")
+    result.add_argument("--bases", type=Path, default=fixtures / "schema_corpus_bases.json")
+    result.add_argument("--manifest", type=Path, default=fixtures / "schema_manifest.json")
+    mode = result.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="Report outputs without writing.")
+    mode.add_argument("--check", action="store_true", help="Fail if checked-in outputs differ.")
+    result.add_argument("--json", action="store_true", help="Emit one structured JSON result.")
+    return result
+
+
+def emit(payload: dict[str, Any], as_json: bool, stream: Any = sys.stdout) -> None:
+    if as_json:
+        stream.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    elif payload["ok"]:
+        stream.write(
+            f"open-responses-schema: {payload['mode']}; roots={payload['root_count']}; "
+            f"schemas={payload['reachable_schema_count']}; corpus={payload['corpus_row_count']}\n"
+        )
+    else:
+        error = payload["error"]
+        stream.write(f"{error['kind']}: {error['message']} Next: {error['next_action']}\n")
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        input_bytes = args.input.read_bytes()
+        artifacts = build(input_bytes)
+        paths = {
+            "output": args.output,
+            "subset": args.subset,
+            "corpus": args.corpus,
+            "bases": args.bases,
+            "manifest": args.manifest,
+        }
+        changed = sorted(
+            key
+            for key, path in paths.items()
+            if not path.exists() or path.read_bytes() != artifacts[key]
+        )
+        manifest = json.loads(artifacts["manifest"])
+        mode = "dry-run" if args.dry_run else "check" if args.check else "write"
+        payload = {
+            "ok": not (args.check and changed),
+            "mode": mode,
+            "network": False,
+            "writes": mode == "write",
+            "changed": changed,
+            "root_count": manifest["root_count"],
+            "reachable_schema_count": manifest["reachable_schema_count"],
+            "corpus_row_count": manifest["corpus"]["row_count"],
+            "digests": manifest["digests"],
+        }
+        if args.check and changed:
+            payload["error"] = {
+                "kind": "generated_artifact_mismatch",
+                "message": "Checked-in Open Responses schema artifacts are stale.",
+                "details": {"changed": changed},
+                "next_action": "Run the generator in write mode with the exact pinned OpenAPI.",
+            }
+            emit(payload, args.json, sys.stderr)
+            return 1
+        if mode == "write":
+            for key, path in paths.items():
+                atomic_write(path, artifacts[key])
+        emit(payload, args.json)
+        return 0
+    except FileNotFoundError:
+        error = GenerationError(
+            "input_not_found",
+            "The requested local OpenAPI file does not exist.",
+            {"input": str(args.input)},
+            "Supply --input pointing to the exact pinned local OpenAPI file.",
+        )
+    except PermissionError:
+        error = GenerationError(
+            "filesystem_error",
+            "A schema artifact could not be read or written.",
+            {"operation": "local_artifact_io"},
+            "Check local file permissions and rerun.",
+        )
+    except GenerationError as caught:
+        error = caught
+    except Exception as caught:  # total agent-facing CLI boundary
+        error = GenerationError(
+            "generation_failed",
+            "The Open Responses schema generator failed unexpectedly.",
+            {"reason": type(caught).__name__},
+            "Inspect the pinned input and rerun with --dry-run --json.",
+        )
+    payload = {
+        "ok": False,
+        "error": {
+            "kind": error.kind,
+            "message": error.message,
+            "details": error.details,
+            "next_action": error.next_action,
+        },
+    }
+    emit(payload, args.json, sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

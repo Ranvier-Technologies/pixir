@@ -460,4 +460,70 @@ defmodule Pixir.ACP.TranslateTest do
       assert {:deny, _} = Translate.permission_outcome({:ok, %{"unexpected" => true}})
     end
   end
+
+  describe "Provider-output warning extension" do
+    test "uses session_info_update _meta without collapsing ACP and Pixir identities" do
+      pixir_sid = "pixir-canonical-session"
+      id = "evt_warning"
+
+      event = %{
+        Event.provider_usage(
+          pixir_sid,
+          %{
+            "output_truncation" => %{
+              "status" => "truncated",
+              "reason" => "provider_output_limit",
+              "provider_reason" => "max_tokens",
+              "provider_usage_event_id" => id,
+              "call_role" => "final_answer"
+            }
+          },
+          id: id
+        )
+        | seq: 12
+      }
+
+      assert %{
+               "sessionId" => @sid,
+               "update" => %{
+                 "sessionUpdate" => "session_info_update",
+                 "_meta" => %{
+                   "pixir" => %{
+                     "schemaVersion" => 1,
+                     "presentation" => %{"type" => "provider_output_warning"},
+                     "warning" => warning
+                   }
+                 }
+               }
+             } = Translate.update(event, @sid)
+
+      assert @sid != pixir_sid
+      assert warning["providerUsageEventId"] == id
+      assert warning["providerUsageSeq"] == 12
+      assert warning["callRole"] == "final_answer"
+      refute Map.has_key?(warning, "content")
+    end
+
+    test "unknown evidence does not fabricate an ACP warning" do
+      id = "evt_unknown"
+
+      event = %{
+        Event.provider_usage(
+          "pixir",
+          %{
+            "output_truncation" => %{
+              "status" => "unknown",
+              "reason" => "missing_terminal_evidence",
+              "provider_usage_event_id" => id,
+              "call_role" => "final_answer"
+            }
+          },
+          id: id
+        )
+        | seq: 1
+      }
+
+      assert Translate.update(event, @sid) == nil
+    end
+  end
 end

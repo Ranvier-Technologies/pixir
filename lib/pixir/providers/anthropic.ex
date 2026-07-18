@@ -8,7 +8,7 @@ defmodule Pixir.Providers.Anthropic do
   request shaping, SSE event decoding, usage normalization, and transport selection.
   """
 
-  alias Pixir.Provider.{FinchTransport, StreamIdle}
+  alias Pixir.Provider.{FinchTransport, OutputTruncation, StreamIdle, ToolCall, TransportError}
   alias Pixir.Providers.ErrBody
   alias Pixir.Providers.Anthropic.Replay
   alias Pixir.Providers.Anthropic.Prompt
@@ -40,15 +40,16 @@ defmodule Pixir.Providers.Anthropic do
           usage: map() | nil,
           usage_summary: map(),
           provider_metadata: map(),
-          finish_reason: :stop | :tool_calls
+          finish_reason: :stop | :tool_calls,
+          output_truncation: OutputTruncation.t()
         }
 
   @doc "Stream one Anthropic Messages API call over HTTP/SSE."
   @spec stream(request(), keyword()) :: {:ok, result()} | {:error, map()}
   def stream(request, opts \\ [])
 
-  def stream(request, opts) when is_map(request) do
-    max_retries = Keyword.get(opts, :max_retries, Pixir.Config.max_retries())
+  def stream(request, opts) when is_map(request) and not is_struct(request) do
+    max_retries = Keyword.get_lazy(opts, :max_retries, &Pixir.Config.max_retries/0)
     sleep = Keyword.get(opts, :sleep, &Process.sleep/1)
 
     attempt(request, opts, 0, max_retries, sleep)
@@ -56,8 +57,8 @@ defmodule Pixir.Providers.Anthropic do
 
   def stream(_request, _opts) do
     {:error,
-     Tool.error(:invalid_args, "Anthropic.stream/2 requires a request map.", %{
-       expected: "map"
+     Tool.error(:invalid_args, "Anthropic.stream/2 requires a plain request map.", %{
+       expected: "plain_map"
      })}
   end
 
@@ -119,15 +120,17 @@ defmodule Pixir.Providers.Anthropic do
   defp retryable_status?(status), do: status in [500, 502, 503, 504, 529]
 
   defp do_stream(request, opts) do
-    with {:ok, transport_metadata} <-
+    with :ok <- validate_request_inputs(request),
+         {:ok, transport_metadata} <-
            transport_metadata(Keyword.get(opts, :provider_transport, :auto)),
-         {:ok, body, prompt_metadata} <- build_body(request, opts),
+         {:ok, body, prompt_metadata} <- safe_build_body(request, opts),
+         {:ok, encoded_body} <- encode_body(body),
          {:ok, headers} <- auth_headers(opts) do
       http_request = %{
         method: :post,
         url: resolve_url(Keyword.get(opts, :base_url)),
         headers: base_headers() ++ headers,
-        body: Jason.encode!(body)
+        body: encoded_body
       }
 
       init = initial_acc(opts, request, transport_metadata, prompt_metadata)
@@ -136,11 +139,11 @@ defmodule Pixir.Providers.Anthropic do
         {:ok, acc} ->
           complete_stream(acc)
 
-        {:error, %{ok: false} = error} ->
-          {:error, error}
+        {:error, reason, _acc} ->
+          {:error, TransportError.project(reason)}
 
         {:error, reason} ->
-          {:error, Tool.error(:network, "provider stream failed", %{reason: inspect(reason)})}
+          {:error, TransportError.project(reason)}
       end
     else
       {:error, %{ok: false} = error} ->
@@ -150,7 +153,10 @@ defmodule Pixir.Providers.Anthropic do
         {:error, Tool.error(kind, message, details)}
 
       {:error, reason} ->
-        {:error, Tool.error(:network, "provider stream failed", %{reason: inspect(reason)})}
+        {:error,
+         Tool.error(:network, "provider stream failed", %{
+           reason: TransportError.reason(reason)
+         })}
     end
   end
 
@@ -159,7 +165,7 @@ defmodule Pixir.Providers.Anthropic do
       status: nil,
       headers: [],
       buffer: "",
-      err_body: "",
+      err_body: ErrBody.new(),
       text: "",
       reasoning: "",
       blocks: %{},
@@ -229,6 +235,232 @@ defmodule Pixir.Providers.Anthropic do
   defp normalize_transport(:websocket), do: {:error, :websocket}
   defp normalize_transport("websocket"), do: {:error, "websocket"}
   defp normalize_transport(other), do: {:error, other}
+
+  defp validate_request_inputs(request) do
+    with :ok <- reject_request_field_collisions(request),
+         :ok <- validate_history_input(get_field(request, :history)),
+         :ok <- validate_message_input(get_field(request, :messages)),
+         :ok <- validate_tool_input(get_field(request, :tools)),
+         :ok <- validate_system_input(get_field(request, :system)),
+         :ok <- validate_optional_text(request, :system_prompt),
+         :ok <- validate_optional_text(request, :developer_context),
+         :ok <- validate_optional_text(request, :agent_instructions),
+         :ok <- validate_optional_text(request, :skills_index),
+         :ok <- validate_prompt_mode(request),
+         :ok <- validate_previous_turn_boundary(request),
+         :ok <- validate_reasoning_effort_input(request) do
+      :ok
+    end
+  end
+
+  defp reject_request_field_collisions(request) do
+    fields = [
+      :model,
+      :messages,
+      :history,
+      :system,
+      :system_prompt,
+      :tools,
+      :developer_context,
+      :agent_instructions,
+      :skills_index,
+      :prompt_mode,
+      :previous_turn_boundary_seq,
+      :max_tokens,
+      :reasoning_effort,
+      :web_search,
+      :hosted_tools,
+      :output_schema
+    ]
+
+    case Enum.find(fields, &request_field_collision?(request, &1)) do
+      nil -> :ok
+      field -> invalid_request_field(field, "normalized_key_collision")
+    end
+  end
+
+  defp request_field_collision?(request, field),
+    do: Map.has_key?(request, field) and Map.has_key?(request, Atom.to_string(field))
+
+  defp validate_history_input(nil), do: :ok
+
+  defp validate_history_input(history) when is_list(history) do
+    if proper_list?(history) and Enum.all?(history, &valid_history_event?/1),
+      do: :ok,
+      else: invalid_request_field(:history, "invalid_event_list")
+  end
+
+  defp validate_history_input(_history),
+    do: invalid_request_field(:history, "invalid_event_list")
+
+  defp valid_history_event?(event) when is_map(event) and not is_struct(event) do
+    event_type(event) in Pixir.Event.canonical_types() and
+      not history_envelope_collision?(event) and json_safe_anthropic_term?(event)
+  end
+
+  defp valid_history_event?(_event), do: false
+
+  defp history_envelope_collision?(event) do
+    Enum.any?([:type, :data, :seq, :session_id, :id, :ts], fn field ->
+      request_field_collision?(event, field)
+    end)
+  end
+
+  defp validate_message_input(nil), do: :ok
+
+  defp validate_message_input(messages) when is_list(messages) do
+    if proper_list?(messages) and Enum.all?(messages, &plain_json_safe_map?/1),
+      do: :ok,
+      else: invalid_request_field(:messages, "invalid_message_list")
+  end
+
+  defp validate_message_input(_messages),
+    do: invalid_request_field(:messages, "invalid_message_list")
+
+  defp validate_tool_input(nil), do: :ok
+
+  defp validate_tool_input(tools) when is_list(tools) do
+    if proper_list?(tools) and Enum.all?(tools, &plain_json_safe_map?/1),
+      do: :ok,
+      else: invalid_request_field(:tools, "invalid_tool_list")
+  end
+
+  defp validate_tool_input(_tools),
+    do: invalid_request_field(:tools, "invalid_tool_list")
+
+  defp validate_system_input(nil), do: :ok
+
+  defp validate_system_input(system) when is_binary(system) do
+    if String.valid?(system), do: :ok, else: invalid_request_field(:system, "invalid_utf8")
+  end
+
+  defp validate_system_input(system) when is_list(system) do
+    if proper_list?(system) and Enum.all?(system, &plain_json_safe_map?/1),
+      do: :ok,
+      else: invalid_request_field(:system, "invalid_system_blocks")
+  end
+
+  defp validate_system_input(_system),
+    do: invalid_request_field(:system, "invalid_type")
+
+  defp validate_optional_text(request, field) do
+    case get_field(request, field) do
+      nil ->
+        :ok
+
+      value when is_binary(value) ->
+        if String.valid?(value), do: :ok, else: invalid_request_field(field, "invalid_utf8")
+
+      _value ->
+        invalid_request_field(field, "invalid_type")
+    end
+  end
+
+  defp validate_prompt_mode(request) do
+    case get_field(request, :prompt_mode) do
+      nil -> :ok
+      mode when mode in [:build, :plan] -> :ok
+      _mode -> invalid_request_field(:prompt_mode, "unsupported_mode")
+    end
+  end
+
+  defp validate_previous_turn_boundary(request) do
+    case get_field(request, :previous_turn_boundary_seq) do
+      nil -> :ok
+      value when is_integer(value) and value >= 0 -> :ok
+      _value -> invalid_request_field(:previous_turn_boundary_seq, "invalid_boundary")
+    end
+  end
+
+  defp validate_reasoning_effort_input(request) do
+    case get_field(request, :reasoning_effort) do
+      nil ->
+        :ok
+
+      value when is_atom(value) ->
+        :ok
+
+      value when is_binary(value) ->
+        if String.valid?(value),
+          do: :ok,
+          else: invalid_request_field(:reasoning_effort, "invalid_utf8")
+
+      _value ->
+        invalid_request_field(:reasoning_effort, "invalid_type")
+    end
+  end
+
+  defp plain_json_safe_map?(value),
+    do: is_map(value) and not is_struct(value) and json_safe_anthropic_term?(value)
+
+  defp json_safe_anthropic_term?(value)
+       when is_nil(value) or is_boolean(value) or is_number(value) or is_atom(value),
+       do: true
+
+  defp json_safe_anthropic_term?(value) when is_binary(value), do: String.valid?(value)
+
+  defp json_safe_anthropic_term?(value) when is_list(value) do
+    proper_list?(value) and Enum.all?(value, &json_safe_anthropic_term?/1)
+  end
+
+  defp json_safe_anthropic_term?(value) when is_struct(value), do: false
+
+  defp json_safe_anthropic_term?(value) when is_map(value) do
+    with {:ok, keys} <- normalized_json_keys(Map.keys(value)),
+         true <- length(keys) == MapSet.size(MapSet.new(keys)) do
+      Enum.all?(value, fn {_key, nested} -> json_safe_anthropic_term?(nested) end)
+    else
+      _ -> false
+    end
+  end
+
+  defp json_safe_anthropic_term?(_value), do: false
+
+  defp normalized_json_keys(keys) do
+    Enum.reduce_while(keys, {:ok, []}, fn
+      key, {:ok, acc} when is_atom(key) ->
+        {:cont, {:ok, [Atom.to_string(key) | acc]}}
+
+      key, {:ok, acc} when is_binary(key) ->
+        if String.valid?(key),
+          do: {:cont, {:ok, [key | acc]}},
+          else: {:halt, :error}
+
+      _key, _acc ->
+        {:halt, :error}
+    end)
+  end
+
+  defp proper_list?([]), do: true
+  defp proper_list?([_head | tail]), do: proper_list?(tail)
+  defp proper_list?(_tail), do: false
+
+  defp invalid_request_field(field, reason) do
+    {:error,
+     Tool.error(:invalid_args, "Anthropic request body fields must be JSON-safe.", %{
+       field: field,
+       reason: reason
+     })}
+  end
+
+  defp encode_body(body) do
+    case Jason.encode(body) do
+      {:ok, encoded} -> {:ok, encoded}
+      {:error, _reason} -> invalid_request_field(:body, "not_json_encodable")
+    end
+  rescue
+    _exception -> invalid_request_field(:body, "not_json_encodable")
+  catch
+    _kind, _reason -> invalid_request_field(:body, "not_json_encodable")
+  end
+
+  defp safe_build_body(request, opts) do
+    build_body(request, opts)
+  rescue
+    _exception -> invalid_request_field(:body, "body_build_failed")
+  catch
+    _kind, _reason -> invalid_request_field(:body, "body_build_failed")
+  end
 
   defp build_body(request, opts) do
     with :ok <- reject_output_schema(request),
@@ -402,15 +634,15 @@ defmodule Pixir.Providers.Anthropic do
 
   defp request_model(request, opts) do
     case get_field(request, :model) || Keyword.get(opts, :model) do
-      value when is_binary(value) and value != "" ->
-        {:ok, value}
+      value when is_binary(value) ->
+        if String.valid?(value) and String.trim(value) != "" do
+          {:ok, value}
+        else
+          invalid_request_field(:model, "invalid_model")
+        end
 
       _ ->
-        {:error,
-         Tool.error(:invalid_args, "Anthropic request is missing a required field.", %{
-           field: :model,
-           expected: "non-empty string"
-         })}
+        invalid_request_field(:model, "invalid_model")
     end
   end
 
@@ -476,7 +708,11 @@ defmodule Pixir.Providers.Anthropic do
         append_history_text(state, "user", event_text(event), model)
 
       :assistant_message ->
-        append_history_text(state, "assistant", event_text(event), model)
+        if get_field(event_data(event), :metadata) |> partial_metadata?() do
+          state
+        else
+          append_history_text(state, "assistant", event_text(event), model)
+        end
 
       :skill_activation ->
         case pending_skill_view_call_id(event, state.pending_calls) do
@@ -777,7 +1013,9 @@ defmodule Pixir.Providers.Anthropic do
   defp subagent_event_text(data) do
     if get_field(data, :event) in ["finished", "failed", "cancelled", "timed_out"] do
       "Subagent #{get_field(data, :subagent_id)} (#{get_field(data, :agent)}) " <>
-        "#{get_field(data, :status)}: " <> (get_field(data, :summary) || "")
+        "#{get_field(data, :status)}: " <>
+        (get_field(data, :summary) || "") <>
+        Pixir.Provider.OutputTruncationSummary.child_context_suffix(data)
     end
   end
 
@@ -884,17 +1122,17 @@ defmodule Pixir.Providers.Anthropic do
        Tool.error(:invalid_args, "Anthropic reasoning_effort is not supported.", %{
          field: :reasoning_effort,
          supported: @valid_reasoning_efforts,
-         received: effort
+         reason: "unsupported_value"
        })}
     end
   end
 
-  defp normalize_reasoning_effort(effort) do
+  defp normalize_reasoning_effort(_effort) do
     {:error,
      Tool.error(:invalid_args, "Anthropic reasoning_effort is not supported.", %{
        field: :reasoning_effort,
        supported: @valid_reasoning_efforts,
-       received: inspect(effort)
+       reason: "invalid_type"
      })}
   end
 
@@ -1016,15 +1254,18 @@ defmodule Pixir.Providers.Anthropic do
 
       true ->
         case Jason.decode(data) do
-          {:ok, payload} ->
+          {:ok, payload} when is_map(payload) ->
             handle_event(event || payload["type"], payload, acc)
 
-          {:error, error} when is_nil(acc.stream_error) ->
+          {:ok, _malformed_payload} ->
+            put_container_error(acc, :payload)
+
+          {:error, _error} when is_nil(acc.stream_error) ->
             %{
               acc
               | stream_error:
                   Tool.error(:invalid_response, "Anthropic SSE data was not valid JSON.", %{
-                    reason: inspect(error)
+                    reason: :invalid_json
                   })
             }
 
@@ -1037,49 +1278,31 @@ defmodule Pixir.Providers.Anthropic do
   defp handle_event(_event, _payload, %{stream_error: %{ok: false}} = acc), do: acc
 
   defp handle_event("message_start", payload, acc) do
-    message = payload["message"] || %{}
-    usage = message["usage"] || payload["usage"]
-    model = message["model"] || payload["model"] || acc.model
-
-    acc
-    |> put_usage(usage)
-    |> Map.put(:model, model)
-    |> put_provider_metadata("model", model)
+    case Map.get(payload, "message") do
+      nil -> apply_message_start(%{}, payload, acc)
+      message when is_map(message) -> apply_message_start(message, payload, acc)
+      _malformed_message -> put_container_error(acc, :message)
+    end
   end
 
   defp handle_event("content_block_start", payload, acc) do
-    index = payload["index"]
-    block = payload["content_block"] || %{}
-    blocks = Map.put(acc.blocks, index, %{block: block, input_json: ""})
-    %{acc | blocks: blocks}
+    case Map.get(payload, "content_block") do
+      nil -> put_content_block(payload["index"], %{}, acc)
+      block when is_map(block) -> put_content_block(payload["index"], block, acc)
+      _malformed_block -> put_container_error(acc, :content_block)
+    end
   end
 
   defp handle_event("content_block_delta", payload, acc) do
-    index = payload["index"]
-
-    case payload["delta"] || %{} do
-      %{"type" => "text_delta"} = delta ->
-        append_text(acc, delta["text"] || "")
-
-      %{"type" => "thinking_delta"} = delta ->
-        append_thinking(acc, index, delta["thinking"] || delta["text"] || "")
-
-      %{"type" => "signature_delta"} = delta ->
-        update_block(acc, index, fn block_state ->
-          update_in(
-            block_state,
-            [:block, "signature"],
-            &((&1 || "") <> (delta["signature"] || ""))
-          )
-        end)
-
-      %{"type" => "input_json_delta"} = delta ->
-        update_block(acc, index, fn block_state ->
-          Map.update!(block_state, :input_json, &(&1 <> (delta["partial_json"] || "")))
-        end)
-
-      _delta ->
+    case Map.get(payload, "delta") do
+      nil ->
         acc
+
+      delta when is_map(delta) ->
+        apply_content_block_delta(delta, payload["index"], acc)
+
+      _malformed_delta ->
+        put_container_error(acc, :delta)
     end
   end
 
@@ -1088,16 +1311,19 @@ defmodule Pixir.Providers.Anthropic do
   end
 
   defp handle_event("message_delta", payload, acc) do
-    delta = payload["delta"] || %{}
-    usage = payload["usage"] || delta["usage"]
+    case Map.get(payload, "delta") do
+      nil ->
+        apply_message_delta(%{}, payload, acc)
 
-    acc
-    |> put_usage(usage)
-    |> Map.put(:stop_reason, delta["stop_reason"] || payload["stop_reason"] || acc.stop_reason)
-    |> Map.put(
-      :stop_details,
-      delta["stop_details"] || payload["stop_details"] || acc.stop_details
-    )
+      delta when is_map(delta) ->
+        apply_message_delta(delta, payload, acc)
+
+      _malformed_delta ->
+        acc
+        |> put_usage(payload["usage"])
+        |> Map.put(:stop_reason, :invalid_terminal_evidence)
+        |> Map.put(:stop_details, nil)
+    end
   end
 
   defp handle_event("message_stop", _payload, acc), do: acc
@@ -1115,6 +1341,74 @@ defmodule Pixir.Providers.Anthropic do
 
   defp handle_event(_event, _payload, acc), do: acc
 
+  defp apply_message_start(message, payload, acc) do
+    usage = usage_or_fallback(message["usage"], payload["usage"])
+    model = message["model"] || payload["model"] || acc.model
+
+    acc
+    |> put_usage(usage)
+    |> Map.put(:model, model)
+    |> put_provider_metadata("model", model)
+  end
+
+  defp apply_content_block_delta(delta, index, acc) do
+    case delta do
+      %{"type" => "text_delta"} = delta ->
+        apply_binary_delta(acc, delta, "text", :text, &append_text/2)
+
+      %{"type" => "thinking_delta"} = delta ->
+        case thinking_delta_text(delta) do
+          {:ok, text} -> append_thinking(acc, index, text)
+          {:error, field} -> put_binary_field_error(acc, field)
+        end
+
+      %{"type" => "signature_delta"} = delta ->
+        case binary_field(delta, "signature", :signature) do
+          {:ok, signature} -> append_block_binary(acc, index, "signature", signature, :signature)
+          {:error, field} -> put_binary_field_error(acc, field)
+        end
+
+      %{"type" => "input_json_delta"} = delta ->
+        apply_binary_delta(acc, delta, "partial_json", :partial_json, fn current, partial_json ->
+          update_block(current, index, fn block_state ->
+            Map.update!(block_state, :input_json, &(&1 <> partial_json))
+          end)
+        end)
+
+      _delta ->
+        acc
+    end
+  end
+
+  defp put_content_block(index, block, acc) do
+    with {:ok, _thinking} <- binary_field(block, "thinking", :thinking),
+         {:ok, _signature} <- binary_field(block, "signature", :signature) do
+      blocks = Map.put(acc.blocks, index, %{block: block, input_json: ""})
+      %{acc | blocks: blocks}
+    else
+      {:error, field} -> put_binary_field_error(acc, field)
+    end
+  end
+
+  defp apply_message_delta(delta, payload, acc) do
+    usage = usage_or_fallback(payload["usage"], delta["usage"])
+
+    stop_reason =
+      if acc.stop_reason == :invalid_terminal_evidence do
+        :invalid_terminal_evidence
+      else
+        delta["stop_reason"] || payload["stop_reason"] || acc.stop_reason
+      end
+
+    acc
+    |> put_usage(usage)
+    |> Map.put(:stop_reason, stop_reason)
+    |> Map.put(
+      :stop_details,
+      delta["stop_details"] || payload["stop_details"] || acc.stop_details
+    )
+  end
+
   defp append_text(acc, ""), do: acc
 
   defp append_text(acc, text) do
@@ -1125,14 +1419,55 @@ defmodule Pixir.Providers.Anthropic do
   defp append_thinking(acc, _index, ""), do: acc
 
   defp append_thinking(acc, index, text) do
-    acc.on_delta.({:reasoning_delta, text})
+    case append_block_binary(acc, index, "thinking", text, :thinking) do
+      %{stream_error: %{ok: false}} = failed ->
+        failed
 
-    acc
-    |> Map.update!(:reasoning, &(&1 <> text))
-    |> Map.put(:delivered_output, true)
-    |> update_block(index, fn block_state ->
-      update_in(block_state, [:block, "thinking"], &((&1 || "") <> text))
-    end)
+      updated ->
+        updated.on_delta.({:reasoning_delta, text})
+
+        updated
+        |> Map.update!(:reasoning, &(&1 <> text))
+        |> Map.put(:delivered_output, true)
+    end
+  end
+
+  defp apply_binary_delta(acc, container, key, field, fun) do
+    case binary_field(container, key, field) do
+      {:ok, value} -> fun.(acc, value)
+      {:error, invalid_field} -> put_binary_field_error(acc, invalid_field)
+    end
+  end
+
+  defp thinking_delta_text(delta) do
+    case Map.fetch(delta, "thinking") do
+      {:ok, nil} -> binary_field(delta, "text", :text)
+      :error -> binary_field(delta, "text", :text)
+      {:ok, thinking} when is_binary(thinking) -> {:ok, thinking}
+      {:ok, _malformed_thinking} -> {:error, :thinking}
+    end
+  end
+
+  defp binary_field(container, key, field) do
+    case Map.fetch(container, key) do
+      :error -> {:ok, ""}
+      {:ok, nil} -> {:ok, ""}
+      {:ok, value} when is_binary(value) -> {:ok, value}
+      {:ok, _malformed_value} -> {:error, field}
+    end
+  end
+
+  defp append_block_binary(acc, index, key, value, field) do
+    block_state = Map.get(acc.blocks, index, %{block: %{}, input_json: ""})
+
+    case binary_field(block_state.block, key, field) do
+      {:ok, current} ->
+        updated_state = put_in(block_state, [:block, key], current <> value)
+        %{acc | blocks: Map.put(acc.blocks, index, updated_state)}
+
+      {:error, invalid_field} ->
+        put_binary_field_error(acc, invalid_field)
+    end
   end
 
   defp update_block(acc, index, fun) do
@@ -1151,14 +1486,12 @@ defmodule Pixir.Providers.Anthropic do
         |> Map.update!(:output_items, &(&1 ++ [{:reasoning, block}]))
 
       %{block: %{"type" => "tool_use"} = block, input_json: input_json} ->
-        case parse_tool_input(input_json, block["input"]) do
-          {:ok, args} ->
-            call = %{call_id: block["id"], name: block["name"], args: args}
-
-            acc
-            |> Map.update!(:blocks, &Map.delete(&1, index))
-            |> Map.update!(:output_items, &(&1 ++ [{:function_call, call}]))
-
+        with {:ok, args} <- parse_tool_input(input_json, block["input"]),
+             {:ok, call} <- ToolCall.from_map(block["id"], block["name"], args) do
+          acc
+          |> Map.update!(:blocks, &Map.delete(&1, index))
+          |> Map.update!(:output_items, &(&1 ++ [{:function_call, call}]))
+        else
           {:error, error} ->
             %{acc | stream_error: error}
         end
@@ -1168,30 +1501,27 @@ defmodule Pixir.Providers.Anthropic do
     end
   end
 
-  defp parse_tool_input("", input) when is_map(input), do: {:ok, input}
-  defp parse_tool_input("", _input), do: {:ok, %{}}
+  defp parse_tool_input("", input) when is_map(input) and not is_struct(input), do: {:ok, input}
+  defp parse_tool_input("", _input), do: {:error, invalid_tool_input(:missing_json_object)}
 
   defp parse_tool_input(input_json, _input) do
     case Jason.decode(input_json) do
       {:ok, decoded} when is_map(decoded) ->
         {:ok, decoded}
 
-      {:ok, decoded} ->
-        {:error,
-         Tool.error(
-           :invalid_response,
-           "Anthropic tool_use input JSON must decode to an object.",
-           %{
-             decoded: inspect(decoded)
-           }
-         )}
+      {:ok, _decoded} ->
+        {:error, invalid_tool_input(:non_object)}
 
-      {:error, error} ->
-        {:error,
-         Tool.error(:invalid_response, "Anthropic tool_use input JSON was invalid.", %{
-           reason: inspect(error)
-         })}
+      {:error, _error} ->
+        {:error, invalid_tool_input(:invalid_json)}
     end
+  end
+
+  defp invalid_tool_input(reason) do
+    Tool.error(:invalid_response, "Anthropic tool_use input must be a JSON object.", %{
+      field: :arguments,
+      reason: reason
+    })
   end
 
   defp put_usage(acc, nil), do: acc
@@ -1201,6 +1531,37 @@ defmodule Pixir.Providers.Anthropic do
     %{acc | usage: Map.merge(acc.usage || %{}, usage)}
   end
 
+  defp put_usage(acc, _malformed_usage), do: acc
+
+  defp usage_or_fallback(nil, fallback), do: fallback
+  defp usage_or_fallback(usage, _fallback), do: usage
+
+  defp put_container_error(%{stream_error: %{ok: false}} = acc, _field), do: acc
+
+  defp put_container_error(acc, field) do
+    error =
+      Tool.error(:invalid_response, "Anthropic SSE field must be a JSON object.", %{
+        field: field,
+        reason: :non_object,
+        retryable: false
+      })
+
+    %{acc | stream_error: error}
+  end
+
+  defp put_binary_field_error(%{stream_error: %{ok: false}} = acc, _field), do: acc
+
+  defp put_binary_field_error(acc, field) do
+    error =
+      Tool.error(:invalid_response, "Anthropic SSE field must be a string.", %{
+        field: field,
+        reason: :non_binary,
+        retryable: false
+      })
+
+    %{acc | stream_error: error}
+  end
+
   defp put_provider_metadata(acc, _key, nil), do: acc
 
   defp put_provider_metadata(acc, key, value),
@@ -1208,19 +1569,25 @@ defmodule Pixir.Providers.Anthropic do
 
   defp complete_stream(%{status: status} = acc)
        when is_integer(status) and (status < 200 or status >= 300) do
-    {:error, classify_http_error(status, acc.err_body, acc.headers)}
+    body = ErrBody.body(acc.err_body)
+
+    {:error, classify_http_error(status, body, acc.headers, ErrBody.truncated?(acc.err_body))}
   end
 
   defp complete_stream(%{stream_error: %{ok: false} = error}), do: {:error, error}
 
   defp complete_stream(acc) do
-    case acc.stop_reason || "end_turn" do
+    case acc.stop_reason do
       "end_turn" ->
-        {:ok, finalize(acc, :stop)}
+        {:ok, finalize(acc, :stop, OutputTruncation.not_truncated("end_turn"))}
+
+      "stop_sequence" ->
+        {:ok, finalize(acc, :stop, OutputTruncation.not_truncated("stop_sequence"))}
 
       "tool_use" ->
         finish_reason = if has_function_call?(acc.output_items), do: :tool_calls, else: :stop
-        {:ok, finalize(acc, finish_reason)}
+
+        {:ok, finalize(acc, finish_reason, OutputTruncation.not_truncated("tool_use"))}
 
       "max_tokens" ->
         finish_reason = if has_function_call?(acc.output_items), do: :tool_calls, else: :stop
@@ -1229,7 +1596,25 @@ defmodule Pixir.Providers.Anthropic do
          acc
          |> put_provider_metadata("stop_reason", "max_tokens")
          |> put_provider_metadata("truncated", true)
-         |> finalize(finish_reason)}
+         |> finalize(
+           finish_reason,
+           OutputTruncation.truncated(:provider_output_limit, "max_tokens")
+         )}
+
+      "model_context_window_exceeded" ->
+        finish_reason = if has_function_call?(acc.output_items), do: :tool_calls, else: :stop
+
+        {:ok,
+         acc
+         |> put_provider_metadata("stop_reason", "model_context_window_exceeded")
+         |> put_provider_metadata("truncated", true)
+         |> finalize(
+           finish_reason,
+           OutputTruncation.truncated(
+             :provider_context_window_limit,
+             "model_context_window_exceeded"
+           )
+         )}
 
       "refusal" ->
         {:error,
@@ -1240,11 +1625,20 @@ defmodule Pixir.Providers.Anthropic do
            model: acc.model
          })}
 
-      other ->
+      nil ->
+        {:ok, finalize(acc, :stop, OutputTruncation.unknown(:missing_terminal_evidence))}
+
+      other when is_binary(other) ->
+        evidence = OutputTruncation.unknown(:unrecognized_terminal_reason, other)
+        safe_unmapped_reason = OutputTruncation.provider_reason(evidence)
+
         {:ok,
          acc
-         |> put_provider_metadata("unmapped_stop_reason", other)
-         |> finalize(:stop)}
+         |> put_provider_metadata("unmapped_stop_reason", safe_unmapped_reason)
+         |> finalize(:stop, evidence)}
+
+      _other ->
+        {:ok, finalize(acc, :stop, OutputTruncation.unknown(:invalid_evidence))}
     end
   end
 
@@ -1252,7 +1646,7 @@ defmodule Pixir.Providers.Anthropic do
     Enum.any?(output_items, &match?({:function_call, _}, &1))
   end
 
-  defp finalize(acc, finish_reason) do
+  defp finalize(acc, finish_reason, output_truncation) do
     %{
       text: acc.text,
       reasoning: acc.reasoning,
@@ -1262,9 +1656,15 @@ defmodule Pixir.Providers.Anthropic do
       usage: acc.usage,
       usage_summary: usage_summary(acc.usage, acc.model),
       provider_metadata: acc.provider_metadata,
-      finish_reason: finish_reason
+      finish_reason: finish_reason,
+      output_truncation: output_truncation
     }
   end
+
+  defp partial_metadata?(metadata) when is_map(metadata),
+    do: get_field(metadata, :partial) == true
+
+  defp partial_metadata?(_metadata), do: false
 
   defp reasoning_items(output_items) do
     for {:reasoning, block} <- output_items, do: block
@@ -1320,10 +1720,10 @@ defmodule Pixir.Providers.Anthropic do
     put_in(envelope, [:error, :details, :retryable], false)
   end
 
-  defp classify_http_error(status, body, headers) do
+  defp classify_http_error(status, body, headers, truncated?) do
     error = do_classify_http_error(status, body, headers)
 
-    if ErrBody.truncated?(body) do
+    if truncated? do
       update_in(error, [:error, :details], &Map.put(&1, :err_body_truncated, true))
     else
       error

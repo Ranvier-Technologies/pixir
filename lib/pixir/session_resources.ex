@@ -12,9 +12,13 @@ defmodule Pixir.SessionResources do
   Provider-specific shapes such as Responses `input_image` are projections across
   the Leakage Boundary. They are assembled from descriptors only when Pixir
   intentionally sends a resource to OpenAI.
+
+  Resource path boundaries validate the Session id. Static symlink and same-UID race
+  hardening for payload paths under `.pixir/sessions/<session_id>/resources/` is
+  deliberately deferred; the Resource store is not an adversarial filesystem sandbox.
   """
 
-  alias Pixir.{Paths, Tool}
+  alias Pixir.{Paths, SessionId, Tool}
 
   @image_mime_prefix "image/"
   @default_mime_type "application/octet-stream"
@@ -119,24 +123,31 @@ defmodule Pixir.SessionResources do
   """
   @spec ingest_attachments(String.t(), [map()] | nil, keyword()) ::
           {:ok, [descriptor()]} | {:error, map()}
-  def ingest_attachments(_session_id, nil, _opts), do: {:ok, []}
-  def ingest_attachments(_session_id, [], _opts), do: {:ok, []}
+  def ingest_attachments(session_id, nil, _opts) do
+    with :ok <- SessionId.validate(session_id), do: {:ok, []}
+  end
+
+  def ingest_attachments(session_id, [], _opts) do
+    with :ok <- SessionId.validate(session_id), do: {:ok, []}
+  end
 
   def ingest_attachments(session_id, attachments, opts)
       when is_binary(session_id) and is_list(attachments) do
     workspace = Keyword.get(opts, :workspace, File.cwd!())
 
-    attachments
-    |> Enum.with_index()
-    |> Enum.reduce_while({:ok, []}, fn {attachment, index}, {:ok, acc} ->
-      case ingest_attachment(session_id, attachment, workspace, index) do
-        {:ok, descriptor} -> {:cont, {:ok, [descriptor | acc]}}
-        {:error, error} -> {:halt, {:error, error}}
+    with :ok <- SessionId.validate(session_id) do
+      attachments
+      |> Enum.with_index()
+      |> Enum.reduce_while({:ok, []}, fn {attachment, index}, {:ok, acc} ->
+        case ingest_attachment(session_id, attachment, workspace, index) do
+          {:ok, descriptor} -> {:cont, {:ok, [descriptor | acc]}}
+          {:error, error} -> {:halt, {:error, error}}
+        end
+      end)
+      |> case do
+        {:ok, descriptors} -> {:ok, Enum.reverse(descriptors)}
+        {:error, _} = error -> error
       end
-    end)
-    |> case do
-      {:ok, descriptors} -> {:ok, Enum.reverse(descriptors)}
-      {:error, _} = error -> error
     end
   end
 
@@ -153,17 +164,19 @@ defmodule Pixir.SessionResources do
       when is_binary(session_id) and is_map(descriptor) do
     workspace = Keyword.get(opts, :workspace, File.cwd!())
 
-    if descriptor["kind"] == "image" do
-      with {:ok, path} <- resource_path(session_id, descriptor, workspace),
-           {:ok, bytes} <- read_resource(path, descriptor) do
-        {:ok, "data:#{descriptor["mime_type"]};base64," <> Base.encode64(bytes)}
+    with :ok <- SessionId.validate(session_id) do
+      if descriptor["kind"] == "image" do
+        with {:ok, path} <- resource_path(session_id, descriptor, workspace),
+             {:ok, bytes} <- read_resource(path, descriptor) do
+          {:ok, "data:#{descriptor["mime_type"]};base64," <> Base.encode64(bytes)}
+        end
+      else
+        {:error,
+         Tool.error(:invalid_args, "session resource is not an image provider input", %{
+           resource_id: descriptor["resource_id"],
+           kind: descriptor["kind"]
+         })}
       end
-    else
-      {:error,
-       Tool.error(:invalid_args, "session resource is not an image provider input", %{
-         resource_id: descriptor["resource_id"],
-         kind: descriptor["kind"]
-       })}
     end
   end
 
@@ -171,7 +184,8 @@ defmodule Pixir.SessionResources do
   @spec resource_path(String.t(), descriptor(), String.t()) :: {:ok, String.t()} | {:error, map()}
   def resource_path(session_id, descriptor, workspace \\ File.cwd!())
       when is_binary(session_id) and is_map(descriptor) do
-    with {:ok, resource_id} <- descriptor_field(descriptor, "resource_id"),
+    with :ok <- SessionId.validate(session_id),
+         {:ok, resource_id} <- descriptor_field(descriptor, "resource_id"),
          {:ok, sha} <- descriptor_field(descriptor, "content_sha256"),
          {:ok, extension} <- descriptor_field(descriptor, "extension") do
       {:ok,
@@ -194,15 +208,18 @@ defmodule Pixir.SessionResources do
       when is_binary(parent_session_id) and is_binary(child_session_id) and is_list(events) do
     workspace = Keyword.get(opts, :workspace, File.cwd!())
 
-    events
-    |> Enum.flat_map(&event_resources/1)
-    |> Enum.uniq_by(& &1["resource_id"])
-    |> Enum.reduce_while(:ok, fn descriptor, :ok ->
-      case copy_descriptor_payload(parent_session_id, child_session_id, descriptor, workspace) do
-        :ok -> {:cont, :ok}
-        {:error, _} = error -> {:halt, error}
-      end
-    end)
+    with :ok <- SessionId.validate(parent_session_id),
+         :ok <- SessionId.validate(child_session_id) do
+      events
+      |> Enum.flat_map(&event_resources/1)
+      |> Enum.uniq_by(& &1["resource_id"])
+      |> Enum.reduce_while(:ok, fn descriptor, :ok ->
+        case copy_descriptor_payload(parent_session_id, child_session_id, descriptor, workspace) do
+          :ok -> {:cont, :ok}
+          {:error, _} = error -> {:halt, error}
+        end
+      end)
+    end
   end
 
   @doc "Find one resource descriptor in folded History by Session resource id."
@@ -443,14 +460,13 @@ defmodule Pixir.SessionResources do
     sha = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
     extension = extension_for_mime(mime_type, attachment)
 
-    dir =
-      session_id
-      |> Paths.ensure_session_resources_dir(workspace)
-      |> Path.join(resource_id)
+    resources_dir = Paths.session_resources_dir(session_id, workspace)
+    dir = Path.join(resources_dir, resource_id)
 
     path = Path.join(dir, sha <> "." <> extension)
 
-    with :ok <- File.mkdir_p(dir),
+    with {:ok, ^resources_dir} <- Paths.ensure_state_dir(workspace, resources_dir),
+         :ok <- File.mkdir_p(dir),
          :ok <- atomic_write(path, bytes) do
       descriptor =
         %{

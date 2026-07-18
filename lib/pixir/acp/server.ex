@@ -894,6 +894,10 @@ defmodule Pixir.ACP.Server do
 
         state
 
+      {:error, %{error: %{kind: :invalid_args, details: details}}} ->
+        write_invalid_session_id(state.out, id, details)
+        state
+
       {:error, error} ->
         write_start_error(state.out, id, error)
         state
@@ -929,11 +933,27 @@ defmodule Pixir.ACP.Server do
 
         state
 
+      {:error, %{error: %{kind: :invalid_args, details: details}}} ->
+        write_invalid_session_id(state.out, id, details)
+        state
+
       {:error, error} ->
         write_start_error(state.out, id, error)
         state
     end
   end
+
+  defp write_invalid_session_id(out, id, details) do
+    data =
+      %{"field" => "sessionId"}
+      |> maybe_put_string_key("reason", details[:reason] || details["reason"])
+      |> maybe_put_string_key("maxBytes", details[:max_bytes] || details["max_bytes"])
+
+    write(out, Protocol.error(id, Protocol.invalid_params(), "invalid session id", data))
+  end
+
+  defp maybe_put_string_key(map, _key, nil), do: map
+  defp maybe_put_string_key(map, key, value), do: Map.put(map, key, value)
 
   # Posture restore runs AFTER Conversation.start on purpose (unknown session ->
   # -32602 from the existence check, never -32603 from folding a missing Log).
@@ -957,19 +977,44 @@ defmodule Pixir.ACP.Server do
   defp replay_history(out, acp_sid, pixir_sid, workspace) do
     case Conversation.history(pixir_sid) do
       {:ok, history} ->
-        Enum.reduce(history, MapSet.new(), fn event, seen ->
-          seen =
-            case Translate.replay(event, acp_sid, translate_opts(event, acp_sid, seen, workspace)) do
-              nil ->
-                seen
+        {seen, warning_state} =
+          Enum.reduce(history, {MapSet.new(), new_warning_state()}, fn event,
+                                                                       {seen, warning_state} ->
+            params =
+              Translate.replay(
+                event,
+                acp_sid,
+                translate_opts(event, acp_sid, seen, workspace)
+              )
 
-              params ->
-                write(out, Protocol.notification("session/update", params))
-                seen
-            end
+            warning_state =
+              case track_acp_warning(warning_state, event) do
+                {:warning, true, warning, next_warning_state} ->
+                  if params, do: write(out, Protocol.notification("session/update", params))
 
-          remember_presented_subagent(seen, event, acp_sid)
-        end)
+                  if event.type == :assistant_message do
+                    warning_params = Translate.output_warning_update(warning, acp_sid)
+                    write(out, Protocol.notification("session/update", warning_params))
+                  end
+
+                  next_warning_state
+
+                {:warning, false, _warning, next_warning_state} ->
+                  if params && event.type != :provider_usage,
+                    do: write(out, Protocol.notification("session/update", params))
+
+                  next_warning_state
+
+                :not_warning ->
+                  if params, do: write(out, Protocol.notification("session/update", params))
+                  warning_state
+              end
+
+            {remember_presented_subagent(seen, event, acp_sid), warning_state}
+          end)
+
+        maybe_write_acp_warning_summary(out, acp_sid, warning_state)
+        seen
 
       _ ->
         MapSet.new()
@@ -995,7 +1040,24 @@ defmodule Pixir.ACP.Server do
         Map.get(state.workspaces, acp_sid)
       )
 
-    params = Translate.update(event, acp_sid, opts)
+    {params, state} =
+      case track_live_acp_warning(state, event) do
+        {:warning, true, warning, state} ->
+          params =
+            if event.type == :provider_usage do
+              Translate.update(event, acp_sid, opts)
+            else
+              Translate.output_warning_update(warning, acp_sid)
+            end
+
+          {params, state}
+
+        {:warning, false, _warning, state} ->
+          {nil, state}
+
+        :not_warning ->
+          {Translate.update(event, acp_sid, opts), state}
+      end
 
     state = %{
       state
@@ -1086,7 +1148,10 @@ defmodule Pixir.ACP.Server do
             )
           end)
 
-        put_in(state.prompts[pixir_sid], %{id: id, task: task, cancel?: false})
+        put_in(
+          state.prompts[pixir_sid],
+          Map.merge(%{id: id, task: task, cancel?: false}, new_warning_state())
+        )
     end
   end
 
@@ -1288,8 +1353,8 @@ defmodule Pixir.ACP.Server do
 
   # Prompt-option precedence: explicit per-turn `_meta` > sticky session value >
   # Pixir config. Explicit entries remain untouched; absent model/effort entries
-  # receive their validated sticky values. Config.merge_provider_opts/2 supplies
-  # the final fallback later inside Turn.
+  # receive their validated sticky values. Turn freezes the final Config fallback
+  # in one ResolvedProviderRequest and attaches its private defaults to Provider opts.
   defp with_session_config(state, acp_sid, meta_opts) do
     meta_opts
     |> put_sticky(:model, Map.get(state.session_models, acp_sid))
@@ -1304,10 +1369,9 @@ defmodule Pixir.ACP.Server do
   end
 
   # `default` must suppress a configured effort, not become a provider value.
-  # Anthropic treats an explicit nil as omission and Config.merge_provider_opts/2
-  # preserves that present keyword key. OpenAI re-reads Config internally after a
-  # nil, so its existing normalization receives the non-enum `default` sentinel
-  # and converts it to omission at the request-body boundary.
+  # Anthropic treats an explicit nil as omission, and the resolved request preserves
+  # that present keyword key. The Responses body normalization receives the non-enum
+  # `default` sentinel and converts it to omission at the request-body boundary.
   defp normalize_provider_default_effort(meta_opts, state) do
     if Keyword.get(meta_opts, :reasoning_effort) == "default" do
       # Classify with the SAME model the turn will actually use: per-turn
@@ -1485,6 +1549,8 @@ defmodule Pixir.ACP.Server do
     cancel? = get_in(state.prompts, [pixir_sid, :cancel?]) || false
     stop_reason = Translate.stop_reason(outcome, cancel?)
 
+    acp_sid = acp_sid_for_pixir(state, pixir_sid)
+    maybe_write_acp_warning_summary(state.out, acp_sid, Map.get(state.prompts, pixir_sid, %{}))
     write(state.out, Protocol.result(id, %{"stopReason" => stop_reason}))
     {:reply, :ok, %{state | prompts: Map.delete(state.prompts, pixir_sid)}}
   end
@@ -1505,6 +1571,93 @@ defmodule Pixir.ACP.Server do
 
     {:noreply,
      %{state | out_id: out_id, pending_requests: Map.put(state.pending_requests, out_id, pending)}}
+  end
+
+  defp new_warning_state do
+    %{
+      warning_keys: MapSet.new(),
+      warning_count: 0,
+      latest_warning_order_key: nil
+    }
+  end
+
+  defp track_live_acp_warning(state, %{type: type} = event)
+       when type in [:provider_usage, :assistant_message] do
+    case Map.fetch(state.prompts, event.session_id) do
+      {:ok, prompt} ->
+        case track_acp_warning(prompt, event) do
+          {:warning, emit?, warning, prompt} ->
+            {:warning, emit?, warning, put_in(state.prompts[event.session_id], prompt)}
+
+          :not_warning ->
+            :not_warning
+        end
+
+      :error ->
+        :not_warning
+    end
+  end
+
+  defp track_live_acp_warning(_state, _event), do: :not_warning
+
+  defp track_acp_warning(warning_state, event) do
+    case acp_event_warning(event) do
+      nil ->
+        :not_warning
+
+      warning ->
+        key = {event.session_id, warning["provider_usage_event_id"]}
+        order_key = {warning["provider_usage_seq"], warning["provider_usage_event_id"]}
+        keys = Map.get(warning_state, :warning_keys, MapSet.new())
+        latest = Map.get(warning_state, :latest_warning_order_key)
+
+        cond do
+          MapSet.member?(keys, key) or (not is_nil(latest) and order_key <= latest) ->
+            {:warning, false, warning, warning_state}
+
+          MapSet.size(keys) < 256 ->
+            {:warning, true, warning,
+             warning_state
+             |> Map.put(:warning_keys, MapSet.put(keys, key))
+             |> Map.update(:warning_count, 1, &(&1 + 1))
+             |> Map.put(:latest_warning_order_key, order_key)}
+
+          true ->
+            {:warning, false, warning,
+             warning_state
+             |> Map.update(:warning_count, 1, &(&1 + 1))
+             |> Map.put(:latest_warning_order_key, order_key)}
+        end
+    end
+  end
+
+  defp acp_event_warning(%{type: :provider_usage} = event),
+    do: Pixir.Provider.OutputTruncationSummary.warning(event)
+
+  defp acp_event_warning(%{type: :assistant_message} = event) do
+    case Pixir.Provider.OutputTruncationSummary.assistant_fallback(event) do
+      {:ok, _projection, warning} -> warning
+      :error -> nil
+    end
+  end
+
+  defp acp_event_warning(_event), do: nil
+
+  defp maybe_write_acp_warning_summary(out, acp_sid, warning_state) when is_binary(acp_sid) do
+    total = Map.get(warning_state, :warning_count, 0)
+
+    if total > 256 do
+      params = Translate.output_warning_summary(total, acp_sid)
+      write(out, Protocol.notification("session/update", params))
+    end
+  end
+
+  defp maybe_write_acp_warning_summary(_out, _acp_sid, _warning_state), do: :ok
+
+  defp acp_sid_for_pixir(state, pixir_sid) do
+    Enum.find_value(state.sessions, fn {acp_sid, candidate} ->
+      if candidate == pixir_sid, do: acp_sid
+    end)
   end
 
   # ── stdin reader ─────────────────────────────────────────────────────────────

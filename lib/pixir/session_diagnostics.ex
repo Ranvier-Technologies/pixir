@@ -17,24 +17,29 @@ defmodule Pixir.SessionDiagnostics do
   def run(session_id, opts) when is_binary(session_id) do
     workspace = opts |> Keyword.get(:workspace, File.cwd!()) |> Path.expand()
 
-    if Log.exists?(session_id, workspace: workspace) do
-      with {:ok, history} <- Log.fold(session_id, workspace: workspace),
-           {:ok, replay} <- ReplayInspector.inspect(session_id, workspace: workspace),
-           {:ok, tree} <- SessionTree.project(session_id, workspace: workspace) do
-        subagents_runtime = subagents_runtime_summary(session_id)
-        {:ok, report(session_id, workspace, history, replay, tree, subagents_runtime, opts)}
-      end
-    else
-      {:error,
-       Tool.error(:not_found, "session log not found", %{
-         session_id: session_id,
-         workspace: workspace,
-         log_path: Log.path(session_id, workspace: workspace),
-         next_actions: [
-           "check the session id",
-           "run pixir diagnose session from the workspace that owns the session log"
-         ]
-       })}
+    case Log.exists(session_id, workspace: workspace) do
+      {:ok, true} ->
+        with {:ok, history} <- Log.fold(session_id, workspace: workspace),
+             {:ok, replay} <- ReplayInspector.inspect(session_id, workspace: workspace),
+             {:ok, tree} <- SessionTree.project(session_id, workspace: workspace) do
+          subagents_runtime = subagents_runtime_summary(session_id)
+          {:ok, report(session_id, workspace, history, replay, tree, subagents_runtime, opts)}
+        end
+
+      {:ok, false} ->
+        {:error,
+         Tool.error(:not_found, "session log not found", %{
+           session_id: session_id,
+           workspace: workspace,
+           log_path: Log.path(session_id, workspace: workspace),
+           next_actions: [
+             "check the session id",
+             "run pixir diagnose session from the workspace that owns the session log"
+           ]
+         })}
+
+      {:error, _error} = error ->
+        error
     end
   end
 
@@ -80,7 +85,61 @@ defmodule Pixir.SessionDiagnostics do
       replay_check(replay),
       tree_check(tree),
       continuation_check(replay["continuation"])
-    ]
+    ] ++ output_truncation_checks(history)
+  end
+
+  defp output_truncation_checks(history) do
+    summary = Pixir.Provider.OutputTruncationSummary.summarize(history)
+    positive = summary["positive_count"]
+    unknown = summary["counts"]["unknown"]
+
+    positive_check =
+      if positive > 0 do
+        warning(
+          "provider_output_truncation",
+          "Provider reported successful output truncation.",
+          %{
+            "classification" => "provider_output_truncated",
+            "severity" => "warning",
+            "positive_count" => positive,
+            "positive_refs" => summary["positive_refs"],
+            "positive_refs_truncated" => summary["positive_refs_truncated"],
+            "next_actions" => [
+              "inspect_the_exact_provider_usage_calls",
+              "treat_the_provider_text_as_potentially_incomplete"
+            ]
+          }
+        )
+      else
+        passed(
+          "provider_output_truncation",
+          "No successful Provider call reported positive output truncation.",
+          %{"positive_count" => 0}
+        )
+      end
+
+    completeness_check =
+      if unknown > 0 do
+        warning(
+          "provider_output_completeness",
+          "Provider-output completeness is unknown for one or more successful calls.",
+          %{
+            "classification" => "provider_output_completeness_unknown",
+            "severity" => "warning",
+            "unknown_count" => unknown,
+            "latest" => summary["latest"],
+            "next_actions" => ["inspect_provider_terminal_evidence_without_assuming_truncation"]
+          }
+        )
+      else
+        passed(
+          "provider_output_completeness",
+          "Every successful Provider call in scope has explicit completeness evidence.",
+          %{"unknown_count" => 0}
+        )
+      end
+
+    [positive_check, completeness_check]
   end
 
   defp log_check(history) do
@@ -1000,7 +1059,8 @@ defmodule Pixir.SessionDiagnostics do
 
     %{
       "count" => length(usage),
-      "latest" => provider_usage_item(latest)
+      "latest" => provider_usage_item(latest),
+      "output_truncation" => Pixir.Provider.OutputTruncationSummary.summarize(history)
     }
   end
 

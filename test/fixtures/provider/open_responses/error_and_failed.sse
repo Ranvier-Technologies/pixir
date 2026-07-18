@@ -1,0 +1,10 @@
+: pinned Open Responses standalone and response failure fixture
+event: error
+data: {"type":"error","sequence_number":1,"error":{"type":"server_error","code":null,"message":"fixture stream failure","param":null}}
+
+event: response.failed
+data: {"type":"response.failed","sequence_number":2,"response":{"id":"resp_failed_fixture","object":"response","created_at":1,"completed_at":2,"status":"failed","incomplete_details":null,"model":"fixture-model","previous_response_id":null,"instructions":"fixture instructions","output":[],"error":{"code":"server_error","message":"fixture response failure"},"tools":[],"tool_choice":"auto","truncation":"disabled","parallel_tool_calls":true,"text":{"format":{"type":"text"}},"top_p":1,"presence_penalty":0,"frequency_penalty":0,"top_logprobs":0,"temperature":1,"reasoning":null,"usage":{"input_tokens":7,"output_tokens":0,"total_tokens":7,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}},"max_output_tokens":null,"max_tool_calls":null,"store":false,"background":false,"service_tier":"default","metadata":{},"safety_identifier":null,"prompt_cache_key":null}}
+
+data: [DONE]
+
+: fixture-eof

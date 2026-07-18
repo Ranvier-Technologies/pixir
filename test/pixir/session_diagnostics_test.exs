@@ -11,14 +11,24 @@ defmodule Pixir.SessionDiagnosticsTest do
       Event.user_message(sid, "run"),
       Event.tool_call(sid, "call_ok", "bash", %{"command" => "pwd"}),
       Event.tool_result(sid, "call_ok", %{"ok" => true, "output" => "/tmp"}),
-      Event.provider_usage(sid, %{
-        "model" => "gpt-5.5",
-        "active_transport" => "websocket",
-        "continuation_attempted" => true,
-        "continuation_reset_reason" => nil,
-        "used_previous_response_id" => true,
-        "usage_summary" => %{"total_tokens" => 42}
-      }),
+      Event.provider_usage(
+        sid,
+        %{
+          "model" => "gpt-5.5",
+          "active_transport" => "websocket",
+          "continuation_attempted" => true,
+          "continuation_reset_reason" => nil,
+          "used_previous_response_id" => true,
+          "usage_summary" => %{"total_tokens" => 42},
+          "output_truncation" => %{
+            "status" => "not_truncated",
+            "provider_reason" => "response.completed",
+            "provider_usage_event_id" => "evt_ready_usage",
+            "call_role" => "final_answer"
+          }
+        },
+        id: "evt_ready_usage"
+      ),
       Event.assistant_message(sid, "done")
     ])
 
@@ -30,6 +40,60 @@ defmodule Pixir.SessionDiagnosticsTest do
     assert result["replay"]["balanced"] == true
     assert result["provider_usage"]["count"] == 1
     assert result["provider_usage"]["latest"]["active_transport"] == "websocket"
+  end
+
+  test "warns explicitly for positive truncation and completeness-unknown without conflation" do
+    for {sid, evidence, expected_check, classification} <- [
+          {
+            "diagnose-positive-output-truncation",
+            %{
+              "status" => "truncated",
+              "reason" => "provider_output_limit",
+              "provider_reason" => "max_tokens"
+            },
+            "provider_output_truncation",
+            "provider_output_truncated"
+          },
+          {
+            "diagnose-unknown-output-completeness",
+            %{
+              "status" => "unknown",
+              "reason" => "missing_terminal_evidence"
+            },
+            "provider_output_completeness",
+            "provider_output_completeness_unknown"
+          }
+        ] do
+      ws = tmp_ws()
+      id = "evt_#{sid}"
+
+      append_all(ws, sid, [
+        Event.user_message(sid, "run"),
+        Event.provider_usage(
+          sid,
+          %{
+            "output_truncation" =>
+              evidence
+              |> Map.put("provider_usage_event_id", id)
+              |> Map.put("call_role", "final_answer")
+          },
+          id: id
+        ),
+        Event.assistant_message(sid, "answer")
+      ])
+
+      on_exit(fn -> File.rm_rf!(ws) end)
+      assert {:ok, result} = SessionDiagnostics.run(sid, workspace: ws)
+      assert result["status"] == "ready_with_warnings"
+
+      assert %{
+               "status" => "warning",
+               "details" => %{
+                 "classification" => ^classification,
+                 "severity" => "warning"
+               }
+             } = Enum.find(result["checks"], &(&1["id"] == expected_check))
+    end
   end
 
   test "warns when provider replay needs a synthetic orphan closure" do
@@ -902,6 +966,47 @@ defmodule Pixir.SessionDiagnosticsTest do
 
     assert %{"status" => "passed"} =
              Enum.find(result["checks"], &(&1["id"] == "subagent_manager_runtime"))
+  end
+
+  test "propagates replay profile preflight failures without Auth or network" do
+    ws = tmp_ws()
+    sid = "diagnose-profile-preflight"
+    home = Path.join(ws, "home")
+    File.mkdir_p!(home)
+    append_all(ws, sid, [Event.user_message(sid, "inspect")])
+
+    prior_home = System.get_env("PIXIR_HOME")
+    System.put_env("PIXIR_HOME", home)
+
+    on_exit(fn ->
+      if prior_home,
+        do: System.put_env("PIXIR_HOME", prior_home),
+        else: System.delete_env("PIXIR_HOME")
+
+      File.rm_rf!(ws)
+    end)
+
+    File.write!(
+      Path.join(home, "config.json"),
+      Jason.encode!(%{"responses_backend" => %{"mode" => "future"}})
+    )
+
+    assert {:error, %{error: %{kind: :invalid_config, details: %{reason: :unknown_mode}}}} =
+             SessionDiagnostics.run(sid, workspace: ws)
+
+    File.write!(
+      Path.join(home, "config.json"),
+      Jason.encode!(%{
+        "responses_backend" => %{
+          "mode" => "open_responses",
+          "base_url" => "http://localhost:11434",
+          "auth" => %{"policy" => "none"}
+        }
+      })
+    )
+
+    assert {:ok, open_diagnostics} = SessionDiagnostics.run(sid, workspace: ws)
+    refute inspect(open_diagnostics) =~ "localhost:11434"
   end
 
   defp tmp_ws do

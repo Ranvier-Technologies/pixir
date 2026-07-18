@@ -18,19 +18,72 @@ defmodule Pixir.VirtualOverlayTest do
     assert :ok = VirtualOverlay.validate_read_set(["mix.exs", "lib/pixir/*.ex"])
     assert {:error, :read_set_required} = VirtualOverlay.validate_read_set([])
 
-    assert {:error, %{kind: :invalid_read_set_entry, index: 1}} =
+    assert {:error, %{kind: :invalid_read_set_entry, index: 1, reason: "empty"}} =
              VirtualOverlay.validate_read_set(["mix.exs", " "])
 
-    # Every canonical spelling of the whole-workspace glob is unbounded;
-    # directory- and extension-bounded patterns stay legal.
-    for unbounded <- ["**/*", "./**/*", "**", "./**", "**/**", " **/* "] do
-      assert {:error, %{kind: :unbounded_read_set, index: 0}} =
+    for unbounded <- [
+          "**/*",
+          "./**/*",
+          "**",
+          "./**",
+          "**/**",
+          " **/* ",
+          "././**/**/**/*",
+          "**/**/**/*",
+          "**/?*",
+          "**/*?",
+          "**/{*}",
+          "**/{*,foo}",
+          "**/*{,}",
+          "**/{a,b,c,d,e,f,g,h,i,*}",
+          "**/{a,b,}{c,d,}{e,f,}{g,h,*}"
+        ] do
+      assert {:error,
+              %{
+                kind: :unbounded_read_set,
+                index: 0,
+                reason: "root_recursive_catch_all"
+              }} =
                VirtualOverlay.validate_read_set([unbounded]),
              "expected #{inspect(unbounded)} to be rejected as unbounded"
     end
 
-    assert :ok = VirtualOverlay.validate_read_set(["**/*.ex"])
-    assert :ok = VirtualOverlay.validate_read_set(["lib/**/*"])
+    for bounded <- ["lib/**/*", "**/*.ex", "./lib/**/*", "lib/**/test_*.exs", "*", "*/**/*"] do
+      assert :ok = VirtualOverlay.validate_read_set([bounded]), bounded
+    end
+
+    assert {:error, %{index: 0, reason: "absolute_path"}} =
+             VirtualOverlay.validate_read_set(["/tmp/**/*"])
+
+    for parent_alias <- ["../workspace/**/*", "lib/../**/*"] do
+      assert {:error, %{index: 0, reason: "parent_component"}} =
+               VirtualOverlay.validate_read_set([parent_alias])
+    end
+
+    assert {:error, %{index: 0, reason: "home_path"}} =
+             VirtualOverlay.validate_read_set(["~/**/*"])
+
+    for {entry, reason} <- [
+          {"foo\0*", "nul_byte"},
+          {"foo{*", "invalid_glob"},
+          {"lib/{foo{bar}}*", "invalid_glob"},
+          {"{**/*,foo}", "invalid_glob"}
+        ] do
+      assert {:error, %{index: 0, reason: ^reason}} =
+               VirtualOverlay.validate_read_set([entry])
+    end
+
+    assert :ok = VirtualOverlay.validate_read_set(["foo["])
+    assert :ok = VirtualOverlay.validate_read_set(["foo{bar"])
+    assert :ok = VirtualOverlay.validate_read_set(["data/a,b,c,d,e,f,g,h,i*.txt"])
+
+    assert {:error, %{error: %{details: %{"reason" => "invalid_utf8"}}} = error} =
+             VirtualOverlay.run(System.tmp_dir!(), %{
+               "read_set" => [<<255>>],
+               "commands" => []
+             })
+
+    assert {:ok, _json} = Jason.encode(error)
   end
 
   test "run rejects whole-workspace globs at the execution boundary", %{ws: ws} do
@@ -38,13 +91,51 @@ defmodule Pixir.VirtualOverlayTest do
 
     assert {:error, %{ok: false, error: %{kind: :invalid_args, details: details}}} =
              VirtualOverlay.run(ws, %{
-               "read_set" => ["lib/example.txt", " ", "./**/*"],
+               "read_set" => ["lib/example.txt", "safe.txt", "./**/*"],
                "commands" => ["true"]
              })
 
     assert details["field"] == "read_set"
     assert details["index"] == 2
+    assert details["reason"] == "root_recursive_catch_all"
     assert details["value"] == "./**/*"
+  end
+
+  test "engine keeps empty-import scratch but rechecks every supplied entry", %{ws: ws} do
+    assert {:ok, artifact} =
+             VirtualOverlay.run(ws, %{"read_set" => [], "commands" => []})
+
+    assert artifact["import"]["read_set"] == []
+    assert artifact["import"]["file_count"] == 0
+
+    aliases = [
+      Path.join(ws, "**/*"),
+      "../#{Path.basename(ws)}/**/*",
+      "././**/**/**/*",
+      "lib/../**/*",
+      "**/**/**/*",
+      "**/?*",
+      "**/{*,foo}",
+      "~/**/*",
+      "foo\0*",
+      "foo{*",
+      "lib/{foo{bar}}*"
+    ]
+
+    for alias_entry <- aliases do
+      assert {:error,
+              %{error: %{kind: :invalid_args, details: %{"index" => 0, "reason" => reason}}}} =
+               VirtualOverlay.run(ws, %{"read_set" => [alias_entry], "commands" => []})
+
+      assert reason in [
+               "absolute_path",
+               "parent_component",
+               "root_recursive_catch_all",
+               "home_path",
+               "nul_byte",
+               "invalid_glob"
+             ]
+    end
   end
 
   test "imports a bounded read_set, runs virtual commands, and emits virtual_diff", %{ws: ws} do
@@ -180,13 +271,19 @@ defmodule Pixir.VirtualOverlayTest do
   end
 
   test "rejects imports outside the parent workspace", %{ws: ws} do
-    assert {:error, %{error: %{kind: :outside_workspace, details: details}}} =
+    assert {:error,
+            %{
+              error: %{
+                kind: :invalid_args,
+                details: %{"reason" => "parent_component"} = details
+              }
+            }} =
              VirtualOverlay.run(ws, %{
                "read_set" => ["../outside.txt"],
                "commands" => []
              })
 
-    assert details["path"] == "../outside.txt"
+    assert details["value"] == "../outside.txt"
     refute Map.has_key?(details, :path)
   end
 

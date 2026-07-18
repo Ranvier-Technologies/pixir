@@ -113,14 +113,24 @@ defmodule Pixir.Tools.RunVirtualCommands do
        when is_map(virtual_overlay) do
     read_set = Map.get(virtual_overlay, :read_set)
 
-    if is_list(read_set) and read_set != [] and Enum.all?(read_set, &non_empty_string?/1) do
-      {:ok,
-       %{
-         read_set: read_set,
-         limits: Map.get(virtual_overlay, :limits)
-       }}
-    else
-      missing_virtual_overlay_context()
+    case VirtualOverlay.validate_read_set(read_set) do
+      :ok ->
+        {:ok,
+         %{
+           read_set: read_set,
+           limits: Map.get(virtual_overlay, :limits)
+         }}
+
+      {:error, %{index: index, reason: reason}} ->
+        {:error,
+         Tool.error(:invalid_args, "operator virtual overlay read_set is unsafe", %{
+           "field" => "virtual_overlay.read_set",
+           "index" => index,
+           "reason" => reason
+         })}
+
+      {:error, _reason} ->
+        missing_virtual_overlay_context()
     end
   end
 
@@ -136,8 +146,6 @@ defmodule Pixir.Tools.RunVirtualCommands do
        }
      )}
   end
-
-  defp non_empty_string?(value), do: is_binary(value) and String.trim(value) != ""
 
   # The model-facing output must carry real feedback (command output and the
   # produced diffs), not only counts: the full artifact rides the durable

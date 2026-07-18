@@ -32,8 +32,31 @@ defmodule Pixir.Subagents.GC do
   end
 
   defp discover_references(workspace) do
-    workspace
-    |> Paths.sessions_dir()
+    sessions_dir = Paths.sessions_dir(workspace)
+
+    case Paths.inspect_state_path(workspace, sessions_dir, expected: :directory) do
+      {:ok, %{state: :missing}} ->
+        {:ok, []}
+
+      {:ok, %{state: :directory}} ->
+        discover_references_in_dir(workspace, sessions_dir)
+
+      {:error, error} ->
+        {:error,
+         error_envelope(
+           "subagent_gc_evidence_error",
+           "blocked",
+           ["inspect_pixir_state_path_without_following_symlinks", "rerun_pixir_gc"],
+           %{
+             "sessions_dir" => sessions_dir,
+             "cause" => json_safe(error)
+           }
+         )}
+    end
+  end
+
+  defp discover_references_in_dir(workspace, sessions_dir) do
+    sessions_dir
     |> Path.join("*.ndjson")
     |> Path.wildcard()
     |> Enum.sort()

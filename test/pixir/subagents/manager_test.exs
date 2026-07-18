@@ -187,6 +187,68 @@ defmodule Pixir.Subagents.ManagerTest do
     end
   end
 
+  defmodule TruncationProvider do
+    def stream(_request, opts) do
+      agent = Keyword.fetch!(opts, :script_agent)
+      Agent.get_and_update(agent, fn [head | tail] -> {head, tail} end)
+    end
+  end
+
+  defmodule UsageAbsentFallbackProvider do
+    def stream(_request, opts) do
+      sid = Keyword.fetch!(opts, :session_id)
+
+      Pixir.Session.emit(
+        sid,
+        Pixir.Event.assistant_message(sid, "fallback answer",
+          metadata: %{
+            "output_truncation" => %{
+              "status" => "truncated",
+              "reason" => "provider_content_filter",
+              "provider_reason" => "content_filter",
+              "provider_usage_event_id" => "evt_absent_usage",
+              "provider_usage_seq" => 77,
+              "call_role" => "final_answer"
+            }
+          }
+        )
+      )
+
+      {:error,
+       Pixir.Tool.error(:provider_http_error, "fixture failed after fallback", %{
+         retryable: false
+       })}
+    end
+  end
+
+  defmodule PartialUsageAbsentFallbackProvider do
+    def stream(_request, opts) do
+      sid = Keyword.fetch!(opts, :session_id)
+
+      Pixir.Session.emit(
+        sid,
+        Pixir.Event.assistant_message(sid, "partial fallback answer",
+          metadata: %{
+            "partial" => true,
+            "output_truncation" => %{
+              "status" => "truncated",
+              "reason" => "provider_content_filter",
+              "provider_reason" => "content_filter",
+              "provider_usage_event_id" => "evt_partial_absent_usage",
+              "provider_usage_seq" => 77,
+              "call_role" => "final_answer"
+            }
+          }
+        )
+      )
+
+      {:error,
+       Pixir.Tool.error(:provider_http_error, "fixture failed after partial fallback", %{
+         retryable: false
+       })}
+    end
+  end
+
   setup do
     workspace =
       Path.join(
@@ -554,5 +616,232 @@ defmodule Pixir.Subagents.ManagerTest do
 
       refute File.exists?(Path.join([workspace, ".pixir", "subagents"]))
     end
+  end
+
+  describe "Provider-output truncation propagation" do
+    test "retains 63/64/65 child warnings with pre-bound totals and durable terminal evidence", %{
+      session_id: session_id,
+      workspace: workspace
+    } do
+      for count <- [63, 64, 65] do
+        {:ok, script_agent} = Agent.start_link(fn -> truncation_script(count) end)
+
+        assert {:ok, agent} =
+                 Subagents.spawn_agent(
+                   session_id,
+                   %{
+                     "task" => "read source #{count} times",
+                     "workspace_mode" => "shared",
+                     "timeout_ms" => 20_000
+                   },
+                   workspace: workspace,
+                   provider: TruncationProvider,
+                   provider_opts: [script_agent: script_agent],
+                   permission_mode: :read_only
+                 )
+
+        assert {:ok, [completed]} =
+                 Subagents.wait(session_id, [agent["id"]], 20_000, workspace: workspace)
+
+        assert completed["status"] == "completed"
+        assert completed["summary"] == "child summary #{count}"
+        assert completed["output_truncation"]["status"] == "truncated"
+        assert completed["output_warning_count"] == count
+        assert length(completed["output_warnings"]) == min(count, 64)
+        assert completed["output_warnings_truncated"] == (count == 65)
+
+        assert Enum.all?(completed["output_warnings"], fn warning ->
+                 warning["child_session_id"] == completed["child_session_id"] and
+                   warning["kind"] == "provider_output_truncated"
+               end)
+
+        assert {:ok, history} = Log.fold(session_id, workspace: workspace)
+
+        terminal =
+          history
+          |> Enum.filter(
+            &(&1.type == :subagent_event and &1.data["subagent_id"] == agent["id"] and
+                &1.data["event"] == "finished")
+          )
+          |> List.last()
+
+        assert terminal.data["summary"] == "child summary #{count}"
+        assert terminal.data["output_warning_count"] == count
+        assert terminal.data["output_warnings_truncated"] == (count == 65)
+
+        assert {:ok, listed} = Subagents.list(session_id, workspace: workspace)
+        public = Enum.find(listed, &(&1["id"] == agent["id"]))
+        assert public["output_warning_count"] == count
+
+        reconstructed = Subagents.reconstruct(history)[agent["id"]]
+        assert reconstructed["output_warning_count"] == count
+        assert reconstructed["output_warnings_truncated"] == (count == 65)
+      end
+    end
+
+    test "usage-absent assistant fallback survives failed-child terminal projection once", %{
+      session_id: session_id,
+      workspace: workspace
+    } do
+      assert {:ok, agent} =
+               Subagents.spawn_agent(
+                 session_id,
+                 %{
+                   "task" => "emit fallback then fail",
+                   "workspace_mode" => "shared",
+                   "timeout_ms" => 5_000
+                 },
+                 workspace: workspace,
+                 provider: UsageAbsentFallbackProvider,
+                 permission_mode: :read_only
+               )
+
+      assert {:ok, [failed]} =
+               Subagents.wait(session_id, [agent["id"]], 10_000, workspace: workspace)
+
+      assert failed["status"] == "failed"
+      assert failed["output_truncation"]["status"] == "truncated"
+      assert failed["output_warning_count"] == 1
+      assert length(failed["output_warnings"]) == 1
+      assert failed["output_warnings_truncated"] == false
+    end
+
+    test "partial usage-absent assistant fallback cannot become child warning or final evidence",
+         %{
+           session_id: session_id,
+           workspace: workspace
+         } do
+      assert {:ok, agent} =
+               Subagents.spawn_agent(
+                 session_id,
+                 %{
+                   "task" => "emit partial fallback then fail",
+                   "workspace_mode" => "shared",
+                   "timeout_ms" => 5_000
+                 },
+                 workspace: workspace,
+                 provider: PartialUsageAbsentFallbackProvider,
+                 permission_mode: :read_only
+               )
+
+      assert {:ok, [failed]} =
+               Subagents.wait(session_id, [agent["id"]], 10_000, workspace: workspace)
+
+      assert failed["status"] == "failed"
+      assert failed["output_truncation"] == nil
+      assert failed["output_warning_count"] == 0
+      assert failed["output_warnings"] == []
+      refute inspect(failed) =~ "evt_partial_absent_usage"
+    end
+
+    test "cold restore bounds warnings and preserves a validated final latest key", %{
+      session_id: session_id,
+      workspace: workspace
+    } do
+      child_sid = "child_cold_restore"
+
+      warnings =
+        for seq <- 1..65 do
+          %{
+            "kind" => "provider_output_truncated",
+            "severity" => "warning",
+            "child_session_id" => child_sid,
+            "provider_usage_event_id" => "evt_cold_#{seq}",
+            "provider_usage_seq" => seq,
+            "reason" => "provider_output_limit",
+            "provider_reason" => "max_tokens",
+            "call_role" => "intermediate"
+          }
+        end
+
+      data = %{
+        "event" => "finished",
+        "subagent_id" => "sub_cold_restore",
+        "child_session_id" => child_sid,
+        "agent" => "default",
+        "task" => "historical",
+        "status" => "completed",
+        "summary" => "historical summary",
+        "workspace" => workspace,
+        "output_warning_count" => 65,
+        "output_warnings" => warnings,
+        "output_warning_reasons" => [
+          "provider_output_limit",
+          "provider_content_filter",
+          "unsafe"
+        ],
+        "output_warnings_truncated" => true,
+        "output_truncation" => %{
+          "status" => "truncated",
+          "reason" => "provider_output_limit",
+          "provider_reason" => "max_tokens",
+          "provider_usage_event_id" => "evt_final_cold",
+          "provider_usage_seq" => 70,
+          "call_role" => "final_answer"
+        }
+      }
+
+      assert {:ok, _} =
+               Pixir.Session.record(session_id, Event.subagent_event(session_id, data))
+
+      assert {:ok, listed} = Subagents.list(session_id, workspace: workspace)
+      restored = Enum.find(listed, &(&1["id"] == "sub_cold_restore"))
+      assert restored["output_warning_count"] == 65
+      assert length(restored["output_warnings"]) == 64
+      assert hd(restored["output_warnings"])["provider_usage_seq"] == 1
+      assert List.last(restored["output_warnings"])["provider_usage_seq"] == 64
+
+      assert restored["output_warning_reasons"] == [
+               "provider_content_filter",
+               "provider_output_limit"
+             ]
+
+      assert restored["output_truncation"]["call_role"] == "final_answer"
+
+      state = :sys.get_state(Manager)
+      internal = get_in(state, [:parents, session_id, :agents, "sub_cold_restore"])
+      assert internal.output_latest_warning_order_key == {70, "evt_final_cold"}
+    end
+  end
+
+  defp truncation_script(count) do
+    calls =
+      for index <- 1..max(count - 1, 0) do
+        call = %{
+          call_id: "call_#{index}",
+          name: "read",
+          args: %{"path" => "source.txt"}
+        }
+
+        {:ok,
+         %{
+           text: "",
+           reasoning: "",
+           function_calls: [call],
+           output_items: [{:function_call, call}],
+           finish_reason: :tool_calls,
+           output_truncation: truncation_evidence()
+         }}
+      end
+
+    calls ++
+      [
+        {:ok,
+         %{
+           text: "child summary #{count}",
+           reasoning: "",
+           function_calls: [],
+           finish_reason: :stop,
+           output_truncation: truncation_evidence()
+         }}
+      ]
+  end
+
+  defp truncation_evidence do
+    %{
+      status: :truncated,
+      reason: :provider_output_limit,
+      provider_reason: "fixture_limit"
+    }
   end
 end

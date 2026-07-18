@@ -9,7 +9,7 @@ defmodule Pixir.SessionSupervisor do
 
   use DynamicSupervisor
 
-  alias Pixir.Session
+  alias Pixir.{Session, SessionId}
 
   def start_link(init_arg) do
     DynamicSupervisor.start_link(__MODULE__, init_arg, name: __MODULE__)
@@ -31,10 +31,12 @@ defmodule Pixir.SessionSupervisor do
     opts = Keyword.put_new_lazy(opts, :id, &Session.gen_id/0)
     id = Keyword.fetch!(opts, :id)
 
-    case DynamicSupervisor.start_child(__MODULE__, {Session, opts}) do
-      {:ok, pid} -> {:ok, id, pid}
-      {:error, {:already_started, pid}} -> {:ok, id, pid}
-      {:error, _} = err -> err
+    with :ok <- SessionId.validate(id) do
+      case DynamicSupervisor.start_child(__MODULE__, {Session, opts}) do
+        {:ok, pid} -> {:ok, id, pid}
+        {:error, {:already_started, pid}} -> {:ok, id, pid}
+        {:error, _} = err -> err
+      end
     end
   end
 
@@ -46,17 +48,19 @@ defmodule Pixir.SessionSupervisor do
   survive its own rejection as an untracked live writer. A Session that is not
   running is a no-op success.
   """
-  @spec stop_session(String.t()) :: {:ok, :stopped | :not_running}
-  def stop_session(session_id) when is_binary(session_id) do
-    case Registry.lookup(Pixir.Sessions.Registry, session_id) do
-      [{pid, _value}] ->
-        case DynamicSupervisor.terminate_child(__MODULE__, pid) do
-          :ok -> {:ok, :stopped}
-          {:error, :not_found} -> {:ok, :not_running}
-        end
+  @spec stop_session(String.t()) :: {:ok, :stopped | :not_running} | {:error, map()}
+  def stop_session(session_id) do
+    with :ok <- SessionId.validate(session_id) do
+      case Registry.lookup(Pixir.Sessions.Registry, session_id) do
+        [{pid, _value}] ->
+          case DynamicSupervisor.terminate_child(__MODULE__, pid) do
+            :ok -> {:ok, :stopped}
+            {:error, :not_found} -> {:ok, :not_running}
+          end
 
-      [] ->
-        {:ok, :not_running}
+        [] ->
+          {:ok, :not_running}
+      end
     end
   end
 

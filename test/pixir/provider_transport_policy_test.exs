@@ -4,7 +4,7 @@ defmodule Pixir.ProviderTransportPolicyTest do
   import ExUnit.CaptureLog
 
   alias Pixir.{Auth, Event, Provider, Tool}
-  alias Pixir.Provider.Connection
+  alias Pixir.Provider.{Connection, TransportError, TransportPolicy}
 
   setup do
     name = :"auth_#{System.unique_integer([:positive])}"
@@ -373,6 +373,25 @@ defmodule Pixir.ProviderTransportPolicyTest do
     def ping(_socket), do: :ok
   end
 
+  defmodule HeaderRejectingWebSocket do
+    def connect(_endpoint, [{"never-matches", _value}], _opts),
+      do: {:ok, :unreachable, "", %{status: 101}}
+
+    def stream(_socket, _initial_buffer, _payload, acc, _fun, _opts), do: {:ok, acc, %{}}
+    def close(_socket), do: :ok
+    def ping(_socket), do: :ok
+  end
+
+  defmodule KillingWebSocket do
+    def connect(_endpoint, _headers, _opts), do: {:ok, :fake_socket, "", %{status: 101}}
+
+    def stream(_socket, _initial_buffer, _payload, _acc, _fun, _opts),
+      do: Process.exit(self(), :kill)
+
+    def close(_socket), do: :ok
+    def ping(_socket), do: :ok
+  end
+
   defmodule CallbackDeltaWebSocket do
     def connect(_endpoint, _headers, opts),
       do: {:ok, {:fake_socket, Keyword.fetch!(opts, :test_pid)}, "", %{status: 101}}
@@ -459,6 +478,28 @@ defmodule Pixir.ProviderTransportPolicyTest do
     assert Jason.decode!(body)["prompt_cache_key"] == "px1:test"
   end
 
+  test "an out-of-shape prompt_cache_key is dropped, not forwarded as cache metadata",
+       %{auth: auth} do
+    # A raw path, user text, or secret mistakenly threaded as the cache key must
+    # never leave as cache metadata. A control character (newline here, the shape
+    # a multi-line path or secret would take) fails the bounded-hint validation,
+    # so the key is dropped rather than uploaded.
+    leaky_key = "/Users/example/secret\ntoken=sk-ant-do-not-send"
+
+    assert {:ok, _result} =
+             Provider.stream(%{history: [], prompt_cache_key: leaky_key},
+               auth: auth,
+               provider_transport: :http_sse,
+               http_transport: http_success_transport(self()),
+               max_retries: 0
+             )
+
+    assert_received {:http_request, %{body: body}}
+    decoded = Jason.decode!(body)
+    refute Map.has_key?(decoded, "prompt_cache_key")
+    refute body =~ "sk-ant-do-not-send"
+  end
+
   test "auto retries WebSocket after the degraded window expires", %{auth: auth} do
     key = {:reversible_fallback, make_ref()}
 
@@ -539,6 +580,45 @@ defmodule Pixir.ProviderTransportPolicyTest do
              Connection.stream_call_timeout(websocket_call_timeout_ms: -1)
   end
 
+  test "a frozen transport policy does not reread application config" do
+    traced = self()
+    tracer = spawn_link(fn -> forward_application_traces(traced) end)
+
+    :erlang.trace(traced, true, [:call, {:tracer, tracer}])
+    assert :erlang.trace_pattern({Application, :get_env, 3}, true, []) == 1
+
+    on_exit(fn ->
+      :erlang.trace_pattern({Application, :get_env, 3}, false, [])
+      Process.exit(tracer, :kill)
+    end)
+
+    request = %{method: :post, url: "https://example.invalid", headers: [], body: "{}"}
+    reducer = fn _chunk, acc -> acc end
+    http_transport = fn _request, acc, _fun -> {:ok, acc} end
+
+    assert {:ok, %{}} =
+             TransportPolicy.stream(request, %{}, reducer,
+               provider_transport: :http_sse,
+               http_transport: http_transport
+             )
+
+    delivered = :erlang.trace_delivered(traced)
+    assert_receive {:trace_delivered, ^traced, ^delivered}
+
+    refute_receive {:application_get_env, [:pixir, :provider_transport, :auto]}
+  end
+
+  defp forward_application_traces(test) do
+    receive do
+      {:trace, _pid, :call, {Application, :get_env, args}} ->
+        send(test, {:application_get_env, args})
+        forward_application_traces(test)
+
+      _message ->
+        forward_application_traces(test)
+    end
+  end
+
   test "connection status formatter redacts stream requests and provider auth" do
     status =
       Connection.format_status(%{
@@ -546,7 +626,7 @@ defmodule Pixir.ProviderTransportPolicyTest do
           key: {:redaction, :status},
           socket: :fake_socket,
           endpoint:
-            "wss://chatgpt.com/backend-api/codex/responses?access_token=query-secret&chatgpt-account-id=acct-query-secret",
+            "wss://HOST-SECRET.invalid/PATH-SECRET?access_token=query-secret&chatgpt-account-id=acct-query-secret",
           headers_fingerprint: "fingerprint",
           previous_response_id: "resp_secret",
           previous_input: [%{"text" => "secret previous input"}],
@@ -570,6 +650,8 @@ defmodule Pixir.ProviderTransportPolicyTest do
     refute rendered =~ "acct-secret"
     refute rendered =~ "acct-query-secret"
     refute rendered =~ "query-secret"
+    refute rendered =~ "HOST-SECRET"
+    refute rendered =~ "PATH-SECRET"
     refute rendered =~ "secret prompt body"
     refute rendered =~ "secret acc"
     refute rendered =~ "resp_secret"
@@ -577,26 +659,147 @@ defmodule Pixir.ProviderTransportPolicyTest do
     assert rendered =~ "redacted?"
   end
 
-  test "connection crash reports redact the last stream message" do
+  test "connection client crashes return bounded errors without logging the request" do
     key = {:redacted_crash_report, make_ref()}
     request = sensitive_http_request(body_with_inputs(["secret crash prompt"]))
+    parent = self()
 
     log =
       capture_log(fn ->
-        assert catch_exit(
-                 Connection.stream(key, request, %{}, fn _chunk, acc -> acc end,
-                   websocket_client: ExplodingWebSocket
-                 )
-               )
+        send(
+          parent,
+          {:exploding_websocket_result,
+           Connection.stream(key, request, %{}, fn _chunk, acc -> acc end,
+             websocket_client: ExplodingWebSocket
+           )}
+        )
       end)
 
+    assert_receive {:exploding_websocket_result,
+                    {:error,
+                     %{error: %{kind: :network, details: %{reason: :transport_failure}}} = error,
+                     %{}}}
+
+    refute inspect(error) =~ "synthetic websocket crash"
     refute log =~ "secret-token"
     refute log =~ "Bearer secret"
     refute log =~ "acct-secret"
     refute log =~ "acct-query-secret"
     refute log =~ "query-secret"
     refute log =~ "secret crash prompt"
-    assert log =~ "<redacted>"
+  end
+
+  test "connection contains function-clause failures from authenticated WebSocket connect" do
+    request = sensitive_http_request(body_with_inputs(["secret connect prompt"]))
+
+    assert {:error, %{error: %{kind: :network, details: %{reason: :function_clause}}} = error,
+            %{}} =
+             Connection.stream(
+               {:redacted_connect_failure, make_ref()},
+               request,
+               %{},
+               fn _chunk, acc -> acc end,
+               websocket_client: HeaderRejectingWebSocket
+             )
+
+    rendered = inspect(error)
+    refute rendered =~ "secret-token"
+    refute rendered =~ "Bearer secret"
+    refute rendered =~ "acct-secret"
+    refute rendered =~ "secret connect prompt"
+  end
+
+  test "direct Connection callers receive a bounded error when the server dies" do
+    request = sensitive_http_request(body_with_inputs(["secret killed prompt"]))
+
+    assert {:error,
+            %{error: %{kind: :network, details: %{reason: :transport_process_exited}}} = error,
+            %{}} =
+             Connection.stream(
+               {:killed_connection, make_ref()},
+               request,
+               %{},
+               fn _chunk, acc -> acc end,
+               websocket_client: KillingWebSocket
+             )
+
+    rendered = inspect(error)
+    refute rendered =~ "secret-token"
+    refute rendered =~ "Bearer secret"
+    refute rendered =~ "acct-secret"
+    refute rendered =~ "secret killed prompt"
+  end
+
+  test "connection status bounds fabricated non-binary endpoints" do
+    status =
+      Connection.format_status(%{
+        state: %{
+          key: :fabricated_endpoint,
+          socket: nil,
+          endpoint: %{secret: "NON_BINARY_ENDPOINT_SECRET"},
+          headers_fingerprint: nil,
+          previous_response_id: nil,
+          previous_input: [],
+          previous_model: nil,
+          last_continuation_reset_reason: nil,
+          degraded_until_ms: 0,
+          failures: 0,
+          idle_timer: nil,
+          keepalive_timer: nil,
+          websocket_client: SuccessfulWebSocket
+        }
+      })
+
+    rendered = inspect(status)
+    assert rendered =~ "<configured_endpoint>"
+    refute rendered =~ "NON_BINARY_ENDPOINT_SECRET"
+  end
+
+  test "transport projection drops raw WebSocket handshake lines" do
+    sentinel = "WEBSOCKET_STATUS_LINE_SECRET"
+
+    projected =
+      TransportError.project(
+        Tool.error(:websocket_handshake_failed, "raw #{sentinel}", %{
+          status: 401,
+          status_line: "HTTP/1.1 401 #{sentinel}",
+          endpoint: "wss://#{sentinel}.invalid"
+        })
+      )
+
+    assert %{error: %{kind: :websocket_handshake_failed, details: %{status: 401}}} = projected
+    refute inspect(projected) =~ sentinel
+  end
+
+  test "transport projection preserves only allowlisted recovery context" do
+    sentinel = "UNTRUSTED_RECOVERY_SECRET"
+
+    projected =
+      TransportError.project(
+        Tool.error(:network, "raw #{sentinel}", %{
+          reason: "stream_callback_failed",
+          exit_kind: :throw,
+          exit_reason: :badarg,
+          continuation_reset_reason: "stream_callback_failed",
+          next_actions: ["retry_turn", sentinel],
+          key: sentinel
+        })
+      )
+
+    assert %{
+             error: %{
+               kind: :network,
+               details: %{
+                 reason: :stream_callback_failed,
+                 exit_kind: :throw,
+                 exit_reason: :badarg,
+                 continuation_reset_reason: "stream_callback_failed",
+                 next_actions: ["retry_turn"]
+               }
+             }
+           } = projected
+
+    refute inspect(projected) =~ sentinel
   end
 
   test "stream callback failure returns structured error and resets continuation" do
@@ -628,6 +831,8 @@ defmodule Pixir.ProviderTransportPolicyTest do
                 kind: :network,
                 details: %{
                   reason: "stream_callback_failed",
+                  exit_kind: :exit,
+                  exit_reason: :transport_failure,
                   continuation_reset_reason: "stream_callback_failed"
                 }
               }

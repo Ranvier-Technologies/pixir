@@ -56,6 +56,13 @@ defmodule Pixir.TurnTest do
     end
   end
 
+  defmodule OptsCaptureProvider do
+    def stream(_request, opts) do
+      send(Keyword.fetch!(opts, :test_pid), {:provider_runtime_opts, opts})
+      {:ok, %{text: "ok", reasoning: "", function_calls: [], finish_reason: :stop}}
+    end
+  end
+
   defmodule StopSessionBeforeUsageProvider do
     def stream(_request, opts) do
       pid = Keyword.fetch!(opts, :session_pid)
@@ -170,6 +177,26 @@ defmodule Pixir.TurnTest do
     refute Map.has_key?(request, :web_search)
   end
 
+  test "custom Provider runtime opts omit consumed Config ingress seams", %{ctx: ctx} do
+    assert {:ok, "ok"} =
+             Turn.run(ctx, "capture runtime opts",
+               provider: OptsCaptureProvider,
+               provider_opts: [
+                 test_pid: self(),
+                 config_path: "/tmp/must-not-survive",
+                 raw_config: %{"secret" => "must-not-survive"},
+                 request_snapshot_loader: fn _ -> :must_not_survive end
+               ]
+             )
+
+    assert_received {:provider_runtime_opts, runtime_opts}
+
+    refute Enum.any?(
+             [:config_path, :raw_config, :request_snapshot_loader],
+             &Keyword.has_key?(runtime_opts, &1)
+           )
+  end
+
   test "prompt-cache-key providers do not receive Anthropic pa1 neutral fields", %{ctx: ctx} do
     assert {:ok, "ok"} =
              Turn.run(ctx, "openai shape",
@@ -207,6 +234,90 @@ defmodule Pixir.TurnTest do
       |> Keyword.put(:provider_opts, provider_opts)
 
     Turn.run(ctx, prompt, opts)
+  end
+
+  test "profile preflight records one configuration failure and never enters Provider plumbing",
+       %{
+         ctx: ctx,
+         sid: sid,
+         ws: ws
+       } do
+    profiles = [{%{"mode" => "future"}, :invalid_config, :unknown_mode}]
+
+    for {profile, kind, reason} <- profiles do
+      assert {:error,
+              %{
+                error: %{
+                  kind: ^kind,
+                  details: %{reason: ^reason}
+                }
+              }} =
+               Turn.run(ctx, "profile preflight #{kind}",
+                 config_opts: [
+                   raw_config: %{
+                     "model" => "gpt-5.4-mini",
+                     "responses_backend" => profile
+                   }
+                 ],
+                 provider_opts: [
+                   auth: :missing_issue_317_turn_auth,
+                   transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+                 ]
+               )
+    end
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    relevant =
+      Enum.filter(history, &(&1.type in [:user_message, :assistant_message, :turn_failed]))
+
+    assert Enum.map(relevant, & &1.type) == [
+             :user_message,
+             :turn_failed
+           ]
+
+    refute Enum.any?(relevant, &(&1.type == :assistant_message))
+
+    for failure <- Enum.filter(relevant, &(&1.type == :turn_failed)) do
+      assert failure.data["terminal_status"] == "configuration_error"
+      assert failure.data["error_kind"] == "invalid_config"
+      assert Map.keys(failure.data["details"]) |> Enum.sort() == ["field", "reason"]
+      refute inspect(failure) =~ "stage.example"
+    end
+  end
+
+  test "explicit non-callable Providers record terminal configuration errors", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    invalid = [nil, false, true, :not_a_real_module_atom, Pixir.Issue317UnloadedProvider]
+
+    for provider <- invalid do
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_config,
+                  details: %{field: :provider, reason: :invalid_resolved_request}
+                }
+              }} =
+               Turn.run(ctx, "reject explicit provider #{inspect(provider)}",
+                 provider: provider,
+                 provider_opts: [
+                   transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+                 ]
+               )
+    end
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    assert Enum.map(history, & &1.type) ==
+             List.duplicate([:user_message, :turn_failed], length(invalid)) |> List.flatten()
+
+    for failure <- Enum.filter(history, &(&1.type == :turn_failed)) do
+      assert failure.data["terminal_status"] == "configuration_error"
+      assert failure.data["error_kind"] == "invalid_config"
+    end
   end
 
   test "single-shot answer records user + assistant and streams text", %{
@@ -894,6 +1005,93 @@ defmodule Pixir.TurnTest do
     assert {:ok, history} = Log.fold(sid, workspace: ws)
     result = Enum.find(history, &(&1.type == :tool_result))
     assert result.data["dry_run"] == true
+  end
+
+  test "Turn sanitizes resolved selection before the real Executor boundary", %{ctx: ctx} do
+    alias Pixir.Tools.Executor
+
+    Code.ensure_loaded!(Executor)
+    traced = self()
+    tracer = spawn_link(fn -> forward_executor_traces(traced) end)
+    :erlang.trace(traced, true, [:call, {:tracer, tracer}])
+    assert :erlang.trace_pattern({Executor, :run, 2}, true, []) == 1
+
+    on_exit(fn ->
+      :erlang.trace_pattern({Executor, :run, 2}, false, [])
+      Process.exit(tracer, :kill)
+    end)
+
+    first = [
+      "data: " <>
+        Jason.encode!(%{
+          type: "response.output_item.done",
+          item: %{
+            type: "function_call",
+            call_id: "call_validate_child",
+            name: "spawn_agent",
+            arguments: Jason.encode!(%{"task" => "validate only", "validate_only" => true})
+          }
+        }) <> "\n\n",
+      "data: " <> Jason.encode!(%{type: "response.completed"}) <> "\n\n"
+    ]
+
+    second = [
+      "data: " <>
+        Jason.encode!(%{type: "response.output_text.delta", delta: "done"}) <> "\n\n",
+      "data: " <> Jason.encode!(%{type: "response.completed"}) <> "\n\n"
+    ]
+
+    {:ok, attempts} = Agent.start_link(fn -> [first, second] end)
+
+    transport = fn _request, acc, fun ->
+      chunks = Agent.get_and_update(attempts, fn [head | tail] -> {head, tail} end)
+      acc = fun.({:status, 200}, acc)
+      {:ok, Enum.reduce(chunks, acc, fn chunk, current -> fun.({:data, chunk}, current) end)}
+    end
+
+    auth = start_auth()
+
+    assert {:ok, "done"} =
+             Turn.run(ctx, "validate child boundary",
+               dry_run: true,
+               config_opts: [raw_config: %{}],
+               provider_opts: [
+                 auth: auth,
+                 transport: transport,
+                 model: "gpt-boundary",
+                 max_retries: 0,
+                 config_path: "/tmp/must-not-survive",
+                 raw_config: %{"secret" => "must-not-survive"},
+                 request_snapshot_loader: fn _ -> :must_not_survive end
+               ]
+             )
+
+    assert_receive {:captured_executor_trace,
+                    {:trace, _pid, :call, {Executor, :run, [_call, context]}}}
+
+    inherited = context.provider_opts
+    assert inherited[:model] == "gpt-boundary"
+    assert inherited[:max_retries] == 0
+    assert inherited[:stream_idle_timeout_ms] == 180_000
+
+    refute Enum.any?(
+             [
+               :resolved_provider_request,
+               :responses_backend,
+               :config_path,
+               :raw_config,
+               :request_snapshot_loader
+             ],
+             &Keyword.has_key?(inherited, &1)
+           )
+  end
+
+  defp forward_executor_traces(test) do
+    receive do
+      message ->
+        send(test, {:captured_executor_trace, message})
+        forward_executor_traces(test)
+    end
   end
 
   test "plan mode denies a mutating tool and never writes the file (D.3)", %{

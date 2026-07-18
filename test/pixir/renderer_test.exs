@@ -103,6 +103,129 @@ defmodule Pixir.RendererTest do
     test "times out when no terminal status arrives" do
       assert :timeout = Renderer.consume_until_done(idle_timeout: 20)
     end
+
+    test "bounds Provider warnings at 255/256/257 and emits one suppression footer" do
+      for count <- [255, 256, 257] do
+        for seq <- 1..count do
+          id = "evt_renderer_#{seq}"
+
+          event =
+            Event.provider_usage(
+              "s",
+              %{
+                "output_truncation" => %{
+                  "status" => "truncated",
+                  "reason" => "provider_output_limit",
+                  "provider_reason" => "max_tokens",
+                  "provider_usage_event_id" => id,
+                  "call_role" => "intermediate"
+                }
+              },
+              id: id,
+              seq: seq
+            )
+
+          send(self(), {:pixir_event, event})
+        end
+
+        send(self(), {:pixir_event, Event.status("s", "done")})
+
+        stderr =
+          capture_io(:stderr, fn ->
+            assert :ok = Renderer.consume_until_done(idle_timeout: 1_000)
+          end)
+
+        assert length(Regex.scan(~r/warning: provider output was truncated/, stderr)) ==
+                 min(count, 256)
+
+        assert length(Regex.scan(~r/additional provider-output truncation notices/, stderr)) ==
+                 if(count == 257, do: 1, else: 0)
+      end
+    end
+
+    test "deduplicates Provider callbacks by Session/Event including the suppressed 257th" do
+      for seq <- 1..257 do
+        send(self(), {:pixir_event, output_warning_event("s", seq, "evt_dedup_#{seq}")})
+      end
+
+      send(self(), {:pixir_event, output_warning_event("s", 257, "evt_dedup_257")})
+      send(self(), {:pixir_event, output_warning_fallback("s", "evt_dedup_257", 257)})
+      send(self(), {:pixir_event, Event.status("s", "done")})
+
+      stderr =
+        capture_io(:stderr, fn ->
+          assert :ok = Renderer.consume_until_done(idle_timeout: 1_000)
+        end)
+
+      assert length(Regex.scan(~r/warning: provider output was truncated/, stderr)) == 256
+      assert stderr =~ "(total=257, shown=256)"
+      refute stderr =~ "total=258"
+    end
+
+    test "same Event id in distinct Sessions remains distinct across consume epochs" do
+      send(self(), {:pixir_event, output_warning_event("session_a", 1, "evt_shared")})
+      send(self(), {:pixir_event, Event.status("session_a", "done")})
+
+      session_a =
+        capture_io(:stderr, fn ->
+          assert :ok = Renderer.consume_until_done(idle_timeout: 1_000, session_id: "session_a")
+        end)
+
+      send(self(), {:pixir_event, output_warning_event("session_b", 1, "evt_shared")})
+      send(self(), {:pixir_event, Event.status("session_b", "done")})
+
+      session_b =
+        capture_io(:stderr, fn ->
+          assert :ok = Renderer.consume_until_done(idle_timeout: 1_000, session_id: "session_b")
+        end)
+
+      assert length(Regex.scan(~r/warning: provider output was truncated/, session_a)) == 1
+      assert length(Regex.scan(~r/warning: provider output was truncated/, session_b)) == 1
+    end
+
+    test "foreign Session warnings fallbacks and terminals cannot contaminate an explicit epoch" do
+      send(self(), {:pixir_event, output_warning_event("foreign", 1, "evt_foreign")})
+      send(self(), {:pixir_event, output_warning_fallback("foreign", "evt_foreign", 1)})
+      send(self(), {:pixir_event, Event.status("foreign", "done")})
+      send(self(), {:pixir_event, output_warning_event("target", 1, "evt_target")})
+      send(self(), {:pixir_event, Event.status("target", "done")})
+
+      stderr =
+        capture_io(:stderr, fn ->
+          capture_io(fn ->
+            assert :ok = Renderer.consume_until_done(idle_timeout: 1_000, session_id: "target")
+          end)
+        end)
+
+      assert length(Regex.scan(~r/warning: provider output was truncated/, stderr)) == 1
+      assert stderr =~ "evt_target"
+      refute stderr =~ "evt_foreign"
+    end
+
+    test "assistant fallback is counted once when usage is absent and deduped when present" do
+      fallback = output_warning_fallback("s", "evt_fallback", 7)
+      send(self(), {:pixir_event, fallback})
+      send(self(), {:pixir_event, Event.status("s", "done")})
+
+      fallback_only =
+        capture_io(:stderr, fn ->
+          capture_io(fn -> assert :ok = Renderer.consume_until_done(idle_timeout: 1_000) end)
+        end)
+
+      assert length(Regex.scan(~r/warning: provider output was truncated/, fallback_only)) == 1
+
+      send(self(), {:pixir_event, output_warning_event("s", 7, "evt_fallback", "final_answer")})
+      send(self(), {:pixir_event, fallback})
+      send(self(), {:pixir_event, Event.status("s", "done")})
+
+      provider_and_fallback =
+        capture_io(:stderr, fn ->
+          capture_io(fn -> assert :ok = Renderer.consume_until_done(idle_timeout: 1_000) end)
+        end)
+
+      assert length(Regex.scan(~r/warning: provider output was truncated/, provider_and_fallback)) ==
+               1
+    end
   end
 
   test "end-to-end: a Turn streams its answer to stdout via the bus" do
@@ -138,5 +261,37 @@ defmodule Pixir.RendererTest do
       end)
 
     assert output =~ "All done."
+  end
+
+  defp output_warning_event(session_id, seq, id, role \\ "intermediate") do
+    Event.provider_usage(
+      session_id,
+      %{
+        "output_truncation" => %{
+          "status" => "truncated",
+          "reason" => "provider_output_limit",
+          "provider_reason" => "max_tokens",
+          "provider_usage_event_id" => id,
+          "call_role" => role
+        }
+      },
+      id: id,
+      seq: seq
+    )
+  end
+
+  defp output_warning_fallback(session_id, id, seq) do
+    Event.assistant_message(session_id, "exact",
+      metadata: %{
+        "output_truncation" => %{
+          "status" => "truncated",
+          "reason" => "provider_output_limit",
+          "provider_reason" => "max_tokens",
+          "provider_usage_event_id" => id,
+          "provider_usage_seq" => seq,
+          "call_role" => "final_answer"
+        }
+      }
+    )
   end
 end

@@ -68,6 +68,13 @@ Or set an OpenAI API key:
 export OPENAI_API_KEY=...
 ```
 
+The default Provider remains ChatGPT/Codex Responses. Source-checkout operators may
+configure the experimental conservative `open_responses` HTTP/SSE profile for a
+validated endpoint, then run `mix pixir.smoke.open_responses --dry-run --json` before
+the opt-in live two-call probe. The profile is reasoning-free, does not enable hosted
+tools, preserves `store: false`, and makes only a bounded interoperability claim. See
+[`docs/open-beta-quickstart.md`](docs/open-beta-quickstart.md#open-responses-profile-experimental).
+
 ## First Run
 
 Run Pixir inside another repository:
@@ -140,6 +147,39 @@ That is enough to use those presenters for dogfood and operator feedback. It is 
 public claim of strict UI parity, production support, or bundled T3/Zed integrations.
 When a presenter result matters, reconcile the visible answer with Pixir's local Log,
 `inspect-replay`, `diagnose`, and `tree` output.
+
+## Pixir Monitor (Source Checkout Only)
+
+A source checkout includes `monitor/`, an experimental loopback-only, read-only web
+Presenter for authoritative Pixir run projections. It is a sibling Phoenix/Bandit app
+that depends on Pixir; Pixir core and the Hex package do not depend on Phoenix.
+
+```bash
+cd monitor
+mix deps.get
+mix escript.build
+./pixir-monitor self-check --json
+./pixir-monitor serve --dry-run --json
+```
+
+The self-check exercises the built escript against its real ephemeral loopback HTTP
+listener: it performs the one-use bootstrap internally, fetches the BEAM-embedded
+JavaScript and CSS, and validates the authoritative Runs envelope without emitting the
+launch capability. Normal operation uses the filesystem projection source by default.
+The Runs inventory selects the newest bounded set of Logs and reports total, selected,
+and truncated counts instead of failing when more Logs exist.
+
+A bounded metadata-only Log watcher emits coalesced SSE invalidation hints. Streams
+rotate after 300 seconds; rotation, reconnects, errors, and hints all lead clients back
+to authoritative HTTP snapshots. Listener-port discovery recovers across Endpoint
+restarts and clears stale port state. Automatic browser launch is Darwin-only and
+passes its in-memory capability through a private `0700` directory and `0600` FIFO,
+never in process arguments.
+
+Pixir Monitor is not included in the Hex package, has no packaged install path, and is
+not a production-supported web UI. Logs remain truth, browser state is disposable, and
+the Monitor exposes no runtime mutation routes. See
+`docs/adr/0038-pixir-monitor-sibling-spa-sse.md` for the experimental contract.
 
 ## What Pixir Includes
 

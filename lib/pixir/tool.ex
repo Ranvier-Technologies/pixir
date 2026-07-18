@@ -70,16 +70,17 @@ defmodule Pixir.Tool do
       `:backpressure`
     * **turn loop** — `:iteration_cap`, `:tool_result_record_failed`,
       `:session_record_unavailable`
-    * **log / writer lease** — `:corrupt_log_line`, `:ephemeral_not_loggable`,
+    * **log / writer lease** — `:unsafe_state_path`, `:corrupt_log_line`, `:ephemeral_not_loggable`,
       `:log_encode_failed`, `:log_read_failed`, `:log_write_failed`,
       `:session_writer_active`, `:session_writer_stale`,
       `:session_writer_ambiguous`, `:session_writer_lost`
     * **provider** — `:provider_http_error`, `:model_not_supported`, `:usage_limit_reached`,
       `:rate_limited`, `:network`, `:provider_refusal`, `:unsupported_transport`,
-      `:context_overflow`, `:stream_idle_timeout`
-    * **auth** — `:not_authenticated`, `:token_request_failed`, `:no_account_id`,
-      `:invalid_response`, `:corrupt_auth`, `:auth_read_failed`, `:auth_write_failed`,
-      `:device_auth_failed`, `:device_code_unsupported`, `:session_start_failed`
+      `:unsupported_backend_capability`, `:context_overflow`, `:stream_idle_timeout`
+    * **auth** — `:not_authenticated`, `:insecure_auth_transport`,
+      `:token_request_failed`, `:no_account_id`, `:invalid_response`, `:corrupt_auth`,
+      `:auth_read_failed`, `:auth_write_failed`, `:device_auth_failed`,
+      `:device_code_unsupported`, `:session_start_failed`
     * **cli / stdin** — `:no_prompt`, `:stdin_error`
 
   Note: a `bash` command that runs but exits nonzero is **not** an error — it returns a
@@ -107,6 +108,7 @@ defmodule Pixir.Tool do
           | :iteration_cap
           | :tool_result_record_failed
           | :session_record_unavailable
+          | :unsafe_state_path
           | :corrupt_log_line
           | :ephemeral_not_loggable
           | :log_encode_failed
@@ -123,9 +125,11 @@ defmodule Pixir.Tool do
           | :network
           | :provider_refusal
           | :unsupported_transport
+          | :unsupported_backend_capability
           | :context_overflow
           | :stream_idle_timeout
           | :not_authenticated
+          | :insecure_auth_transport
           | :token_request_failed
           | :no_account_id
           | :invalid_response

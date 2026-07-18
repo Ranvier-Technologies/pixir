@@ -128,4 +128,98 @@ defmodule Pixir.SessionLeaseTest do
     refute File.exists?(path)
     assert File.exists?(release_record_path)
   end
+
+  test "lease operations reject symlinked state ancestors and final files", %{ws: ws, sid: sid} do
+    outside = ws <> "-outside"
+    File.mkdir_p!(outside)
+    on_exit(fn -> File.rm_rf!(outside) end)
+    sentinel = Path.join(outside, "sentinel")
+    File.write!(sentinel, "unchanged")
+
+    File.mkdir_p!(Paths.project_root(ws))
+    File.ln_s!(outside, Paths.session_leases_dir(ws))
+
+    assert {:error, %{error: %{kind: :unsafe_state_path}}} =
+             SessionLease.acquire(sid, workspace: ws)
+
+    assert {:error, %{error: %{kind: :unsafe_state_path}}} =
+             SessionLease.status(sid, workspace: ws)
+
+    File.rm!(Paths.session_leases_dir(ws))
+    Paths.ensure_session_leases_dir(ws)
+    lease_path = Paths.session_lease(sid, ws)
+    File.ln_s!(sentinel, lease_path)
+
+    assert {:error, %{error: %{kind: :unsafe_state_path}}} =
+             SessionLease.acquire(sid, workspace: ws)
+
+    assert {:error, %{error: %{kind: :unsafe_state_path}}} =
+             SessionLease.release(%{
+               "session_id" => sid,
+               "workspace" => ws,
+               "holder_id" => "holder"
+             })
+
+    assert File.read!(sentinel) == "unchanged"
+  end
+
+  test "unsafe releases directory preserves the original stale lease", %{ws: ws, sid: sid} do
+    outside = ws <> "-release-outside"
+    File.mkdir_p!(outside)
+    on_exit(fn -> File.rm_rf!(outside) end)
+    assert {:ok, lease} = SessionLease.acquire(sid, workspace: ws)
+
+    stale =
+      lease
+      |> Map.put("heartbeat_at_ms", System.system_time(:millisecond) - 60_000)
+      |> Map.put("stale_after_ms", 1)
+
+    File.write!(lease["lease_path"], Jason.encode!(stale))
+    File.ln_s!(outside, Paths.session_lease_releases_dir(ws))
+
+    assert {:error, %{error: %{kind: :unsafe_state_path}}} =
+             SessionLease.force_release(sid, workspace: ws, reason: "must_preserve_lease")
+
+    assert File.exists?(lease["lease_path"])
+    assert File.ls!(outside) == []
+  end
+
+  test "forced-release filename is bounded while JSON preserves a 235-byte id", %{ws: ws} do
+    sid = "a" <> String.duplicate("b", 234)
+    assert {:ok, lease} = SessionLease.acquire(sid, workspace: ws)
+
+    stale =
+      lease
+      |> Map.put("heartbeat_at_ms", System.system_time(:millisecond) - 60_000)
+      |> Map.put("stale_after_ms", 1)
+
+    File.write!(lease["lease_path"], Jason.encode!(stale))
+
+    assert {:ok, %{"release_record_path" => release_path}} =
+             SessionLease.force_release(sid, workspace: ws, reason: "bounded_name")
+
+    assert byte_size(Path.basename(release_path)) < 255
+    assert %{"session_id" => ^sid} = release_path |> File.read!() |> Jason.decode!()
+  end
+
+  test "non-string workspace in untrusted lease JSON is classified ambiguous", %{ws: ws, sid: sid} do
+    Paths.ensure_session_leases_dir(ws)
+
+    File.write!(
+      Paths.session_lease(sid, ws),
+      Jason.encode!(%{
+        "version" => 1,
+        "purpose" => "session_writer",
+        "session_id" => sid,
+        "workspace" => 123,
+        "holder_id" => "holder",
+        "heartbeat_at_ms" => System.system_time(:millisecond)
+      })
+    )
+
+    assert {:ok, %{"state" => "ambiguous"}} = SessionLease.status(sid, workspace: ws)
+
+    assert {:error, %{error: %{kind: :session_writer_ambiguous}}} =
+             SessionLease.acquire(sid, workspace: ws)
+  end
 end

@@ -25,6 +25,7 @@ defmodule Pixir.Config do
 
   alias Pixir.Paths
   alias Pixir.Provider.HostedTools
+  alias Pixir.Providers.ResponsesBackend
 
   @default_model "gpt-5.5"
   @default_bash_timeout_ms 120_000
@@ -53,17 +54,28 @@ defmodule Pixir.Config do
   def load(opts \\ []) do
     path = Keyword.get(opts, :config_path, Paths.config_file())
 
-    case read_raw(path, opts) do
-      {:ok, raw} ->
-        warnings = warnings(raw)
-        effective = effective_map(raw, warnings)
+    case read_source_document(path, opts) do
+      {:ok, source} ->
+        case decode_source_document_for_load(source) do
+          {:ok, raw, profile_error} ->
+            {profile_warning, profile_summary} = profile_projection(raw, profile_error)
+            warnings = warnings(raw) ++ List.wrap(profile_warning)
 
-        %{
-          "path" => Path.expand(path),
-          "present" => true,
-          "effective" => effective,
-          "warnings" => warnings
-        }
+            effective =
+              raw
+              |> effective_map(warnings)
+              |> maybe_put_responses_backend(profile_summary)
+
+            %{
+              "path" => Path.expand(path),
+              "present" => true,
+              "effective" => effective,
+              "warnings" => warnings
+            }
+
+          {:error, error} ->
+            config_error_projection(path, error)
+        end
 
       {:missing, _} ->
         %{
@@ -73,14 +85,63 @@ defmodule Pixir.Config do
           "warnings" => []
         }
 
-      {:error, reason} ->
-        %{
-          "path" => Path.expand(path),
-          "present" => true,
-          "error" => inspect(reason),
-          "effective" => effective_map(%{}, []),
-          "warnings" => []
-        }
+      {:error, error} ->
+        config_error_projection(path, error)
+    end
+  end
+
+  @doc "Resolve one immutable model/backend snapshot from exactly one source-document read."
+  @spec request_snapshot(keyword()) :: {:ok, map()} | {:error, map()}
+  def request_snapshot(opts \\ []) do
+    path = Keyword.get(opts, :config_path, Paths.config_file())
+
+    with {:ok, source} <- invoke_snapshot_loader(path, opts),
+         {:ok, raw} <- decode_source_document(source),
+         {:ok, backend} <- snapshot_backend(raw) do
+      {model, model_source, provider_defaults} = snapshot_request_values(raw)
+
+      {:ok,
+       %{
+         model: model,
+         model_source: model_source,
+         responses_backend: backend,
+         provider_defaults: provider_defaults,
+         config_present?: source.present?
+       }}
+    else
+      {:missing, source} ->
+        {model, model_source, provider_defaults} = snapshot_request_values(%{})
+
+        {:ok,
+         %{
+           model: model,
+           model_source: model_source,
+           responses_backend: :absent,
+           provider_defaults: provider_defaults,
+           config_present?: source.present?
+         }}
+
+      {:error, %{ok: false, error: %{kind: :invalid_config}}} = error ->
+        error
+
+      {:error, %{kind: :invalid_json}} ->
+        invalid_config(:config, :invalid_json, "The Pixir configuration JSON is invalid.")
+
+      {:error, %{kind: :read_failed}} ->
+        invalid_config(:config, :read_failed, "The Pixir configuration could not be read.")
+
+      {:error, _other} ->
+        invalid_config(:config, :read_failed, "The Pixir configuration could not be read.")
+    end
+  end
+
+  @doc "Resolve only the explicit Responses backend descriptor from one request snapshot."
+  @spec responses_backend(keyword()) ::
+          {:ok, :absent | ResponsesBackend.t()} | {:error, map()}
+  def responses_backend(opts \\ []) do
+    case request_snapshot(opts) do
+      {:ok, %{responses_backend: backend}} -> {:ok, backend}
+      {:error, _} = error -> error
     end
   end
 
@@ -139,11 +200,13 @@ defmodule Pixir.Config do
   def compaction_model_assisted(opts \\ []),
     do: get_in(load(opts), ["effective", "compaction", "model_assisted"])
 
-  @doc "Model slug from config.json only (no env/app precedence)."
+  @doc "Effective model when config.json is present; application and env precedence still applies."
   @spec file_model(keyword()) :: String.t() | nil
   def file_model(opts \\ []) do
-    with %{"present" => true} <- load(opts),
-         model when is_binary(model) <- get_in(load(opts), ["effective", "model"]) do
+    loaded = load(opts)
+
+    with %{"present" => true} <- loaded,
+         model when is_binary(model) <- get_in(loaded, ["effective", "model"]) do
       model
     else
       _ -> nil
@@ -199,28 +262,389 @@ defmodule Pixir.Config do
   defp put_optional(opts, _key, nil), do: opts
   defp put_optional(opts, key, value), do: Keyword.put_new(opts, key, value)
 
-  defp read_raw(path, opts) do
-    case Keyword.get(opts, :raw_config) do
-      raw when is_map(raw) ->
-        {:ok, raw}
+  defp invoke_snapshot_loader(path, opts) do
+    case Keyword.fetch(opts, :request_snapshot_loader) do
+      :error ->
+        read_source_document(path, opts)
 
-      _ ->
-        case File.read(path) do
-          {:ok, contents} ->
-            case Jason.decode(contents) do
-              {:ok, raw} when is_map(raw) -> {:ok, raw}
-              {:ok, _} -> {:error, :not_object}
-              {:error, reason} -> {:error, reason}
-            end
+      {:ok, loader} when not is_function(loader) ->
+        invalid_loader(:invalid_loader_type)
 
-          {:error, :enoent} ->
-            {:missing, path}
+      {:ok, loader} when not is_function(loader, 1) ->
+        invalid_loader(:invalid_loader_arity)
 
-          {:error, reason} ->
-            {:error, reason}
+      {:ok, loader} ->
+        loader_opts = Keyword.delete(opts, :request_snapshot_loader)
+
+        try do
+          loader.(loader_opts)
+          |> validate_loader_result()
+        rescue
+          _error -> invalid_loader(:loader_execution_failed)
+        catch
+          _kind, _reason -> invalid_loader(:loader_execution_failed)
         end
     end
   end
+
+  defp validate_loader_result({:ok, source}) when is_map(source) do
+    with true <- Map.get(source, :present?) == true,
+         origin when origin in [:programmatic, :file] <- Map.get(source, :origin),
+         document <- Map.get(source, :document),
+         true <- valid_source_document?(origin, document) do
+      {:ok, %{present?: true, origin: origin, document: document}}
+    else
+      _ -> invalid_loader(:invalid_loader_result)
+    end
+  end
+
+  defp validate_loader_result({:missing, source}) when is_map(source) do
+    if Map.get(source, :present?) == false and Map.get(source, :origin) == :file and
+         is_binary(Map.get(source, :path)) do
+      {:missing, %{present?: false, origin: :file, path: Map.get(source, :path)}}
+    else
+      invalid_loader(:invalid_loader_result)
+    end
+  end
+
+  defp validate_loader_result({:error, %{kind: :read_failed} = error})
+       when map_size(error) == 1,
+       do: {:error, error}
+
+  defp validate_loader_result({:error, %{kind: :invalid_json, position: position} = error})
+       when map_size(error) == 2 and is_integer(position) and position >= 0,
+       do: {:error, error}
+
+  defp validate_loader_result(_result), do: invalid_loader(:invalid_loader_result)
+
+  defp valid_source_document?(:programmatic, document), do: plain_map?(document)
+  defp valid_source_document?(:file, document), do: is_binary(document)
+
+  # Frozen #317 seam: one invocation performs at most one File.read/1.
+  defp read_source_document(path, opts) do
+    case Keyword.fetch(opts, :raw_config) do
+      {:ok, raw} when is_map(raw) and not is_struct(raw) ->
+        {:ok, %{present?: true, origin: :programmatic, document: raw}}
+
+      {:ok, nil} ->
+        read_source_file(path)
+
+      {:ok, _invalid} ->
+        {:error, %{kind: :invalid_json, position: 0}}
+
+      :error ->
+        read_source_file(path)
+    end
+  end
+
+  defp read_source_file(path) do
+    case File.read(path) do
+      {:ok, contents} ->
+        {:ok, %{present?: true, origin: :file, document: contents}}
+
+      {:error, :enoent} ->
+        {:missing, %{present?: false, origin: :file, path: Path.expand(path)}}
+
+      {:error, _reason} ->
+        {:error, %{kind: :read_failed}}
+    end
+  end
+
+  defp plain_map?(value), do: is_map(value) and not is_struct(value)
+
+  defp decode_source_document(%{origin: :programmatic, document: raw})
+       when is_map(raw) and not is_struct(raw),
+       do: normalize_programmatic_document(raw)
+
+  defp decode_source_document(%{origin: :file, document: contents}) when is_binary(contents) do
+    with {:ok, ordered, raw} <- decode_file_document(contents),
+         {:ok, profile_override} <- duplicate_safe_profile(ordered) do
+      {:ok, maybe_override_profile(raw, profile_override)}
+    end
+  end
+
+  defp decode_source_document(_source), do: invalid_loader(:invalid_loader_result)
+
+  defp decode_source_document_for_load(%{origin: :programmatic, document: raw})
+       when is_map(raw) and not is_struct(raw) do
+    normalize_programmatic_for_load(raw)
+  end
+
+  defp decode_source_document_for_load(%{origin: :file, document: contents}) do
+    with {:ok, ordered, raw} <- decode_file_document(contents) do
+      case duplicate_safe_profile(ordered) do
+        {:ok, profile_override} ->
+          {:ok, maybe_override_profile(raw, profile_override), nil}
+
+        {:error, %{ok: false, error: %{kind: :invalid_config} = error}} ->
+          {:ok, Map.delete(raw, "responses_backend"), error}
+
+        {:error, _} = error ->
+          error
+      end
+    end
+  end
+
+  defp decode_source_document_for_load(_source),
+    do: {:error, %{kind: :invalid_json, position: 0}}
+
+  defp decode_file_document(contents) do
+    case decode_ordered(contents) do
+      {:ok, ordered} ->
+        with :ok <- reject_non_profile_duplicates(ordered) do
+          {:ok, ordered, ordered_document_to_plain(ordered)}
+        end
+
+      {:error, %Jason.DecodeError{} = error} ->
+        {:error, %{kind: :invalid_json, position: bounded_position(error.position, contents)}}
+
+      {:error, _} ->
+        {:error, %{kind: :invalid_json, position: 0}}
+    end
+  end
+
+  defp ordered_document_to_plain(%Jason.OrderedObject{values: pairs}) do
+    Map.new(pairs, fn {key, value} -> {key, ordered_document_to_plain(value)} end)
+  end
+
+  defp ordered_document_to_plain(list) when is_list(list) do
+    Enum.map(list, &ordered_document_to_plain/1)
+  end
+
+  defp ordered_document_to_plain(value), do: value
+
+  defp reject_non_profile_duplicates(%Jason.OrderedObject{values: pairs}) do
+    reject_ordered_pairs(pairs, MapSet.new(), :root)
+  end
+
+  defp reject_ordered_pairs([], _seen, _level), do: :ok
+
+  defp reject_ordered_pairs([{key, value} | rest], seen, level) do
+    cond do
+      MapSet.member?(seen, key) and level == :root and key == "responses_backend" ->
+        reject_ordered_pairs(rest, seen, level)
+
+      MapSet.member?(seen, key) ->
+        invalid_config(:config, :unknown_field)
+
+      level == :root and key == "responses_backend" ->
+        reject_ordered_pairs(rest, MapSet.put(seen, key), level)
+
+      true ->
+        with :ok <- reject_ordered_value_duplicates(value) do
+          reject_ordered_pairs(rest, MapSet.put(seen, key), level)
+        end
+    end
+  end
+
+  defp reject_ordered_value_duplicates(%Jason.OrderedObject{values: pairs}),
+    do: reject_ordered_pairs(pairs, MapSet.new(), :nested)
+
+  defp reject_ordered_value_duplicates(list) when is_list(list) do
+    Enum.reduce_while(list, :ok, fn value, :ok ->
+      case reject_ordered_value_duplicates(value) do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp reject_ordered_value_duplicates(_value), do: :ok
+
+  defp decode_ordered(contents) do
+    case Jason.decode(contents, objects: :ordered_objects) do
+      {:ok, %Jason.OrderedObject{} = object} -> {:ok, object}
+      {:ok, _non_object} -> {:error, %{kind: :invalid_json, position: 0}}
+      {:error, %Jason.DecodeError{} = error} -> {:error, error}
+    end
+  end
+
+  defp duplicate_safe_profile(%Jason.OrderedObject{values: pairs}) do
+    profiles = for {"responses_backend", value} <- pairs, do: value
+
+    case profiles do
+      [] -> {:ok, :absent}
+      [profile] -> ordered_to_plain(profile, :responses_backend)
+      _duplicates -> invalid_config(:responses_backend, :unknown_field)
+    end
+  end
+
+  defp ordered_to_plain(%Jason.OrderedObject{values: pairs}, field) do
+    Enum.reduce_while(pairs, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
+      if Map.has_key?(acc, key) do
+        {:halt, invalid_config(field, :unknown_field)}
+      else
+        case ordered_to_plain(value, nested_profile_field(key, field)) do
+          {:ok, normalized} -> {:cont, {:ok, Map.put(acc, key, normalized)}}
+          {:error, _} = error -> {:halt, error}
+        end
+      end
+    end)
+  end
+
+  defp ordered_to_plain(list, field) when is_list(list) do
+    list
+    |> Enum.reduce_while({:ok, []}, fn value, {:ok, acc} ->
+      case ordered_to_plain(value, field) do
+        {:ok, normalized} -> {:cont, {:ok, [normalized | acc]}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      error -> error
+    end
+  end
+
+  defp ordered_to_plain(value, _field), do: {:ok, value}
+
+  defp nested_profile_field("auth", _field), do: :auth
+  defp nested_profile_field(_key, field), do: field
+
+  defp normalize_programmatic_document(raw) do
+    Enum.reduce_while(raw, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
+      normalized = if is_atom(key), do: Atom.to_string(key), else: key
+
+      cond do
+        not is_binary(normalized) ->
+          {:halt, invalid_config(:config, :invalid_json)}
+
+        Map.has_key?(acc, normalized) ->
+          {:halt, invalid_config(:config, :unknown_field)}
+
+        true ->
+          {:cont, {:ok, Map.put(acc, normalized, value)}}
+      end
+    end)
+  end
+
+  defp normalize_programmatic_for_load(raw) do
+    raw
+    |> Enum.reduce_while({:ok, %{}, nil}, fn {key, value}, {:ok, acc, profile_error} ->
+      normalized = if is_atom(key), do: Atom.to_string(key), else: key
+
+      cond do
+        not is_binary(normalized) ->
+          {:halt, invalid_config(:config, :invalid_json)}
+
+        Map.has_key?(acc, normalized) and normalized == "responses_backend" ->
+          {:cont, {:ok, Map.delete(acc, normalized), %{details: %{reason: :unknown_field}}}}
+
+        Map.has_key?(acc, normalized) ->
+          {:halt, invalid_config(:config, :unknown_field)}
+
+        normalized == "responses_backend" and not is_nil(profile_error) ->
+          {:cont, {:ok, acc, profile_error}}
+
+        true ->
+          {:cont, {:ok, Map.put(acc, normalized, value), profile_error}}
+      end
+    end)
+  end
+
+  defp maybe_override_profile(raw, :absent), do: raw
+  defp maybe_override_profile(raw, profile), do: Map.put(raw, "responses_backend", profile)
+
+  defp snapshot_backend(raw) do
+    case Map.fetch(raw, "responses_backend") do
+      :error -> {:ok, :absent}
+      {:ok, value} -> ResponsesBackend.resolve(value, source: :config)
+    end
+  end
+
+  defp snapshot_request_values(raw) do
+    warnings = warnings(raw)
+    ignored = MapSet.new(warnings, & &1["field"])
+    {model, model_source} = resolve_model_with_source(raw)
+
+    provider_defaults = %{
+      max_retries: resolve_max_retries(raw, ignored),
+      stream_idle_timeout_ms: resolve_stream_idle_timeout_ms(raw, ignored),
+      reasoning_effort: resolve_reasoning_effort(raw, ignored),
+      text_verbosity: resolve_text_verbosity(raw, ignored),
+      web_search: resolve_web_search(raw, ignored)
+    }
+
+    {model, model_source, provider_defaults}
+  end
+
+  defp normalize_model(model) when is_binary(model) do
+    if String.valid?(model) do
+      case String.trim(model) do
+        "" -> nil
+        trimmed -> trimmed
+      end
+    else
+      nil
+    end
+  end
+
+  defp normalize_model(_model), do: nil
+
+  defp profile_projection(_raw, %{details: %{reason: reason}}) do
+    {profile_warning(reason), nil}
+  end
+
+  defp profile_projection(raw, nil) do
+    case Map.fetch(raw, "responses_backend") do
+      :error ->
+        {nil, nil}
+
+      {:ok, value} ->
+        case ResponsesBackend.resolve(value, source: :config) do
+          {:ok, backend} ->
+            {nil, ResponsesBackend.summary(backend)}
+
+          {:error, %{error: %{details: %{reason: reason}}}} ->
+            {profile_warning(reason), nil}
+        end
+    end
+  end
+
+  defp profile_warning(reason) do
+    %{
+      "field" => "responses_backend",
+      "reason" => to_string(reason),
+      "message" => "The responses_backend configuration is invalid and was ignored."
+    }
+  end
+
+  defp maybe_put_responses_backend(effective, nil), do: effective
+
+  defp maybe_put_responses_backend(effective, summary),
+    do: Map.put(effective, "responses_backend", summary)
+
+  defp config_error_projection(path, error) do
+    %{
+      "path" => Path.expand(path),
+      "present" => true,
+      "error" => public_config_error(error),
+      "effective" => effective_map(%{}, []),
+      "warnings" => []
+    }
+  end
+
+  defp public_config_error({:error, error}), do: public_config_error(error)
+
+  defp public_config_error(%{kind: :invalid_json, position: position}),
+    do: %{kind: :invalid_json, position: position}
+
+  defp public_config_error(%{kind: :read_failed}), do: %{kind: :read_failed}
+  defp public_config_error(%{ok: false, error: error}), do: public_config_error(error)
+  defp public_config_error(%{kind: kind}), do: %{kind: kind}
+  defp public_config_error(_error), do: %{kind: :invalid_json, position: 0}
+
+  defp bounded_position(position, contents) when is_integer(position),
+    do: min(max(position, 0), byte_size(contents))
+
+  defp bounded_position(_position, _contents), do: 0
+
+  defp invalid_loader(reason),
+    do:
+      invalid_config(:request_snapshot_loader, reason, "The request snapshot loader is invalid.")
+
+  defp invalid_config(field, reason, message \\ "The Pixir configuration is invalid."),
+    do: {:error, Pixir.Tool.error(:invalid_config, message, %{field: field, reason: reason})}
 
   defp effective_map(raw, warnings) do
     ignored = MapSet.new(warnings, & &1["field"])
@@ -406,8 +830,19 @@ defmodule Pixir.Config do
   defp web_search_config_status(false), do: {:ok, nil}
   defp web_search_config_status(true), do: {:ok, %{"enabled" => true}}
 
-  defp web_search_config_status(value) when is_map(value) or is_list(value) do
+  defp web_search_config_status(value) when is_map(value) and not is_struct(value) do
+    normalize_web_search_status(value)
+  end
+
+  defp web_search_config_status(value) when is_list(value) do
+    normalize_web_search_status(value)
+  end
+
+  defp web_search_config_status(_value), do: :invalid
+
+  defp normalize_web_search_status(value) do
     with {:ok, normalized} <- normalize_string_key_map(value),
+         true <- json_safe_config_term?(normalized),
          :ok <- reject_web_search_config_fields(normalized),
          {:ok, _tool} <- HostedTools.web_search(normalized) do
       if Map.get(normalized, "enabled") == false, do: {:ok, nil}, else: {:ok, normalized}
@@ -416,7 +851,25 @@ defmodule Pixir.Config do
     end
   end
 
-  defp web_search_config_status(_value), do: :invalid
+  defp json_safe_config_term?(value)
+       when is_nil(value) or is_boolean(value) or is_number(value),
+       do: true
+
+  defp json_safe_config_term?(value) when is_binary(value), do: String.valid?(value)
+
+  defp json_safe_config_term?(value) when is_list(value) do
+    proper_list?(value) and Enum.all?(value, &json_safe_config_term?/1)
+  end
+
+  defp json_safe_config_term?(value) when is_struct(value), do: false
+
+  defp json_safe_config_term?(value) when is_map(value) do
+    Enum.all?(value, fn {key, nested} ->
+      is_binary(key) and String.valid?(key) and json_safe_config_term?(nested)
+    end)
+  end
+
+  defp json_safe_config_term?(_value), do: false
 
   defp reject_web_search_config_fields(config) do
     allowed = HostedTools.web_search_config_fields()
@@ -425,8 +878,8 @@ defmodule Pixir.Config do
     if unsupported == [], do: :ok, else: {:error, :unsupported_web_search_config_fields}
   end
 
-  defp normalize_string_key_map(value) when is_map(value) do
-    {:ok, Map.new(value, fn {key, val} -> {normalize_config_key(key), val} end)}
+  defp normalize_string_key_map(value) when is_map(value) and not is_struct(value) do
+    normalize_config_pairs(Map.to_list(value))
   rescue
     ArgumentError -> {:error, :invalid_key}
   end
@@ -435,8 +888,8 @@ defmodule Pixir.Config do
   # before the rescue could run; reject them up front so a malformed
   # config.json array cannot crash Config.load/1.
   defp normalize_string_key_map(value) when is_list(value) do
-    if Enum.all?(value, &match?({_key, _val}, &1)) do
-      {:ok, Map.new(value, fn {key, val} -> {normalize_config_key(key), val} end)}
+    if proper_list?(value) do
+      normalize_config_pairs(value)
     else
       {:error, :invalid_key}
     end
@@ -444,22 +897,42 @@ defmodule Pixir.Config do
     ArgumentError -> {:error, :invalid_key}
   end
 
+  defp normalize_config_pairs(pairs) do
+    Enum.reduce_while(pairs, {:ok, %{}}, fn
+      {key, value}, {:ok, acc} ->
+        normalized_key = normalize_config_key(key)
+
+        if Map.has_key?(acc, normalized_key) do
+          {:halt, {:error, :invalid_key}}
+        else
+          {:cont, {:ok, Map.put(acc, normalized_key, value)}}
+        end
+
+      _entry, _acc ->
+        {:halt, {:error, :invalid_key}}
+    end)
+  end
+
   defp normalize_config_key(key) when is_binary(key), do: key
   defp normalize_config_key(key) when is_atom(key), do: Atom.to_string(key)
-  defp normalize_config_key(key), do: raise(ArgumentError, "invalid config key #{inspect(key)}")
+  defp normalize_config_key(_key), do: raise(ArgumentError, "invalid config key")
 
   defp resolve_tail_events(raw, ignored) do
     value =
       case Map.get(raw, "compaction") do
-        %{"tail_events" => tail} -> tail
-        _ -> nil
+        compaction when is_map(compaction) and not is_struct(compaction) ->
+          normalized_config_value(compaction, "tail_events")
+
+        _ ->
+          nil
       end
 
     resolve_positive_int(
       Application.get_env(:pixir, :compaction_tail_events),
       value,
       @default_tail_events,
-      MapSet.member?(ignored, "compaction.tail_events")
+      MapSet.member?(ignored, "compaction") ||
+        MapSet.member?(ignored, "compaction.tail_events")
     )
   end
 
@@ -470,23 +943,37 @@ defmodule Pixir.Config do
       is_boolean(app) ->
         app
 
-      MapSet.member?(ignored, "compaction.model_assisted") ->
+      MapSet.member?(ignored, "compaction") ||
+          MapSet.member?(ignored, "compaction.model_assisted") ->
         false
 
       true ->
         case Map.get(raw, "compaction") do
-          %{"model_assisted" => value} when is_boolean(value) -> value
-          _ -> false
+          compaction when is_map(compaction) and not is_struct(compaction) ->
+            case normalized_config_value(compaction, "model_assisted") do
+              value when is_boolean(value) -> value
+              _ -> false
+            end
+
+          _ ->
+            false
         end
     end
   end
 
-  defp resolve_model(raw) do
-    Application.get_env(:pixir, :model) || System.get_env("PIXIR_MODEL") ||
-      case Map.get(raw, "model") do
-        model when is_binary(model) -> model
-        _ -> nil
-      end || @default_model
+  defp resolve_model(raw), do: elem(resolve_model_with_source(raw), 0)
+
+  defp resolve_model_with_source(raw) do
+    app_model = normalize_model(Application.get_env(:pixir, :model))
+    env_model = normalize_model(System.get_env("PIXIR_MODEL"))
+    file_model = normalize_model(Map.get(raw, "model"))
+
+    cond do
+      app_model -> {app_model, :application}
+      env_model -> {env_model, :env}
+      file_model -> {file_model, :file}
+      true -> {@default_model, :default}
+    end
   end
 
   defp resolve_models(raw, field, ignored) do
@@ -495,7 +982,11 @@ defmodule Pixir.Config do
     else
       case Map.get(raw, field) do
         list when is_list(list) ->
-          slugs = Enum.filter(list, &is_binary/1)
+          slugs =
+            if proper_list?(list),
+              do: Enum.filter(list, &(is_binary(&1) and String.valid?(&1))),
+              else: []
+
           if slugs == [], do: nil, else: slugs
 
         nil ->
@@ -507,8 +998,9 @@ defmodule Pixir.Config do
     end
   end
 
-  defp resolve_models_refreshed_at(%{"models_refreshed_at" => stamp}) when is_binary(stamp),
-    do: stamp
+  defp resolve_models_refreshed_at(%{"models_refreshed_at" => stamp}) when is_binary(stamp) do
+    if String.valid?(stamp), do: stamp, else: nil
+  end
 
   defp resolve_models_refreshed_at(_raw), do: nil
 
@@ -517,9 +1009,11 @@ defmodule Pixir.Config do
       %{}
     else
       case Map.get(raw, "context_windows") do
-        %{} = windows ->
+        windows when is_map(windows) and not is_struct(windows) ->
           windows
-          |> Enum.filter(fn {_model, tokens} -> is_integer(tokens) and tokens > 0 end)
+          |> Enum.filter(fn {model, tokens} ->
+            is_binary(model) and String.valid?(model) and is_integer(tokens) and tokens > 0
+          end)
           |> Map.new()
 
         _ ->
@@ -548,6 +1042,7 @@ defmodule Pixir.Config do
     |> maybe_warn_model(raw)
     |> maybe_warn_models(raw, "models")
     |> maybe_warn_models(raw, "anthropic_models")
+    |> maybe_warn_models_refreshed_at(raw)
     |> maybe_warn_context_windows(raw)
   end
 
@@ -565,34 +1060,51 @@ defmodule Pixir.Config do
   end
 
   defp maybe_warn_reasoning_effort(warnings, raw) do
-    case nested_string(raw, "reasoning", "effort") do
-      nil ->
-        warnings
-
-      value ->
-        case normalize_reasoning_effort(value) do
-          nil ->
-            [warning("reasoning.effort", "invalid value #{inspect(value)}; ignoring") | warnings]
-
-          _ ->
-            warnings
-        end
-    end
+    maybe_warn_nested_enum(
+      warnings,
+      raw,
+      "reasoning",
+      "effort",
+      "reasoning.effort",
+      &normalize_reasoning_effort/1
+    )
   end
 
   defp maybe_warn_text_verbosity(warnings, raw) do
-    case nested_string(raw, "text", "verbosity") do
+    maybe_warn_nested_enum(
+      warnings,
+      raw,
+      "text",
+      "verbosity",
+      "text.verbosity",
+      &normalize_text_verbosity/1
+    )
+  end
+
+  defp maybe_warn_nested_enum(warnings, raw, parent, child, field, normalize) do
+    case Map.get(raw, parent) do
       nil ->
         warnings
 
-      value ->
-        case normalize_text_verbosity(value) do
-          nil ->
-            [warning("text.verbosity", "invalid value #{inspect(value)}; ignoring") | warnings]
-
-          _ ->
+      nested when is_map(nested) and not is_struct(nested) ->
+        case fetch_normalized_config_value(nested, child) do
+          :error ->
             warnings
+
+          {:ok, value} when is_binary(value) ->
+            if String.valid?(value) and normalize.(String.trim(value)),
+              do: warnings,
+              else: [warning(field, "invalid value; ignoring") | warnings]
+
+          {:ok, _value} ->
+            [warning(field, "invalid value; ignoring") | warnings]
+
+          :collision ->
+            [warning(field, "invalid value; ignoring") | warnings]
         end
+
+      _invalid_parent ->
+        [warning(field, "invalid value; ignoring") | warnings]
     end
   end
 
@@ -604,7 +1116,7 @@ defmodule Pixir.Config do
       value ->
         case web_search_config_status(value) do
           :invalid ->
-            [warning("web_search", "invalid value #{inspect(value)}; ignoring") | warnings]
+            [warning("web_search", "invalid value; ignoring") | warnings]
 
           {:ok, _normalized} ->
             warnings
@@ -617,19 +1129,19 @@ defmodule Pixir.Config do
       nil ->
         warnings
 
-      %{} = host_commands ->
+      host_commands when is_map(host_commands) and not is_struct(host_commands) ->
         warnings
         |> maybe_warn_positive_int(
           "host_commands.max_concurrent",
-          Map.get(host_commands, "max_concurrent")
+          normalized_config_value(host_commands, "max_concurrent")
         )
         |> maybe_warn_non_negative_int(
           "host_commands.queue_limit",
-          Map.get(host_commands, "queue_limit")
+          normalized_config_value(host_commands, "queue_limit")
         )
         |> maybe_warn_non_negative_int(
           "host_commands.queue_timeout_ms",
-          Map.get(host_commands, "queue_timeout_ms")
+          normalized_config_value(host_commands, "queue_timeout_ms")
         )
 
       _ ->
@@ -673,11 +1185,12 @@ defmodule Pixir.Config do
 
   defp maybe_warn_tail_events(warnings, raw) do
     case Map.get(raw, "compaction") do
-      %{"tail_events" => value} ->
-        maybe_warn_positive_int(warnings, "compaction.tail_events", value)
-
-      %{} ->
-        warnings
+      compaction when is_map(compaction) and not is_struct(compaction) ->
+        case fetch_normalized_config_value(compaction, "tail_events") do
+          {:ok, value} -> maybe_warn_positive_int(warnings, "compaction.tail_events", value)
+          :error -> warnings
+          :collision -> [warning("compaction.tail_events", "invalid value; ignoring") | warnings]
+        end
 
       nil ->
         warnings
@@ -689,22 +1202,41 @@ defmodule Pixir.Config do
 
   defp maybe_warn_model_assisted(warnings, raw) do
     case Map.get(raw, "compaction") do
-      %{"model_assisted" => value} when is_boolean(value) ->
+      compaction when is_map(compaction) and not is_struct(compaction) ->
+        case fetch_normalized_config_value(compaction, "model_assisted") do
+          {:ok, value} when is_boolean(value) ->
+            warnings
+
+          {:ok, _value} ->
+            [warning("compaction.model_assisted", "must be a boolean; ignoring") | warnings]
+
+          :error ->
+            warnings
+
+          :collision ->
+            [warning("compaction.model_assisted", "must be a boolean; ignoring") | warnings]
+        end
+
+      nil ->
         warnings
 
-      %{"model_assisted" => _} ->
-        [warning("compaction.model_assisted", "must be a boolean; ignoring") | warnings]
-
-      _ ->
-        warnings
+      _invalid_parent ->
+        [warning("compaction", "must be an object; ignoring model_assisted") | warnings]
     end
   end
 
   defp maybe_warn_model(warnings, raw) do
-    if Map.has_key?(raw, "model") and not is_binary(raw["model"]) do
-      [warning("model", "must be a string; ignoring") | warnings]
-    else
-      warnings
+    case Map.fetch(raw, "model") do
+      :error ->
+        warnings
+
+      {:ok, model} when is_binary(model) ->
+        if normalize_model(model),
+          do: warnings,
+          else: [warning("model", "must be a non-empty string; ignoring") | warnings]
+
+      {:ok, _other} ->
+        [warning("model", "must be a string; ignoring") | warnings]
     end
   end
 
@@ -725,16 +1257,35 @@ defmodule Pixir.Config do
     end
   end
 
+  defp maybe_warn_models_refreshed_at(warnings, raw) do
+    case Map.get(raw, "models_refreshed_at") do
+      nil ->
+        warnings
+
+      stamp when is_binary(stamp) ->
+        if String.valid?(stamp),
+          do: warnings,
+          else: [warning("models_refreshed_at", "must be a UTF-8 string; ignoring") | warnings]
+
+      _other ->
+        [warning("models_refreshed_at", "must be a UTF-8 string; ignoring") | warnings]
+    end
+  end
+
   defp maybe_warn_context_windows(warnings, raw) do
     case Map.get(raw, "context_windows") do
       nil ->
         warnings
 
-      %{} = windows ->
+      windows when is_map(windows) and not is_struct(windows) ->
         invalid =
           Enum.any?(windows, fn
-            {_model, tokens} when is_integer(tokens) and tokens > 0 -> false
-            _ -> true
+            {model, tokens}
+            when is_binary(model) and is_integer(tokens) and tokens > 0 ->
+              not String.valid?(model)
+
+            _ ->
+              true
           end)
 
         if invalid do
@@ -758,24 +1309,38 @@ defmodule Pixir.Config do
 
   defp nested_string(%{} = raw, key, nested_key) do
     case Map.get(raw, key) do
-      %{^nested_key => value} when is_binary(value) -> String.trim(value)
-      _ -> nil
+      nested when is_map(nested) and not is_struct(nested) ->
+        case normalized_config_value(nested, nested_key) do
+          value when is_binary(value) -> if String.valid?(value), do: String.trim(value)
+          _ -> nil
+        end
+
+      _ ->
+        nil
     end
   end
 
   defp nested_string(_raw, _key, _nested_key), do: nil
 
-  defp host_commands_raw_value(%{"host_commands" => %{} = host_commands}, key),
-    do: Map.get(host_commands, key)
+  defp host_commands_raw_value(%{"host_commands" => host_commands}, key)
+       when is_map(host_commands) and not is_struct(host_commands),
+       do: normalized_config_value(host_commands, key)
 
   defp host_commands_raw_value(_raw, _key), do: nil
 
   defp host_commands_app_value(field) do
     case Application.get_env(:pixir, :host_commands) do
-      nil -> nil
-      config when is_list(config) -> Keyword.get(config, field)
-      %{} = config -> Map.get(config, field) || Map.get(config, Atom.to_string(field))
-      _ -> nil
+      nil ->
+        nil
+
+      config when is_list(config) ->
+        if proper_keyword_list?(config), do: Keyword.get(config, field), else: nil
+
+      config when is_map(config) and not is_struct(config) ->
+        normalized_config_value(config, Atom.to_string(field))
+
+      _ ->
+        nil
     end
   end
 
@@ -787,8 +1352,8 @@ defmodule Pixir.Config do
   defp normalize_permission_mode("read_only"), do: {:ok, "read_only"}
   defp normalize_permission_mode("read-only"), do: {:ok, "read_only"}
 
-  defp normalize_permission_mode(value),
-    do: {:error, "invalid value #{inspect(value)}; expected auto, ask, or read_only"}
+  defp normalize_permission_mode(_value),
+    do: {:error, "invalid value; expected auto, ask, or read_only"}
 
   defp normalize_reasoning_effort(nil), do: nil
 
@@ -846,7 +1411,44 @@ defmodule Pixir.Config do
     end
   end
 
-  defp valid_models_list?(list), do: Enum.all?(list, &is_binary/1)
+  defp valid_models_list?(list) do
+    proper_list?(list) and Enum.all?(list, &(is_binary(&1) and String.valid?(&1)))
+  end
+
+  defp proper_list?([]), do: true
+  defp proper_list?([_head | tail]), do: proper_list?(tail)
+  defp proper_list?(_tail), do: false
+
+  defp proper_keyword_list?(list) do
+    proper_list?(list) and Enum.all?(list, &match?({key, _value} when is_atom(key), &1))
+  end
+
+  defp normalized_config_value(map, key) do
+    case fetch_normalized_config_value(map, key) do
+      {:ok, value} -> value
+      :error -> nil
+      :collision -> :invalid_normalized_key_collision
+    end
+  end
+
+  defp fetch_normalized_config_value(map, key) do
+    atom_key = existing_config_atom(key)
+    string_value = Map.fetch(map, key)
+    atom_value = if atom_key, do: Map.fetch(map, atom_key), else: :error
+
+    case {string_value, atom_value} do
+      {{:ok, _string}, {:ok, _atom}} -> :collision
+      {{:ok, value}, :error} -> {:ok, value}
+      {:error, {:ok, value}} -> {:ok, value}
+      {:error, :error} -> :error
+    end
+  end
+
+  defp existing_config_atom(key) do
+    String.to_existing_atom(key)
+  rescue
+    ArgumentError -> nil
+  end
 
   defp permission_atom("auto"), do: :auto
   defp permission_atom("ask"), do: :ask

@@ -9,7 +9,7 @@ defmodule Pixir.Compaction do
   while resume/fork/debug still read the original Log.
   """
 
-  alias Pixir.{Config, Event, Log, Provider, Session, SessionSupervisor, Tool}
+  alias Pixir.{Config, Event, Log, Provider, Session, SessionId, SessionSupervisor, Tool}
 
   @summary_limit 480
   @max_named_skill_identities 5
@@ -124,18 +124,21 @@ defmodule Pixir.Compaction do
   def model_contract(session_id, events, opts \\ [])
 
   def model_contract(session_id, [], _opts) when is_binary(session_id) do
-    {:error,
-     Tool.error(:invalid_args, "cannot build model contract for empty events", %{
-       session_id: session_id,
-       events: []
-     })}
+    with :ok <- SessionId.validate(session_id) do
+      {:error,
+       Tool.error(:invalid_args, "cannot build model contract for empty events", %{
+         session_id: session_id,
+         events: []
+       })}
+    end
   end
 
   def model_contract(session_id, events, opts)
       when is_binary(session_id) and is_list(events) do
     tail_events = tail_events(opts)
 
-    with {:ok, tail_events} <- validate_tail_events(tail_events) do
+    with :ok <- SessionId.validate(session_id),
+         {:ok, tail_events} <- validate_tail_events(tail_events) do
       {:ok,
        %{
          "developer_instruction" => developer_instruction(),
@@ -149,6 +152,12 @@ defmodule Pixir.Compaction do
            "events" => Enum.map(events, &event_for_model/1)
          }
        }}
+    end
+  end
+
+  def model_contract(session_id, _events, _opts) do
+    with :ok <- SessionId.validate(session_id) do
+      {:error, Tool.error(:invalid_args, "model contract events must be a list", %{})}
     end
   end
 
@@ -288,7 +297,14 @@ defmodule Pixir.Compaction do
   end
 
   defp workspace(opts), do: Keyword.get(opts, :workspace, File.cwd!())
-  defp tail_events(opts), do: Keyword.get(opts, :tail_events, Config.compaction_tail_events())
+
+  defp tail_events(opts) do
+    case Keyword.fetch(opts, :tail_events) do
+      {:ok, value} -> value
+      :error -> Config.compaction_tail_events()
+    end
+  end
+
   defp trigger(opts), do: Keyword.get(opts, :trigger, "manual")
 
   defp model_assisted_enabled?(opts) do
@@ -318,6 +334,10 @@ defmodule Pixir.Compaction do
            model_assisted_event_data(session_id, compact_prefix, event, opts) do
       {:ok, model_event}
     else
+      {:error, %{error: %{kind: kind}}} = error
+      when kind in [:invalid_config, :unsupported_backend] ->
+        error
+
       {:error, reason} ->
         {:ok,
          event
@@ -385,9 +405,13 @@ defmodule Pixir.Compaction do
         :max_retries,
         :sleep,
         :reasoning_effort,
-        :text_verbosity
+        :text_verbosity,
+        :responses_backend,
+        :resolved_provider_request,
+        :config_path,
+        :raw_config,
+        :request_snapshot_loader
       ])
-      |> Config.merge_provider_opts(config_opts(opts))
       |> Keyword.put(:on_delta, fn _ -> :ok end)
 
     case Provider.stream(request, provider_opts) do

@@ -1,0 +1,33 @@
+{
+  "schema": "pixir.presenter.run", "schema_version": 1, "projection_id": "projection:stale-running-no-owner", "projected_at": "2026-07-10T20:20:30Z",
+  "run": {"id": "dlg-stale", "delegate_id": "dlg-stale", "parent_session_id": "parent-stale", "workflow_id": null, "strategy": "subagents", "mode": "read_only", "title": null, "evidence_refs": ["e-snapshot-stale"]},
+  "source": {"mode": "reconstructed", "durable_origin": "fixture", "as_of_seq": 0, "last_durable_at": "2026-07-10T20:20:00Z", "live_observed_at": null, "freshness": "stale", "limitations": ["source_stale"]},
+  "execution": {"state": "running", "terminal": false, "basis": "subagent_event_fold", "evidence_refs": ["e-parent-0"]},
+  "liveness": {"state": "stale_handle", "reachable": false, "basis": "delegate_owner", "observed_at": "2026-07-10T20:20:30Z", "evidence_refs": ["e-owner-stale"]},
+  "counts": {"planned_units": 1, "observed_units": 1, "running_units": 1, "completed_units": 0, "attention_units": 1},
+  "graph": null,
+  "units": [{
+    "logical_id": "delegate:dlg-stale:subagent:sub-stale", "unit_kind": "subagent", "materialization": "durable", "label": "explorer", "agent": "explorer", "execution_kind": "subagent", "workspace_mode": "unknown", "posture": "unknown", "depends_on": [],
+    "execution": {"state": "running", "terminal": false, "basis": "subagent_event_fold", "evidence_refs": ["e-parent-0"]},
+    "liveness": {"state": "stale_handle", "reachable": false, "basis": "delegate_owner", "observed_at": "2026-07-10T20:20:30Z", "evidence_refs": ["e-owner-stale"]},
+    "gate": {"state": "not_applicable", "dependent_safe": null, "basis": "not_applicable", "evidence_refs": []},
+    "advisory": {"present": false, "verdict": "unknown", "mergeable": null, "declared_gate": null, "parse_status": "not_present", "summary": null, "major_count": null, "minor_count": null, "evidence_refs": []},
+    "attempts": [{"attempt_id": "delegate:dlg-stale:subagent:sub-stale:attempt:0", "ordinal": 0, "materialization": "durable", "status_basis": "parent_log", "relation": "fresh", "predecessor_attempt_id": null, "child_session_id": "child-stale", "status": "running", "started_at": "2026-07-10T20:20:00Z", "ended_at": null, "error_kind": null, "summary": null, "child_event_window": {"session_id": "child-stale", "from_seq": null, "to_seq_exclusive": null, "basis": "whole_child_log_single_attempt", "evidence_refs": []}, "usage": {"source": "none", "complete": true, "calls": 0, "groups": [], "evidence_refs": [], "limitations": []}, "evidence_refs": ["e-parent-0"], "limitations": []}],
+    "artifacts": [],
+    "usage": {"source": "none", "complete": true, "calls": 0, "groups": [], "evidence_refs": [], "limitations": []},
+    "mutation": {"status": "read_only", "observed_paths": [], "observed_semantics": "none", "evidence_refs": ["e-snapshot-stale"], "limitations": []},
+    "attention": {"required": true, "reasons": ["nonterminal_stale_handle"], "evidence_refs": ["e-parent-0", "e-owner-stale"]},
+    "safe_actions": [],
+    "evidence_refs": ["e-snapshot-stale", "e-parent-0", "e-owner-stale"],
+    "limitations": ["source_stale"]
+  }],
+  "usage": {"source": "none", "complete": true, "calls": 0, "groups": [], "evidence_refs": [], "limitations": []},
+  "mutation": {"status": "read_only", "observed_paths": [], "observed_semantics": "none", "evidence_refs": ["e-snapshot-stale"], "limitations": []},
+  "safe_actions": [],
+  "evidence": [
+    {"id": "e-snapshot-stale", "authority": "derived", "source_kind": "delegate_snapshot", "session_id": "parent-stale", "seq": null, "description": "Snapshot supplies run identity and read-only mode."},
+    {"id": "e-parent-0", "authority": "canonical", "source_kind": "parent_log", "session_id": "parent-stale", "seq": 0, "description": "Durable child execution remains running."},
+    {"id": "e-owner-stale", "authority": "volatile", "source_kind": "delegate_owner", "session_id": "parent-stale", "seq": null, "description": "Only a snapshot remains; no live Owner is reachable."}
+  ],
+  "limitations": ["source_stale"]
+}

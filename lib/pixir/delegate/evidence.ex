@@ -14,9 +14,15 @@ defmodule Pixir.Delegate.Evidence do
   lives outside the delegated workspace write scope. This is not a shell sandbox:
   user-global Pixir state is local filesystem state and should be treated as audit
   preservation, not containment against an arbitrary host process.
+
+  Workspace-local source Logs use the canonical Session-id grammar and the same
+  `lstat`-based static path preflight as `Pixir.Log`. Existing or dangling symlinks are
+  reported as failed mirror evidence without reading their targets. The accepted
+  same-UID check/reopen race remains; this mirror does not provide descriptor-relative
+  or race-free filesystem access.
   """
 
-  alias Pixir.{Log, Paths}
+  alias Pixir.{Log, Paths, SessionId, Tool}
 
   @schema_version 1
   @metadata_filename "evidence.json"
@@ -52,16 +58,19 @@ defmodule Pixir.Delegate.Evidence do
 
   defp attach_evidence(payload, opts) do
     case evidence_from_payload(payload, opts) do
-      nil ->
+      {:ok, nil} ->
         {:ok, payload}
 
-      evidence ->
+      {:ok, evidence} ->
         payload =
           payload
           |> Map.put("evidence", merge_evidence(payload["evidence"], evidence))
           |> put_diagnostics_evidence(evidence)
 
         {:ok, payload}
+
+      {:error, _error} = error ->
+        error
     end
   end
 
@@ -71,37 +80,46 @@ defmodule Pixir.Delegate.Evidence do
          delegate_id when is_binary(delegate_id) and delegate_id != "" <- payload["delegate_id"],
          workspace when is_binary(workspace) and workspace != "" <- payload["workspace"] do
       workspace = Path.expand(workspace)
-      local_log_path = Log.path(session_id, workspace: workspace)
       mirror_requirement = mirror_requirement(payload)
 
-      %{
-        "schema_version" => @schema_version,
-        "kind" => "delegate_evidence",
-        "source_of_truth" => "session_log",
-        "delegate_id" => delegate_id,
-        "session_id" => session_id,
-        "workspace" => workspace,
-        "workspace_project_state_dir" => Paths.project_root(workspace),
-        "workspace_log_path" => local_log_path,
-        "workspace_log_exists" => File.exists?(local_log_path),
-        "guarantee" => %{
-          "primary" => "out_of_workspace_audit_preservation_for_write_capable_delegate_runs",
-          "path_blocking" => "defense_in_depth_not_a_shell_sandbox",
-          "truth_model" => "mirror_is_audit_preservation_copy_session_log_remains_truth"
-        },
-        "mirror" =>
-          mirror(
-            session_id,
-            delegate_id,
-            workspace,
-            local_log_path,
-            payload,
-            opts,
-            mirror_requirement
-          )
-      }
+      with :ok <- SessionId.validate(session_id),
+           local_log_path = Log.path(session_id, workspace: workspace),
+           {:ok, logs} <- log_specs(session_id, workspace, local_log_path, payload) do
+        parent = hd(logs)
+        {workspace_log_exists?, workspace_log_error} = source_existence(parent)
+
+        %{
+          "schema_version" => @schema_version,
+          "kind" => "delegate_evidence",
+          "source_of_truth" => "session_log",
+          "delegate_id" => delegate_id,
+          "session_id" => session_id,
+          "workspace" => workspace,
+          "workspace_project_state_dir" => Paths.project_root(workspace),
+          "workspace_log_path" => local_log_path,
+          "workspace_log_exists" => workspace_log_exists?,
+          "guarantee" => %{
+            "primary" => "out_of_workspace_audit_preservation_for_write_capable_delegate_runs",
+            "path_blocking" => "defense_in_depth_not_a_shell_sandbox",
+            "truth_model" => "mirror_is_audit_preservation_copy_session_log_remains_truth"
+          },
+          "mirror" =>
+            mirror(
+              session_id,
+              delegate_id,
+              workspace,
+              payload,
+              opts,
+              mirror_requirement,
+              logs
+            )
+        }
+        |> maybe_put("workspace_log_error", workspace_log_error)
+        |> then(&{:ok, &1})
+      end
     else
-      _missing_identity -> nil
+      {:error, _error} = error -> error
+      _missing_identity -> {:ok, nil}
     end
   end
 
@@ -118,7 +136,7 @@ defmodule Pixir.Delegate.Evidence do
     end
   end
 
-  defp mirror(_session_id, _delegate_id, _workspace, _local_log_path, _payload, _opts, false) do
+  defp mirror(_session_id, _delegate_id, _workspace, _payload, _opts, false, _logs) do
     %{
       "required" => false,
       "status" => "not_required",
@@ -127,10 +145,9 @@ defmodule Pixir.Delegate.Evidence do
     }
   end
 
-  defp mirror(session_id, delegate_id, workspace, local_log_path, payload, _opts, :unknown) do
+  defp mirror(_session_id, delegate_id, workspace, _payload, _opts, :unknown, logs) do
     root = delegate_root(workspace, delegate_id)
     metadata_path = Path.join(root, @metadata_filename)
-    logs = log_specs(session_id, workspace, local_log_path, payload)
 
     if File.exists?(metadata_path) do
       mirror_report(root, metadata_path, workspace, logs)
@@ -152,11 +169,10 @@ defmodule Pixir.Delegate.Evidence do
     exception -> mirror_failed_payload(Paths.global_root(), nil, workspace, [], exception)
   end
 
-  defp mirror(session_id, delegate_id, workspace, local_log_path, payload, opts, true) do
+  defp mirror(session_id, delegate_id, workspace, payload, opts, true, logs) do
     root = delegate_root(workspace, delegate_id)
     sessions_dir = Path.join(root, "sessions")
     metadata_path = Path.join(root, @metadata_filename)
-    logs = log_specs(session_id, workspace, local_log_path, payload)
 
     if Keyword.fetch!(opts, :refresh?) do
       refresh_mirror(
@@ -242,30 +258,65 @@ defmodule Pixir.Delegate.Evidence do
   defp copy_log(log, sessions_dir) do
     destination = Path.join(sessions_dir, safe_id(log.session_id) <> ".ndjson")
 
+    case source_state(log) do
+      {:ok, :missing} ->
+        missing_source_copy(log, destination)
+
+      {:ok, :regular} ->
+        copy_existing_log(log, destination)
+
+      {:error, error} ->
+        %{
+          "role" => log.role,
+          "session_id" => log.session_id,
+          "source_path" => log.source_path,
+          "log_copy_path" => destination,
+          "status" => "mirror_failed",
+          "error" => path_error_payload(error)
+        }
+    end
+  rescue
+    exception ->
+      %{
+        "role" => log.role,
+        "session_id" => log.session_id,
+        "source_path" => log.source_path,
+        "log_copy_path" => Path.join(sessions_dir, safe_id(log.session_id) <> ".ndjson"),
+        "status" => "mirror_failed",
+        "error" => %{
+          "kind" => "delegate_evidence_source_read_failed",
+          "message" => Exception.message(exception)
+        }
+      }
+  end
+
+  defp missing_source_copy(log, destination) do
+    if File.exists?(destination) do
+      existing = File.stat!(destination)
+
+      %{
+        "role" => log.role,
+        "session_id" => log.session_id,
+        "source_path" => log.source_path,
+        "log_copy_path" => destination,
+        "status" => "source_missing_mirror_retained",
+        "mirror_bytes" => existing.size
+      }
+    else
+      %{
+        "role" => log.role,
+        "session_id" => log.session_id,
+        "source_path" => log.source_path,
+        "log_copy_path" => destination,
+        "status" => "pending_source_log"
+      }
+    end
+  end
+
+  defp copy_existing_log(log, destination) do
     cond do
-      not File.exists?(log.source_path) and File.exists?(destination) ->
-        existing = File.stat!(destination)
-
-        %{
-          "role" => log.role,
-          "session_id" => log.session_id,
-          "source_path" => log.source_path,
-          "log_copy_path" => destination,
-          "status" => "source_missing_mirror_retained",
-          "mirror_bytes" => existing.size
-        }
-
-      not File.exists?(log.source_path) ->
-        %{
-          "role" => log.role,
-          "session_id" => log.session_id,
-          "source_path" => log.source_path,
-          "log_copy_path" => destination,
-          "status" => "pending_source_log"
-        }
-
-      mirror_regressed?(log.source_path, destination) ->
-        source = File.stat!(log.source_path)
+      mirror_regressed?(log, destination) ->
+        source = source_stat!(log)
         existing = File.stat!(destination)
 
         %{
@@ -276,11 +327,11 @@ defmodule Pixir.Delegate.Evidence do
           "status" => "source_regressed_mirror_retained",
           "source_bytes" => source.size,
           "mirror_bytes" => existing.size,
-          "source_sha256" => file_sha256(log.source_path)
+          "source_sha256" => source_sha256(log)
         }
 
-      mirror_diverged?(log.source_path, destination) ->
-        source = File.stat!(log.source_path)
+      mirror_diverged?(log, destination) ->
+        source = source_stat!(log)
         existing = File.stat!(destination)
 
         %{
@@ -291,13 +342,13 @@ defmodule Pixir.Delegate.Evidence do
           "status" => "source_diverged_mirror_retained",
           "source_bytes" => source.size,
           "mirror_bytes" => existing.size,
-          "source_sha256" => file_sha256(log.source_path),
+          "source_sha256" => source_sha256(log),
           "mirror_sha256" => file_sha256(destination)
         }
 
       true ->
-        copy_atomic!(log.source_path, destination)
-        source = File.stat!(log.source_path)
+        copy_atomic!(log, destination)
+        source = source_stat!(log)
 
         %{
           "role" => log.role,
@@ -307,15 +358,16 @@ defmodule Pixir.Delegate.Evidence do
           "status" => "mirrored",
           "source_bytes" => source.size,
           "mirror_bytes" => File.stat!(destination).size,
-          "source_sha256" => file_sha256(log.source_path),
+          "source_sha256" => source_sha256(log),
           "copied_at" => now()
         }
     end
   end
 
-  defp mirror_regressed?(source_path, destination) do
+  defp mirror_regressed?(log, destination) do
     with true <- File.exists?(destination),
-         {:ok, source} <- File.stat(source_path),
+         :ok <- preflight_source(log),
+         {:ok, source} <- File.stat(log.source_path),
          {:ok, mirror} <- File.stat(destination) do
       source.size < mirror.size
     else
@@ -323,10 +375,11 @@ defmodule Pixir.Delegate.Evidence do
     end
   end
 
-  defp mirror_diverged?(source_path, destination) do
+  defp mirror_diverged?(log, destination) do
     with true <- File.exists?(destination),
          {:ok, mirror} <- File.read(destination),
-         {:ok, source} <- File.open(source_path, [:read, :binary]) do
+         :ok <- preflight_source(log),
+         {:ok, source} <- File.open(log.source_path, [:read, :binary]) do
       try do
         IO.binread(source, byte_size(mirror)) != mirror
       after
@@ -337,15 +390,77 @@ defmodule Pixir.Delegate.Evidence do
     end
   end
 
-  defp copy_atomic!(source, destination) do
+  defp copy_atomic!(log, destination) do
     tmp = destination <> ".tmp-" <> Integer.to_string(System.unique_integer([:positive]))
 
     try do
-      File.cp!(source, tmp)
+      preflight_source!(log)
+      File.cp!(log.source_path, tmp)
       File.rename!(tmp, destination)
     after
       File.rm(tmp)
     end
+  end
+
+  defp source_stat!(log) do
+    preflight_source!(log)
+    File.stat!(log.source_path)
+  end
+
+  defp source_sha256(log) do
+    preflight_source!(log)
+    file_sha256(log.source_path)
+  end
+
+  defp source_existence(log) do
+    case source_state(log) do
+      {:ok, :regular} -> {true, nil}
+      {:ok, :missing} -> {false, nil}
+      {:error, error} -> {false, path_error_payload(error)}
+    end
+  end
+
+  defp source_state(log) do
+    case Paths.inspect_state_path(log.workspace, log.source_path, expected: :regular) do
+      {:ok, %{state: state}} -> {:ok, state}
+      {:error, _error} = error -> error
+    end
+  end
+
+  defp preflight_source(log) do
+    case source_state(log) do
+      {:ok, :regular} -> :ok
+      {:ok, :missing} -> {:error, :source_log_missing}
+      {:error, _error} = error -> error
+    end
+  end
+
+  defp preflight_source!(log) do
+    case preflight_source(log) do
+      :ok ->
+        :ok
+
+      {:error, %{error: %{details: details}}} ->
+        raise "source Session Log path became unsafe: #{details["reason"] || "unsafe_state_path"}"
+
+      {:error, :source_log_missing} ->
+        raise "source Session Log disappeared before mirror read"
+    end
+  end
+
+  defp path_error_payload(%{error: %{kind: kind, message: message, details: details}}) do
+    %{
+      "kind" => if(is_atom(kind), do: Atom.to_string(kind), else: to_string(kind)),
+      "message" => message,
+      "details" => details
+    }
+  end
+
+  defp path_error_payload(_error) do
+    %{
+      "kind" => "delegate_evidence_source_read_failed",
+      "message" => "source Session Log path could not be verified"
+    }
   end
 
   defp write_json_atomic!(path, map) do
@@ -488,35 +603,83 @@ defmodule Pixir.Delegate.Evidence do
       source_path: local_log_path
     }
 
-    children =
-      payload
-      |> Map.get("children", [])
-      |> Enum.flat_map(&child_log_spec(&1, workspace, payload["delegate_id"]))
+    children = if is_list(payload["children"]), do: payload["children"], else: []
 
-    [parent | children]
-    |> Enum.uniq_by(&{&1.role, &1.session_id})
+    children
+    |> Enum.reduce_while({:ok, []}, fn child, {:ok, acc} ->
+      case child_log_spec(child, workspace, payload["delegate_id"]) do
+        {:ok, specs} -> {:cont, {:ok, acc ++ specs}}
+        {:error, _error} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, child_specs} -> {:ok, Enum.uniq_by([parent | child_specs], &{&1.role, &1.session_id})}
+      {:error, _error} = error -> error
+    end
   end
 
   defp child_log_spec(%{"child_session_id" => session_id} = child, workspace, delegate_id)
        when is_binary(session_id) and session_id != "" do
-    source_path =
-      case child["child_log_path"] do
-        path when is_binary(path) and path != "" -> path
-        _ -> Log.path(session_id, workspace: workspace)
-      end
-
-    [
-      %{
-        role: "child",
-        delegate_id: delegate_id,
-        workspace: workspace,
-        session_id: session_id,
-        source_path: source_path
-      }
-    ]
+    with :ok <- SessionId.validate(session_id),
+         {:ok, child_workspace} <- child_workspace(child, session_id, workspace),
+         source_path = Log.path(session_id, workspace: child_workspace),
+         :ok <-
+           validate_explicit_child_log_path(child["child_log_path"], source_path, child_workspace) do
+      {:ok,
+       [
+         %{
+           role: "child",
+           delegate_id: delegate_id,
+           workspace: child_workspace,
+           session_id: session_id,
+           source_path: source_path
+         }
+       ]}
+    end
   end
 
-  defp child_log_spec(_child, _workspace, _delegate_id), do: []
+  defp child_log_spec(_child, _workspace, _delegate_id), do: {:ok, []}
+
+  defp child_workspace(%{"workspace" => child_workspace}, _session_id, parent_workspace)
+       when is_binary(child_workspace) and child_workspace != "" do
+    {:ok, Path.expand(child_workspace, parent_workspace)}
+  end
+
+  defp child_workspace(%{"child_log_path" => path}, session_id, parent_workspace)
+       when is_binary(path) and path != "" do
+    expanded = Path.expand(path, parent_workspace)
+    sessions_dir = Path.dirname(expanded)
+    project_dir = Path.dirname(sessions_dir)
+    inferred_workspace = Path.dirname(project_dir)
+
+    if Path.basename(expanded) == session_id <> ".ndjson" and
+         Path.basename(sessions_dir) == "sessions" and
+         Path.basename(project_dir) == ".pixir" and
+         Log.path(session_id, workspace: inferred_workspace) == expanded do
+      {:ok, inferred_workspace}
+    else
+      {:error, invalid_child_log_path()}
+    end
+  end
+
+  defp child_workspace(_child, _session_id, parent_workspace), do: {:ok, parent_workspace}
+
+  defp validate_explicit_child_log_path(nil, _expected, _workspace), do: :ok
+  defp validate_explicit_child_log_path("", _expected, _workspace), do: :ok
+
+  defp validate_explicit_child_log_path(path, expected, workspace) when is_binary(path) do
+    if Path.expand(path, workspace) == expected, do: :ok, else: {:error, invalid_child_log_path()}
+  end
+
+  defp validate_explicit_child_log_path(_path, _expected, _workspace),
+    do: {:error, invalid_child_log_path()}
+
+  defp invalid_child_log_path do
+    Tool.error(:invalid_args, "delegate child Log path is not canonical", %{
+      "field" => "children[].child_log_path",
+      "next_actions" => ["use_the_child_workspace_and_canonical_child_session_log"]
+    })
+  end
 
   defp result_envelope(payload) do
     Map.take(payload, [
@@ -565,6 +728,9 @@ defmodule Pixir.Delegate.Evidence do
 
   defp merge_evidence(%{} = existing, evidence), do: Map.merge(existing, evidence)
   defp merge_evidence(_existing, evidence), do: evidence
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp put_diagnostics_evidence(payload, evidence) do
     Map.update(payload, "diagnostics", %{"evidence" => diagnostics_evidence(evidence)}, fn

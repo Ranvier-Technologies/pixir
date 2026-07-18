@@ -33,7 +33,6 @@ defmodule Pixir.Turn do
 
   alias Pixir.{
     Compaction,
-    Config,
     Event,
     RecoveryCommands,
     Session,
@@ -42,7 +41,8 @@ defmodule Pixir.Turn do
     Tool
   }
 
-  alias Pixir.Provider.{Cache, ContextWindow}
+  alias Pixir.Provider.{Cache, ContextWindow, OutputTruncation}
+  alias Pixir.Providers.{ResolvedProviderRequest, ResponsesBackend}
   alias Pixir.Providers.Registry, as: ProviderRegistry
   alias Pixir.Tools.{Executor, Registry}
 
@@ -108,7 +108,7 @@ defmodule Pixir.Turn do
          skills_opts,
          previous_turn_boundary_seq
        ) do
-    provider_opts = opts |> Keyword.get(:provider_opts, []) |> Config.merge_provider_opts()
+    provider_opts = Keyword.get(opts, :provider_opts, [])
     bash_timeout_ms = Keyword.get(opts, :bash_timeout_ms)
     virtual_overlay = normalize_virtual_overlay(Keyword.get(opts, :virtual_overlay))
 
@@ -117,54 +117,98 @@ defmodule Pixir.Turn do
 
     mode = normalize_mode(Keyword.get(opts, :mode, :build))
 
-    provider =
-      Keyword.get(opts, :provider) || ProviderRegistry.resolve(provider_opts[:model]).provider
-
-    state = %{
-      provider: provider,
-      provider_opts: provider_opts,
-      skills_opts: skills_opts,
-      agents_opts: Keyword.get(opts, :agents_opts, []),
-      subagent_depth: Keyword.get(opts, :subagent_depth, 0),
-      agent_instructions: Keyword.get(opts, :agent_instructions),
-      previous_turn_boundary_seq: previous_turn_boundary_seq,
-      # Rendered once per turn: the Skills index does filesystem discovery and
-      # the cache_control request fields are rebuilt every tool-loop iteration.
-      rendered_skills_index:
-        if ProviderRegistry.entry_for(provider).capabilities.prompt_cache == :cache_control do
-          rendered_skills_index(ctx.workspace, skills_opts)
-        end,
-      presenter_context: Keyword.get(opts, :presenter_context),
-      delegation_context: Keyword.get(opts, :delegation_context),
-      # Model that will produce reasoning items this Turn — stamped on each `reasoning`
-      # event so replay can drop items captured under a different model (ADR 0007).
-      model: provider_opts[:model] || ProviderRegistry.entry_for(provider).default_model,
-      dry_run: Keyword.get(opts, :dry_run, false),
-      # ADR 0020 overflow recovery uses a finite tail-shrinking sequence. A
-      # compacted retry can still overflow on smaller-window models, so subsequent
-      # :context_overflow failures in the same Turn consume the next smaller tail
-      # instead of giving up after the first recorded checkpoint.
-      overflow_recovery_tail_attempts: @overflow_recovery_tail_attempts,
-      # The interaction mode (`:build` | `:plan`, default `:build`). In `:plan`
-      # the Turn instructs the model to plan (not act) and the permission posture
-      # is forced to `:read_only`, so mutating tools are denied (plan-and-wait,
-      # D.3) — regardless of any caller-supplied permission_mode.
-      mode: mode,
-      cap:
-        opts
-        |> Keyword.get(:max_iterations, default_max_iterations())
-        |> normalize_max_iterations(),
-      bash_timeout_ms: bash_timeout_ms,
-      bash_timeout_source: bash_timeout_source,
-      virtual_overlay: virtual_overlay,
-      permission: %{
-        mode: permission_mode(mode, Keyword.get(opts, :permission_mode, :auto)),
-        asker: Keyword.get(opts, :asker, fn _request -> :deny end),
-        policy: Keyword.get(opts, :write_policy)
-      }
+    selection = %{
+      provider_intent: provider_intent(opts),
+      request: %{},
+      provider_opts: provider_opts
     }
 
-    loop(ctx, 0, state)
+    with {:ok, resolved} <-
+           ProviderRegistry.resolve_request(selection, Keyword.get(opts, :config_opts, [])),
+         :ok <- activate_resolved_backend(resolved) do
+      provider = ResolvedProviderRequest.provider(resolved)
+      capabilities = ResolvedProviderRequest.capabilities(resolved)
+
+      provider_opts = ResolvedProviderRequest.attach_to_provider_opts(resolved, provider_opts)
+
+      state = %{
+        provider: provider,
+        provider_opts: provider_opts,
+        resolved_provider_request: resolved,
+        capabilities: capabilities,
+        skills_opts: skills_opts,
+        agents_opts: Keyword.get(opts, :agents_opts, []),
+        subagent_depth: Keyword.get(opts, :subagent_depth, 0),
+        agent_instructions: Keyword.get(opts, :agent_instructions),
+        previous_turn_boundary_seq: previous_turn_boundary_seq,
+        # Rendered once per turn: the Skills index does filesystem discovery and
+        # the cache_control request fields are rebuilt every tool-loop iteration.
+        rendered_skills_index:
+          if capabilities.prompt_cache == :cache_control do
+            rendered_skills_index(ctx.workspace, skills_opts)
+          end,
+        presenter_context: Keyword.get(opts, :presenter_context),
+        delegation_context: Keyword.get(opts, :delegation_context),
+        # Model that will produce reasoning items this Turn — stamped on each `reasoning`
+        # event so replay can drop items captured under a different model (ADR 0007).
+        model: ResolvedProviderRequest.model(resolved),
+        dry_run: Keyword.get(opts, :dry_run, false),
+        # ADR 0020 overflow recovery uses a finite tail-shrinking sequence. A
+        # compacted retry can still overflow on smaller-window models, so subsequent
+        # :context_overflow failures in the same Turn consume the next smaller tail
+        # instead of giving up after the first recorded checkpoint.
+        overflow_recovery_tail_attempts: @overflow_recovery_tail_attempts,
+        # The interaction mode (`:build` | `:plan`, default `:build`). In `:plan`
+        # the Turn instructs the model to plan (not act) and the permission posture
+        # is forced to `:read_only`, so mutating tools are denied (plan-and-wait,
+        # D.3) — regardless of any caller-supplied permission_mode.
+        mode: mode,
+        cap:
+          opts
+          |> Keyword.get(:max_iterations, default_max_iterations())
+          |> normalize_max_iterations(),
+        bash_timeout_ms: bash_timeout_ms,
+        bash_timeout_source: bash_timeout_source,
+        virtual_overlay: virtual_overlay,
+        permission: %{
+          mode: permission_mode(mode, Keyword.get(opts, :permission_mode, :auto)),
+          asker: Keyword.get(opts, :asker, fn _request -> :deny end),
+          policy: Keyword.get(opts, :write_policy)
+        }
+      }
+
+      loop(ctx, 0, state)
+    else
+      {:error, error} -> finish_configuration_error(ctx.session_id, error)
+    end
+  end
+
+  defp provider_intent(opts) do
+    case Keyword.fetch(opts, :provider) do
+      :error -> :auto
+      {:ok, provider} -> {:explicit, provider}
+    end
+  end
+
+  defp activate_resolved_backend(resolved) do
+    case ResolvedProviderRequest.responses_backend(resolved) do
+      :not_applicable -> :ok
+      backend -> ResponsesBackend.activation_status(backend)
+    end
+  end
+
+  defp finish_configuration_error(sid, error) do
+    failure_data = %{
+      "terminal_status" => "configuration_error",
+      "error_kind" => error_kind(error),
+      "error_message" => human_error(error),
+      "details" => error_details(error)
+    }
+
+    {:ok, _} = Session.record(sid, Event.turn_failed(sid, failure_data))
+    Session.emit(sid, Event.text_delta(sid, human_error(error)))
+    Session.emit(sid, Event.status(sid, "error"))
+    {:error, error}
   end
 
   # Accept a string ("plan"/"build") or atom mode from the front-end seam.
@@ -197,7 +241,7 @@ defmodule Pixir.Turn do
   defp maybe_put_provider_request(request, key, value), do: Map.put(request, key, value)
 
   defp maybe_put_cache_control_prompt_fields(request, state) do
-    case ProviderRegistry.entry_for(state.provider).capabilities.prompt_cache do
+    case state.capabilities.prompt_cache do
       :cache_control ->
         request =
           request
@@ -229,18 +273,17 @@ defmodule Pixir.Turn do
     end
   end
 
-  defp reasoning_dialect(provider),
-    do: ProviderRegistry.entry_for(provider).capabilities.reasoning_dialect
+  defp reasoning_dialect(state), do: state.capabilities.reasoning_dialect
 
-  defp provider_tool_specs(provider) do
-    case ProviderRegistry.entry_for(provider).capabilities.tool_dialect do
+  defp provider_tool_specs(state) do
+    case state.capabilities.tool_dialect do
       :anthropic -> Registry.anthropic_specs()
       :responses -> Registry.responses_specs()
     end
   end
 
   defp reasoning_event_opts(state) do
-    case reasoning_dialect(state.provider) do
+    case reasoning_dialect(state) do
       dialect when is_binary(dialect) -> [dialect: dialect]
       _ -> []
     end
@@ -387,7 +430,7 @@ defmodule Pixir.Turn do
     # visible. See ADR 0020 update.
     history = maybe_preflight_critical_compaction(ctx, history)
 
-    tools = provider_tool_specs(state.provider)
+    tools = provider_tool_specs(state)
 
     system_prompt =
       system_prompt(
@@ -398,7 +441,9 @@ defmodule Pixir.Turn do
         state.rendered_skills_index
       )
 
-    cache_metadata = cache_metadata(ctx, state, tools) |> provider_cache_metadata(state.provider)
+    cache_metadata =
+      cache_metadata(ctx, state, tools)
+      |> resolved_provider_cache_metadata(state.capabilities)
 
     request =
       %{
@@ -429,13 +474,13 @@ defmodule Pixir.Turn do
 
       case state.provider.stream(request, provider_opts) do
         {:ok, %{finish_reason: :stop} = result} ->
-          with :ok <-
+          with {:ok, _usage_event, final_evidence} <-
                  record_provider_usage(sid, result, state, cache_metadata, iteration, history) do
-            finish(sid, result.text)
+            finish(sid, result.text, final_evidence)
           end
 
         {:ok, %{finish_reason: :tool_calls, function_calls: calls} = result} ->
-          with :ok <-
+          with {:ok, _usage_event, _evidence} <-
                  record_provider_usage(sid, result, state, cache_metadata, iteration, history) do
             continue_or_cap(
               ctx,
@@ -969,6 +1014,8 @@ defmodule Pixir.Turn do
   defp record_provider_usage(sid, result, state, cache_metadata, iteration, history) do
     summary = provider_usage_summary(result, state.provider)
     {:ok, assessment} = ContextWindow.assess(summary, state.model)
+    call_role = if result[:finish_reason] == :stop, do: "final_answer", else: "intermediate"
+    truncation = OutputTruncation.from_result(result, state.provider)
 
     data =
       %{
@@ -986,11 +1033,21 @@ defmodule Pixir.Turn do
       |> Map.merge(provider_hosted_tool_evidence(result))
       |> Map.merge(context_pressure_evidence(assessment))
 
-    case safe_session_record(sid, Event.provider_usage(sid, data), "provider_usage") do
-      {:ok, _} ->
+    usage_event = Event.provider_usage(sid, data)
+
+    evidence =
+      truncation
+      |> OutputTruncation.to_event_data()
+      |> Map.put("provider_usage_event_id", usage_event.id)
+      |> Map.put("call_role", call_role)
+
+    usage_event = put_in(usage_event, [:data, "output_truncation"], evidence)
+
+    case safe_session_record(sid, usage_event, "provider_usage") do
+      {:ok, stamped_event} ->
         emit_context_pressure_snapshot(sid, assessment, history)
         advise_context_pressure(sid, assessment, history)
-        :ok
+        {:ok, stamped_event, Map.put(evidence, "provider_usage_seq", stamped_event.seq)}
 
       {:error, error} ->
         Logger.warning("provider_usage evidence could not be recorded",
@@ -1119,6 +1176,18 @@ defmodule Pixir.Turn do
   @doc false
   def provider_cache_metadata(metadata, provider) when is_map(metadata) do
     case ProviderRegistry.entry_for(provider).capabilities do
+      %{prompt_cache: :cache_control, prompt_contract_version: version} ->
+        metadata
+        |> Map.put("prompt_contract_version", version)
+        |> Map.delete("prompt_cache_key")
+
+      %{prompt_cache: :prompt_cache_key} ->
+        metadata
+    end
+  end
+
+  defp resolved_provider_cache_metadata(metadata, capabilities) do
+    case capabilities do
       %{prompt_cache: :cache_control, prompt_contract_version: version} ->
         metadata
         |> Map.put("prompt_contract_version", version)
@@ -1263,7 +1332,7 @@ defmodule Pixir.Turn do
             skills_opts: state.skills_opts,
             agents_opts: state.agents_opts,
             provider: state.provider,
-            provider_opts: state.provider_opts,
+            provider_opts: ResolvedProviderRequest.for_child_turn(state.provider_opts),
             subagent_depth: state.subagent_depth,
             permission: state.permission
           }
@@ -1295,9 +1364,20 @@ defmodule Pixir.Turn do
     {:error, error}
   end
 
-  defp finish(sid, text) do
+  defp finish(sid, text, output_truncation) do
+    opts =
+      if output_truncation["status"] == "truncated" do
+        [metadata: %{"output_truncation" => output_truncation}]
+      else
+        []
+      end
+
     with {:ok, _} <-
-           safe_session_record(sid, Event.assistant_message(sid, text), "assistant_message") do
+           safe_session_record(
+             sid,
+             Event.assistant_message(sid, text, opts),
+             "assistant_message"
+           ) do
       Session.emit(sid, Event.status(sid, "done"))
       {:ok, text}
     end

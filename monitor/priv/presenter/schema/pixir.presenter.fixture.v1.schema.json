@@ -1,0 +1,296 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pixir.dev/schemas/pixir.presenter.fixture.v1.schema.json",
+  "title": "Pixir Presenter Projection Input Fixture v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "fixture_schema",
+    "fixture_version",
+    "scenario",
+    "source_class",
+    "observed_at",
+    "inputs",
+    "completeness",
+    "sanitization"
+  ],
+  "properties": {
+    "fixture_schema": {"const": "pixir.presenter.fixture"},
+    "fixture_version": {"const": 1},
+    "scenario": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+    "source_class": {
+      "enum": [
+        "real_minimized",
+        "synthetic_from_delegate_contract",
+        "synthetic_from_runtime_contract",
+        "synthetic_from_workflow_contract",
+        "synthetic_from_projection_contract"
+      ]
+    },
+    "observed_at": {"type": "string", "format": "date-time"},
+    "inputs": {"$ref": "#/$defs/inputs"},
+    "completeness": {"$ref": "#/$defs/completeness"},
+    "sanitization": {"$ref": "#/$defs/sanitization"}
+  },
+  "$defs": {
+    "nullableString": {"type": ["string", "null"]},
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "terminal_envelope",
+        "delegate_snapshot",
+        "parent_log",
+        "parent_log_origin",
+        "child_logs",
+        "runtime_diagnostics",
+        "owner_state",
+        "evidence_mirror"
+      ],
+      "properties": {
+        "terminal_envelope": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/delegateEnvelope"}
+          ]
+        },
+        "delegate_snapshot": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/delegateEnvelope"}
+          ]
+        },
+        "parent_log": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "array", "items": {"$ref": "#/$defs/event"}}
+          ]
+        },
+        "parent_log_origin": {
+          "enum": ["fixture", "workspace_log", null]
+        },
+        "child_logs": {
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [
+              {"type": "null"},
+              {"type": "array", "items": {"$ref": "#/$defs/event"}}
+            ]
+          }
+        },
+        "runtime_diagnostics": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/runtimeDiagnostics"}
+          ]
+        },
+        "owner_state": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/ownerState"}
+          ]
+        },
+        "evidence_mirror": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/evidenceMirror"}
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"parent_log": {"type": "null"}}},
+          "then": {"properties": {"parent_log_origin": {"type": "null"}}},
+          "else": {"properties": {"parent_log_origin": {"enum": ["fixture", "workspace_log"]}}}
+        }
+      ],
+      "anyOf": [
+        {"properties": {"terminal_envelope": {"type": "object"}}},
+        {"properties": {"delegate_snapshot": {"type": "object"}}},
+        {"properties": {"parent_log": {"type": "array", "minItems": 1}}},
+        {"properties": {"runtime_diagnostics": {"type": "object"}}},
+        {"properties": {"evidence_mirror": {"type": "object"}}}
+      ]
+    },
+    "delegateEnvelope": {
+      "type": "object",
+      "required": ["kind", "parent_session_id", "strategy", "mode", "status"],
+      "properties": {
+        "kind": {"type": "string", "minLength": 1},
+        "delegate_id": {"$ref": "#/$defs/nullableString"},
+        "parent_session_id": {"type": "string", "minLength": 1},
+        "strategy": {"enum": ["workflow", "subagents", "unknown"]},
+        "mode": {"enum": ["read_only", "bounded_write", "unknown"]},
+        "status": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": true
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seq", "ts", "type", "data"],
+      "properties": {
+        "seq": {"type": "integer", "minimum": 0},
+        "ts": {"type": "string", "format": "date-time"},
+        "type": {
+          "enum": [
+            "user_message",
+            "assistant_message",
+            "reasoning",
+            "skill_activation",
+            "subagent_event",
+            "workflow_event",
+            "session_fork",
+            "branch_summary",
+            "history_compaction",
+            "provider_usage",
+            "turn_failed",
+            "tool_call",
+            "tool_result",
+            "permission_decision"
+          ]
+        },
+        "data": {"type": "object"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"type": {"const": "workflow_event"}}},
+          "then": {"properties": {"data": {"required": ["kind", "workflow_id"]}}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "subagent_event"}}},
+          "then": {
+            "properties": {
+              "data": {
+                "required": ["event", "subagent_id", "child_session_id", "status"]
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "provider_usage"}}},
+          "then": {
+            "properties": {
+              "data": {
+                "required": ["model", "usage_summary"],
+                "properties": {
+                  "model": {"type": "string", "minLength": 1},
+                  "usage_summary": {"$ref": "#/$defs/usageSummary"}
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"type": {"enum": ["user_message", "assistant_message"]}}},
+          "then": {"properties": {"data": {"required": ["text"]}}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "turn_failed"}}},
+          "then": {"properties": {"data": {"required": ["terminal_status", "error_kind"]}}}
+        }
+      ]
+    },
+    "usageSummary": {
+      "type": "object",
+      "required": ["input_tokens", "output_tokens", "reasoning_tokens", "total_tokens", "cached_tokens"],
+      "properties": {
+        "input_tokens": {"type": "integer", "minimum": 0},
+        "output_tokens": {"type": "integer", "minimum": 0},
+        "reasoning_tokens": {"type": "integer", "minimum": 0},
+        "total_tokens": {"type": "integer", "minimum": 0},
+        "cached_tokens": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    },
+    "runtimeDiagnostics": {
+      "type": "object",
+      "required": ["parent_session_id", "observed_at", "running_count", "subagents", "runtime_gaps"],
+      "properties": {
+        "parent_session_id": {"type": "string", "minLength": 1},
+        "observed_at": {"type": "string", "format": "date-time"},
+        "running_count": {"type": "integer", "minimum": 0},
+        "subagents": {"type": "array", "items": {"type": "object"}},
+        "runtime_gaps": {"type": "array"}
+      },
+      "additionalProperties": true
+    },
+    "ownerState": {
+      "type": "object",
+      "required": ["state", "reachable"],
+      "properties": {
+        "state": {
+          "enum": ["live_delegate_owner", "snapshot_only", "stale_handle", "owner_unavailable"]
+        },
+        "reachable": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "evidenceMirror": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "captured_at", "logs"],
+      "properties": {
+        "status": {"enum": ["verified_copy", "source_diverged_mirror_retained"]},
+        "captured_at": {"type": "string", "format": "date-time"},
+        "logs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "role",
+              "session_id",
+              "status",
+              "reported_source_sha256",
+              "reported_mirror_sha256",
+              "events"
+            ],
+            "properties": {
+              "role": {"enum": ["parent", "child"]},
+              "session_id": {"type": "string", "minLength": 1},
+              "status": {"enum": ["verified_copy", "source_diverged_mirror_retained"]},
+              "reported_source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "reported_mirror_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "events": {"type": "array", "items": {"$ref": "#/$defs/event"}}
+            }
+          }
+        }
+      }
+    },
+    "completeness": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "enum": ["terminal_envelope", "delegate_snapshot", "parent_log", "child_logs", "runtime_diagnostics", "evidence_mirror"]
+      },
+      "additionalProperties": {
+        "enum": [
+          "complete",
+          "complete_for_contract_scenario",
+          "complete_through_observed_at",
+          "complete_snapshot",
+          "minimized",
+          "provider_usage_sampled",
+          "not_retained",
+          "present_empty",
+          "explicitly_missing",
+          "unavailable",
+          "not_applicable"
+        ]
+      }
+    },
+    "sanitization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["absolute_paths_removed", "identifiers_replaced", "model_content_minimized", "secrets_removed"],
+      "properties": {
+        "absolute_paths_removed": {"const": true},
+        "identifiers_replaced": {"const": true},
+        "model_content_minimized": {"const": true},
+        "secrets_removed": {"const": true}
+      }
+    }
+  }
+}

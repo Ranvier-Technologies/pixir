@@ -1,0 +1,66 @@
+{
+  "schema": "pixir.monitor.semantic_zoom_gate.budgets",
+  "schema_version": 1,
+  "calibrated": true,
+  "pins": {
+    "dom_tolerance": 32,
+    "initial_ceiling": 971,
+    "member_step_nodes": 305,
+    "member_page_2_ceiling": 731,
+    "edge_step_nodes": 145,
+    "edge_page_2_ceiling": 439,
+    "overflow_zoom_ceiling": 231,
+    "k": 9.34,
+    "denom_floor_ms": 25,
+    "expansion_ratio": 2,
+    "cluster_member_page_1_step_ms": 25,
+    "cluster_member_page_2_step_ms": 25,
+    "arc_edge_page_1_step_ms": 25,
+    "arc_edge_page_2_step_ms": 25,
+    "overflow_level_1_step_ms": 25,
+    "overflow_level_2_step_ms": 25
+  },
+  "structural": {
+    "level_zero_entity_cards": 7,
+    "deeper_entity_cards": 8,
+    "cluster_cards": 6,
+    "overflow_cards": 1,
+    "boundary_cards": 1,
+    "distribution_rows_per_entity": 5,
+    "run_scoped_source_presentations": 1,
+    "level_zero_arc_links_min": 1,
+    "member_page_size": 12,
+    "edge_page_size": 100,
+    "arc_bound": "choose(entity_cards, 2) + 1"
+  },
+  "negative": {
+    "refetch_cycles": 25,
+    "scroll_tolerance_px": 2,
+    "horizontal_overflow_tolerance_px": 2,
+    "red_proof_clones": 500
+  },
+  "timeouts_ms": {
+    "fixture_materialization": 60000,
+    "browser_readiness": 15000,
+    "monitor_serving": 35000,
+    "monitor_readiness": 15000,
+    "fifo_handoff": 15000,
+    "cdp_connect": 10000,
+    "cdp_command": 10000,
+    "view_convergence": 15000,
+    "refetch_cycle": 5000,
+    "child_term_grace": 1000,
+    "child_kill_grace": 1000
+  },
+  "_comment": {
+    "arc_bound": "Workflow edges advance in topological order, so a non-empty level-zero graph must render at least one arc and at most one aggregate arc for each unordered pair of visible entities. Exact intra-wave edges do not exist. Only the overflow entity can legally contribute a self-arc, hence C(entities,2)+1.",
+    "calibration": "Every committed pin, including the B5a per-step ceilings, was calibrated on the named host on 2026-07-15; normal mode refuses any null required pin. To recalibrate: run --calibrate on the named host, review the proposed pins in the evidence, copy them all together, and apply the documented 25ms B5a floor.",
+    "step_absolute_ceiling": "Each B5a absolute step ceiling is max(ceil(the measured step latency (single sample per step) in milliseconds * 1.25 shared calibration headroom), 25ms). The frozen B5 expansion-ratio assertions remain in force alongside B5a.",
+    "step_ceiling_floor": "B5a step ceilings use one measured latency sample per step and are pinned at max(ceil(sample x 1.25), 25ms): the 25ms floor absorbs single-digit-ms timer noise on cheap steps while remaining ~2 orders of magnitude tighter than the ratio bound B5 alone."
+  },
+  "calibration": {
+    "host": "macstudio-local",
+    "date": "2026-07-15",
+    "evidence": "measured 100u zoom_nodes 142 / 500u 159 (delta 17), body 750/767, render 139.9ms/1044.7ms (ratio 7.47)"
+  }
+}

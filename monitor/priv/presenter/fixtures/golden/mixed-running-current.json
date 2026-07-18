@@ -1,0 +1,288 @@
+{
+  "schema": "pixir.presenter.run",
+  "schema_version": 1,
+  "projection_id": "projection:mixed-running-current",
+  "projected_at": "2026-07-10T19:00:05Z",
+  "run": {
+    "id": "dlg-mixed",
+    "delegate_id": "dlg-mixed",
+    "parent_session_id": "parent-mixed",
+    "workflow_id": null,
+    "strategy": "subagents",
+    "mode": "read_only",
+    "title": null,
+    "evidence_refs": [
+      "e-snapshot-mixed"
+    ]
+  },
+  "source": {
+    "mode": "mixed",
+    "durable_origin": "fixture",
+    "as_of_seq": 0,
+    "last_durable_at": "2026-07-10T19:00:00Z",
+    "live_observed_at": "2026-07-10T19:00:05Z",
+    "freshness": "current",
+    "limitations": []
+  },
+  "execution": {
+    "state": "running",
+    "terminal": false,
+    "basis": "subagent_event_fold",
+    "evidence_refs": [
+      "e-parent-0"
+    ]
+  },
+  "liveness": {
+    "state": "live",
+    "reachable": true,
+    "basis": "delegate_owner",
+    "observed_at": "2026-07-10T19:00:05Z",
+    "evidence_refs": [
+      "e-owner-live",
+      "e-manager-live"
+    ]
+  },
+  "counts": {
+    "planned_units": 1,
+    "observed_units": 1,
+    "running_units": 1,
+    "completed_units": 0,
+    "attention_units": 0
+  },
+  "graph": null,
+  "units": [
+    {
+      "logical_id": "delegate:dlg-mixed:subagent:sub-live",
+      "unit_kind": "subagent",
+      "label": "explorer",
+      "agent": "explorer",
+      "execution_kind": "subagent",
+      "workspace_mode": "shared",
+      "posture": "unknown",
+      "depends_on": [],
+      "execution": {
+        "state": "running",
+        "terminal": false,
+        "basis": "subagent_event_fold",
+        "evidence_refs": [
+          "e-parent-0"
+        ]
+      },
+      "liveness": {
+        "state": "live",
+        "reachable": true,
+        "basis": "manager_diagnostics",
+        "observed_at": "2026-07-10T19:00:05Z",
+        "evidence_refs": [
+          "e-manager-live"
+        ]
+      },
+      "gate": {
+        "state": "not_applicable",
+        "dependent_safe": null,
+        "basis": "not_applicable",
+        "evidence_refs": []
+      },
+      "advisory": {
+        "present": false,
+        "verdict": "unknown",
+        "mergeable": null,
+        "declared_gate": null,
+        "parse_status": "not_present",
+        "summary": null,
+        "major_count": null,
+        "minor_count": null,
+        "evidence_refs": []
+      },
+      "attempts": [
+        {
+          "attempt_id": "delegate:dlg-mixed:subagent:sub-live:attempt:0",
+          "ordinal": 0,
+          "relation": "fresh",
+          "predecessor_attempt_id": null,
+          "child_session_id": "child-live",
+          "status": "running",
+          "started_at": "2026-07-10T19:00:00Z",
+          "ended_at": null,
+          "error_kind": null,
+          "summary": null,
+          "usage": {
+            "source": "provider_usage_fold",
+            "complete": true,
+            "calls": 2,
+            "groups": [
+              {
+                "provider": "openai",
+                "model": "gpt-test",
+                "calls": 2,
+                "input_tokens": 2200,
+                "output_tokens": 250,
+                "reasoning_tokens": 70,
+                "total_tokens": 2450,
+                "cached_tokens": 1100,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 1100
+              }
+            ],
+            "evidence_refs": [
+              "e-child-1",
+              "e-child-2"
+            ],
+            "limitations": []
+          },
+          "evidence_refs": [
+            "e-parent-0",
+            "e-child-1",
+            "e-child-2",
+            "e-manager-live"
+          ],
+          "limitations": [],
+          "materialization": "durable",
+          "status_basis": "parent_log",
+          "child_event_window": {
+            "session_id": "child-live",
+            "from_seq": null,
+            "to_seq_exclusive": null,
+            "basis": "whole_child_log_single_attempt",
+            "evidence_refs": [
+              "e-child-1",
+              "e-child-2"
+            ]
+          }
+        }
+      ],
+      "artifacts": [],
+      "usage": {
+        "source": "provider_usage_fold",
+        "complete": true,
+        "calls": 2,
+        "groups": [
+          {
+            "provider": "openai",
+            "model": "gpt-test",
+            "calls": 2,
+            "input_tokens": 2200,
+            "output_tokens": 250,
+            "reasoning_tokens": 70,
+            "total_tokens": 2450,
+            "cached_tokens": 1100,
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 1100
+          }
+        ],
+        "evidence_refs": [
+          "e-child-1",
+          "e-child-2"
+        ],
+        "limitations": []
+      },
+      "mutation": {
+        "status": "read_only",
+        "observed_paths": [],
+        "observed_semantics": "none",
+        "evidence_refs": [
+          "e-snapshot-mixed"
+        ],
+        "limitations": []
+      },
+      "safe_actions": [],
+      "evidence_refs": [
+        "e-parent-0",
+        "e-manager-live",
+        "e-owner-live"
+      ],
+      "limitations": [],
+      "materialization": "durable",
+      "attention": {
+        "required": false,
+        "reasons": [],
+        "evidence_refs": []
+      }
+    }
+  ],
+  "usage": {
+    "source": "provider_usage_fold",
+    "complete": true,
+    "calls": 2,
+    "groups": [
+      {
+        "provider": "openai",
+        "model": "gpt-test",
+        "calls": 2,
+        "input_tokens": 2200,
+        "output_tokens": 250,
+        "reasoning_tokens": 70,
+        "total_tokens": 2450,
+        "cached_tokens": 1100,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 1100
+      }
+    ],
+    "evidence_refs": [
+      "e-child-1",
+      "e-child-2"
+    ],
+    "limitations": []
+  },
+  "mutation": {
+    "status": "read_only",
+    "observed_paths": [],
+    "observed_semantics": "none",
+    "evidence_refs": [
+      "e-snapshot-mixed"
+    ],
+    "limitations": []
+  },
+  "safe_actions": [],
+  "evidence": [
+    {
+      "id": "e-snapshot-mixed",
+      "authority": "derived",
+      "source_kind": "delegate_snapshot",
+      "session_id": "parent-mixed",
+      "seq": null,
+      "description": "Delegate status snapshot supplies identity and read-only mode."
+    },
+    {
+      "id": "e-parent-0",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-mixed",
+      "seq": 0,
+      "description": "Durable Subagent start event."
+    },
+    {
+      "id": "e-child-1",
+      "authority": "canonical",
+      "source_kind": "child_log",
+      "session_id": "child-live",
+      "seq": 1,
+      "description": "First durable provider usage event."
+    },
+    {
+      "id": "e-child-2",
+      "authority": "canonical",
+      "source_kind": "child_log",
+      "session_id": "child-live",
+      "seq": 2,
+      "description": "Second durable provider usage event."
+    },
+    {
+      "id": "e-manager-live",
+      "authority": "volatile",
+      "source_kind": "manager_diagnostics",
+      "session_id": "parent-mixed",
+      "seq": null,
+      "description": "Manager reports indexed live child PID and no runtime gaps."
+    },
+    {
+      "id": "e-owner-live",
+      "authority": "volatile",
+      "source_kind": "delegate_owner",
+      "session_id": "parent-mixed",
+      "seq": null,
+      "description": "Current runtime has a reachable Delegate owner."
+    }
+  ],
+  "limitations": []
+}

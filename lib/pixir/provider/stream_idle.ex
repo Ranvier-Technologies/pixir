@@ -9,6 +9,7 @@ defmodule Pixir.Provider.StreamIdle do
   """
 
   alias Pixir.{Config, Tool}
+  alias Pixir.Provider.TransportError
 
   @default_idle_ms 180_000
 
@@ -47,7 +48,7 @@ defmodule Pixir.Provider.StreamIdle do
   def run(stream_fn, opts, transport_label) when is_function(stream_fn, 1) do
     case idle_timeout_ms(opts) do
       timeout when timeout in [:infinity, 0] ->
-        stream_fn.(fn -> :ok end)
+        run_stream(stream_fn, fn -> :ok end, transport_label)
 
       idle_ms ->
         run_monitored(stream_fn, idle_ms, transport_label)
@@ -61,7 +62,7 @@ defmodule Pixir.Provider.StreamIdle do
 
     {pid, mon} =
       spawn_monitor(fn ->
-        send(caller, {ref, :done, stream_fn.(activity)})
+        send(caller, {ref, :done, run_stream(stream_fn, activity, transport_label)})
       end)
 
     watch(ref, idle_ms, transport_label, mon, pid)
@@ -81,7 +82,7 @@ defmodule Pixir.Provider.StreamIdle do
 
         {:error,
          Tool.error(:network, "Provider stream process exited.", %{
-           reason: inspect(reason),
+           reason: TransportError.reason(reason),
            transport: transport_label
          })}
     after
@@ -90,6 +91,24 @@ defmodule Pixir.Provider.StreamIdle do
         Process.demonitor(mon, [:flush])
         {:error, error(idle_ms, transport_label)}
     end
+  end
+
+  defp run_stream(stream_fn, activity, transport_label) do
+    stream_fn.(activity)
+  rescue
+    exception ->
+      {:error,
+       Tool.error(:network, "Provider stream process exited.", %{
+         reason: TransportError.reason(exception),
+         transport: transport_label
+       })}
+  catch
+    kind, reason ->
+      {:error,
+       Tool.error(:network, "Provider stream process exited.", %{
+         reason: TransportError.reason({kind, reason}),
+         transport: transport_label
+       })}
   end
 
   @doc false

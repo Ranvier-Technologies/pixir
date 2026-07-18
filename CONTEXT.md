@@ -29,14 +29,24 @@ messages, collect input, subscribe to **Events**, parse slash commands, attach i
 or translate protocol frames, but it does not own **Session** state, **History**,
 permissions, **Tools**, or the **Turn** loop.
 
-The CLI renderer, ACP stdio server, and a T3 Code adapter are Presenters or Presenter
-adapters. They may make interaction nicer, but the Harness remains Pixir.
+The CLI renderer, ACP stdio server, a T3 Code adapter, and the source-checkout
+Pixir Monitor are Presenters or Presenter adapters. Pixir Monitor is an experimental
+sibling Phoenix/Bandit application; it reads recomputable Pixir projections without
+adding Phoenix to the Harness core or the Hex package. Presenters may make interaction
+nicer, but the Harness remains Pixir.
 
 ### Presenter Projection
 The Presenter-side read model or UI state derived from Pixir **Events**. A Presenter
 Projection may store chat bubbles, work-log rows, diff panels, tree views, or local
 adapter bookkeeping so the UI can reload quickly. It is not the canonical replay source:
 if it conflicts with the Pixir **Log**, the Log wins.
+
+In Pixir Monitor, `pixir.presenter.run.v1` is recomputed from authoritative Pixir
+evidence without a Presenter store. HTTP snapshots are authoritative; bounded SSE
+messages are invalidation hints that trigger refetch, including after anomalies or
+reconnect. Browser state is disposable. Execution, liveness, runtime gate,
+model-authored advisory, and source provenance remain independent projection
+dimensions, and retries remain attempts in one logical unit lineage.
 
 In a T3 Code integration, the T3 database owns presentation state and product UX; Pixir
 owns runtime truth. T3 may supply late UX context such as open files, selected ranges,

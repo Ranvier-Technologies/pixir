@@ -1,0 +1,54 @@
+{
+  "fixture_schema": "pixir.presenter.fixture",
+  "fixture_version": 1,
+  "scenario": "live-runtime-only-no-log",
+  "source_class": "synthetic_from_runtime_contract",
+  "observed_at": "2026-07-10T19:10:00Z",
+  "inputs": {
+    "terminal_envelope": null,
+    "delegate_snapshot": {
+      "kind": "delegate_status",
+      "delegate_id": "dlg-live-only",
+      "parent_session_id": "parent-live-only",
+      "strategy": "subagents",
+      "mode": "read_only",
+      "status": "running"
+    },
+    "parent_log": null,
+    "parent_log_origin": null,
+    "child_logs": {},
+    "runtime_diagnostics": {
+      "parent_session_id": "parent-live-only",
+      "observed_at": "2026-07-10T19:10:00Z",
+      "running_count": 1,
+      "subagents": [
+        {
+          "id": "sub-live-only",
+          "child_session_id": "child-live-only",
+          "status": "running",
+          "agent": "explorer",
+          "child_indexed": true,
+          "child_pid_alive": true
+        }
+      ],
+      "runtime_gaps": []
+    },
+    "owner_state": {
+      "state": "live_delegate_owner",
+      "reachable": true,
+      "delegate_owner": true
+    },
+    "evidence_mirror": null
+  },
+  "completeness": {
+    "parent_log": "unavailable",
+    "child_logs": "unavailable",
+    "runtime_diagnostics": "complete_snapshot"
+  },
+  "sanitization": {
+    "absolute_paths_removed": true,
+    "identifiers_replaced": true,
+    "model_content_minimized": true,
+    "secrets_removed": true
+  }
+}

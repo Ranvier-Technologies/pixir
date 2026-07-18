@@ -1,0 +1,159 @@
+{
+  "fixture_schema": "pixir.presenter.fixture",
+  "fixture_version": 1,
+  "scenario": "held-missing-child-log",
+  "source_class": "synthetic_from_workflow_contract",
+  "observed_at": "2026-07-10T19:20:06Z",
+  "inputs": {
+    "terminal_envelope": {
+      "kind": "delegate_result",
+      "delegate_id": "dlg-held",
+      "parent_session_id": "parent-held",
+      "strategy": "workflow",
+      "mode": "read_only",
+      "workflow_id": "wf-held",
+      "status": "partial",
+      "safe_next_actions": [
+        "rerun_after_dependencies_checkpoint_ready"
+      ]
+    },
+    "delegate_snapshot": null,
+    "parent_log": [
+      {
+        "seq": 0,
+        "ts": "2026-07-10T19:20:00Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "workflow_started",
+          "workflow_id": "wf-held",
+          "workflow_name": "Held dependency",
+          "graph": {
+            "steps": [
+              {
+                "id": "producer",
+                "agent": "worker",
+                "depends_on": [],
+                "execution_kind": "subagent",
+                "workspace_mode": "shared",
+                "posture": "read_only"
+              },
+              {
+                "id": "consumer",
+                "agent": "reviewer",
+                "depends_on": [
+                  "producer"
+                ],
+                "execution_kind": "subagent",
+                "workspace_mode": "shared",
+                "posture": "read_only"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "seq": 1,
+        "ts": "2026-07-10T19:20:01Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "step_scheduled",
+          "workflow_id": "wf-held",
+          "step_id": "producer",
+          "wave": 1,
+          "execution_kind": "subagent"
+        }
+      },
+      {
+        "seq": 2,
+        "ts": "2026-07-10T19:20:02Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "started",
+          "status": "running",
+          "subagent_id": "sub-producer",
+          "child_session_id": "child-missing",
+          "agent": "worker",
+          "delegation_context": {
+            "step_id": "producer"
+          }
+        }
+      },
+      {
+        "seq": 3,
+        "ts": "2026-07-10T19:20:03Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "failed",
+          "status": "failed",
+          "subagent_id": "sub-producer",
+          "child_session_id": "child-missing",
+          "agent": "worker",
+          "summary": "Provider failed.",
+          "delegation_context": {
+            "step_id": "producer"
+          }
+        }
+      },
+      {
+        "seq": 4,
+        "ts": "2026-07-10T19:20:04Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "checkpoint_decided",
+          "workflow_id": "wf-held",
+          "step_id": "producer",
+          "child_session_id": "child-missing",
+          "checkpoint_status": "failed",
+          "dependent_safe": false
+        }
+      },
+      {
+        "seq": 5,
+        "ts": "2026-07-10T19:20:05Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "step_held",
+          "workflow_id": "wf-held",
+          "step_id": "consumer",
+          "checkpoint_status": "held",
+          "dependent_safe": false,
+          "reason": "dependency_not_checkpoint_ready"
+        }
+      },
+      {
+        "seq": 6,
+        "ts": "2026-07-10T19:20:06Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "workflow_finished",
+          "workflow_id": "wf-held",
+          "status": "partial",
+          "ok": false,
+          "safe_next_actions": [
+            "rerun_after_dependencies_checkpoint_ready"
+          ]
+        }
+      }
+    ],
+    "parent_log_origin": "fixture",
+    "child_logs": {
+      "child-missing": null
+    },
+    "runtime_diagnostics": null,
+    "owner_state": {
+      "state": "snapshot_only",
+      "reachable": false
+    },
+    "evidence_mirror": null
+  },
+  "completeness": {
+    "parent_log": "complete",
+    "child_logs": "explicitly_missing"
+  },
+  "sanitization": {
+    "absolute_paths_removed": true,
+    "identifiers_replaced": true,
+    "model_content_minimized": true,
+    "secrets_removed": true
+  }
+}

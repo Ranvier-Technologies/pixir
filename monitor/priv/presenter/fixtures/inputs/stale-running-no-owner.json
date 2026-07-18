@@ -1,0 +1,21 @@
+{
+  "fixture_schema": "pixir.presenter.fixture",
+  "fixture_version": 1,
+  "scenario": "stale-running-no-owner",
+  "source_class": "synthetic_from_runtime_contract",
+  "observed_at": "2026-07-10T20:20:30Z",
+  "inputs": {
+    "terminal_envelope": null,
+    "delegate_snapshot": {"kind": "delegate_status", "delegate_id": "dlg-stale", "parent_session_id": "parent-stale", "strategy": "subagents", "mode": "read_only", "status": "running", "children": [{"subagent_id": "sub-stale", "child_session_id": "child-stale", "agent": "explorer", "status": "running"}]},
+    "parent_log": [
+      {"seq": 0, "ts": "2026-07-10T20:20:00Z", "type": "subagent_event", "data": {"event": "started", "subagent_id": "sub-stale", "child_session_id": "child-stale", "agent": "explorer", "status": "running"}}
+    ],
+    "parent_log_origin": "fixture",
+    "child_logs": {"child-stale": []},
+    "runtime_diagnostics": null,
+    "owner_state": {"state": "snapshot_only", "reachable": false},
+    "evidence_mirror": null
+  },
+  "completeness": {"delegate_snapshot": "complete_snapshot", "parent_log": "complete_through_observed_at", "child_logs": "complete_through_observed_at"},
+  "sanitization": {"absolute_paths_removed": true, "identifiers_replaced": true, "model_content_minimized": true, "secrets_removed": true}
+}

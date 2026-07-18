@@ -1,7 +1,7 @@
 defmodule Pixir.LogTest do
   use ExUnit.Case, async: true
 
-  alias Pixir.{Event, Log}
+  alias Pixir.{Event, Log, Paths}
 
   setup do
     ws =
@@ -159,5 +159,45 @@ defmodule Pixir.LogTest do
              Log.fold(sid, workspace: ws)
 
     assert reason == {:unknown_event_type, "definitely_not_a_real_event_type"}
+  end
+
+  test "structured existence and fold refuse symlinked sessions without disclosing target", %{
+    ws: ws,
+    sid: sid
+  } do
+    outside = ws <> "-outside-read"
+    File.mkdir_p!(outside)
+    on_exit(fn -> File.rm_rf!(outside) end)
+    File.mkdir_p!(Paths.project_root(ws))
+
+    outside_log = Path.join(outside, sid <> ".ndjson")
+    File.write!(outside_log, "outside-secret-that-must-not-be-read")
+    File.ln_s!(outside, Paths.sessions_dir(ws))
+
+    assert {:error, %{error: %{kind: :unsafe_state_path}} = exists_error} =
+             Log.exists(sid, workspace: ws)
+
+    assert {:error, %{error: %{kind: :unsafe_state_path}} = fold_error} =
+             Log.fold(sid, workspace: ws)
+
+    refute inspect(exists_error) =~ "outside-secret"
+    refute inspect(fold_error) =~ "outside-secret"
+    assert File.read!(outside_log) == "outside-secret-that-must-not-be-read"
+  end
+
+  test "append refuses a final Log symlink without changing outside bytes", %{ws: ws, sid: sid} do
+    outside = ws <> "-outside-write"
+    File.mkdir_p!(outside)
+    on_exit(fn -> File.rm_rf!(outside) end)
+    Paths.ensure_sessions_dir(ws)
+    sentinel = Path.join(outside, "sentinel")
+    File.write!(sentinel, "unchanged")
+    File.ln_s!(sentinel, Paths.session_log(sid, ws))
+    event = Event.user_message(sid, "must not escape") |> Event.with_seq(0)
+
+    assert {:error, %{error: %{kind: :unsafe_state_path}}} =
+             Log.append(event, workspace: ws)
+
+    assert File.read!(sentinel) == "unchanged"
   end
 end

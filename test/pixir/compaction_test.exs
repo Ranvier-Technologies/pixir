@@ -549,6 +549,36 @@ defmodule Pixir.CompactionTest do
              Compaction.dry_run(sid, workspace: ws, tail_events: 1, model_assisted: true)
   end
 
+  test "model-assisted compaction propagates profile preflight errors without fallback", %{
+    ws: ws,
+    sid: sid
+  } do
+    append_history(ws, [
+      Event.user_message(sid, "one"),
+      Event.assistant_message(sid, "two"),
+      Event.user_message(sid, "three")
+    ])
+
+    cases = [{%{"mode" => "future"}, :invalid_config}]
+
+    for {profile, kind} <- cases do
+      assert {:error, %{error: %{kind: ^kind}} = payload} =
+               Compaction.compact(sid,
+                 workspace: ws,
+                 tail_events: 1,
+                 model_assisted: true,
+                 responses_backend: profile,
+                 auth: :missing_compaction_profile_auth,
+                 transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+               )
+
+      refute Map.has_key?(payload, "model_assisted_fallback")
+    end
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+    refute Enum.any?(history, &(&1.type == :history_compaction))
+  end
+
   test "compact uses model-assisted Provider path and records checkpoint after validation", %{
     ws: ws,
     sid: sid
@@ -591,6 +621,41 @@ defmodule Pixir.CompactionTest do
 
     assert data["strategy"] == "model_assisted_operational_summary_v1"
     refute Map.get(data, "model_assisted_fallback")
+  end
+
+  test "model-assisted compaction receives snapshotted Provider defaults", %{ws: ws, sid: sid} do
+    auth = start_auth()
+
+    append_history(ws, [
+      Event.user_message(sid, "implement compaction"),
+      Event.assistant_message(sid, "working"),
+      Event.user_message(sid, "continue")
+    ])
+
+    test = self()
+    delegate = compaction_transport(valid_model_checkpoint())
+
+    transport = fn request, acc, fun ->
+      send(test, {:compaction_request, Jason.decode!(request.body)})
+      delegate.(request, acc, fun)
+    end
+
+    assert {:ok, %{"recorded" => true, "model_assisted" => true}} =
+             Compaction.compact(sid,
+               workspace: ws,
+               tail_events: 1,
+               model_assisted: true,
+               raw_config: %{
+                 "reasoning" => %{"effort" => "high"},
+                 "text" => %{"verbosity" => "low"}
+               },
+               auth: auth,
+               transport: transport
+             )
+
+    assert_received {:compaction_request, body}
+    assert body["reasoning"] == %{"effort" => "high"}
+    assert body["text"]["format"]["name"] == "pixir_history_compaction_checkpoint"
   end
 
   test "compact falls back to deterministic checkpoint when model output is invalid", %{
