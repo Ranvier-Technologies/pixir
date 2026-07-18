@@ -14,7 +14,7 @@ defmodule Pixir.Events do
   instead of full presenters.
   """
 
-  alias Pixir.Event
+  alias Pixir.{Event, SessionId}
 
   @registry Pixir.Events.Registry
 
@@ -28,16 +28,20 @@ defmodule Pixir.Events do
   Subscribe the calling process to a Session's events. Delivered as
   `{:pixir_event, %Pixir.Event{}}` messages.
   """
-  @spec subscribe(String.t(), keyword()) :: :ok
-  def subscribe(session_id, opts \\ []) when is_binary(session_id) do
-    {:ok, _} = Registry.register(@registry, session_id, %{only: only(opts)})
-    :ok
+  @spec subscribe(String.t(), keyword()) :: :ok | {:error, map()}
+  def subscribe(session_id, opts \\ []) do
+    with :ok <- SessionId.validate(session_id) do
+      {:ok, _} = Registry.register(@registry, session_id, %{only: only(opts)})
+      :ok
+    end
   end
 
   @doc "Unsubscribe the calling process from a Session's events."
-  @spec unsubscribe(String.t()) :: :ok
-  def unsubscribe(session_id) when is_binary(session_id) do
-    Registry.unregister(@registry, session_id)
+  @spec unsubscribe(String.t()) :: :ok | {:error, map()}
+  def unsubscribe(session_id) do
+    with :ok <- SessionId.validate(session_id) do
+      Registry.unregister(@registry, session_id)
+    end
   end
 
   @doc """
@@ -45,19 +49,27 @@ defmodule Pixir.Events do
   can be threaded (e.g. logged after publishing). Fan-out only — persistence is the
   Session's responsibility (canonical events go to the Log).
   """
-  @spec publish(Event.t()) :: Event.t()
-  def publish(%{session_id: session_id} = event) when is_binary(session_id) do
-    Registry.dispatch(@registry, session_id, fn subscribers ->
-      for {pid, meta} <- subscribers, deliver?(meta, event), do: send(pid, {:pixir_event, event})
-    end)
+  @spec publish(Event.t()) :: Event.t() | {:error, map()}
+  def publish(%{session_id: session_id} = event) do
+    with :ok <- SessionId.validate(session_id) do
+      Registry.dispatch(@registry, session_id, fn subscribers ->
+        for {pid, meta} <- subscribers,
+            deliver?(meta, event),
+            do: send(pid, {:pixir_event, event})
+      end)
 
-    event
+      event
+    end
   end
 
+  def publish(_event), do: SessionId.validate(nil)
+
   @doc "Number of live subscribers for a Session (mostly for tests/diagnostics)."
-  @spec subscriber_count(String.t()) :: non_neg_integer()
-  def subscriber_count(session_id) when is_binary(session_id) do
-    @registry |> Registry.lookup(session_id) |> length()
+  @spec subscriber_count(String.t()) :: non_neg_integer() | {:error, map()}
+  def subscriber_count(session_id) do
+    with :ok <- SessionId.validate(session_id) do
+      @registry |> Registry.lookup(session_id) |> length()
+    end
   end
 
   defp only(opts) do

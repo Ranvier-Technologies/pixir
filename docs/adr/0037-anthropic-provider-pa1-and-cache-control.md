@@ -240,7 +240,8 @@ on output caps) finalizes successfully with truncation recorded as evidence:
 `:stop` for plain text, `:tool_calls` when completed `tool_use` blocks exist
 so they are not discarded, and `provider_metadata` carries
 `stop_reason: "max_tokens"` plus `truncated: true` in both cases. A shared
-cross-provider truncation-honesty contract is future work. `pause_turn` is
+cross-provider truncation-honesty contract is defined by ADR 0039; its neutral
+value is authoritative while these private keys remain compatibility evidence. `pause_turn` is
 out of scope (no server-side tools are mapped).
 
 ## Out of scope (deliberate)

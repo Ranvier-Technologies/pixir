@@ -1,0 +1,373 @@
+{
+  "fixture_schema": "pixir.presenter.fixture",
+  "fixture_version": 1,
+  "scenario": "f4-advisory-retry-reconstructed",
+  "source_class": "real_minimized",
+  "observed_at": "2026-07-10T00:54:47.061745Z",
+  "inputs": {
+    "terminal_envelope": {
+      "kind": "delegate_result",
+      "delegate_id": "dlg-f4",
+      "parent_session_id": "parent-f4",
+      "strategy": "workflow",
+      "mode": "bounded_write",
+      "workflow_id": "wf-f4",
+      "status": "completed",
+      "write_destination": {
+        "contract_status": "repo_mutating_success",
+        "writes_applied_to": "workspace"
+      },
+      "steps": [
+        {
+          "step_id": "propose",
+          "checkpoint": {
+            "artifact_refs": [
+              {
+                "kind": "virtual_diff",
+                "version": 1,
+                "hash": "sha256:virtual-diff-f4"
+              }
+            ]
+          }
+        },
+        {
+          "step_id": "apply",
+          "apply_from": "propose",
+          "checkpoint": {
+            "virtual_diff_apply": {
+              "kind": "virtual_diff_apply",
+              "version": 1,
+              "status": "applied",
+              "artifact": {
+                "kind": "virtual_diff",
+                "version": 1,
+                "sha256": "sha256:virtual-diff-f4"
+              },
+              "files": [
+                {
+                  "path": "docs/example.md",
+                  "status": "applied"
+                }
+              ],
+              "counts": {
+                "selected": 1,
+                "applicable": 1,
+                "applied": 1,
+                "conflicted": 0
+              }
+            }
+          }
+        }
+      ],
+      "children": [
+        {
+          "step_id": "propose",
+          "subagent_id": null,
+          "child_session_id": null,
+          "status": "completed",
+          "checkpoint_status": "checkpoint_ready",
+          "workspace_mode": "virtual_overlay"
+        },
+        {
+          "step_id": "review",
+          "subagent_id": "sub-review",
+          "child_session_id": "child-f4-b",
+          "status": "completed",
+          "checkpoint_status": "checkpoint_ready",
+          "workspace_mode": "shared"
+        },
+        {
+          "step_id": "apply",
+          "subagent_id": null,
+          "child_session_id": null,
+          "status": "completed",
+          "checkpoint_status": "checkpoint_ready",
+          "workspace_mode": "shared"
+        }
+      ]
+    },
+    "delegate_snapshot": null,
+    "parent_log": [
+      {
+        "seq": 0,
+        "ts": "2026-07-10T00:48:38.393481Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "workflow_started",
+          "workflow_id": "wf-f4",
+          "workflow_name": "Propose, review, apply",
+          "graph": {
+            "steps": [
+              {
+                "id": "propose",
+                "agent": "default",
+                "depends_on": [],
+                "execution_kind": "virtual_overlay",
+                "workspace_mode": "virtual_overlay",
+                "posture": "virtual_scratch"
+              },
+              {
+                "id": "review",
+                "agent": "reviewer",
+                "depends_on": [
+                  "propose"
+                ],
+                "execution_kind": "subagent",
+                "workspace_mode": "shared",
+                "posture": "read_only"
+              },
+              {
+                "id": "apply",
+                "agent": null,
+                "depends_on": [
+                  "propose",
+                  "review"
+                ],
+                "execution_kind": "virtual_diff_apply",
+                "workspace_mode": "shared",
+                "posture": "apply",
+                "apply_from": "propose"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "seq": 1,
+        "ts": "2026-07-10T00:48:38.394112Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "step_scheduled",
+          "workflow_id": "wf-f4",
+          "step_id": "propose",
+          "wave": 1,
+          "execution_kind": "virtual_overlay"
+        }
+      },
+      {
+        "seq": 2,
+        "ts": "2026-07-10T00:48:38.413798Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "checkpoint_decided",
+          "workflow_id": "wf-f4",
+          "step_id": "propose",
+          "execution_kind": "virtual_overlay",
+          "checkpoint_status": "checkpoint_ready",
+          "dependent_safe": true,
+          "checkpoint": {
+            "known_limitations": [
+              "virtual_diff_not_applied"
+            ],
+            "artifact_refs": [
+              {
+                "kind": "virtual_diff",
+                "version": 1,
+                "hash": "sha256:virtual-diff-f4",
+                "workspace_strategy": "virtual_overlay"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "seq": 3,
+        "ts": "2026-07-10T00:48:38.414331Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "step_scheduled",
+          "workflow_id": "wf-f4",
+          "step_id": "review",
+          "wave": 2,
+          "execution_kind": "subagent"
+        }
+      },
+      {
+        "seq": 4,
+        "ts": "2026-07-10T00:48:38.416929Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "started",
+          "status": "running",
+          "subagent_id": "sub-review",
+          "child_session_id": "child-f4-a",
+          "agent": "reviewer"
+        }
+      },
+      {
+        "seq": 5,
+        "ts": "2026-07-10T00:50:19.004629Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "retrying",
+          "status": "queued",
+          "subagent_id": "sub-review",
+          "child_session_id": "child-f4-a",
+          "failed_child_session_id": "child-f4-a",
+          "error_kind": "websocket_closed",
+          "retry_attempts": 1,
+          "retry_max_attempts": 1
+        }
+      },
+      {
+        "seq": 6,
+        "ts": "2026-07-10T00:50:19.080250Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "started",
+          "status": "running",
+          "subagent_id": "sub-review",
+          "child_session_id": "child-f4-b",
+          "agent": "reviewer"
+        }
+      },
+      {
+        "seq": 7,
+        "ts": "2026-07-10T00:54:47.050173Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "finished",
+          "status": "completed",
+          "subagent_id": "sub-review",
+          "child_session_id": "child-f4-b",
+          "agent": "reviewer",
+          "summary": "{\"mergeable\":false,\"checkpoint_status\":\"partial\",\"majors\":[\"Two claims remain unverified\"],\"minors\":[],\"summary\":\"Useful evidence exists, but the review recommends stopping.\"}"
+        }
+      },
+      {
+        "seq": 8,
+        "ts": "2026-07-10T00:54:47.051722Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "checkpoint_decided",
+          "workflow_id": "wf-f4",
+          "step_id": "review",
+          "execution_kind": "subagent",
+          "child_session_id": "child-f4-b",
+          "checkpoint_status": "checkpoint_ready",
+          "dependent_safe": true
+        }
+      },
+      {
+        "seq": 9,
+        "ts": "2026-07-10T00:54:47.053348Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "step_scheduled",
+          "workflow_id": "wf-f4",
+          "step_id": "apply",
+          "wave": 3,
+          "execution_kind": "virtual_diff_apply"
+        }
+      },
+      {
+        "seq": 10,
+        "ts": "2026-07-10T00:54:47.060935Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "checkpoint_decided",
+          "workflow_id": "wf-f4",
+          "step_id": "apply",
+          "execution_kind": "virtual_diff_apply",
+          "checkpoint_status": "checkpoint_ready",
+          "dependent_safe": true,
+          "checkpoint": {
+            "artifact_refs": [
+              {
+                "kind": "virtual_diff_apply",
+                "version": 1,
+                "hash": "sha256:virtual-diff-apply-f4"
+              }
+            ],
+            "verification": {
+              "source": "virtual_diff_apply_engine",
+              "apply_status": "applied",
+              "applied_paths": [
+                "docs/example.md"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "seq": 11,
+        "ts": "2026-07-10T00:54:47.061745Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "workflow_finished",
+          "workflow_id": "wf-f4",
+          "status": "completed",
+          "ok": true,
+          "summary": {
+            "steps": 3,
+            "checkpoint_ready_steps": 3
+          }
+        }
+      }
+    ],
+    "parent_log_origin": "fixture",
+    "child_logs": {
+      "child-f4-a": [
+        {
+          "seq": 9,
+          "ts": "2026-07-10T00:49:56.079339Z",
+          "type": "provider_usage",
+          "data": {
+            "model": "gpt-5.6-sol",
+            "usage_summary": {
+              "input_tokens": 28378,
+              "output_tokens": 501,
+              "reasoning_tokens": 475,
+              "total_tokens": 28879,
+              "cached_tokens": 23040,
+              "cache": {
+                "creation_tokens": 0,
+                "read_tokens": 23040
+              },
+              "cache_hit_rate": 0.8118965395729086
+            }
+          }
+        }
+      ],
+      "child-f4-b": [
+        {
+          "seq": 12,
+          "ts": "2026-07-10T00:52:46.180139Z",
+          "type": "provider_usage",
+          "data": {
+            "model": "gpt-5.6-sol",
+            "usage_summary": {
+              "input_tokens": 35344,
+              "output_tokens": 2303,
+              "reasoning_tokens": 2277,
+              "total_tokens": 37647,
+              "cached_tokens": 31232,
+              "cache": {
+                "creation_tokens": 0,
+                "read_tokens": 31232
+              },
+              "cache_hit_rate": 0.8836577636939792
+            }
+          }
+        }
+      ]
+    },
+    "runtime_diagnostics": null,
+    "owner_state": {
+      "state": "snapshot_only",
+      "reachable": false
+    },
+    "evidence_mirror": null
+  },
+  "completeness": {
+    "terminal_envelope": "minimized",
+    "parent_log": "complete_for_contract_scenario",
+    "child_logs": "provider_usage_sampled"
+  },
+  "sanitization": {
+    "absolute_paths_removed": true,
+    "identifiers_replaced": true,
+    "model_content_minimized": true,
+    "secrets_removed": true
+  }
+}

@@ -104,6 +104,48 @@ defmodule Pixir.ACP.ServerTest do
   defp tool_calls(calls),
     do: {:ok, %{text: "", reasoning: "", function_calls: calls, finish_reason: :tool_calls}}
 
+  defp truncated_stop(text) do
+    {:ok,
+     %{
+       text: text,
+       reasoning: "",
+       function_calls: [],
+       finish_reason: :stop,
+       output_truncation: truncation_evidence()
+     }}
+  end
+
+  defp truncation_script(count) do
+    calls =
+      for index <- 1..max(count - 1, 0) do
+        call = %{
+          call_id: "call_#{index}",
+          name: "read",
+          args: %{"path" => "fixture.txt"}
+        }
+
+        {:ok,
+         %{
+           text: "",
+           reasoning: "",
+           function_calls: [call],
+           output_items: [{:function_call, call}],
+           finish_reason: :tool_calls,
+           output_truncation: truncation_evidence()
+         }}
+      end
+
+    calls ++ [truncated_stop("final")]
+  end
+
+  defp truncation_evidence do
+    %{
+      status: :truncated,
+      reason: :provider_output_limit,
+      provider_reason: "fixture_limit"
+    }
+  end
+
   setup do
     ws =
       Path.join(
@@ -224,6 +266,29 @@ defmodule Pixir.ACP.ServerTest do
            ] = resp["result"]["authMethods"]
 
     assert description =~ "terminal"
+  end
+
+  test "load and resume map hostile Session ids to -32602 without killing ACP", %{
+    out: out,
+    ws: ws
+  } do
+    server = start_server(out)
+    hostile = "../../../outside;PWN"
+
+    for {id, method} <- [{1, "session/load"}, {2, "session/resume"}] do
+      Server.feed(server, request(id, method, %{"sessionId" => hostile, "cwd" => ws}))
+      response = await_id(out, id)
+
+      assert response["error"]["code"] == -32602
+      assert response["error"]["message"] == "invalid session id"
+      assert response["error"]["data"]["field"] == "sessionId"
+      assert is_binary(response["error"]["data"]["reason"])
+      refute inspect(response) =~ hostile
+    end
+
+    Server.feed(server, request(3, "initialize", %{"protocolVersion" => 1}))
+    assert %{"result" => %{"protocolVersion" => 1}} = await_id(out, 3)
+    refute File.exists?(Path.join(ws, ".pixir"))
   end
 
   test "initialize advertises the model catalog under _meta.pixir.models", %{out: out} do
@@ -1049,6 +1114,157 @@ defmodule Pixir.ACP.ServerTest do
     refute "Provider stream process exited." in agent_chunks
   end
 
+  test "session/load bounds 257 warnings and treats correlated assistant metadata as fallback", %{
+    out: out,
+    ws: ws
+  } do
+    sid = "truncation-load-replay"
+
+    for index <- 0..256 do
+      id = "evt_load_#{String.pad_leading(Integer.to_string(index), 3, "0")}"
+
+      event =
+        Event.provider_usage(
+          sid,
+          %{
+            "output_truncation" => %{
+              "status" => "truncated",
+              "reason" => "provider_output_limit",
+              "provider_reason" => "max_tokens",
+              "provider_usage_event_id" => id,
+              "call_role" => if(index == 256, do: "final_answer", else: "intermediate")
+            }
+          },
+          id: id
+        )
+        |> Event.with_seq(index)
+
+      assert {:ok, _} = Pixir.Log.append(event, workspace: ws)
+    end
+
+    fallback =
+      Event.assistant_message(sid, "exact loaded text",
+        metadata: %{
+          "output_truncation" => %{
+            "status" => "truncated",
+            "reason" => "provider_output_limit",
+            "provider_reason" => "max_tokens",
+            "provider_usage_event_id" => "evt_load_256",
+            "provider_usage_seq" => 256,
+            "call_role" => "final_answer"
+          }
+        }
+      )
+      |> Event.with_seq(257)
+
+    assert {:ok, _} = Pixir.Log.append(fallback, workspace: ws)
+
+    server = start_server(out)
+    Server.feed(server, request(5, "session/load", %{"sessionId" => sid, "cwd" => ws}))
+    assert await_id(out, 5)["result"]["sessionId"] == sid
+    lines = written_lines(out)
+
+    warnings =
+      Enum.filter(lines, fn line ->
+        get_in(line, ["params", "update", "_meta", "pixir", "presentation", "type"]) ==
+          "provider_output_warning"
+      end)
+
+    summaries =
+      Enum.filter(lines, fn line ->
+        get_in(line, ["params", "update", "_meta", "pixir", "presentation", "type"]) ==
+          "provider_output_warning_summary"
+      end)
+
+    assert length(warnings) == 256
+    assert [summary] = summaries
+
+    assert get_in(summary, [
+             "params",
+             "update",
+             "_meta",
+             "pixir",
+             "warningSummary",
+             "warningCount"
+           ]) == 257
+
+    assert Enum.count(lines, fn line ->
+             get_in(line, ["params", "update", "sessionUpdate"]) == "agent_message_chunk"
+           end) == 1
+  end
+
+  test "session/load emits a validated usage-absent assistant fallback once", %{out: out, ws: ws} do
+    sid = "truncation-load-fallback-only"
+
+    event =
+      Event.assistant_message(sid, "historical exact text",
+        metadata: %{
+          "output_truncation" => %{
+            "status" => "truncated",
+            "reason" => "provider_content_filter",
+            "provider_reason" => "content_filter",
+            "provider_usage_event_id" => "evt_missing_usage",
+            "provider_usage_seq" => 9,
+            "call_role" => "final_answer"
+          }
+        }
+      )
+      |> Event.with_seq(0)
+
+    assert {:ok, _} = Pixir.Log.append(event, workspace: ws)
+    server = start_server(out)
+    Server.feed(server, request(5, "session/load", %{"sessionId" => sid, "cwd" => ws}))
+    assert await_id(out, 5)["result"]["sessionId"] == sid
+
+    lines = written_lines(out)
+
+    assert Enum.count(lines, fn line ->
+             get_in(line, ["params", "update", "_meta", "pixir", "presentation", "type"]) ==
+               "provider_output_warning"
+           end) == 1
+
+    assert Enum.count(lines, fn line ->
+             get_in(line, ["params", "update", "sessionUpdate"]) == "agent_message_chunk"
+           end) == 1
+  end
+
+  test "session/load rejects partial usage-absent assistant fallback evidence", %{
+    out: out,
+    ws: ws
+  } do
+    sid = "truncation-load-partial-fallback"
+
+    event =
+      Event.assistant_message(sid, "partial historical text",
+        metadata: %{
+          "partial" => true,
+          "output_truncation" => %{
+            "status" => "truncated",
+            "reason" => "provider_content_filter",
+            "provider_reason" => "content_filter",
+            "provider_usage_event_id" => "evt_partial_missing_usage",
+            "provider_usage_seq" => 9,
+            "call_role" => "final_answer"
+          }
+        }
+      )
+      |> Event.with_seq(0)
+
+    assert {:ok, _} = Pixir.Log.append(event, workspace: ws)
+    server = start_server(out)
+    Server.feed(server, request(5, "session/load", %{"sessionId" => sid, "cwd" => ws}))
+    assert await_id(out, 5)["result"]["sessionId"] == sid
+
+    lines = written_lines(out)
+
+    refute Enum.any?(lines, fn line ->
+             get_in(line, ["params", "update", "_meta", "pixir", "presentation", "type"]) ==
+               "provider_output_warning"
+           end)
+
+    refute inspect(lines) =~ "evt_partial_missing_usage"
+  end
+
   test "session/load replays workspace-backed locations from raw NDJSON", %{out: out, ws: ws} do
     sid = "raw-location-replay"
     Pixir.Paths.ensure_sessions_dir(ws)
@@ -1121,6 +1337,28 @@ defmodule Pixir.ACP.ServerTest do
     # No replay — just the resume response.
     assert resp["id"] == 5
     assert resp["result"]["sessionId"] == sid
+  end
+
+  test "reattach posture failure stops the started Session and releases its lease", %{
+    out: out,
+    ws: ws
+  } do
+    sid = "acp-posture-failure"
+
+    event =
+      Event.tool_call(sid, "write-1", "write", %{"path" => "blocked.txt", "content" => "x"})
+      |> Event.with_seq(0)
+
+    assert {:ok, [_]} = Pixir.Log.create_session(sid, [event], workspace: ws)
+    server = start_server(out)
+    Server.feed(server, request(50, "session/resume", %{"sessionId" => sid, "cwd" => ws}))
+    assert %{"error" => _error} = await_id(out, 50)
+
+    refute File.exists?(Pixir.Paths.session_lease(sid, ws))
+    assert Registry.lookup(Pixir.Sessions.Registry, sid) == []
+
+    Server.feed(server, request(51, "initialize", %{"protocolVersion" => 1}))
+    assert %{"result" => %{"protocolVersion" => 1}} = await_id(out, 51)
   end
 
   test "session/load and session/resume preserve bounded child write policy", %{ws: ws} do
@@ -1292,6 +1530,84 @@ defmodule Pixir.ACP.ServerTest do
     assert prompt_resp["result"]["stopReason"] == "end_turn"
   end
 
+  test "ACP live warning projection is ordered and bounded at 255/256/257", %{ws: ws} do
+    File.write!(Path.join(ws, "fixture.txt"), "fixture\n")
+
+    for count <- [255, 256, 257] do
+      {:ok, out} = StringIO.open("")
+      {:ok, agent} = Agent.start_link(fn -> truncation_script(count) end)
+
+      server =
+        start_server(out,
+          id: {:truncation_server, count},
+          provider: StubProvider,
+          provider_opts: [agent: agent]
+        )
+
+      Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+      [new_resp] = await_lines(out, 1)
+      sid = new_resp["result"]["sessionId"]
+
+      Server.feed(
+        server,
+        request(3, "session/prompt", %{
+          "sessionId" => sid,
+          "prompt" => [%{"type" => "text", "text" => "read repeatedly"}]
+        })
+      )
+
+      assert await_id(out, 3, 20_000)["result"]["stopReason"] == "end_turn"
+
+      updates =
+        written_lines(out)
+        |> Enum.filter(&(&1["method"] == "session/update"))
+
+      updates =
+        [
+          %{
+            "method" => "session/update",
+            "params" => %{
+              "update" => %{"_meta" => %{"pixir" => %{"presentation" => "snapshot"}}}
+            }
+          }
+          | updates
+        ]
+
+      warnings =
+        Enum.filter(updates, fn line ->
+          presentation_type(line) == "provider_output_warning"
+        end)
+
+      summaries =
+        Enum.filter(updates, fn line ->
+          presentation_type(line) == "provider_output_warning_summary"
+        end)
+
+      assert length(warnings) == min(count, 256)
+      assert Enum.all?(warnings, &(get_in(&1, ["params", "sessionId"]) == sid))
+
+      seqs =
+        Enum.map(
+          warnings,
+          &get_in(&1, ["params", "update", "_meta", "pixir", "warning", "providerUsageSeq"])
+        )
+
+      assert seqs == Enum.sort(seqs)
+
+      if count == 257 do
+        assert [summary] = summaries
+
+        assert get_in(summary, ["params", "update", "_meta", "pixir", "warningSummary"]) == %{
+                 "warningCount" => 257,
+                 "warningsShown" => 256,
+                 "warningsTruncated" => true
+               }
+      else
+        assert summaries == []
+      end
+    end
+  end
+
   test "session/prompt emits a final assistant chunk when provider returns text without deltas",
        %{
          out: out,
@@ -1311,19 +1627,21 @@ defmodule Pixir.ACP.ServerTest do
       })
     )
 
-    lines = await_lines(out, 3)
+    # The PromptResponse is terminal for this request, so the fallback chunk has
+    # already been emitted. Other session updates are orthogonal to this contract.
+    prompt_resp = await_id(out, 3)
+    lines = written_lines(out)
 
-    chunk =
-      Enum.find(lines, fn line ->
+    chunks =
+      Enum.filter(lines, fn line ->
         line["method"] == "session/update" and
+          line["params"]["sessionId"] == sid and
           line["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
       end)
 
-    refute is_nil(chunk)
-    assert chunk["params"]["sessionId"] == sid
+    assert [chunk] = chunks
     assert chunk["params"]["update"]["content"]["text"] == "final text without streaming"
 
-    prompt_resp = Enum.find(lines, &(&1["id"] == 3))
     assert prompt_resp["result"]["stopReason"] == "end_turn"
   end
 
@@ -2448,6 +2766,13 @@ defmodule Pixir.ACP.ServerTest do
   end
 
   # ── helpers ──────────────────────────────────────────────────────────────────
+
+  defp presentation_type(line) do
+    case get_in(line, ["params", "update", "_meta", "pixir", "presentation"]) do
+      %{"type" => type} when is_binary(type) -> type
+      _non_map_or_missing -> nil
+    end
+  end
 
   defp default_model_id, do: Enum.find(Pixir.Providers.Registry.models(), & &1["default"])["id"]
 

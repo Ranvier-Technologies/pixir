@@ -21,6 +21,27 @@ the RHS of a leading assignment and may be expanded by the shell at runtime;
 confinement is defense-in-depth, not a sandbox. Run Pixir against
 workspaces and credentials you are willing to expose to the tasks you delegate.
 
+## Pixir-owned state paths
+
+Pixir applies a narrower static guarantee to its own Session state. Session ids are
+validated before they become Registry keys, filename components, recovery-command
+arguments, or durable references. Before operating on Session Logs, writer leases,
+or lease-release diagnostics, Pixir walks each existing path component below the
+trusted Workspace root with `lstat` and rejects regular or dangling symlinks,
+non-directory ancestors, and unexpected final types. The caller-selected Workspace
+root is the trusted anchor, including when the caller deliberately selected a symlink
+alias as that root.
+
+This is a **preflight-time guarantee**, not a race-free filesystem capability. A
+process running as the same OS user may replace a checked component between the
+`lstat` and the later open, rename, or remove operation. Operators who need protection
+from a hostile same-UID process must add an OS-level isolation boundary.
+
+Session Resource path hardening is intentionally incomplete in this preview. Resource
+boundaries validate the Session id, but static symlink/race hardening of payload paths
+under `.pixir/sessions/<session_id>/resources/` is deferred. Do not treat the Resource
+store as a same-UID adversarial sandbox.
+
 ## Reporting a vulnerability
 
 **Please do not open a public issue for security reports.**
@@ -67,6 +88,9 @@ valuable:
 - The tripwire not catching a runtime-computed shell escape, including
   `VAR=/outside cmd $VAR` where the outside path is expanded at runtime
   (documented limitation above, not a full sandbox).
+- Same-UID replacement races after a Pixir-owned state-path preflight, and
+  payload-level Session Resource symlink hardening under the Resource container
+  (documented limitations above).
 - Vulnerabilities in the underlying Provider, model output, Erlang/OTP, or
   third-party dependencies — report those upstream.
 - Anything requiring the operator to have already granted the task access to the

@@ -1358,6 +1358,69 @@ defmodule Pixir.WorkflowsTest do
     end
   end
 
+  test "Workflow derives read_set acceptance from the shared classifier", %{ws: ws} do
+    aliases = [
+      Path.join(ws, "**/*"),
+      "../#{Path.basename(ws)}/**/*",
+      "././**/**/**/*",
+      "lib/../**/*",
+      "**/**/**/*"
+    ]
+
+    for alias_entry <- aliases do
+      step = %{
+        "id" => "classified_read_set",
+        "task" => "classify read set",
+        "workspace_mode" => "virtual_overlay",
+        "read_set" => ["source.txt", alias_entry],
+        "virtual_commands" => ["true"]
+      }
+
+      assert {:error, %{error: %{kind: :invalid_args, details: details}}} =
+               Workflows.dry_run(%{"steps" => [step]}, workspace: ws)
+
+      assert details["id"] == "classified_read_set"
+      assert details["field"] == "read_set"
+      assert details["index"] == 1
+
+      assert details["reason"] in [
+               "absolute_path",
+               "parent_component",
+               "root_recursive_catch_all"
+             ]
+    end
+
+    assert {:ok, plan} =
+             Workflows.dry_run(
+               %{
+                 "steps" => [
+                   %{
+                     "id" => "bounded_read_set",
+                     "task" => "accept bounded patterns",
+                     "workspace_mode" => "virtual_overlay",
+                     "read_set" => [
+                       "lib/**/*",
+                       "**/*.ex",
+                       "./lib/**/*",
+                       "lib/**/test_*.exs"
+                     ],
+                     "virtual_commands" => ["true"]
+                   }
+                 ]
+               },
+               workspace: ws
+             )
+
+    assert [step] = plan["would_run"]
+
+    assert step["read_set"] == [
+             "lib/**/*",
+             "**/*.ex",
+             "./lib/**/*",
+             "lib/**/test_*.exs"
+           ]
+  end
+
   test "abnormal virtual_overlay runner exits return a structured workflow error", %{
     sid: sid,
     ws: ws

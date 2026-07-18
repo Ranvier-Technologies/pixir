@@ -1,0 +1,37 @@
+{
+  "schema": "pixir.presenter.run", "schema_version": 1, "projection_id": "projection:invalid-model-advisory", "projected_at": "2026-07-10T20:40:05Z",
+  "run": {"id": "dlg-invalid-advisory", "delegate_id": "dlg-invalid-advisory", "parent_session_id": "parent-invalid-advisory", "workflow_id": "wf-invalid-advisory", "strategy": "workflow", "mode": "read_only", "title": "Invalid advisory", "evidence_refs": ["e-envelope-invalid"]},
+  "source": {"mode": "reconstructed", "durable_origin": "fixture", "as_of_seq": 4, "last_durable_at": "2026-07-10T20:40:05Z", "live_observed_at": null, "freshness": "terminal", "limitations": []},
+  "execution": {"state": "completed", "terminal": true, "basis": "workflow_event_fold", "evidence_refs": ["e-parent-4"]},
+  "liveness": {"state": "not_applicable", "reachable": false, "basis": "terminal_execution", "observed_at": null, "evidence_refs": []},
+  "counts": {"planned_units": 1, "observed_units": 1, "running_units": 0, "completed_units": 1, "attention_units": 1},
+  "graph": {"waves": [["workflow:wf-invalid-advisory:step:review"]], "edges": []},
+  "units": [{
+    "logical_id": "workflow:wf-invalid-advisory:step:review", "unit_kind": "workflow_step", "materialization": "durable", "label": "review", "agent": "reviewer", "execution_kind": "subagent", "workspace_mode": "shared", "posture": "read_only", "depends_on": [],
+    "execution": {"state": "completed", "terminal": true, "basis": "subagent_event_fold", "evidence_refs": ["e-parent-2"]},
+    "liveness": {"state": "not_applicable", "reachable": false, "basis": "terminal_execution", "observed_at": null, "evidence_refs": []},
+    "gate": {"state": "checkpoint_ready", "dependent_safe": true, "basis": "workflow_event", "evidence_refs": ["e-parent-3"]},
+    "advisory": {"present": true, "verdict": "unknown", "mergeable": null, "declared_gate": null, "parse_status": "invalid", "summary": null, "raw_excerpt": "{\"mergeable\":false,\"summary\":\"stop\"", "major_count": null, "minor_count": null, "evidence_refs": ["e-model-invalid"]},
+    "attempts": [{"attempt_id": "workflow:wf-invalid-advisory:step:review:attempt:0", "ordinal": 0, "materialization": "durable", "status_basis": "parent_log", "relation": "fresh", "predecessor_attempt_id": null, "child_session_id": "child-invalid-review", "status": "completed", "started_at": "2026-07-10T20:40:01Z", "ended_at": "2026-07-10T20:40:03Z", "error_kind": null, "summary": null, "child_event_window": {"session_id": "child-invalid-review", "from_seq": null, "to_seq_exclusive": null, "basis": "whole_child_log_single_attempt", "evidence_refs": []}, "usage": {"source": "none", "complete": true, "calls": 0, "groups": [], "evidence_refs": [], "limitations": []}, "evidence_refs": ["e-parent-1", "e-parent-2", "e-model-invalid"], "limitations": []}],
+    "artifacts": [],
+    "usage": {"source": "none", "complete": true, "calls": 0, "groups": [], "evidence_refs": [], "limitations": []},
+    "mutation": {"status": "read_only", "observed_paths": [], "observed_semantics": "none", "evidence_refs": ["e-envelope-invalid"], "limitations": []},
+    "attention": {"required": true, "reasons": ["advisory_unparseable"], "evidence_refs": ["e-model-invalid"]},
+    "safe_actions": [],
+    "evidence_refs": ["e-envelope-invalid", "e-parent-0", "e-parent-1", "e-parent-2", "e-parent-3", "e-parent-4", "e-model-invalid"],
+    "limitations": ["model_advisory_unparseable"]
+  }],
+  "usage": {"source": "none", "complete": true, "calls": 0, "groups": [], "evidence_refs": [], "limitations": []},
+  "mutation": {"status": "read_only", "observed_paths": [], "observed_semantics": "none", "evidence_refs": ["e-envelope-invalid"], "limitations": []},
+  "safe_actions": [],
+  "evidence": [
+    {"id": "e-envelope-invalid", "authority": "derived", "source_kind": "terminal_envelope", "session_id": "parent-invalid-advisory", "seq": null, "description": "Envelope supplies run identity and read-only mode."},
+    {"id": "e-parent-0", "authority": "canonical", "source_kind": "parent_log", "session_id": "parent-invalid-advisory", "seq": 0, "description": "Workflow graph defines the review step."},
+    {"id": "e-parent-1", "authority": "canonical", "source_kind": "parent_log", "session_id": "parent-invalid-advisory", "seq": 1, "description": "Review attempt started."},
+    {"id": "e-parent-2", "authority": "canonical", "source_kind": "parent_log", "session_id": "parent-invalid-advisory", "seq": 2, "description": "Review attempt completed with a truncated model summary."},
+    {"id": "e-parent-3", "authority": "canonical", "source_kind": "parent_log", "session_id": "parent-invalid-advisory", "seq": 3, "description": "Runtime checkpoint is ready."},
+    {"id": "e-parent-4", "authority": "canonical", "source_kind": "parent_log", "session_id": "parent-invalid-advisory", "seq": 4, "description": "Workflow finished completed."},
+    {"id": "e-model-invalid", "authority": "model_declared", "source_kind": "model_summary", "session_id": "child-invalid-review", "seq": 2, "description": "Model summary is truncated and cannot be parsed as advisory JSON."}
+  ],
+  "limitations": ["model_advisory_unparseable"]
+}

@@ -1,0 +1,307 @@
+{
+  "schema": "pixir.presenter.run",
+  "schema_version": 1,
+  "projection_id": "projection:partial-write-indeterminate",
+  "projected_at": "2026-07-10T19:40:04Z",
+  "run": {
+    "id": "dlg-partial-write",
+    "delegate_id": "dlg-partial-write",
+    "parent_session_id": "parent-partial-write",
+    "workflow_id": null,
+    "strategy": "subagents",
+    "mode": "bounded_write",
+    "title": null,
+    "evidence_refs": [
+      "e-envelope-partial"
+    ]
+  },
+  "source": {
+    "mode": "reconstructed",
+    "durable_origin": "fixture",
+    "as_of_seq": 1,
+    "last_durable_at": "2026-07-10T19:40:04Z",
+    "live_observed_at": null,
+    "freshness": "terminal",
+    "limitations": []
+  },
+  "execution": {
+    "state": "failed",
+    "terminal": true,
+    "basis": "subagent_event_fold",
+    "evidence_refs": [
+      "e-parent-1"
+    ]
+  },
+  "liveness": {
+    "state": "not_applicable",
+    "reachable": false,
+    "basis": "terminal_execution",
+    "observed_at": null,
+    "evidence_refs": []
+  },
+  "counts": {
+    "planned_units": 1,
+    "observed_units": 1,
+    "running_units": 0,
+    "completed_units": 0,
+    "attention_units": 1
+  },
+  "graph": null,
+  "units": [
+    {
+      "logical_id": "delegate:dlg-partial-write:subagent:sub-writer",
+      "unit_kind": "subagent",
+      "label": "worker",
+      "agent": "worker",
+      "execution_kind": "subagent",
+      "workspace_mode": "shared",
+      "posture": "unknown",
+      "depends_on": [],
+      "execution": {
+        "state": "failed",
+        "terminal": true,
+        "basis": "subagent_event_fold",
+        "evidence_refs": [
+          "e-parent-1",
+          "e-child-3"
+        ]
+      },
+      "liveness": {
+        "state": "not_applicable",
+        "reachable": false,
+        "basis": "terminal_execution",
+        "observed_at": null,
+        "evidence_refs": []
+      },
+      "gate": {
+        "state": "not_applicable",
+        "dependent_safe": null,
+        "basis": "not_applicable",
+        "evidence_refs": []
+      },
+      "advisory": {
+        "present": false,
+        "verdict": "unknown",
+        "mergeable": null,
+        "declared_gate": null,
+        "parse_status": "not_present",
+        "summary": null,
+        "major_count": null,
+        "minor_count": null,
+        "evidence_refs": []
+      },
+      "attempts": [
+        {
+          "attempt_id": "delegate:dlg-partial-write:subagent:sub-writer:attempt:0",
+          "ordinal": 0,
+          "relation": "fresh",
+          "predecessor_attempt_id": null,
+          "child_session_id": "child-writer",
+          "status": "failed",
+          "started_at": "2026-07-10T19:40:00Z",
+          "ended_at": "2026-07-10T19:40:04Z",
+          "error_kind": "websocket_closed",
+          "summary": "Provider failed after one observed write.",
+          "evidence_refs": [
+            "e-parent-0",
+            "e-parent-1",
+            "e-child-3"
+          ],
+          "limitations": [
+            "partial_repo_mutation"
+          ],
+          "materialization": "durable",
+          "status_basis": "parent_log",
+          "child_event_window": {
+            "session_id": "child-writer",
+            "from_seq": null,
+            "to_seq_exclusive": null,
+            "basis": "whole_child_log_single_attempt",
+            "evidence_refs": [
+              "e-child-3"
+            ]
+          }
+        }
+      ],
+      "artifacts": [],
+      "usage": {
+        "source": "none",
+        "complete": true,
+        "calls": 0,
+        "groups": [],
+        "evidence_refs": [],
+        "limitations": []
+      },
+      "mutation": {
+        "status": "partial",
+        "observed_paths": [
+          "lib/pixir/example.ex"
+        ],
+        "observed_semantics": "at_least",
+        "evidence_refs": [
+          "e-envelope-partial",
+          "e-child-1",
+          "e-child-2"
+        ],
+        "limitations": [
+          "partial_repo_mutation"
+        ]
+      },
+      "safe_actions": [
+        {
+          "id": "inspect_child_session_log",
+          "scope": "delegate:dlg-partial-write:subagent:sub-writer",
+          "kind": "inspect",
+          "effect": "read_only",
+          "presentation": "informational",
+          "command": null,
+          "evidence_refs": [
+            "e-envelope-partial"
+          ],
+          "source_field": "next_actions"
+        },
+        {
+          "id": "inspect_partial_writes_before_retry",
+          "scope": "delegate:dlg-partial-write:subagent:sub-writer",
+          "kind": "inspect",
+          "effect": "read_only",
+          "presentation": "informational",
+          "command": null,
+          "evidence_refs": [
+            "e-envelope-partial"
+          ],
+          "source_field": "next_actions"
+        }
+      ],
+      "evidence_refs": [
+        "e-envelope-partial",
+        "e-parent-0",
+        "e-parent-1",
+        "e-child-1",
+        "e-child-2",
+        "e-child-3"
+      ],
+      "limitations": [
+        "partial_repo_mutation"
+      ],
+      "materialization": "durable",
+      "attention": {
+        "required": true,
+        "reasons": [
+          "execution_failed",
+          "mutation_partial"
+        ],
+        "evidence_refs": [
+          "e-envelope-partial",
+          "e-parent-0",
+          "e-parent-1",
+          "e-child-1",
+          "e-child-2",
+          "e-child-3"
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "source": "none",
+    "complete": true,
+    "calls": 0,
+    "groups": [],
+    "evidence_refs": [],
+    "limitations": []
+  },
+  "mutation": {
+    "status": "partial",
+    "observed_paths": [
+      "lib/pixir/example.ex"
+    ],
+    "observed_semantics": "at_least",
+    "evidence_refs": [
+      "e-envelope-partial",
+      "e-child-1",
+      "e-child-2"
+    ],
+    "limitations": [
+      "partial_repo_mutation"
+    ]
+  },
+  "safe_actions": [
+    {
+      "id": "inspect_child_session_log",
+      "scope": "delegate:dlg-partial-write:subagent:sub-writer",
+      "kind": "inspect",
+      "effect": "read_only",
+      "presentation": "informational",
+      "command": null,
+      "evidence_refs": [
+        "e-envelope-partial"
+      ],
+      "source_field": "next_actions"
+    },
+    {
+      "id": "inspect_partial_writes_before_retry",
+      "scope": "delegate:dlg-partial-write:subagent:sub-writer",
+      "kind": "inspect",
+      "effect": "read_only",
+      "presentation": "informational",
+      "command": null,
+      "evidence_refs": [
+        "e-envelope-partial"
+      ],
+      "source_field": "next_actions"
+    }
+  ],
+  "evidence": [
+    {
+      "id": "e-envelope-partial",
+      "authority": "derived",
+      "source_kind": "terminal_envelope",
+      "session_id": "parent-partial-write",
+      "seq": null,
+      "description": "Terminal envelope reports partial repo mutation and lower-bound observed writes."
+    },
+    {
+      "id": "e-parent-0",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-partial-write",
+      "seq": 0,
+      "description": "Writer attempt started."
+    },
+    {
+      "id": "e-parent-1",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-partial-write",
+      "seq": 1,
+      "description": "Writer attempt failed."
+    },
+    {
+      "id": "e-child-1",
+      "authority": "canonical",
+      "source_kind": "child_log",
+      "session_id": "child-writer",
+      "seq": 1,
+      "description": "Write tool call targeted the observed path."
+    },
+    {
+      "id": "e-child-2",
+      "authority": "canonical",
+      "source_kind": "child_log",
+      "session_id": "child-writer",
+      "seq": 2,
+      "description": "Write tool result succeeded."
+    },
+    {
+      "id": "e-child-3",
+      "authority": "canonical",
+      "source_kind": "child_log",
+      "session_id": "child-writer",
+      "seq": 3,
+      "description": "Turn failed after the observed write."
+    }
+  ],
+  "limitations": [
+    "partial_repo_mutation"
+  ]
+}

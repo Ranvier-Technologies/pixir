@@ -9,6 +9,162 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-07-17
+
+The Monitor cut: 42 pull requests since 0.1.10. Pixir Monitor — a read-only,
+loopback-only web console over the append-only Log — goes from first
+implementation to daily driver in one release, hardened by a maturity
+gauntlet, a degradation suite, and browser evidence that is now mandatory in
+CI. The provider gains the Open Responses conformance arc and truncation
+honesty for successful output, and the post-0.1.10 security tranche lands
+session-id and read-set confinement. The Monitor lives in `monitor/` as a
+sibling escript project and ships in the repository, not in the Hex package;
+Pixir core does not depend on Phoenix.
+
+### Security
+- Session-id and read-set confinement hardening (#323). `Pixir.SessionId` is
+  the single 1..235-byte UTF-8 session-id grammar, and untrusted ids are
+  validated before the Log, writer-lease, Registry, recovery-command,
+  process, CLI, ACP, Delegate, Workflow, and Resource boundaries. Pixir-owned
+  Session Log and writer-lease paths get a structured `lstat` preflight that
+  refuses existing or dangling symlinks; evidence, doctor, and GC consumers
+  are hardened; and leases are released on both failed `Session.init/1` and
+  post-start rejection. Competing virtual-overlay `read_set` grammars are
+  replaced by one shared structural classifier used by specification and
+  execution callers, and lexical Workspace confinement is fixed for trusted
+  root `/`. Documented boundary: this is a deterministic confinement
+  tripwire, not a descriptor-relative POSIX sandbox — `openat`-style
+  no-follow, hard-link, mount, and same-UID check/reopen race closure are
+  explicitly not claimed, and Session Resource payload-path hardening below
+  the validated session-id boundary is deferred.
+- Responses and Anthropic body construction is hardened so hostile structs,
+  improper lists, authority collisions, non-UTF-8 terms, and build or encode
+  failures return redacted structured errors before credential assembly or
+  transport (#317).
+- Monitor 503 diagnostics no longer include the absolute workspace root;
+  the error detail carries the workspace basename instead, and the full path
+  stays observable only in the local server log (#369).
+
+### Added
+- **Pixir Monitor v1** (#324, ADR 0038): a local web presenter over the
+  frozen `pixir.presenter.run.v1` contract for Workflow runs and Pixir
+  Delegate fan-outs. The append-only Log remains canonical and the presenter
+  stores no independent run state: authoritative HTTP snapshots plus bounded
+  SSE invalidation hints, with disposable browser state that refetches after
+  gaps, reconnects, or invalidation anomalies. The server is read-only and
+  loopback-only with exact Host/Origin and Fetch Metadata checks, a one-use
+  in-memory bootstrap token, strict CSP/Trusted Types, local assets only,
+  and no mutation routes; model-authored hostile content renders literally.
+  Surfaces: Runs inventory, Workflow Run Detail, Subagent Fan-out Detail,
+  and Unit Inspector, keeping execution, dependency gates, advisory
+  verdicts, liveness, and evidence source as independent dimensions, retry
+  and resume attempts in one logical-unit lineage, and usage derived only
+  from durable `provider_usage` events. A v1.1 operator repair pass (#329)
+  followed: honest gate/advisory distributions, correct pagination totals, a
+  truthful parent-Log-only attention lower bound, and actual-edge dependency
+  captions.
+- Monitor daily-driver train (#331, #332, #333, #334, #346, #347): launch
+  against an explicit workspace resolved at invocation time; bounded search
+  by title, Run id, or parent-observed child Session with the query in the
+  route and the searched domain confessed; recency ordering over a frozen
+  temporal schema with evidence-derived durations and confessed
+  completeness; Follow as a refetch policy represented in the route, with
+  refetch convergence later proven in a real browser (identity loss vs. a
+  missing logical Unit are distinguished); list-scope activity honesty —
+  the Runs list stopped offering liveness it cannot evidence, so list rows
+  carry only "unobserved"/"not applicable", grouping is "Needs
+  attention"/"Recent" over the parent Log only, and an "Active" state is
+  pinned out by regression; and daily triage works at 390px narrow
+  viewports.
+- Monitor structure contracts, frozen then implemented: semantic-zoom v1
+  (#336) — a bounded 100-unit Workflow zoom with wave:bucket clusters,
+  six-plus-overflow windows, arc counts, and an exact edge ledger (#348) —
+  and workspace-set v1 (#339) — a two-workspace read-only Workspace
+  Overview keyed by operator-chosen workspace keys (#349). Large Delegate
+  fan-outs group without inventing topology (#338), and the Overview stays
+  useful when one workspace is stale or unavailable, with per-source
+  degradation states and Retry (#340).
+- Monitor honesty doctrine, adjudicated mid-release (#360, #403): the
+  Builder normalizes out-of-vocabulary enums to `unknown` and unparseable
+  timestamps to `null`, confessing every normalization
+  (`unknown_enum:<field>:<raw>`, `malformed_timestamp:<field>:<raw>`);
+  advisory classification stays the sole verdict authority; list and detail
+  fail-close with the same execution vocabulary. The same sweep caught a
+  real bug: a malformed event timestamp could win the lexicographic maximum
+  into `source.last_durable_at`, so derived date-times now consider only
+  parseable values and confess exclusions. The launch page reaches a
+  terminal honest state in three categories (capability absent, capability
+  rejected, generic failure) announced via a `role="status"` live region
+  (#399), and the darwin launcher hands the launch capability to osascript
+  via the environment, with the child actually reaped (#386).
+- Monitor evidence and maturity gates: a 500-unit Workflow performance gate
+  within DOM and render budgets, with scale growth measured against the
+  100-unit baseline (#337); the maturity-gauntlet evidence package across
+  security, accessibility, and envelope frontiers (#341), adjudicated
+  operator-side with all three frontiers remaining Experimental (#360);
+  scale cells exercised at magnitude — 512 logs, 50-row pages, 32 KiB
+  fields (#397); a real 300-second SSE stream rotation — the page held open
+  past the server's stream-lifetime timer, the stream required to end, and
+  a second authenticated stream plus authoritative refetch required to
+  follow — driven end to end (#400); four hostile-text vector classes
+  (script, entities, RTL override, near-cap field) sealed per evidence
+  source, eight source-qualified instances across both sources, plus
+  keyboard deep-links into paginated cluster members (#402); and a named
+  main landmark whose accessible-name gap fails closed (#390) with the
+  variant-B redesign, a vertical per-source registry, across the Overview
+  and zoom cluster views (#391, #392).
+- Monitor test tiers: a real built-escript CDP browser harness drives the
+  suites above; the default browser suites are mandatory in CI with an
+  action-pinned Chrome and Node 22 (the missing gate was Node's global
+  WebSocket, not Chrome) and a fail-loud toolchain assertion instead of
+  silent skips — confessed exception: the five-minute lifecycle suite
+  stays out of CI by design, opt-in via `PIXIR_MONITOR_LIFECYCLE=1`
+  (#401); and a first tier executes the Presenter's frozen JavaScript seam
+  in `node:vm`, fail-closed (#404).
+- Monitor integration: a secure Codex sidecar handoff over a FIFO (#357),
+  and detail projections restored in the built escript: schema loading had
+  assumed a source layout (`:code.priv_dir/1`) that fails inside the
+  escript, so the vendored Presenter schema is now embedded at compile
+  time (#358).
+- Open Responses conformance arc (#317, #318, #319, #320): an opaque,
+  fail-closed, request-scoped Responses backend profile snapshots provider,
+  model, capabilities, backend policy, and defaults once per request;
+  request-scoped routing and auth enforce exact URL/transport capabilities
+  with ephemeral policies for existing ChatGPT credentials, `bearer_env`,
+  and `none` (strict token68, HTTPS or literal-loopback HTTP only, never
+  stored or projected); open mode stays HTTP/SSE-only with `store: false`,
+  a strict WHATWG SSE decoder, and 24 pinned event roots validated before
+  any reducer effect. Conformance evidence is deterministic: a checked-in
+  69-schema validator generated from a pinned OpenAPI commit with no
+  runtime schema dependency or network, a 14,235-mutation differential
+  corpus against an independent JSON Schema Draft 2020-12 oracle, and an
+  offline smoke task. The default ChatGPT/Codex wire — request bytes,
+  ordered headers, WebSocket/SSE policy — keeps exact regression coverage.
+- Provider-neutral output-truncation evidence (#268, ADR 0039): a tri-state
+  contract for successful OpenAI and Anthropic calls persists durable
+  call-level evidence through Turn, Event, and Log, and surfaces bounded,
+  deduplicated projections in CLI, ACP, diagnostics, replay, Subagents, and
+  Delegate. Provider text is preserved exactly; successful truncation is
+  distinguished from input overflow, error partials, and local channel
+  bounds; tool execution stays gated on complete validated calls.
+
+### Fixed
+- Exact-cap error-body truncation provenance (#306): the binary-only error
+  accumulator is replaced by an opaque capture that records whether any
+  byte was actually discarded, so `err_body_truncated` is true byte-drop
+  evidence rather than retained-length inference. At exactly 16,384
+  received bytes the marker stays absent; a later nonempty byte makes it
+  true and sticky for that capture; each retry starts fresh. OpenAI
+  Responses, Anthropic Messages, and model-catalog refresh share the
+  contract with retry and classification policy unchanged.
+
+### Changed
+- The public skills surface is pruned to the delegation trio plus
+  diagnostics (#344): `pixir-audited-executor` folds into
+  `pixir-delegate-codex` as its audited single-run mode, and the
+  fork-maintenance skill family leaves the public mirror (the sync script
+  gains fail-closed verify checks for the excluded paths).
+
 ## [0.1.10] - 2026-07-11
 
 Hardening cut: the resume-sandbox security arc (#311) plus the five majors

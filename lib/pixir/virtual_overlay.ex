@@ -6,6 +6,11 @@ defmodule Pixir.VirtualOverlay do
   Bashex in-memory filesystem, executes virtual shell commands there, and returns an
   ADR 0029 `virtual_diff` artifact. It is deliberately not a model-visible Tool and it
   does not apply virtual writes back to the parent Workspace.
+
+  One shared classifier rejects absolute paths, lexical parent components, invalid
+  entries, and normalized whole-Workspace recursive catch-alls before import. Bounded
+  directory or extension patterns remain valid and all existing file, byte, and
+  post-expansion symlink limits still apply.
   """
 
   alias Pixir.{Tool, Tools.Workspace}
@@ -88,12 +93,9 @@ defmodule Pixir.VirtualOverlay do
   defp read_set(params) do
     case Map.get(params, "read_set", []) do
       values when is_list(values) ->
-        if Enum.all?(values, &is_binary/1) do
-          with :ok <- reject_unbounded_entries(values) do
-            {:ok, Enum.reject(values, &(String.trim(&1) == ""))}
-          end
-        else
-          invalid_string_list("read_set", values)
+        case validate_read_set_entries(values) do
+          :ok -> {:ok, Enum.map(values, &String.trim/1)}
+          {:error, reason} -> invalid_read_set(values, reason)
         end
 
       value ->
@@ -149,56 +151,204 @@ defmodule Pixir.VirtualOverlay do
     end
   end
 
-  @doc "Validate the structural read_set contract without rendering caller error payloads."
-  @spec validate_read_set(term()) :: :ok | {:error, atom() | map()}
-  def validate_read_set(read_set) when is_list(read_set) and read_set != [] do
+  @doc """
+  Classify one read-set entry without rendering a caller-specific error envelope.
+
+  The returned zero-based `index` and stable `reason` are shared by Workflow, Delegate,
+  Subagent Manager, Tool, and engine boundaries. Classification is lexical: absolute
+  paths and every `..` component are rejected before normalization; empty/dot components
+  are then removed and adjacent `**` components collapsed to detect whole-Workspace
+  recursive aliases.
+  """
+  @spec classify_read_set_entry(term(), non_neg_integer()) :: :ok | {:error, map()}
+  def classify_read_set_entry(entry, index \\ 0)
+
+  def classify_read_set_entry(entry, index) when not is_binary(entry),
+    do: read_set_classification(:invalid_read_set_entry, index, "non_string")
+
+  def classify_read_set_entry(entry, index) do
+    cond do
+      not String.valid?(entry) ->
+        read_set_classification(:invalid_read_set_entry, index, "invalid_utf8")
+
+      String.trim(entry) == "" ->
+        read_set_classification(:invalid_read_set_entry, index, "empty")
+
+      String.contains?(entry, <<0>>) ->
+        read_set_classification(:invalid_read_set_entry, index, "nul_byte")
+
+      home_path?(entry) ->
+        read_set_classification(:invalid_read_set_entry, index, "home_path")
+
+      Path.type(String.trim(entry)) == :absolute ->
+        read_set_classification(:invalid_read_set_entry, index, "absolute_path")
+
+      ".." in lexical_components(entry) ->
+        read_set_classification(:invalid_read_set_entry, index, "parent_component")
+
+      glob?(entry) and not valid_glob_syntax?(entry) ->
+        read_set_classification(:invalid_read_set_entry, index, "invalid_glob")
+
+      root_recursive_catch_all?(entry) ->
+        read_set_classification(:unbounded_read_set, index, "root_recursive_catch_all")
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc "Validate supplied entries while allowing the engine's intentional empty scratch import."
+  @spec validate_read_set_entries(term()) :: :ok | {:error, atom() | map()}
+  def validate_read_set_entries(read_set) when is_list(read_set) do
     read_set
     |> Enum.with_index()
     |> Enum.reduce_while(:ok, fn {entry, index}, :ok ->
-      cond do
-        not is_binary(entry) or String.trim(entry) == "" ->
-          {:halt, {:error, %{kind: :invalid_read_set_entry, index: index}}}
-
-        unbounded_glob?(entry) ->
-          {:halt, {:error, %{kind: :unbounded_read_set, index: index}}}
-
-        true ->
-          {:cont, :ok}
+      case classify_read_set_entry(entry, index) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
   end
 
-  def validate_read_set(_read_set), do: {:error, :read_set_required}
+  def validate_read_set_entries(_read_set), do: {:error, :read_set_required}
 
-  # Canonical whole-workspace glob detection. Directory- and extension-bounded
-  # patterns ("lib/**/*", "**/*.ex") stay legal. This rejects only the exact
-  # spellings listed below. Robust normalized rejection (repeated `**`, `.`/`..`
-  # collapse, `../<ws>/**` round-trip) is
-  # deferred to the read_set-confinement hardening issue. Same-UID threat model.
-  defp unbounded_glob?(entry) do
-    entry
-    |> String.trim()
-    |> String.trim_leading("./")
-    |> Kernel.in(["**", "**/*", "**/**"])
+  @doc "Validate the non-empty structural read_set contract for specifications."
+  @spec validate_read_set(term()) :: :ok | {:error, atom() | map()}
+  def validate_read_set(read_set) when is_list(read_set) and read_set != [] do
+    validate_read_set_entries(read_set)
   end
 
-  # The execution-boundary slice of the read_set contract: spec validators
-  # (Runner, cli_contract) also require a non-empty list, but the engine
-  # accepts an empty import (pure virtual scratch), so run/3 only refuses
-  # entries that would expand to the whole workspace.
-  defp reject_unbounded_entries(read_set) do
-    case Enum.find_index(read_set, &unbounded_glob?/1) do
-      nil ->
-        :ok
+  def validate_read_set(_read_set), do: {:error, :read_set_required}
 
-      index ->
-        {:error,
-         Tool.error(
-           :invalid_args,
-           "virtual_overlay read_set must be bounded: whole-workspace globs are rejected",
-           %{"field" => "read_set", "index" => index, "value" => Enum.at(read_set, index)}
-         )}
+  defp invalid_read_set(read_set, %{index: index} = classification) do
+    value = Enum.at(read_set, index)
+
+    {:error,
+     Tool.error(
+       :invalid_args,
+       "virtual_overlay read_set entry is unsafe",
+       %{
+         "field" => "read_set",
+         "index" => index,
+         "reason" => classification.reason,
+         "value" => if(is_binary(value) and String.valid?(value), do: value, else: inspect(value))
+       }
+     )}
+  end
+
+  defp invalid_read_set(read_set, _reason), do: invalid_string_list("read_set", read_set)
+
+  defp read_set_classification(kind, index, reason),
+    do: {:error, %{kind: kind, index: index, reason: reason}}
+
+  defp lexical_components(entry),
+    do: entry |> String.trim() |> String.split("/", trim: false)
+
+  defp root_recursive_catch_all?(entry) do
+    normalized =
+      entry
+      |> lexical_components()
+      |> Enum.reject(&(&1 in ["", "."]))
+      |> collapse_adjacent_recursive_globs()
+
+    case normalized do
+      ["**"] -> true
+      ["**", tail] -> universal_glob_component?(tail)
+      _bounded -> false
     end
+  end
+
+  defp home_path?(entry) do
+    trimmed = String.trim(entry)
+    trimmed == "~" or String.starts_with?(trimmed, "~/")
+  end
+
+  defp valid_glob_syntax?(entry) do
+    entry |> String.trim() |> valid_brace_syntax?()
+  end
+
+  defp valid_brace_syntax?(value) do
+    value
+    |> :binary.bin_to_list()
+    |> Enum.reduce_while(0, fn
+      ?{, 0 -> {:cont, 1}
+      ?{, 1 -> {:halt, :invalid}
+      ?}, 1 -> {:cont, 0}
+      ?}, 0 -> {:cont, 0}
+      ?/, 1 -> {:halt, :invalid}
+      _byte, depth -> {:cont, depth}
+    end)
+    |> Kernel.==(0)
+  end
+
+  defp universal_glob_component?(component) do
+    component
+    |> glob_segments()
+    |> Enum.reduce_while(MapSet.new([{false, 0}]), fn segment, states ->
+      options = glob_segment_states(segment)
+
+      next_states =
+        for {left_star?, left_questions} <- states,
+            {right_star?, right_questions} <- options,
+            left_questions + right_questions <= 1,
+            into: MapSet.new() do
+          {left_star? or right_star?, left_questions + right_questions}
+        end
+
+      if MapSet.size(next_states) == 0,
+        do: {:halt, MapSet.new()},
+        else: {:cont, next_states}
+    end)
+    |> Enum.any?(fn {has_star?, _questions} -> has_star? end)
+  end
+
+  defp glob_segments(component) do
+    case :binary.match(component, "{") do
+      :nomatch ->
+        [{:literal, component}]
+
+      {open_at, 1} ->
+        prefix = binary_part(component, 0, open_at)
+        after_open_at = open_at + 1
+        after_open = binary_part(component, after_open_at, byte_size(component) - after_open_at)
+        {close_at, 1} = :binary.match(after_open, "}")
+        body = binary_part(after_open, 0, close_at)
+        suffix_at = close_at + 1
+        suffix = binary_part(after_open, suffix_at, byte_size(after_open) - suffix_at)
+
+        [{:literal, prefix}, {:alternatives, String.split(body, ",", trim: false)}]
+        |> Kernel.++(glob_segments(suffix))
+    end
+  end
+
+  defp glob_segment_states({:literal, pattern}) do
+    case plain_glob_state(pattern) do
+      nil -> []
+      state -> [state]
+    end
+  end
+
+  defp glob_segment_states({:alternatives, alternatives}) do
+    alternatives
+    |> Enum.map(&plain_glob_state/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  defp plain_glob_state(pattern) do
+    if Regex.match?(~r/\A[*?]*\z/u, pattern) do
+      questions = Enum.count(String.graphemes(pattern), &(&1 == "?"))
+      if questions <= 1, do: {String.contains?(pattern, "*"), questions}
+    end
+  end
+
+  defp collapse_adjacent_recursive_globs(components) do
+    components
+    |> Enum.reduce([], fn
+      "**", ["**" | _rest] = acc -> acc
+      component, acc -> [component | acc]
+    end)
+    |> Enum.reverse()
   end
 
   @doc "The accepted limit keys, as strings — the single source for spec validators."
@@ -628,9 +778,7 @@ defmodule Pixir.VirtualOverlay do
   defp relative!(path, root), do: Path.relative_to(Path.expand(path), root)
 
   defp under_path?(path, root) do
-    expanded_path = Path.expand(path)
-    expanded_root = Path.expand(root)
-    expanded_path == expanded_root or String.starts_with?(expanded_path, expanded_root <> "/")
+    Workspace.contains?(root, path)
   end
 
   defp sha256(content), do: :crypto.hash(:sha256, content) |> Base.encode16(case: :lower)

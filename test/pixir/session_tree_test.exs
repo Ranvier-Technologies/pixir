@@ -119,6 +119,35 @@ defmodule Pixir.SessionTreeTest do
     assert subagent["session"]["forks"] == []
   end
 
+  test "refuses hostile child Session ids from durable events before recursion", %{
+    ws: ws,
+    child_ws: child_ws,
+    sid: sid
+  } do
+    hostile = "../../../outside/tree-child;PWN"
+
+    append!(
+      ws,
+      Event.subagent_event(
+        sid,
+        %{
+          "subagent_id" => "sub_hostile",
+          "child_session_id" => hostile,
+          "event" => "started",
+          "status" => "detached",
+          "workspace" => child_ws
+        },
+        seq: 0
+      )
+    )
+
+    assert {:error, %{error: %{kind: :invalid_args}} = error} =
+             SessionTree.project(sid, workspace: ws)
+
+    refute inspect(error) =~ hostile
+    refute File.exists?(Path.join(ws, "outside"))
+  end
+
   test "missing root Session is a structured not_found error", %{ws: ws} do
     assert {:error, %{ok: false, error: %{kind: :not_found, details: details}}} =
              SessionTree.project("missing", workspace: ws)

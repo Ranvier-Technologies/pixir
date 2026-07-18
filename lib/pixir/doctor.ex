@@ -156,43 +156,62 @@ defmodule Pixir.Doctor do
         })
 
       {:error, reason} ->
-        failed("workspace", "Workspace is present but Pixir cannot write session logs.", %{
-          "kind" => "workspace_not_writable",
-          "path" => workspace,
-          "project_state_dir" => Paths.project_root(workspace),
-          "sessions_dir" => Paths.sessions_dir(workspace),
-          "reason" => inspect(reason),
-          "next_actions" => [
-            "run pixir doctor from a writable project directory",
-            "fix permissions for #{Paths.project_root(workspace)}"
-          ]
-        })
+        details =
+          %{
+            "kind" => "workspace_not_writable",
+            "path" => workspace,
+            "project_state_dir" => Paths.project_root(workspace),
+            "sessions_dir" => Paths.sessions_dir(workspace),
+            "next_actions" => [
+              "run pixir doctor from a writable project directory",
+              "fix permissions for #{Paths.project_root(workspace)}"
+            ]
+          }
+          |> Map.merge(workspace_probe_error_details(reason))
+
+        failed("workspace", "Workspace is present but Pixir cannot write session logs.", details)
     end
   end
 
   defp session_write_probe(workspace) do
+    sessions_dir = Paths.sessions_dir(workspace)
+
     probe_path =
-      workspace
-      |> Paths.sessions_dir()
-      |> Path.join(".doctor-write-probe-#{System.unique_integer([:positive])}")
+      Path.join(sessions_dir, ".doctor-write-probe-#{System.unique_integer([:positive])}")
 
-    try do
-      sessions_dir = Paths.ensure_sessions_dir(workspace)
-
-      case File.write(probe_path, "ok") do
-        :ok ->
-          _ = File.rm(probe_path)
-          {:ok, sessions_dir}
-
-        {:error, reason} ->
-          {:error, reason}
-      end
-    rescue
-      exception -> {:error, Exception.message(exception)}
-    after
-      if File.exists?(probe_path), do: File.rm(probe_path)
+    with {:ok, ^sessions_dir} <- Paths.ensure_state_dir(workspace, sessions_dir),
+         :ok <- Paths.preflight_new_state_path(workspace, probe_path),
+         :ok <- File.write(probe_path, "ok"),
+         :ok <- Paths.preflight_state_path(workspace, probe_path, expected: :regular),
+         :ok <- remove_write_probe(workspace, probe_path) do
+      {:ok, sessions_dir}
+    else
+      {:error, reason} ->
+        _ = remove_write_probe(workspace, probe_path)
+        {:error, reason}
     end
   end
+
+  defp remove_write_probe(workspace, probe_path) do
+    case Paths.inspect_state_path(workspace, probe_path, expected: :regular) do
+      {:ok, %{state: :missing}} -> :ok
+      {:ok, %{state: :regular}} -> File.rm(probe_path)
+      {:error, _error} = error -> error
+    end
+  end
+
+  defp workspace_probe_error_details(%{error: %{kind: kind, message: message} = error}) do
+    %{
+      "reason" => message,
+      "cause" => %{
+        "kind" => to_string(kind),
+        "message" => message,
+        "details" => Map.get(error, :details, %{})
+      }
+    }
+  end
+
+  defp workspace_probe_error_details(reason), do: %{"reason" => inspect(reason)}
 
   defp auth_check(opts, entry, model) do
     case entry.auth do

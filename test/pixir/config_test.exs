@@ -3,6 +3,10 @@ defmodule Pixir.ConfigTest do
 
   alias Pixir.Config
 
+  defmodule HostileWebSearchValue do
+    defstruct [:secret]
+  end
+
   setup do
     home =
       Path.join(
@@ -306,6 +310,97 @@ defmodule Pixir.ConfigTest do
     assert get_in(Config.load(config_path: config_path), ["effective", "model"]) == "from-env"
   end
 
+  test "blank models are ignored consistently across load, snapshot, and file_model", %{
+    config_path: config_path
+  } do
+    for blank <- ["", "   "] do
+      File.write!(config_path, Jason.encode!(%{"model" => blank}))
+
+      loaded = Config.load(config_path: config_path)
+      assert loaded["effective"]["model"] == "gpt-5.5"
+      assert Enum.any?(loaded["warnings"], &(&1["field"] == "model"))
+
+      assert {:ok, snapshot} = Config.request_snapshot(config_path: config_path)
+      assert snapshot.model == "gpt-5.5"
+      assert snapshot.model_source == :default
+      assert Config.file_model(config_path: config_path) == "gpt-5.5"
+    end
+  end
+
+  test "invalid UTF-8 models warn and fall back consistently" do
+    invalid = <<255>>
+    raw = %{"model" => invalid}
+
+    loaded = Config.load(raw_config: raw)
+    assert loaded["effective"]["model"] == "gpt-5.5"
+    assert Enum.any?(loaded["warnings"], &(&1["field"] == "model"))
+
+    assert {:ok, snapshot} = Config.request_snapshot(raw_config: raw)
+    assert snapshot.model == "gpt-5.5"
+    assert snapshot.model_source == :default
+    assert Config.file_model(raw_config: raw) == "gpt-5.5"
+    refute inspect(loaded) =~ inspect(invalid)
+  end
+
+  test "model catalogs and refresh stamps keep Config.load JSON-serializable" do
+    invalid = <<255, 254>>
+
+    loaded =
+      Config.load(
+        raw_config: %{
+          "models" => ["gpt-5.5", invalid],
+          "anthropic_models" => [invalid],
+          "models_refreshed_at" => invalid
+        }
+      )
+
+    assert loaded["effective"]["models"] == nil
+    assert loaded["effective"]["anthropic_models"] == nil
+    assert loaded["effective"]["models_refreshed_at"] == nil
+
+    for field <- ["models", "anthropic_models", "models_refreshed_at"] do
+      assert Enum.any?(loaded["warnings"], &(&1["field"] == field))
+    end
+
+    assert {:ok, _json} = Jason.encode(loaded)
+    refute inspect(loaded) =~ inspect(invalid)
+  end
+
+  test "trimmed app and env model precedence stays identical in snapshots and projections" do
+    loader = fn _opts ->
+      {:ok,
+       %{
+         present?: true,
+         origin: :programmatic,
+         document: %{"model" => " file-model "}
+       }}
+    end
+
+    System.put_env("PIXIR_MODEL", " env-model ")
+    Application.put_env(:pixir, :model, "   ")
+
+    loaded = Config.load(raw_config: %{"model" => " file-model "})
+    assert loaded["effective"]["model"] == "env-model"
+    assert Config.file_model(raw_config: %{"model" => " file-model "}) == "env-model"
+
+    assert {:ok, env_snapshot} =
+             Config.request_snapshot(request_snapshot_loader: loader)
+
+    assert env_snapshot.model == "env-model"
+    assert env_snapshot.model_source == :env
+
+    Application.put_env(:pixir, :model, " app-model ")
+
+    assert Config.load(raw_config: %{"model" => " file-model "})["effective"]["model"] ==
+             "app-model"
+
+    assert {:ok, app_snapshot} =
+             Config.request_snapshot(request_snapshot_loader: loader)
+
+    assert app_snapshot.model == "app-model"
+    assert app_snapshot.model_source == :application
+  end
+
   test "merge_provider_opts preserves explicit provider opts", %{config_path: config_path} do
     File.write!(
       config_path,
@@ -334,5 +429,495 @@ defmodule Pixir.ConfigTest do
   test "permission_default resolves to atoms", %{config_path: config_path} do
     File.write!(config_path, Jason.encode!(%{"permission_default" => "read_only"}))
     assert Config.permission_default(config_path: config_path) == :read_only
+  end
+
+  test "request_snapshot resolves model and open backend from one loader invocation" do
+    {:ok, calls} = Agent.start_link(fn -> 0 end)
+
+    loader = fn opts ->
+      refute Keyword.has_key?(opts, :request_snapshot_loader)
+      assert Agent.get_and_update(calls, &{&1, &1 + 1}) == 0
+
+      {:ok,
+       %{
+         present?: true,
+         origin: :file,
+         document:
+           Jason.encode!(%{
+             "model" => "gpt-first",
+             "max_retries" => 7,
+             "stream_idle_timeout_ms" => 12_345,
+             "reasoning" => %{"effort" => "high"},
+             "text" => %{"verbosity" => "low"},
+             "web_search" => %{"enabled" => true, "search_context_size" => "medium"},
+             "responses_backend" => %{
+               "mode" => "open_responses",
+               "responses_url" => "https://first.example/v1/responses",
+               "auth" => %{"policy" => "none"}
+             }
+           })
+       }}
+    end
+
+    assert {:ok, snapshot} = Config.request_snapshot(request_snapshot_loader: loader)
+    assert Agent.get(calls, & &1) == 1
+    assert snapshot.model == "gpt-first"
+    assert snapshot.model_source == :file
+    assert snapshot.config_present?
+    assert snapshot.provider_defaults.max_retries == 7
+    assert snapshot.provider_defaults.stream_idle_timeout_ms == 12_345
+    assert snapshot.provider_defaults.reasoning_effort == "high"
+    assert snapshot.provider_defaults.text_verbosity == "low"
+
+    assert snapshot.provider_defaults.web_search == %{
+             "enabled" => true,
+             "search_context_size" => "medium"
+           }
+
+    assert Pixir.Providers.ResponsesBackend.endpoint(snapshot.responses_backend) ==
+             {:responses_url, "https://first.example/v1/responses"}
+  end
+
+  test "responses_backend keeps successful absent and explicit values inside ok tuples" do
+    assert {:ok, :absent} = Config.responses_backend(raw_config: %{})
+
+    assert {:ok, backend} =
+             Config.responses_backend(
+               raw_config: %{"responses_backend" => %{"mode" => "chatgpt_codex"}}
+             )
+
+    assert Pixir.Providers.ResponsesBackend.mode(backend) == :chatgpt_codex
+
+    assert {:error, %{error: %{kind: :invalid_config}}} =
+             Config.responses_backend(raw_config: %{"responses_backend" => %{"mode" => "future"}})
+  end
+
+  test "invalid reasoning and text warnings never echo configured values" do
+    sentinel = "SECRET_INVALID_ENUM_VALUE"
+
+    result =
+      Config.load(
+        raw_config: %{
+          "reasoning" => %{"effort" => sentinel},
+          "text" => %{"verbosity" => sentinel}
+        }
+      )
+
+    assert Enum.any?(result["warnings"], &(&1["field"] == "reasoning.effort"))
+    assert Enum.any?(result["warnings"], &(&1["field"] == "text.verbosity"))
+    refute inspect(result) =~ sentinel
+    assert {:ok, _json} = Jason.encode(result)
+  end
+
+  test "whole-document structs fail closed without raising or leaking" do
+    sentinel = "https://SECRET.example/v1/responses"
+    struct = URI.parse(sentinel)
+
+    loaded = Config.load(raw_config: struct)
+    assert loaded["error"] == %{kind: :invalid_json, position: 0}
+    refute inspect(loaded) =~ sentinel
+    assert {:ok, _json} = Jason.encode(loaded)
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :invalid_config,
+                details: %{field: :config, reason: :invalid_json}
+              }
+            } = payload} = Config.request_snapshot(raw_config: struct)
+
+    refute inspect(payload) =~ sentinel
+
+    assert {:error,
+            %{error: %{kind: :invalid_config, details: %{reason: :invalid_loader_result}}}} =
+             Config.request_snapshot(
+               request_snapshot_loader: fn _opts ->
+                 {:ok, %{present?: true, origin: :programmatic, document: struct}}
+               end
+             )
+  end
+
+  test "whole-value web search and context-window structs stay total and redacted" do
+    sentinel = "https://SECRET.example/v1/responses"
+    uri = URI.parse(sentinel)
+
+    for value <- [uri, DateTime.utc_now(), MapSet.new([:enabled])] do
+      loaded = Config.load(raw_config: %{"web_search" => value})
+      assert Enum.any?(loaded["warnings"], &(&1["field"] == "web_search"))
+      assert loaded["effective"]["web_search"] == nil
+      refute inspect(loaded) =~ sentinel
+      assert {:ok, snapshot} = Config.request_snapshot(raw_config: %{"web_search" => value})
+      assert snapshot.provider_defaults.web_search == nil
+    end
+
+    loaded = Config.load(raw_config: %{"context_windows" => uri})
+    assert Enum.any?(loaded["warnings"], &(&1["field"] == "context_windows"))
+    assert loaded["effective"]["context_windows"] == %{}
+    refute inspect(loaded) =~ sentinel
+
+    loaded = Config.load(raw_config: %{"context_windows" => %{uri => 128_000}})
+    assert Enum.any?(loaded["warnings"], &(&1["field"] == "context_windows"))
+    assert loaded["effective"]["context_windows"] == %{}
+    refute inspect(loaded) =~ sentinel
+    assert {:ok, _json} = Jason.encode(loaded)
+  end
+
+  test "struct-shaped nested config parents cannot smuggle validated defaults" do
+    sentinel = "https://NESTED_CONFIG_SECRET.example/token"
+
+    raw = %{
+      "reasoning" => Map.put(URI.parse(sentinel), "effort", "high"),
+      "text" => Map.put(DateTime.utc_now(), "verbosity", "low"),
+      "compaction" =>
+        DateTime.utc_now()
+        |> Map.put("tail_events", 7)
+        |> Map.put("model_assisted", true),
+      "host_commands" => Map.put(URI.parse(sentinel), "max_concurrent", 9)
+    }
+
+    loaded = Config.load(raw_config: raw)
+    warnings = MapSet.new(loaded["warnings"], & &1["field"])
+
+    assert MapSet.member?(warnings, "reasoning.effort")
+    assert MapSet.member?(warnings, "text.verbosity")
+    assert MapSet.member?(warnings, "compaction")
+    assert MapSet.member?(warnings, "host_commands")
+    assert loaded["effective"]["reasoning"]["effort"] == nil
+    assert loaded["effective"]["text"]["verbosity"] == nil
+    assert loaded["effective"]["compaction"] == %{"tail_events" => 40, "model_assisted" => false}
+
+    assert loaded["effective"]["host_commands"] == %{
+             "max_concurrent" => 4,
+             "queue_limit" => 16,
+             "queue_timeout_ms" => 5_000
+           }
+
+    refute inspect(loaded) =~ sentinel
+
+    assert {:ok, snapshot} = Config.request_snapshot(raw_config: raw)
+    assert snapshot.provider_defaults.reasoning_effort == nil
+    assert snapshot.provider_defaults.text_verbosity == nil
+    refute inspect(snapshot) =~ sentinel
+  end
+
+  test "programmatic nested config keys normalize atom forms and reject collisions" do
+    assert {:ok, atom_snapshot} =
+             Config.request_snapshot(
+               raw_config: %{
+                 "reasoning" => %{effort: "high"},
+                 "text" => %{verbosity: "low"}
+               }
+             )
+
+    assert atom_snapshot.provider_defaults.reasoning_effort == "high"
+    assert atom_snapshot.provider_defaults.text_verbosity == "low"
+
+    collision = %{
+      "reasoning" => %{"effort" => "low", effort: "high"},
+      "text" => %{"verbosity" => "high", verbosity: "low"}
+    }
+
+    loaded = Config.load(raw_config: collision)
+    assert loaded["effective"]["reasoning"]["effort"] == nil
+    assert loaded["effective"]["text"]["verbosity"] == nil
+    assert Enum.any?(loaded["warnings"], &(&1["field"] == "reasoning.effort"))
+    assert Enum.any?(loaded["warnings"], &(&1["field"] == "text.verbosity"))
+
+    assert {:ok, collision_snapshot} = Config.request_snapshot(raw_config: collision)
+    assert collision_snapshot.provider_defaults.reasoning_effort == nil
+    assert collision_snapshot.provider_defaults.text_verbosity == nil
+  end
+
+  test "file snapshots reject duplicate non-profile keys at any nested depth", %{
+    config_path: config_path
+  } do
+    File.write!(
+      config_path,
+      ~s({"reasoning":{"effort":"high","effort":"low"},"model":"gpt-5.5"})
+    )
+
+    loaded = Config.load(config_path: config_path)
+    assert loaded["error"] == %{kind: :invalid_config}
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :invalid_config,
+                details: %{field: :config, reason: :unknown_field}
+              }
+            }} = Config.request_snapshot(config_path: config_path)
+  end
+
+  test "improper config lists stay total across application and raw snapshots" do
+    improper_web_search = [{:enabled, true} | :secret_tail]
+    improper_models = ["gpt-5.5" | :secret_tail]
+
+    Application.put_env(:pixir, :web_search, improper_web_search)
+
+    assert {:ok, app_snapshot} = Config.request_snapshot(raw_config: %{})
+    assert app_snapshot.provider_defaults.web_search == nil
+
+    Application.delete_env(:pixir, :web_search)
+
+    assert {:ok, raw_snapshot} =
+             Config.request_snapshot(
+               raw_config: %{
+                 "web_search" => improper_web_search,
+                 "models" => improper_models
+               }
+             )
+
+    assert raw_snapshot.provider_defaults.web_search == nil
+    assert raw_snapshot.model == "gpt-5.5"
+
+    loaded = Config.load(raw_config: %{"models" => improper_models})
+    assert loaded["effective"]["models"] == nil
+    assert Enum.any?(loaded["warnings"], &(&1["field"] == "models"))
+  end
+
+  test "request_snapshot loader failures stay bounded, structured, JSON-safe, and redacted" do
+    sentinel = "LOADER_SECRET_SENTINEL"
+
+    cases = [
+      {{:not_a_loader, sentinel}, :invalid_loader_type},
+      {fn -> :bad_arity end, :invalid_loader_arity},
+      {fn _opts -> {:ok, :invalid_document} end, :invalid_loader_result},
+      {fn _opts -> {:error, {:secret, sentinel}} end, :invalid_loader_result},
+      {fn _opts -> raise sentinel end, :loader_execution_failed},
+      {fn _opts -> throw(sentinel) end, :loader_execution_failed},
+      {fn _opts -> exit(sentinel) end, :loader_execution_failed}
+    ]
+
+    for {loader, reason} <- cases do
+      assert {:error,
+              %{
+                ok: false,
+                error: %{
+                  kind: :invalid_config,
+                  message: message,
+                  details: %{field: :request_snapshot_loader, reason: ^reason} = details
+                }
+              } = payload} = Config.request_snapshot(request_snapshot_loader: loader)
+
+      assert is_binary(message) and byte_size(message) in 1..240
+      assert map_size(details) == 2
+      assert match?({:ok, _}, Jason.encode(payload))
+      refute inspect(payload) =~ sentinel
+      refute inspect(payload) =~ "#Function"
+    end
+  end
+
+  test "request_snapshot loader accepts only closed sanitized source errors" do
+    for {source_error, reason} <- [
+          {%{kind: :read_failed}, :read_failed},
+          {%{kind: :invalid_json, position: 17}, :invalid_json}
+        ] do
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_config,
+                  details: %{field: :config, reason: ^reason}
+                }
+              }} =
+               Config.request_snapshot(
+                 request_snapshot_loader: fn _opts -> {:error, source_error} end
+               )
+    end
+
+    sentinel = "LOADER_SOURCE_ERROR_SECRET"
+
+    rejected = [
+      %{kind: :read_failed, detail: sentinel},
+      %{kind: :invalid_json, position: -1},
+      %{kind: :invalid_json, position: 2, source: sentinel},
+      %{kind: :unknown, value: sentinel}
+    ]
+
+    for source_error <- rejected do
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_config,
+                  details: %{
+                    field: :request_snapshot_loader,
+                    reason: :invalid_loader_result
+                  }
+                }
+              } = error} =
+               Config.request_snapshot(
+                 request_snapshot_loader: fn _opts -> {:error, source_error} end
+               )
+
+      refute inspect(error) =~ sentinel
+    end
+  end
+
+  test "nested structs in raw or application web_search config are ignored safely" do
+    unsafe = %{"filters" => Date.utc_today()}
+
+    loaded = Config.load(raw_config: %{"web_search" => unsafe})
+    assert loaded["effective"]["web_search"] == nil
+    assert Enum.any?(loaded["warnings"], &(&1["field"] == "web_search"))
+
+    assert {:ok, raw_snapshot} =
+             Config.request_snapshot(raw_config: %{"web_search" => unsafe})
+
+    assert raw_snapshot.provider_defaults.web_search == nil
+
+    Application.put_env(:pixir, :web_search, unsafe)
+    assert Config.load(raw_config: %{})["effective"]["web_search"] == nil
+    assert {:ok, app_snapshot} = Config.request_snapshot(raw_config: %{})
+    assert app_snapshot.provider_defaults.web_search == nil
+  end
+
+  test "rejected web_search warnings never inspect or echo hostile values" do
+    sentinel = "HOSTILE_WEB_SEARCH_SENTINEL"
+    hostile = %{"filters" => %HostileWebSearchValue{secret: sentinel}}
+
+    loaded = Config.load(raw_config: %{"web_search" => hostile})
+    assert loaded["effective"]["web_search"] == nil
+
+    assert [%{"field" => "web_search", "message" => "invalid value; ignoring"}] =
+             loaded["warnings"]
+
+    refute inspect(loaded) =~ sentinel
+
+    Application.put_env(:pixir, :web_search, hostile)
+    assert Config.load(raw_config: %{})["effective"]["web_search"] == nil
+  end
+
+  test "invalid web_search map keys never enter errors or warnings" do
+    sentinel = "HOSTILE_WEB_SEARCH_KEY_SENTINEL"
+    hostile_key = %HostileWebSearchValue{secret: sentinel}
+    unsafe = %{hostile_key => "value"}
+
+    loaded = Config.load(raw_config: %{"web_search" => unsafe})
+    assert loaded["effective"]["web_search"] == nil
+
+    assert [%{"field" => "web_search", "message" => "invalid value; ignoring"}] =
+             loaded["warnings"]
+
+    refute inspect(loaded) =~ sentinel
+
+    assert {:ok, snapshot} =
+             Config.request_snapshot(raw_config: %{"web_search" => unsafe})
+
+    assert snapshot.provider_defaults.web_search == nil
+  end
+
+  test "web_search normalized key collisions fail closed instead of last-write-win" do
+    for web_search <- [
+          %{:enabled => false, "enabled" => true},
+          %{:filters => %{"first" => true}, "filters" => %{"second" => true}}
+        ] do
+      loaded = Config.load(raw_config: %{"web_search" => web_search})
+      assert loaded["effective"]["web_search"] == nil
+      assert Enum.any?(loaded["warnings"], &(&1["field"] == "web_search"))
+
+      assert {:ok, snapshot} =
+               Config.request_snapshot(raw_config: %{"web_search" => web_search})
+
+      assert snapshot.provider_defaults.web_search == nil
+    end
+  end
+
+  test "invalid permission defaults never enter warnings or request snapshots" do
+    sentinel = "HOSTILE_PERMISSION_DEFAULT_SENTINEL"
+    hostile = %HostileWebSearchValue{secret: sentinel}
+    raw = %{"permission_default" => hostile}
+
+    loaded = Config.load(raw_config: raw)
+    assert loaded["effective"]["permission_default"] == "auto"
+
+    assert [
+             %{
+               "field" => "permission_default",
+               "message" => "invalid value; expected auto, ask, or read_only"
+             }
+           ] = loaded["warnings"]
+
+    refute inspect(loaded) =~ sentinel
+
+    assert {:ok, snapshot} = Config.request_snapshot(raw_config: raw)
+    assert snapshot.model == "gpt-5.5"
+    refute inspect(snapshot) =~ sentinel
+  end
+
+  test "load warns and omits duplicate literal profile keys while snapshot fails closed", %{
+    config_path: config_path
+  } do
+    File.write!(
+      config_path,
+      ~s({"model":"gpt-5.4-mini","responses_backend":{"mode":"open_responses","responses_url":"https://first.example/v1/responses","responses_url":"https://secret.example/v1/responses","auth":{"policy":"none"}}})
+    )
+
+    loaded = Config.load(config_path: config_path)
+    assert loaded["present"]
+    refute Map.has_key?(loaded["effective"], "responses_backend")
+
+    assert Enum.any?(loaded["warnings"], fn warning ->
+             warning["field"] == "responses_backend" and warning["reason"] == "unknown_field"
+           end)
+
+    refute inspect(loaded) =~ "secret.example"
+
+    assert {:error, %{error: %{kind: :invalid_config, details: %{reason: :unknown_field}}}} =
+             Config.request_snapshot(config_path: config_path)
+  end
+
+  test "programmatic normalized profile-key collisions warn in load and fail in snapshots" do
+    raw = %{
+      :responses_backend => %{"mode" => "chatgpt_codex"},
+      "responses_backend" => %{"mode" => "future"}
+    }
+
+    loaded = Config.load(raw_config: raw)
+    refute Map.has_key?(loaded["effective"], "responses_backend")
+
+    assert [%{"field" => "responses_backend", "reason" => "unknown_field"}] =
+             loaded["warnings"]
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :invalid_config,
+                details: %{field: :config, reason: :unknown_field}
+              }
+            }} = Config.request_snapshot(raw_config: raw)
+  end
+
+  test "malformed whole-file JSON never projects source bytes", %{config_path: config_path} do
+    sentinel = "https://SECRET.example/v1/responses"
+    bytes = ~s({"responses_backend":{"responses_url":"#{sentinel}"})
+    File.write!(config_path, bytes)
+
+    loaded = Config.load(config_path: config_path)
+    assert %{kind: :invalid_json, position: position} = loaded["error"]
+    assert position in 0..byte_size(bytes)
+    assert Map.keys(loaded["error"]) |> Enum.sort() == [:kind, :position]
+    refute inspect(loaded) =~ sentinel
+    assert match?({:ok, _}, Jason.encode(loaded))
+
+    assert {:error,
+            %{error: %{kind: :invalid_config, details: %{field: :config, reason: :invalid_json}}}} =
+             Config.request_snapshot(config_path: config_path)
+  end
+
+  test "valid and malformed profile load projections never expose endpoint values" do
+    open = %{
+      "mode" => "open_responses",
+      "responses_url" => "https://private.example/v1/responses",
+      "auth" => %{"policy" => "none"}
+    }
+
+    valid = Config.load(raw_config: %{"responses_backend" => open})
+    assert valid["effective"]["responses_backend"]["mode"] == "open_responses"
+    assert valid["effective"]["responses_backend"]["endpoint_kind"] == "responses_url"
+    refute inspect(valid) =~ "private.example"
+
+    malformed = Config.load(raw_config: %{"responses_backend" => Map.put(open, "mode", "future")})
+    refute Map.has_key?(malformed["effective"], "responses_backend")
+    assert hd(malformed["warnings"])["reason"] == "unknown_mode"
+    refute inspect(malformed) =~ "private.example"
   end
 end

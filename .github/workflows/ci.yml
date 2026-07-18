@@ -19,7 +19,7 @@ jobs:
     # GitHub-hosted runners, everywhere else (the development repo) keeps
     # Blacksmith. Rename the mirror -> update this.
     runs-on: ${{ github.repository == 'Ranvier-Technologies/pixir' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -66,6 +66,72 @@ jobs:
 
       - name: Run WebSocket smoke
         run: mix pixir.smoke.websocket --dry-run --json
+
+      - name: Set up Chrome for Pixir Monitor browser suites
+        # ACTION pinned by commit (browser-actions/setup-chrome v2.1.2); the
+        # BROWSER deliberately tracks the stable channel — these suites are
+        # honesty gates against the browser operators actually run, and a
+        # breaking stable release failing CI is signal, not flake. Upgrades
+        # every default browser-gated Monitor suite from local-only to
+        # CI-mandatory (#401) on the mirror's ubuntu runner and Blacksmith
+        # alike; install-dependencies keeps both runner families
+        # self-sufficient on Chrome's shared libraries. The opt-in 300s
+        # lifecycle suite (PIXIR_MONITOR_LIFECYCLE=1) stays OUT of CI by
+        # design; the 25-minute budget covers the default suites only.
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@2e1d749697dd1612b833dba4a722266286fbefcd
+        with:
+          chrome-version: stable
+          install-dependencies: true
+
+      - name: Set up Node.js for Pixir Monitor browser suites
+        # Pinned action (actions/setup-node v7.0.0, lightweight tag = commit).
+        # The CDP harnesses gate on the global WebSocket that ships in
+        # Node >= 22; the runner image's default node predates it, which left
+        # all 13 browser suites skipping even with Chrome installed (measured
+        # on run 29539227088: 267 passed, 13 skipped).
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "22"
+
+      - name: Fetch Pixir Monitor dependencies
+        working-directory: monitor
+        run: mix deps.get
+
+      - name: Check Pixir Monitor formatting
+        working-directory: monitor
+        run: mix format --check-formatted
+
+      - name: Compile Pixir Monitor with warnings as errors
+        working-directory: monitor
+        run: mix compile --warnings-as-errors
+
+      - name: Run Pixir Monitor tests with warnings as errors
+        working-directory: monitor
+        env:
+          MIX_ENV: test
+          # The browser suites detect this binary first; --no-sandbox is a CI
+          # runner necessity (root containers), gated to this env knob so
+          # local runs never carry it (adjudicated in the #397 round).
+          PIXIR_MONITOR_BROWSER_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+          PIXIR_MONITOR_BROWSER_EXTRA_ARGS: "--no-sandbox --disable-dev-shm-usage"
+        run: mix do compile --warnings-as-errors + test --warnings-as-errors
+
+      - name: Build Pixir Monitor escript
+        working-directory: monitor
+        run: mix escript.build
+
+      - name: Self-check built Pixir Monitor escript
+        working-directory: monitor
+        run: ./pixir-monitor self-check --json
+
+      - name: Exercise Pixir Monitor help
+        working-directory: monitor
+        run: ./pixir-monitor --help
+
+      - name: Exercise Pixir Monitor dry-run serve
+        working-directory: monitor
+        run: ./pixir-monitor serve --dry-run --json
 
       - name: Build docs with warnings as errors
         run: mix docs --warnings-as-errors

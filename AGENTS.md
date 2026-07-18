@@ -58,6 +58,11 @@ is grounded enough:
    - `0034` Delegate service runtime residency before async start.
    - `0035` Write-capable Sessions require an external evidence mirror.
    - `0036` Idle-timeout recovery does not auto-resume ambiguous work.
+   - `0037` Anthropic provider registry routing, pa1 prompt contract, explicit
+     cache control, and seam-parity transport.
+   - `0038` Pixir Monitor is an experimental sibling source-checkout SPA using
+     authoritative snapshots and bounded SSE invalidation hints.
+   - `0039` Provider-output truncation is neutral, durable success evidence.
 5. **Nearest local instructions:** read the closest subtree `AGENTS.md` before editing
    code, docs, tests, benchmarks, or ADRs.
 
@@ -90,6 +95,9 @@ The repo should reveal what Pixir is by its module names:
 - `Pixir.SessionTree` - read-only projection of Session/Subagent hierarchy from Logs.
 - `Pixir.Compaction` - durable `history_compaction` checkpoints and replay repair.
 - `Pixir.CLI` / `Pixir.Renderer` - terminal presenter.
+- `monitor/` - experimental source-only Pixir Monitor sibling app. It is a loopback-only,
+  read-only Phoenix/Bandit Presenter over recomputable projections; its dependencies do
+  not enter Pixir core or the Hex package. Read `monitor/AGENTS.md` before work there.
 - `Pixir.ACP.*` - ACP stdio presenter. stdout is JSON-RPC only.
 
 ## Beta Stance
@@ -100,12 +108,14 @@ Pixir Harness is public as an early source-install developer preview:
   subscription OAuth/API-key fallback, core tools, Skills, Subagents, Workflows,
   Workflow Templates, Session Resources/Image Attachments/resource links, Provider
   usage, opt-in Provider-hosted Web Search, and local diagnostics.
-- Experimental: long-running non-blocking Subagent UX, Workflow Templates as product
-  surface, PATCHMD customization operations, benchmark drivers, and client-specific
-  projection behavior. Skill Context Hydration is accepted as a design direction but is
-  not yet an implemented public surface.
-- Not included: Hex publication, stable public Elixir API, packaged T3Code provider,
-  MCP support, web UI, self-update, telemetry, or production support promises.
+- Experimental: the source-only `monitor/` Pixir Monitor sibling app, long-running
+  non-blocking Subagent UX, Workflow Templates as product surface, PATCHMD customization
+  operations, benchmark drivers, and client-specific projection behavior. Pixir Monitor
+  is loopback-only and read-only; it is not part of the Hex package or a production
+  support promise. Skill Context Hydration is accepted as a design direction but is not
+  yet an implemented public surface.
+- Not included: stable public Elixir API, packaged T3Code provider, MCP support,
+  packaged/Hex web UI, self-update, telemetry, or production support promises.
 
 T3Code integration is dogfood through a separate local adapter/patch workflow. Do not
 imply an upstream T3Code PR or packaged provider install path unless a later decision

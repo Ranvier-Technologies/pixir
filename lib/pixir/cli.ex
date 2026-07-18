@@ -1117,7 +1117,6 @@ defmodule Pixir.CLI do
     with {:ok, policy_opts} <- prepare_runtime_policy(runtime),
          :ok <- ensure_policy_mode(mode, policy_opts, runtime),
          :ok <- ensure_interactive_ask(mode),
-         :ok <- require_auth(turn_opts),
          {:ok, sid} <- start_session([], mode, policy_opts) do
       run_turn(
         sid,
@@ -1144,7 +1143,6 @@ defmodule Pixir.CLI do
          {:ok, mode, policy_opts, attestation} <-
            restore_resume_posture(resume_opts, mode, policy_opts),
          :ok <- ensure_interactive_ask(mode),
-         :ok <- require_auth(turn_opts),
          {:ok, prompt} <- read_prompt(resume_opts.prompt_args),
          {:ok, started_id} <- start_session(resume_start_opts(resume_opts), mode, policy_opts),
          :ok <- ensure_resume_id(started_id, resume_opts.id),
@@ -1220,7 +1218,6 @@ defmodule Pixir.CLI do
     if String.starts_with?(arg, "-") do
       {:error,
        Pixir.Tool.error(:invalid_args, "unsupported resume option", %{
-         option: arg,
          accepted_options: [
            "--force-release-writer-lease",
            "--force-release-reason",
@@ -1333,7 +1330,18 @@ defmodule Pixir.CLI do
     # One-shot final-report contract (ADR 0005): the streamed accumulator lets the
     # final assistant_message flush any text the transport never delivered as deltas,
     # and lets `:done` without a final report exit as an honest incomplete outcome.
-    {:ok, report} = Agent.start_link(fn -> %{streamed: [], final: :none} end)
+    {:ok, report} =
+      Agent.start_link(fn ->
+        %{
+          streamed: [],
+          final: :none,
+          output_truncation: nil,
+          warnings: [],
+          warning_count: 0,
+          warning_keys: MapSet.new(),
+          latest_warning_order_key: nil
+        }
+      end)
 
     sigint_trap =
       case Sigint.install(session_id) do
@@ -1343,8 +1351,8 @@ defmodule Pixir.CLI do
 
     try do
       on_event = fn event ->
-        track_final_report(event, report)
-        unless json?, do: render_event(event)
+        presentation = track_final_report(event, report)
+        unless json?, do: render_tracked_event(event, presentation)
       end
 
       case Conversation.await(session_id, Keyword.put(await_opts, :on_event, on_event)) do
@@ -1381,18 +1389,56 @@ defmodule Pixir.CLI do
 
   # Each provider call starts at a status "thinking", so the streamed accumulator
   # resets per call and the final assistant_message compares against its own deltas.
-  defp track_final_report(%{type: :status, data: %{"status" => "thinking"}}, report),
-    do: Agent.update(report, &%{&1 | streamed: []})
+  defp track_final_report(%{type: :status, data: %{"status" => "thinking"}}, report) do
+    Agent.update(report, &%{&1 | streamed: []})
+    :render
+  end
 
-  defp track_final_report(%{type: :text_delta, data: %{"chunk" => chunk}}, report),
-    do: Agent.update(report, fn state -> %{state | streamed: [chunk | state.streamed]} end)
+  defp track_final_report(%{type: :text_delta, data: %{"chunk" => chunk}}, report) do
+    Agent.update(report, fn state -> %{state | streamed: [chunk | state.streamed]} end)
+    :render
+  end
 
-  defp track_final_report(%{type: :assistant_message, data: data}, report) do
+  defp track_final_report(%{type: :provider_usage} = event, report) do
+    projection = Pixir.Provider.OutputTruncationSummary.project(event)
+    warning = Pixir.Provider.OutputTruncationSummary.warning(event)
+
+    Agent.get_and_update(report, fn state ->
+      state =
+        if projection["call_role"] == "final_answer" do
+          %{state | output_truncation: projection}
+        else
+          state
+        end
+
+      case warning do
+        nil ->
+          {:render, state}
+
+        warning ->
+          {emit?, next} = track_cli_warning(state, event.session_id, warning)
+          {if(emit?, do: :render, else: :suppress), next}
+      end
+    end)
+  end
+
+  defp track_final_report(%{type: :assistant_message, data: data} = event, report) do
     text = Map.get(data, "text", "")
 
-    streamed =
+    {streamed, presentation} =
       Agent.get_and_update(report, fn state ->
-        {IO.iodata_to_binary(Enum.reverse(state.streamed)), %{state | final: text}}
+        streamed = IO.iodata_to_binary(Enum.reverse(state.streamed))
+        state = %{state | final: text}
+
+        case Pixir.Provider.OutputTruncationSummary.assistant_fallback(event) do
+          {:ok, projection, warning} ->
+            state = %{state | output_truncation: projection}
+            {emit?, state} = track_cli_warning(state, event.session_id, warning)
+            {{streamed, if(emit?, do: {:fallback_warning, warning}, else: :render)}, state}
+
+          :error ->
+            {{streamed, :render}, state}
+        end
       end)
 
     # Channel discipline: the model's answer belongs on stdout even when the transport
@@ -1411,26 +1457,81 @@ defmodule Pixir.CLI do
         IO.write(["\n", text])
     end
 
-    :ok
+    presentation
   end
 
-  defp track_final_report(_event, _report), do: :ok
+  defp track_final_report(_event, _report), do: :render
+
+  defp track_cli_warning(state, session_id, warning) do
+    key = {session_id, warning["provider_usage_event_id"]}
+    order_key = {warning["provider_usage_seq"], warning["provider_usage_event_id"]}
+
+    cond do
+      MapSet.member?(state.warning_keys, key) ->
+        {false, state}
+
+      not is_nil(state.latest_warning_order_key) and order_key <= state.latest_warning_order_key ->
+        {false, state}
+
+      MapSet.size(state.warning_keys) < 256 ->
+        {true,
+         %{
+           state
+           | warnings: state.warnings ++ [warning],
+             warning_count: state.warning_count + 1,
+             warning_keys: MapSet.put(state.warning_keys, key),
+             latest_warning_order_key: order_key
+         }}
+
+      true ->
+        {false,
+         %{
+           state
+           | warning_count: state.warning_count + 1,
+             latest_warning_order_key: order_key
+         }}
+    end
+  end
+
+  defp render_tracked_event(_event, :suppress), do: :ok
+
+  defp render_tracked_event(event, {:fallback_warning, warning}) do
+    Renderer.write({:stderr, Renderer.output_truncation_warning(warning)})
+    render_event(event)
+  end
+
+  defp render_tracked_event(event, :render), do: render_event(event)
 
   # A `:done` Turn without a non-empty final assistant message is an incomplete
   # outcome (exit 6, matching the Delegate contract), never a silent success.
-  defp finish_one_shot(session_id, %{final: final}, true) do
+  defp finish_one_shot(session_id, %{final: final} = report, true) do
+    evidence = output_truncation_report(report)
+
     if is_binary(final) and String.trim(final) != "" do
       IO.puts(
-        Jason.encode!(one_shot_payload(session_id, "completed", true, %{"output" => final}))
+        Jason.encode!(
+          one_shot_payload(
+            session_id,
+            "completed",
+            true,
+            Map.put(evidence, "output", final)
+          )
+        )
       )
 
       :ok
     else
       IO.puts(
         Jason.encode!(
-          one_shot_payload(session_id, "incomplete", false, %{
-            "message" => "completed without a final assistant message"
-          })
+          one_shot_payload(
+            session_id,
+            "incomplete",
+            false,
+            %{
+              "message" => "completed without a final assistant message"
+            }
+            |> Map.merge(evidence)
+          )
         )
       )
 
@@ -1438,7 +1539,9 @@ defmodule Pixir.CLI do
     end
   end
 
-  defp finish_one_shot(session_id, %{final: final}, _json?) do
+  defp finish_one_shot(session_id, %{final: final} = report, _json?) do
+    maybe_render_suppression(report)
+
     if is_binary(final) and String.trim(final) != "" do
       print_session_resume_hint(session_id)
       :ok
@@ -1447,6 +1550,24 @@ defmodule Pixir.CLI do
       IO.puts(:stderr, "inspect evidence with: #{diagnose_command(session_id)}")
       print_session_resume_hint(session_id)
       {:error, 6}
+    end
+  end
+
+  defp output_truncation_report(report) do
+    %{
+      "output_truncation" => report.output_truncation,
+      "warning_count" => report.warning_count,
+      "warnings_truncated" => report.warning_count > length(report.warnings),
+      "warnings" => report.warnings
+    }
+  end
+
+  defp maybe_render_suppression(report) do
+    if report.warning_count > length(report.warnings) do
+      IO.write(
+        :stderr,
+        Renderer.output_truncation_suppression(report.warning_count, length(report.warnings))
+      )
     end
   end
 
@@ -1654,7 +1775,10 @@ defmodule Pixir.CLI do
   defp persist_legacy_root_attestation(nil, _session_id), do: :ok
 
   defp persist_legacy_root_attestation(attestation, session_id) do
-    case Session.record(session_id, Event.subagent_event(session_id, attestation)) do
+    recorder =
+      Application.get_env(:pixir, :cli_attestation_recorder, &Session.record/2)
+
+    case recorder.(session_id, Event.subagent_event(session_id, attestation)) do
       {:ok, _event} ->
         :ok
 
@@ -1713,15 +1837,6 @@ defmodule Pixir.CLI do
        "mode" => Atom.to_string(mode),
        "next_actions" => ["remove_--ask_or_--read-only", "run_policy_in_auto_mode"]
      })}
-  end
-
-  defp require_auth(opts) do
-    if Keyword.get(opts, :skip_auth?, false) or Auth.authenticated?() do
-      :ok
-    else
-      print_error_msg("not signed in — run `pixir login` or set OPENAI_API_KEY")
-      {:error, 1}
-    end
   end
 
   defp ensure_interactive_ask(:ask) do

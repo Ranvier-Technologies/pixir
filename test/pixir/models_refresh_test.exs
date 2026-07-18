@@ -128,6 +128,45 @@ defmodule Pixir.ModelsRefreshTest do
     assert File.read!(path) == original
   end
 
+  test "non-200 marker records only actual byte drops at the exact cap", %{
+    config_path: path
+  } do
+    original = Jason.encode!(%{"models" => ["gpt-existing"], "foreign" => true}, pretty: true)
+    auth = start_auth("sk-openai")
+    cap = ErrBody.max_bytes()
+
+    for {received_bytes, expected_truncated} <- [
+          {cap - 1, false},
+          {cap, false},
+          {cap + 1, true}
+        ] do
+      File.write!(path, original)
+      body = String.duplicate("x", received_bytes)
+
+      assert {:ok, result} =
+               ModelsRefresh.refresh(
+                 config_path: path,
+                 auth: auth,
+                 env: fn _ -> nil end,
+                 http: fn _ -> {:ok, %{status: 503, body: body}} end
+               )
+
+      openai = result["providers"]["openai"]
+      expected_body = binary_part(body, 0, min(received_bytes, cap))
+
+      assert openai["err_body"] == expected_body
+      assert byte_size(openai["err_body"]) <= cap
+      assert Map.has_key?(openai, "err_body_truncated") == expected_truncated
+
+      if expected_truncated do
+        assert openai["err_body_truncated"] == true
+      end
+
+      assert result["wrote_config"] == false
+      assert File.read!(path) == original
+    end
+  end
+
   test "garbage JSON response is fail-closed", %{config_path: path} do
     original = ~s({"models":["gpt-existing"],"foreign":"same"})
     File.write!(path, original)

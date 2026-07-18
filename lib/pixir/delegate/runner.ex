@@ -775,12 +775,7 @@ defmodule Pixir.Delegate.Runner do
          })}
 
       read_set_validation != :ok ->
-        {:error,
-         error_payload("invalid_spec", "virtual_overlay requires a bounded read_set", %{
-           "json_pointer" => "/subagents/read_set",
-           "path" => ["subagents", "read_set"],
-           "next_actions" => ["add_a_non_empty_bounded_read_set"]
-         })}
+        {:error, runner_read_set_error(read_set, read_set_validation)}
 
       not is_map(limits) ->
         {:error,
@@ -814,6 +809,26 @@ defmodule Pixir.Delegate.Runner do
     else
       {:ok, nil}
     end
+  end
+
+  defp runner_read_set_error(read_set, {:error, %{index: index, reason: reason}}) do
+    error_payload("invalid_spec", "virtual_overlay requires a bounded read_set", %{
+      "field" => "subagents.read_set[#{index + 1}]",
+      "json_pointer" => "/subagents/read_set/#{index}",
+      "path" => ["subagents", "read_set", index],
+      "index" => index,
+      "reason" => reason,
+      "observed" => Enum.at(read_set, index),
+      "next_actions" => ["replace_read_set_entry_with_a_bounded_path"]
+    })
+  end
+
+  defp runner_read_set_error(_read_set, _validation) do
+    error_payload("invalid_spec", "virtual_overlay requires a bounded read_set", %{
+      "json_pointer" => "/subagents/read_set",
+      "path" => ["subagents", "read_set"],
+      "next_actions" => ["add_a_non_empty_bounded_read_set"]
+    })
   end
 
   @doc false
@@ -1920,7 +1935,12 @@ defmodule Pixir.Delegate.Runner do
       "task" => agent["task"],
       "workspace_mode" => agent["workspace_mode"],
       "child_log_path" => agent["child_log_path"],
-      "next_actions" => agent["next_actions"] || []
+      "next_actions" => agent["next_actions"] || [],
+      "output_truncation" => agent["output_truncation"],
+      "output_warning_count" => agent["output_warning_count"] || 0,
+      "output_warnings" => agent["output_warnings"] || [],
+      "output_warning_reasons" => agent["output_warning_reasons"] || [],
+      "output_warnings_truncated" => agent["output_warnings_truncated"] || false
     }
     |> maybe_put("index", agent["index"])
     |> maybe_put("timeout_ms", agent["timeout_ms"])

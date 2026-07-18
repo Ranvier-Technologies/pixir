@@ -1,0 +1,522 @@
+{
+  "schema": "pixir.presenter.run",
+  "schema_version": 1,
+  "projection_id": "projection:wave1-parallel-audit-reconstructed",
+  "projected_at": "2026-07-10T19:00:00Z",
+  "run": {
+    "id": "dlg-wave1",
+    "delegate_id": "dlg-wave1",
+    "parent_session_id": "parent-wave1",
+    "workflow_id": "wf-wave1",
+    "strategy": "workflow",
+    "mode": "read_only",
+    "title": "Release audit 0.1.9",
+    "evidence_refs": [
+      "e-envelope-wave1"
+    ]
+  },
+  "source": {
+    "mode": "reconstructed",
+    "durable_origin": "fixture",
+    "as_of_seq": 13,
+    "last_durable_at": "2026-07-10T16:33:35.108886Z",
+    "live_observed_at": null,
+    "freshness": "terminal",
+    "limitations": []
+  },
+  "execution": {
+    "state": "completed",
+    "terminal": true,
+    "basis": "workflow_event_fold",
+    "evidence_refs": [
+      "e-parent-13"
+    ]
+  },
+  "liveness": {
+    "state": "not_applicable",
+    "reachable": false,
+    "basis": "terminal_execution",
+    "observed_at": null,
+    "evidence_refs": []
+  },
+  "counts": {
+    "planned_units": 3,
+    "observed_units": 3,
+    "running_units": 0,
+    "completed_units": 3,
+    "attention_units": 0
+  },
+  "graph": {
+    "waves": [
+      [
+        "workflow:wf-wave1:step:claims",
+        "workflow:wf-wave1:step:mechanics"
+      ],
+      [
+        "workflow:wf-wave1:step:synthesis"
+      ]
+    ],
+    "edges": [
+      {
+        "from": "workflow:wf-wave1:step:claims",
+        "to": "workflow:wf-wave1:step:synthesis",
+        "state": "ready"
+      },
+      {
+        "from": "workflow:wf-wave1:step:mechanics",
+        "to": "workflow:wf-wave1:step:synthesis",
+        "state": "ready"
+      }
+    ]
+  },
+  "units": [
+    {
+      "logical_id": "workflow:wf-wave1:step:claims",
+      "unit_kind": "workflow_step",
+      "label": "claims",
+      "agent": "reviewer",
+      "execution_kind": "subagent",
+      "workspace_mode": "shared",
+      "posture": "read_only",
+      "depends_on": [],
+      "execution": {
+        "state": "completed",
+        "terminal": true,
+        "basis": "subagent_event_fold",
+        "evidence_refs": [
+          "e-parent-7"
+        ]
+      },
+      "liveness": {
+        "state": "not_applicable",
+        "reachable": false,
+        "basis": "terminal_execution",
+        "observed_at": null,
+        "evidence_refs": []
+      },
+      "gate": {
+        "state": "checkpoint_ready",
+        "dependent_safe": true,
+        "basis": "workflow_event",
+        "evidence_refs": [
+          "e-parent-8"
+        ]
+      },
+      "advisory": {
+        "present": false,
+        "verdict": "unknown",
+        "mergeable": null,
+        "declared_gate": null,
+        "parse_status": "not_present",
+        "summary": null,
+        "major_count": null,
+        "minor_count": null,
+        "evidence_refs": []
+      },
+      "attempts": [
+        {
+          "attempt_id": "workflow:wf-wave1:step:claims:attempt:0",
+          "ordinal": 0,
+          "relation": "fresh",
+          "predecessor_attempt_id": null,
+          "child_session_id": "child-claims",
+          "status": "completed",
+          "started_at": "2026-07-10T16:22:05.657624Z",
+          "ended_at": "2026-07-10T16:31:55.674706Z",
+          "error_kind": null,
+          "summary": "Claims checked against code.",
+          "evidence_refs": [
+            "e-parent-2",
+            "e-parent-7"
+          ],
+          "limitations": [],
+          "materialization": "durable",
+          "status_basis": "parent_log",
+          "child_event_window": {
+            "session_id": "child-claims",
+            "from_seq": null,
+            "to_seq_exclusive": null,
+            "basis": "whole_child_log_single_attempt",
+            "evidence_refs": []
+          }
+        }
+      ],
+      "artifacts": [],
+      "usage": {
+        "source": "incomplete",
+        "complete": false,
+        "calls": 0,
+        "groups": [],
+        "evidence_refs": [],
+        "limitations": [
+          "usage_fixture_minimized"
+        ]
+      },
+      "mutation": {
+        "status": "read_only",
+        "observed_paths": [],
+        "observed_semantics": "none",
+        "evidence_refs": [
+          "e-envelope-wave1"
+        ],
+        "limitations": []
+      },
+      "safe_actions": [],
+      "evidence_refs": [
+        "e-parent-0",
+        "e-parent-2",
+        "e-parent-7",
+        "e-parent-8"
+      ],
+      "limitations": [
+        "usage_fixture_minimized"
+      ],
+      "materialization": "durable",
+      "attention": {
+        "required": false,
+        "reasons": [],
+        "evidence_refs": []
+      }
+    },
+    {
+      "logical_id": "workflow:wf-wave1:step:mechanics",
+      "unit_kind": "workflow_step",
+      "label": "mechanics",
+      "agent": "reviewer",
+      "execution_kind": "subagent",
+      "workspace_mode": "shared",
+      "posture": "read_only",
+      "depends_on": [],
+      "execution": {
+        "state": "completed",
+        "terminal": true,
+        "basis": "subagent_event_fold",
+        "evidence_refs": [
+          "e-parent-5"
+        ]
+      },
+      "liveness": {
+        "state": "not_applicable",
+        "reachable": false,
+        "basis": "terminal_execution",
+        "observed_at": null,
+        "evidence_refs": []
+      },
+      "gate": {
+        "state": "checkpoint_ready",
+        "dependent_safe": true,
+        "basis": "workflow_event",
+        "evidence_refs": [
+          "e-parent-6"
+        ]
+      },
+      "advisory": {
+        "present": false,
+        "verdict": "unknown",
+        "mergeable": null,
+        "declared_gate": null,
+        "parse_status": "not_present",
+        "summary": null,
+        "major_count": null,
+        "minor_count": null,
+        "evidence_refs": []
+      },
+      "attempts": [
+        {
+          "attempt_id": "workflow:wf-wave1:step:mechanics:attempt:0",
+          "ordinal": 0,
+          "relation": "fresh",
+          "predecessor_attempt_id": null,
+          "child_session_id": "child-mechanics",
+          "status": "completed",
+          "started_at": "2026-07-10T16:22:05.664830Z",
+          "ended_at": "2026-07-10T16:25:10.991382Z",
+          "error_kind": null,
+          "summary": "Mechanical checks passed.",
+          "evidence_refs": [
+            "e-parent-4",
+            "e-parent-5"
+          ],
+          "limitations": [],
+          "materialization": "durable",
+          "status_basis": "parent_log",
+          "child_event_window": {
+            "session_id": "child-mechanics",
+            "from_seq": null,
+            "to_seq_exclusive": null,
+            "basis": "whole_child_log_single_attempt",
+            "evidence_refs": []
+          }
+        }
+      ],
+      "artifacts": [],
+      "usage": {
+        "source": "incomplete",
+        "complete": false,
+        "calls": 0,
+        "groups": [],
+        "evidence_refs": [],
+        "limitations": [
+          "usage_fixture_minimized"
+        ]
+      },
+      "mutation": {
+        "status": "read_only",
+        "observed_paths": [],
+        "observed_semantics": "none",
+        "evidence_refs": [
+          "e-envelope-wave1"
+        ],
+        "limitations": []
+      },
+      "safe_actions": [],
+      "evidence_refs": [
+        "e-parent-0",
+        "e-parent-4",
+        "e-parent-5",
+        "e-parent-6"
+      ],
+      "limitations": [
+        "usage_fixture_minimized"
+      ],
+      "materialization": "durable",
+      "attention": {
+        "required": false,
+        "reasons": [],
+        "evidence_refs": []
+      }
+    },
+    {
+      "logical_id": "workflow:wf-wave1:step:synthesis",
+      "unit_kind": "workflow_step",
+      "label": "synthesis",
+      "agent": "reviewer",
+      "execution_kind": "subagent",
+      "workspace_mode": "shared",
+      "posture": "read_only",
+      "depends_on": [
+        "workflow:wf-wave1:step:claims",
+        "workflow:wf-wave1:step:mechanics"
+      ],
+      "execution": {
+        "state": "completed",
+        "terminal": true,
+        "basis": "subagent_event_fold",
+        "evidence_refs": [
+          "e-parent-11"
+        ]
+      },
+      "liveness": {
+        "state": "not_applicable",
+        "reachable": false,
+        "basis": "terminal_execution",
+        "observed_at": null,
+        "evidence_refs": []
+      },
+      "gate": {
+        "state": "checkpoint_ready",
+        "dependent_safe": true,
+        "basis": "workflow_event",
+        "evidence_refs": [
+          "e-parent-12"
+        ]
+      },
+      "advisory": {
+        "present": false,
+        "verdict": "unknown",
+        "mergeable": null,
+        "declared_gate": null,
+        "parse_status": "not_present",
+        "summary": null,
+        "major_count": null,
+        "minor_count": null,
+        "evidence_refs": []
+      },
+      "attempts": [
+        {
+          "attempt_id": "workflow:wf-wave1:step:synthesis:attempt:0",
+          "ordinal": 0,
+          "relation": "fresh",
+          "predecessor_attempt_id": null,
+          "child_session_id": "child-synthesis",
+          "status": "completed",
+          "started_at": "2026-07-10T16:31:55.681081Z",
+          "ended_at": "2026-07-10T16:33:35.106949Z",
+          "error_kind": null,
+          "summary": "Release audit is mergeable.",
+          "evidence_refs": [
+            "e-parent-10",
+            "e-parent-11"
+          ],
+          "limitations": [],
+          "materialization": "durable",
+          "status_basis": "parent_log",
+          "child_event_window": {
+            "session_id": "child-synthesis",
+            "from_seq": null,
+            "to_seq_exclusive": null,
+            "basis": "whole_child_log_single_attempt",
+            "evidence_refs": []
+          }
+        }
+      ],
+      "artifacts": [],
+      "usage": {
+        "source": "incomplete",
+        "complete": false,
+        "calls": 0,
+        "groups": [],
+        "evidence_refs": [],
+        "limitations": [
+          "usage_fixture_minimized"
+        ]
+      },
+      "mutation": {
+        "status": "read_only",
+        "observed_paths": [],
+        "observed_semantics": "none",
+        "evidence_refs": [
+          "e-envelope-wave1"
+        ],
+        "limitations": []
+      },
+      "safe_actions": [],
+      "evidence_refs": [
+        "e-parent-0",
+        "e-parent-10",
+        "e-parent-11",
+        "e-parent-12"
+      ],
+      "limitations": [
+        "usage_fixture_minimized"
+      ],
+      "materialization": "durable",
+      "attention": {
+        "required": false,
+        "reasons": [],
+        "evidence_refs": []
+      }
+    }
+  ],
+  "usage": {
+    "source": "incomplete",
+    "complete": false,
+    "calls": 0,
+    "groups": [],
+    "evidence_refs": [],
+    "limitations": [
+      "usage_fixture_minimized"
+    ]
+  },
+  "mutation": {
+    "status": "read_only",
+    "observed_paths": [],
+    "observed_semantics": "none",
+    "evidence_refs": [
+      "e-envelope-wave1"
+    ],
+    "limitations": []
+  },
+  "safe_actions": [],
+  "evidence": [
+    {
+      "id": "e-envelope-wave1",
+      "authority": "derived",
+      "source_kind": "terminal_envelope",
+      "session_id": "parent-wave1",
+      "seq": null,
+      "description": "Terminal envelope confirms read-only mode and final wave summary."
+    },
+    {
+      "id": "e-parent-0",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-wave1",
+      "seq": 0,
+      "description": "Workflow graph defines two parallel inputs and one synthesis dependency."
+    },
+    {
+      "id": "e-parent-2",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-wave1",
+      "seq": 2,
+      "description": "Claims attempt started."
+    },
+    {
+      "id": "e-parent-4",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-wave1",
+      "seq": 4,
+      "description": "Mechanics attempt started."
+    },
+    {
+      "id": "e-parent-5",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-wave1",
+      "seq": 5,
+      "description": "Mechanics attempt completed."
+    },
+    {
+      "id": "e-parent-6",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-wave1",
+      "seq": 6,
+      "description": "Mechanics checkpoint opened."
+    },
+    {
+      "id": "e-parent-7",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-wave1",
+      "seq": 7,
+      "description": "Claims attempt completed."
+    },
+    {
+      "id": "e-parent-8",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-wave1",
+      "seq": 8,
+      "description": "Claims checkpoint opened."
+    },
+    {
+      "id": "e-parent-10",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-wave1",
+      "seq": 10,
+      "description": "Synthesis attempt started after both checkpoints."
+    },
+    {
+      "id": "e-parent-11",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-wave1",
+      "seq": 11,
+      "description": "Synthesis attempt completed."
+    },
+    {
+      "id": "e-parent-12",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-wave1",
+      "seq": 12,
+      "description": "Synthesis checkpoint opened."
+    },
+    {
+      "id": "e-parent-13",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-wave1",
+      "seq": 13,
+      "description": "Workflow finished completed."
+    }
+  ],
+  "limitations": [
+    "usage_fixture_minimized"
+  ]
+}

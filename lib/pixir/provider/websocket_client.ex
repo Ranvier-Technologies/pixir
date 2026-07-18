@@ -2,14 +2,17 @@ defmodule Pixir.Provider.WebSocketClient do
   @moduledoc """
   Minimal Responses WebSocket client used by the production Provider connection.
 
-  The client intentionally emits the same SSE-shaped chunks that `Pixir.Provider`
-  already knows how to fold. This keeps the model-event parser in one place while the
-  connection process owns socket lifetime and continuation state.
+  The client intentionally emits the data-only SSE-shaped chunks that the default
+  ChatGPT/Codex reducer already knows how to fold. This keeps that model-event parser in
+  one place while the connection process owns socket lifetime and continuation state.
+  Profiles that require a named `event:` field must not enable this transport until the
+  adapter projects the JSON `type` into a matching event name; the initial strict
+  `open_responses` profile is therefore gated to HTTP/SSE by `ResponsesBackend`.
   """
 
   import Bitwise, only: [|||: 2]
 
-  alias Pixir.Provider.StreamIdle
+  alias Pixir.Provider.{StreamIdle, TransportError}
   alias Pixir.Tool
 
   @user_agent "pixir-websocket/0.1"
@@ -36,7 +39,6 @@ defmodule Pixir.Provider.WebSocketClient do
             {:error,
              Tool.error(:websocket_handshake_failed, "WebSocket handshake did not upgrade.", %{
                status: handshake.status,
-               status_line: handshake.status_line,
                endpoint: safe_endpoint(endpoint)
              })}
           end
@@ -67,8 +69,9 @@ defmodule Pixir.Provider.WebSocketClient do
 
       {:error, reason} ->
         {:error,
-         Tool.error(:websocket_failed, "WebSocket request failed.", %{reason: inspect(reason)}),
-         acc}
+         Tool.error(:websocket_failed, "WebSocket request failed.", %{
+           reason: TransportError.reason(reason)
+         }), acc}
     end
   end
 
@@ -100,7 +103,7 @@ defmodule Pixir.Provider.WebSocketClient do
       {:error, reason} ->
         {:error,
          Tool.error(:websocket_handshake_failed, "WebSocket handshake failed.", %{
-           reason: inspect(reason),
+           reason: TransportError.reason(reason),
            endpoint: safe_endpoint(URI.to_string(uri))
          })}
     end
@@ -155,7 +158,7 @@ defmodule Pixir.Provider.WebSocketClient do
       {:error, reason} ->
         {:error,
          Tool.error(:websocket_connect_failed, "Could not open TLS connection.", %{
-           reason: inspect(reason),
+           reason: TransportError.reason(reason),
            endpoint: safe_endpoint(URI.to_string(uri))
          })}
     end
@@ -287,7 +290,15 @@ defmodule Pixir.Provider.WebSocketClient do
             read_response_loop(socket, rest, idle_deadline, idle_ms, acc, fun, opts, response)
 
           {:done, acc, response} ->
-            {:ok, acc, response}
+            # The terminal frame owns this receive boundary. Fold only complete frames already
+            # present in `rest`; never perform an arbitrary post-terminal recv on the reusable
+            # connection. HTTP/SSE transports may already have delivered a complete body.
+            control_fun = fn
+              %{opcode: 0x9, payload: payload} -> :ssl.send(socket, pong_frame(payload))
+              _frame -> :ok
+            end
+
+            {:ok, fold_buffered_terminal_frames(rest, acc, fun, control_fun), response}
 
           {:error, error, acc} ->
             {:error, error, acc}
@@ -318,7 +329,7 @@ defmodule Pixir.Provider.WebSocketClient do
             {:error, reason} ->
               {:error,
                Tool.error(:websocket_read_failed, "Could not read WebSocket frame.", %{
-                 reason: inspect(reason)
+                 reason: TransportError.reason(reason)
                }), acc}
           end
         end
@@ -462,7 +473,7 @@ defmodule Pixir.Provider.WebSocketClient do
         acc = fun.({:data, "data: " <> Jason.encode!(event) <> "\n\n"}, acc)
         response = maybe_capture_response_id(event, response)
 
-        if type in ["response.completed", "response.failed", "error"] do
+        if terminal_event?(type) do
           {:done, acc, response}
         else
           {:continue, acc, response}
@@ -472,6 +483,97 @@ defmodule Pixir.Provider.WebSocketClient do
         {:continue, acc, response}
     end
   end
+
+  @doc false
+  @spec fold_buffered_terminal_frames(binary(), acc, (term(), acc -> acc)) :: acc
+        when acc: term()
+  def fold_buffered_terminal_frames(buffer, acc, fun) when is_binary(buffer) do
+    fold_buffered_terminal_frames(buffer, acc, fun, fn _frame -> :ok end)
+  end
+
+  @doc false
+  def fold_buffered_terminal_frames(buffer, acc, fun, control_fun) when is_binary(buffer) do
+    fold_buffered_terminal_frames(buffer, acc, fun, control_fun, nil, "")
+  end
+
+  defp fold_buffered_terminal_frames(
+         buffer,
+         acc,
+         fun,
+         control_fun,
+         fragment_opcode,
+         fragment_payload
+       ) do
+    case next_frame(buffer) do
+      {:ok, %{opcode: 0x1, fin: true, payload: payload}, rest} ->
+        acc = feed_buffered_terminal(payload, acc, fun)
+
+        fold_buffered_terminal_frames(rest, acc, fun, control_fun, nil, "")
+
+      {:ok, %{opcode: 0x1, fin: false, payload: payload}, rest} ->
+        fold_buffered_terminal_frames(rest, acc, fun, control_fun, 0x1, payload)
+
+      {:ok, %{opcode: 0x0, fin: false, payload: payload}, rest}
+      when fragment_opcode == 0x1 ->
+        fold_buffered_terminal_frames(
+          rest,
+          acc,
+          fun,
+          control_fun,
+          0x1,
+          fragment_payload <> payload
+        )
+
+      {:ok, %{opcode: 0x0, fin: true, payload: payload}, rest}
+      when fragment_opcode == 0x1 ->
+        acc = feed_buffered_terminal(fragment_payload <> payload, acc, fun)
+        fold_buffered_terminal_frames(rest, acc, fun, control_fun, nil, "")
+
+      {:ok, %{opcode: opcode} = frame, rest} when opcode in [0x9, 0xA] ->
+        _ = control_fun.(frame)
+
+        fold_buffered_terminal_frames(
+          rest,
+          acc,
+          fun,
+          control_fun,
+          fragment_opcode,
+          fragment_payload
+        )
+
+      {:ok, _frame, rest} ->
+        fold_buffered_terminal_frames(
+          rest,
+          acc,
+          fun,
+          control_fun,
+          fragment_opcode,
+          fragment_payload
+        )
+
+      _ ->
+        acc
+    end
+  end
+
+  defp feed_buffered_terminal(payload, acc, fun) do
+    case Jason.decode(payload) do
+      {:ok, %{"type" => type} = event} ->
+        if terminal_event?(type) do
+          fun.({:data, "data: " <> Jason.encode!(event) <> "\n\n"}, acc)
+        else
+          acc
+        end
+
+      _ ->
+        acc
+    end
+  end
+
+  @doc false
+  @spec terminal_event?(term()) :: boolean()
+  def terminal_event?(type),
+    do: type in ["response.completed", "response.incomplete", "response.failed", "error"]
 
   @doc false
   @spec response_id_from_event(map()) :: String.t() | nil
@@ -514,8 +616,13 @@ defmodule Pixir.Provider.WebSocketClient do
   end
 
   defp safe_endpoint(endpoint) when is_binary(endpoint) do
-    endpoint
-    |> String.replace(~r/(authorization|access_token|api_key)=([^&]+)/i, "\\1=<redacted>")
-    |> String.replace(~r/(chatgpt-account-id)=([^&]+)/i, "\\1=<redacted>")
+    case URI.parse(endpoint).scheme do
+      scheme when scheme in ["http", "https", "ws", "wss"] -> "<#{scheme}_endpoint>"
+      _scheme -> "<configured_endpoint>"
+    end
+  rescue
+    _error -> "<configured_endpoint>"
   end
+
+  defp safe_endpoint(_endpoint), do: "<configured_endpoint>"
 end

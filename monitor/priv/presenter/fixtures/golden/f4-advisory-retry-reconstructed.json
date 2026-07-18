@@ -1,0 +1,637 @@
+{
+  "schema": "pixir.presenter.run",
+  "schema_version": 1,
+  "projection_id": "projection:f4-advisory-retry-reconstructed",
+  "projected_at": "2026-07-10T19:00:00Z",
+  "run": {
+    "id": "dlg-f4",
+    "delegate_id": "dlg-f4",
+    "parent_session_id": "parent-f4",
+    "workflow_id": "wf-f4",
+    "strategy": "workflow",
+    "mode": "bounded_write",
+    "title": "Propose, review, apply",
+    "evidence_refs": [
+      "e-envelope-f4"
+    ]
+  },
+  "source": {
+    "mode": "reconstructed",
+    "durable_origin": "fixture",
+    "as_of_seq": 11,
+    "last_durable_at": "2026-07-10T00:54:47.061745Z",
+    "live_observed_at": null,
+    "freshness": "terminal",
+    "limitations": []
+  },
+  "execution": {
+    "state": "completed",
+    "terminal": true,
+    "basis": "workflow_event_fold",
+    "evidence_refs": [
+      "e-parent-11"
+    ]
+  },
+  "liveness": {
+    "state": "not_applicable",
+    "reachable": false,
+    "basis": "terminal_execution",
+    "observed_at": null,
+    "evidence_refs": []
+  },
+  "counts": {
+    "planned_units": 3,
+    "observed_units": 3,
+    "running_units": 0,
+    "completed_units": 3,
+    "attention_units": 1
+  },
+  "graph": {
+    "waves": [
+      [
+        "workflow:wf-f4:step:propose"
+      ],
+      [
+        "workflow:wf-f4:step:review"
+      ],
+      [
+        "workflow:wf-f4:step:apply"
+      ]
+    ],
+    "edges": [
+      {
+        "from": "workflow:wf-f4:step:propose",
+        "to": "workflow:wf-f4:step:review",
+        "state": "ready"
+      },
+      {
+        "from": "workflow:wf-f4:step:propose",
+        "to": "workflow:wf-f4:step:apply",
+        "state": "ready"
+      },
+      {
+        "from": "workflow:wf-f4:step:review",
+        "to": "workflow:wf-f4:step:apply",
+        "state": "ready"
+      }
+    ]
+  },
+  "units": [
+    {
+      "logical_id": "workflow:wf-f4:step:propose",
+      "unit_kind": "workflow_step",
+      "label": "propose",
+      "agent": "default",
+      "execution_kind": "virtual_overlay",
+      "workspace_mode": "virtual_overlay",
+      "posture": "virtual_scratch",
+      "depends_on": [],
+      "execution": {
+        "state": "completed",
+        "terminal": true,
+        "basis": "workflow_event_fold",
+        "evidence_refs": [
+          "e-parent-2"
+        ]
+      },
+      "liveness": {
+        "state": "not_applicable",
+        "reachable": false,
+        "basis": "terminal_execution",
+        "observed_at": null,
+        "evidence_refs": []
+      },
+      "gate": {
+        "state": "checkpoint_ready",
+        "dependent_safe": true,
+        "basis": "workflow_event",
+        "evidence_refs": [
+          "e-parent-2"
+        ]
+      },
+      "advisory": {
+        "present": false,
+        "verdict": "unknown",
+        "mergeable": null,
+        "declared_gate": null,
+        "parse_status": "not_present",
+        "summary": null,
+        "major_count": null,
+        "minor_count": null,
+        "evidence_refs": []
+      },
+      "attempts": [],
+      "artifacts": [
+        {
+          "kind": "virtual_diff",
+          "version": 1,
+          "hash": "sha256:virtual-diff-f4",
+          "status": "produced",
+          "workspace_strategy": "virtual_overlay",
+          "evidence_refs": [
+            "e-parent-2",
+            "e-envelope-f4"
+          ],
+          "producer_unit_id": "workflow:wf-f4:step:propose",
+          "source_artifact_hash": "sha256:virtual-diff-f4",
+          "application_state": "applied",
+          "applied_by_unit_id": "workflow:wf-f4:step:apply",
+          "correlation": "matched"
+        }
+      ],
+      "usage": {
+        "source": "none",
+        "complete": true,
+        "calls": 0,
+        "groups": [],
+        "evidence_refs": [],
+        "limitations": []
+      },
+      "mutation": {
+        "status": "isolated_only",
+        "observed_paths": [],
+        "observed_semantics": "none",
+        "evidence_refs": [
+          "e-parent-2"
+        ],
+        "limitations": []
+      },
+      "safe_actions": [],
+      "evidence_refs": [
+        "e-parent-0",
+        "e-parent-2"
+      ],
+      "limitations": [],
+      "materialization": "durable",
+      "attention": {
+        "required": false,
+        "reasons": [],
+        "evidence_refs": []
+      }
+    },
+    {
+      "logical_id": "workflow:wf-f4:step:review",
+      "unit_kind": "workflow_step",
+      "label": "review",
+      "agent": "reviewer",
+      "execution_kind": "subagent",
+      "workspace_mode": "shared",
+      "posture": "read_only",
+      "depends_on": [
+        "workflow:wf-f4:step:propose"
+      ],
+      "execution": {
+        "state": "completed",
+        "terminal": true,
+        "basis": "subagent_event_fold",
+        "evidence_refs": [
+          "e-parent-7"
+        ]
+      },
+      "liveness": {
+        "state": "not_applicable",
+        "reachable": false,
+        "basis": "terminal_execution",
+        "observed_at": null,
+        "evidence_refs": []
+      },
+      "gate": {
+        "state": "checkpoint_ready",
+        "dependent_safe": true,
+        "basis": "workflow_event",
+        "evidence_refs": [
+          "e-parent-8"
+        ]
+      },
+      "advisory": {
+        "present": true,
+        "verdict": "stop",
+        "mergeable": false,
+        "declared_gate": "partial",
+        "parse_status": "valid",
+        "summary": "Useful evidence exists, but the review recommends stopping.",
+        "major_count": 1,
+        "minor_count": 0,
+        "evidence_refs": [
+          "e-advisory-review"
+        ]
+      },
+      "attempts": [
+        {
+          "attempt_id": "workflow:wf-f4:step:review:attempt:0",
+          "ordinal": 0,
+          "relation": "fresh",
+          "predecessor_attempt_id": null,
+          "child_session_id": "child-f4-a",
+          "status": "failed",
+          "started_at": "2026-07-10T00:48:38.416929Z",
+          "ended_at": "2026-07-10T00:50:19.004629Z",
+          "error_kind": "websocket_closed",
+          "summary": null,
+          "usage": {
+            "source": "incomplete",
+            "complete": false,
+            "calls": 1,
+            "groups": [
+              {
+                "provider": "unknown",
+                "model": "gpt-5.6-sol",
+                "calls": 1,
+                "input_tokens": 28378,
+                "output_tokens": 501,
+                "reasoning_tokens": 475,
+                "total_tokens": 28879,
+                "cached_tokens": 23040,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 23040
+              }
+            ],
+            "evidence_refs": [
+              "e-child-a-9"
+            ],
+            "limitations": [
+              "usage_fixture_minimized"
+            ]
+          },
+          "evidence_refs": [
+            "e-parent-4",
+            "e-parent-5",
+            "e-child-a-9"
+          ],
+          "limitations": [],
+          "materialization": "durable",
+          "status_basis": "parent_log",
+          "child_event_window": {
+            "session_id": "child-f4-a",
+            "from_seq": null,
+            "to_seq_exclusive": null,
+            "basis": "whole_child_log_single_attempt",
+            "evidence_refs": [
+              "e-child-a-9"
+            ]
+          }
+        },
+        {
+          "attempt_id": "workflow:wf-f4:step:review:attempt:1",
+          "ordinal": 1,
+          "relation": "retry",
+          "predecessor_attempt_id": "workflow:wf-f4:step:review:attempt:0",
+          "child_session_id": "child-f4-b",
+          "status": "completed",
+          "started_at": "2026-07-10T00:50:19.080250Z",
+          "ended_at": "2026-07-10T00:54:47.050173Z",
+          "error_kind": null,
+          "summary": "Useful evidence exists, but the review recommends stopping.",
+          "usage": {
+            "source": "incomplete",
+            "complete": false,
+            "calls": 1,
+            "groups": [
+              {
+                "provider": "unknown",
+                "model": "gpt-5.6-sol",
+                "calls": 1,
+                "input_tokens": 35344,
+                "output_tokens": 2303,
+                "reasoning_tokens": 2277,
+                "total_tokens": 37647,
+                "cached_tokens": 31232,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 31232
+              }
+            ],
+            "evidence_refs": [
+              "e-child-b-12"
+            ],
+            "limitations": [
+              "usage_fixture_minimized"
+            ]
+          },
+          "evidence_refs": [
+            "e-parent-6",
+            "e-parent-7",
+            "e-child-b-12"
+          ],
+          "limitations": [],
+          "materialization": "durable",
+          "status_basis": "parent_log",
+          "child_event_window": {
+            "session_id": "child-f4-b",
+            "from_seq": null,
+            "to_seq_exclusive": null,
+            "basis": "whole_child_log_single_attempt",
+            "evidence_refs": [
+              "e-child-b-12"
+            ]
+          }
+        }
+      ],
+      "artifacts": [],
+      "usage": {
+        "source": "incomplete",
+        "complete": false,
+        "calls": 2,
+        "groups": [
+          {
+            "provider": "unknown",
+            "model": "gpt-5.6-sol",
+            "calls": 2,
+            "input_tokens": 63722,
+            "output_tokens": 2804,
+            "reasoning_tokens": 2752,
+            "total_tokens": 66526,
+            "cached_tokens": 54272,
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 54272
+          }
+        ],
+        "evidence_refs": [
+          "e-child-a-9",
+          "e-child-b-12"
+        ],
+        "limitations": [
+          "usage_fixture_minimized"
+        ]
+      },
+      "mutation": {
+        "status": "none",
+        "observed_paths": [],
+        "observed_semantics": "none",
+        "evidence_refs": [],
+        "limitations": []
+      },
+      "safe_actions": [],
+      "evidence_refs": [
+        "e-parent-0",
+        "e-parent-4",
+        "e-parent-5",
+        "e-parent-6",
+        "e-parent-7",
+        "e-parent-8",
+        "e-advisory-review"
+      ],
+      "limitations": [
+        "advisory_gate_disagreement",
+        "usage_fixture_minimized"
+      ],
+      "materialization": "durable",
+      "attention": {
+        "required": true,
+        "reasons": [
+          "advisory_stop",
+          "advisory_gate_disagreement"
+        ],
+        "evidence_refs": [
+          "e-parent-7",
+          "e-parent-8",
+          "e-advisory-review"
+        ]
+      }
+    },
+    {
+      "logical_id": "workflow:wf-f4:step:apply",
+      "unit_kind": "workflow_step",
+      "label": "apply",
+      "agent": null,
+      "execution_kind": "virtual_diff_apply",
+      "workspace_mode": "shared",
+      "posture": "apply",
+      "depends_on": [
+        "workflow:wf-f4:step:propose",
+        "workflow:wf-f4:step:review"
+      ],
+      "execution": {
+        "state": "completed",
+        "terminal": true,
+        "basis": "workflow_event_fold",
+        "evidence_refs": [
+          "e-parent-10"
+        ]
+      },
+      "liveness": {
+        "state": "not_applicable",
+        "reachable": false,
+        "basis": "terminal_execution",
+        "observed_at": null,
+        "evidence_refs": []
+      },
+      "gate": {
+        "state": "checkpoint_ready",
+        "dependent_safe": true,
+        "basis": "workflow_event",
+        "evidence_refs": [
+          "e-parent-10"
+        ]
+      },
+      "advisory": {
+        "present": false,
+        "verdict": "unknown",
+        "mergeable": null,
+        "declared_gate": null,
+        "parse_status": "not_present",
+        "summary": null,
+        "major_count": null,
+        "minor_count": null,
+        "evidence_refs": []
+      },
+      "attempts": [],
+      "artifacts": [
+        {
+          "kind": "virtual_diff_apply",
+          "version": 1,
+          "hash": "sha256:virtual-diff-apply-f4",
+          "status": "applied",
+          "workspace_strategy": null,
+          "evidence_refs": [
+            "e-parent-10",
+            "e-envelope-f4"
+          ],
+          "producer_unit_id": "workflow:wf-f4:step:propose",
+          "source_artifact_hash": "sha256:virtual-diff-f4",
+          "application_state": "applied",
+          "applied_by_unit_id": "workflow:wf-f4:step:apply",
+          "correlation": "matched"
+        }
+      ],
+      "usage": {
+        "source": "none",
+        "complete": true,
+        "calls": 0,
+        "groups": [],
+        "evidence_refs": [],
+        "limitations": []
+      },
+      "mutation": {
+        "status": "workspace_applied",
+        "observed_paths": [
+          "docs/example.md"
+        ],
+        "observed_semantics": "exact",
+        "evidence_refs": [
+          "e-parent-10"
+        ],
+        "limitations": []
+      },
+      "safe_actions": [],
+      "evidence_refs": [
+        "e-parent-0",
+        "e-parent-10"
+      ],
+      "limitations": [],
+      "materialization": "durable",
+      "attention": {
+        "required": false,
+        "reasons": [],
+        "evidence_refs": []
+      }
+    }
+  ],
+  "usage": {
+    "source": "incomplete",
+    "complete": false,
+    "calls": 2,
+    "groups": [
+      {
+        "provider": "unknown",
+        "model": "gpt-5.6-sol",
+        "calls": 2,
+        "input_tokens": 63722,
+        "output_tokens": 2804,
+        "reasoning_tokens": 2752,
+        "total_tokens": 66526,
+        "cached_tokens": 54272,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 54272
+      }
+    ],
+    "evidence_refs": [
+      "e-child-a-9",
+      "e-child-b-12"
+    ],
+    "limitations": [
+      "usage_fixture_minimized"
+    ]
+  },
+  "mutation": {
+    "status": "workspace_applied",
+    "observed_paths": [
+      "docs/example.md"
+    ],
+    "observed_semantics": "exact",
+    "evidence_refs": [
+      "e-parent-10"
+    ],
+    "limitations": []
+  },
+  "safe_actions": [],
+  "evidence": [
+    {
+      "id": "e-envelope-f4",
+      "authority": "derived",
+      "source_kind": "terminal_envelope",
+      "session_id": "parent-f4",
+      "seq": null,
+      "description": "Terminal Delegate envelope supplies delegate id and mode."
+    },
+    {
+      "id": "e-parent-0",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-f4",
+      "seq": 0,
+      "description": "Workflow graph and unit order."
+    },
+    {
+      "id": "e-parent-2",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-f4",
+      "seq": 2,
+      "description": "Propose checkpoint and virtual diff artifact."
+    },
+    {
+      "id": "e-parent-4",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-f4",
+      "seq": 4,
+      "description": "First review attempt started in child-f4-a."
+    },
+    {
+      "id": "e-parent-5",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-f4",
+      "seq": 5,
+      "description": "First review attempt failed and retry was queued."
+    },
+    {
+      "id": "e-parent-6",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-f4",
+      "seq": 6,
+      "description": "Second review attempt started in child-f4-b."
+    },
+    {
+      "id": "e-parent-7",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-f4",
+      "seq": 7,
+      "description": "Second review attempt completed."
+    },
+    {
+      "id": "e-advisory-review",
+      "authority": "model_declared",
+      "source_kind": "model_summary",
+      "session_id": "parent-f4",
+      "seq": 7,
+      "description": "Parsed reviewer JSON declared partial and mergeable false."
+    },
+    {
+      "id": "e-parent-8",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-f4",
+      "seq": 8,
+      "description": "Runtime checkpoint opened the review dependency gate."
+    },
+    {
+      "id": "e-parent-10",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-f4",
+      "seq": 10,
+      "description": "Apply engine checkpoint recorded exact workspace mutation."
+    },
+    {
+      "id": "e-parent-11",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-f4",
+      "seq": 11,
+      "description": "Workflow finished completed."
+    },
+    {
+      "id": "e-child-a-9",
+      "authority": "canonical",
+      "source_kind": "child_log",
+      "session_id": "child-f4-a",
+      "seq": 9,
+      "description": "Durable provider usage from first attempt."
+    },
+    {
+      "id": "e-child-b-12",
+      "authority": "canonical",
+      "source_kind": "child_log",
+      "session_id": "child-f4-b",
+      "seq": 12,
+      "description": "Durable provider usage from second attempt."
+    }
+  ],
+  "limitations": [
+    "advisory_gate_disagreement",
+    "usage_fixture_minimized"
+  ]
+}

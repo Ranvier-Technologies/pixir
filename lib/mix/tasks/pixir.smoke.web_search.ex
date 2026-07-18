@@ -32,7 +32,7 @@ defmodule Mix.Tasks.Pixir.Smoke.WebSearch do
 
   use Mix.Task
 
-  alias Pixir.{Auth, Event, Provider, Tool}
+  alias Pixir.{Event, Provider, Tool}
 
   @command "mix pixir.smoke.web_search"
   @schema_version 1
@@ -97,11 +97,10 @@ defmodule Mix.Tasks.Pixir.Smoke.WebSearch do
     request = provider_request(config)
 
     if config.dry_run? do
-      print_success(dry_run_payload(config, request), json?)
+      print_success(dry_run_payload(config, request, json?), json?)
       :ok
     else
       Mix.Task.run("app.start")
-      ensure_auth!(json?)
       run_probe!(config, request, json?)
       :ok
     end
@@ -212,7 +211,7 @@ defmodule Mix.Tasks.Pixir.Smoke.WebSearch do
 
   defp print_help(_json?), do: Mix.shell().info(@moduledoc)
 
-  defp dry_run_payload(config, request) do
+  defp dry_run_payload(config, request, json?) do
     case Provider.request_body_preview(request, reasoning_effort: config.reasoning_effort) do
       {:ok, body} ->
         %{
@@ -231,16 +230,41 @@ defmodule Mix.Tasks.Pixir.Smoke.WebSearch do
           ]
         }
 
-      {:error, reason} ->
-        fail!(
-          reason.kind,
-          reason.message,
-          stringify(reason.details || %{}),
-          ["Run `#{@command} --help` and check the web_search option shape."],
-          true
-        )
+      error_result ->
+        case normalize_preview_error(error_result) do
+          {:ok, error} ->
+            fail!(
+              error.kind,
+              error.message,
+              stringify(error.details),
+              ["Run `#{@command} --help` and check the web_search option shape."],
+              json?
+            )
+
+          :error ->
+            fail!(
+              :invalid_response,
+              "Provider preview returned an invalid error shape.",
+              %{},
+              ["Run `#{@command} --help` and check the web_search option shape."],
+              json?
+            )
+        end
     end
   end
+
+  @doc false
+  def normalize_preview_error(
+        {:error, %{error: %{kind: kind, message: message, details: details} = error}}
+      )
+      when is_atom(kind) and is_binary(message) and is_map(details),
+      do: {:ok, error}
+
+  def normalize_preview_error({:error, %{kind: kind, message: message, details: details} = error})
+      when is_atom(kind) and is_binary(message) and is_map(details),
+      do: {:ok, error}
+
+  def normalize_preview_error(_result), do: :error
 
   defp request_shape(body) do
     %{
@@ -350,23 +374,6 @@ defmodule Mix.Tasks.Pixir.Smoke.WebSearch do
   end
 
   defp validate_probe_payload!(_payload, _json?), do: :ok
-
-  defp ensure_auth!(json?) do
-    if Auth.authenticated?() do
-      :ok
-    else
-      fail!(
-        :not_authenticated,
-        "No Pixir credential is available.",
-        %{},
-        [
-          "Run `mix pixir.smoke.login --wait` and approve the device-code flow.",
-          "Alternatively set OPENAI_API_KEY for this shell."
-        ],
-        json?
-      )
-    end
-  end
 
   defp input_preview(%{"content" => content}) when is_list(content) do
     content

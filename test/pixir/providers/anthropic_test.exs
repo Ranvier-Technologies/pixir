@@ -1,5 +1,5 @@
 defmodule Pixir.Providers.AnthropicTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Pixir.Providers.Anthropic
 
@@ -13,6 +13,55 @@ defmodule Pixir.Providers.AnthropicTest do
       acc = Enum.reduce(chunks, acc, fn chunk, a -> fun.({:data, chunk}, a) end)
       {:ok, acc}
     end
+  end
+
+  defp canned_attempts(attempts) do
+    test = self()
+    {:ok, agent} = Agent.start_link(fn -> :queue.from_list(attempts) end)
+
+    fn http_request, acc, fun ->
+      send(test, {:request, http_request})
+
+      {chunks, status} =
+        Agent.get_and_update(agent, fn queue ->
+          case :queue.out(queue) do
+            {{:value, attempt}, rest} -> {attempt, rest}
+            {:empty, empty} -> raise "no canned Anthropic attempt left: #{inspect(empty)}"
+          end
+        end)
+
+      acc = fun.({:status, status}, acc)
+      acc = fun.({:headers, []}, acc)
+      acc = Enum.reduce(chunks, acc, fn chunk, current -> fun.({:data, chunk}, current) end)
+      {:ok, acc}
+    end
+  end
+
+  defp error_body_cases do
+    cap = Pixir.Providers.ErrBody.max_bytes()
+
+    [
+      {"under", [String.duplicate("u", cap - 1)], false},
+      {"exact", [String.duplicate("e", cap)], false},
+      {"exact_chunked", [String.duplicate("c", div(cap, 2)), String.duplicate("d", div(cap, 2))],
+       false},
+      {"exact_then_empty", [String.duplicate("z", cap), ""], false},
+      {"exact_then_one", [String.duplicate("y", cap), "x"], true},
+      {"over_then_empty", [String.duplicate("p", cap - 1), "qr", ""], true},
+      {"over_chunked", [String.duplicate("p", cap - 1), "qr", "later"], true}
+    ]
+  end
+
+  defp exact_error_json(type, bytes) do
+    base = Jason.encode!(%{error: %{type: type, message: ""}})
+
+    body =
+      Jason.encode!(%{
+        error: %{type: type, message: String.duplicate("m", bytes - byte_size(base))}
+      })
+
+    true = byte_size(body) == bytes
+    body
   end
 
   defp sse(event, map), do: "event: #{event}\ndata: " <> Jason.encode!(map) <> "\n\n"
@@ -397,6 +446,16 @@ defmodule Pixir.Providers.AnthropicTest do
       sse("content_block_delta", %{
         type: "content_block_delta",
         index: 0,
+        delta: %{type: "text_delta", text: nil}
+      }),
+      sse("content_block_delta", %{
+        type: "content_block_delta",
+        index: 0,
+        delta: %{type: "text_delta"}
+      }),
+      sse("content_block_delta", %{
+        type: "content_block_delta",
+        index: 0,
         delta: %{type: "text_delta", text: "Hello"}
       }),
       sse("content_block_delta", %{
@@ -434,6 +493,310 @@ defmodule Pixir.Providers.AnthropicTest do
 
     assert_received {:delta, {:text_delta, "Hello"}}
     assert_received {:delta, {:text_delta, ", world"}}
+  end
+
+  test "non-object SSE containers fail safely without retries or raw-value echo" do
+    malformed_values = [[], "secret-do-not-echo", 7, true, false]
+
+    cases = [
+      {:payload, fn value -> sse(value) end},
+      {:message,
+       fn value ->
+         sse("message_start", %{type: "message_start", message: value})
+       end},
+      {:content_block,
+       fn value ->
+         sse("content_block_start", %{
+           type: "content_block_start",
+           index: 0,
+           content_block: value
+         })
+       end},
+      {:delta,
+       fn value ->
+         sse("content_block_delta", %{
+           type: "content_block_delta",
+           index: 0,
+           delta: value
+         })
+       end}
+    ]
+
+    for {field, build_chunk} <- cases, value <- malformed_values do
+      {:ok, attempts} = Agent.start_link(fn -> 0 end)
+      parent = self()
+
+      transport = fn _request, acc, fun ->
+        Agent.update(attempts, &(&1 + 1))
+        acc = fun.({:status, 200}, acc)
+        acc = fun.({:data, build_chunk.(value)}, acc)
+
+        terminal =
+          sse("message_delta", %{type: "message_delta", delta: %{stop_reason: "end_turn"}})
+
+        {:ok, fun.({:data, terminal}, acc)}
+      end
+
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_response,
+                  details: %{field: ^field, reason: :non_object, retryable: false}
+                }
+              } = error} =
+               Anthropic.stream(request(),
+                 api_key: "sk-ant-test",
+                 transport: transport,
+                 max_retries: 2,
+                 sleep: fn _ -> flunk("invalid_response must not retry") end,
+                 on_delta: fn delta -> send(parent, {:unexpected_delta, delta}) end
+               )
+
+      assert Agent.get(attempts, & &1) == 1
+      refute inspect(error) =~ "secret-do-not-echo"
+      refute_received {:unexpected_delta, _delta}
+    end
+  end
+
+  test "non-binary content deltas fail safely without fallback, retry, or mutation" do
+    malformed_values = [[], %{"secret" => "do-not-echo"}, 7, true, false]
+
+    thinking_start =
+      sse("content_block_start", %{
+        type: "content_block_start",
+        index: 0,
+        content_block: %{type: "thinking", thinking: "", signature: ""}
+      })
+
+    tool_start =
+      sse("content_block_start", %{
+        type: "content_block_start",
+        index: 0,
+        content_block: %{type: "tool_use", id: "toolu_safe", name: "read", input: %{}}
+      })
+
+    cases = [
+      {:text,
+       fn value ->
+         {[],
+          sse("content_block_delta", %{
+            type: "content_block_delta",
+            index: 0,
+            delta: %{type: "text_delta", text: value}
+          })}
+       end},
+      {:thinking,
+       fn value ->
+         {[thinking_start],
+          sse("content_block_delta", %{
+            type: "content_block_delta",
+            index: 0,
+            delta: %{type: "thinking_delta", thinking: value, text: "unsafe-fallback"}
+          })}
+       end},
+      {:text,
+       fn value ->
+         {[thinking_start],
+          sse("content_block_delta", %{
+            type: "content_block_delta",
+            index: 0,
+            delta: %{type: "thinking_delta", thinking: nil, text: value}
+          })}
+       end},
+      {:signature,
+       fn value ->
+         {[thinking_start],
+          sse("content_block_delta", %{
+            type: "content_block_delta",
+            index: 0,
+            delta: %{type: "signature_delta", signature: value}
+          })}
+       end},
+      {:partial_json,
+       fn value ->
+         {[tool_start],
+          sse("content_block_delta", %{
+            type: "content_block_delta",
+            index: 0,
+            delta: %{type: "input_json_delta", partial_json: value}
+          })}
+       end}
+    ]
+
+    for {field, build_chunks} <- cases, value <- malformed_values do
+      {:ok, attempts} = Agent.start_link(fn -> 0 end)
+      parent = self()
+      {prefix, invalid_delta} = build_chunks.(value)
+
+      transport = fn _request, acc, fun ->
+        Agent.update(attempts, &(&1 + 1))
+        acc = fun.({:status, 200}, acc)
+        acc = Enum.reduce(prefix, acc, fn chunk, current -> fun.({:data, chunk}, current) end)
+        acc = fun.({:data, invalid_delta}, acc)
+
+        acc =
+          fun.({:data, sse("content_block_stop", %{type: "content_block_stop", index: 0})}, acc)
+
+        terminal =
+          sse("message_delta", %{type: "message_delta", delta: %{stop_reason: "end_turn"}})
+
+        {:ok, fun.({:data, terminal}, acc)}
+      end
+
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_response,
+                  details: %{field: ^field, reason: :non_binary, retryable: false}
+                }
+              } = error} =
+               Anthropic.stream(request(),
+                 api_key: "sk-ant-test",
+                 transport: transport,
+                 max_retries: 2,
+                 sleep: fn _ -> flunk("invalid_response must not retry") end,
+                 on_delta: fn delta -> send(parent, {:unexpected_delta, delta}) end
+               )
+
+      assert Agent.get(attempts, & &1) == 1
+      refute inspect(error) =~ "do-not-echo"
+      refute inspect(error) =~ "unsafe-fallback"
+      refute_received {:unexpected_delta, _delta}
+    end
+
+    for {field, build_block} <- [
+          {:thinking, fn value -> %{type: "thinking", thinking: value, signature: ""} end},
+          {:signature, fn value -> %{type: "thinking", thinking: "", signature: value} end}
+        ],
+        value <- malformed_values do
+      {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+      transport = fn _request, acc, fun ->
+        Agent.update(attempts, &(&1 + 1))
+        acc = fun.({:status, 200}, acc)
+
+        start =
+          sse("content_block_start", %{
+            type: "content_block_start",
+            index: 0,
+            content_block: build_block.(value)
+          })
+
+        acc = fun.({:data, start}, acc)
+
+        terminal =
+          sse("message_delta", %{type: "message_delta", delta: %{stop_reason: "end_turn"}})
+
+        {:ok, fun.({:data, terminal}, acc)}
+      end
+
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_response,
+                  details: %{field: ^field, reason: :non_binary, retryable: false}
+                }
+              } = error} =
+               Anthropic.stream(request(),
+                 api_key: "sk-ant-test",
+                 transport: transport,
+                 max_retries: 2,
+                 sleep: fn _ -> flunk("invalid_response must not retry") end
+               )
+
+      assert Agent.get(attempts, & &1) == 1
+      refute inspect(error) =~ "do-not-echo"
+    end
+  end
+
+  test "binary content deltas preserve valid bytes exactly" do
+    parent = self()
+    text = "text\n雪\0"
+    thinking = "thinking\n雪\0"
+    signature = "signature\n雪\0"
+    argument = "argument\n雪\0"
+    partial_json = Jason.encode!(%{"path" => argument})
+
+    chunks = [
+      sse("content_block_start", %{
+        type: "content_block_start",
+        index: 0,
+        content_block: %{type: "text", text: ""}
+      }),
+      sse("content_block_delta", %{
+        type: "content_block_delta",
+        index: 0,
+        delta: %{type: "text_delta", text: text}
+      }),
+      sse("content_block_start", %{
+        type: "content_block_start",
+        index: 1,
+        content_block: %{type: "thinking", thinking: "prefix-", signature: "prefix-"}
+      }),
+      sse("content_block_delta", %{
+        type: "content_block_delta",
+        index: 1,
+        delta: %{type: "thinking_delta", thinking: nil, text: "fallback-"}
+      }),
+      sse("content_block_delta", %{
+        type: "content_block_delta",
+        index: 1,
+        delta: %{type: "thinking_delta", thinking: thinking, text: "unused-fallback"}
+      }),
+      sse("content_block_delta", %{
+        type: "content_block_delta",
+        index: 1,
+        delta: %{type: "signature_delta", signature: nil}
+      }),
+      sse("content_block_delta", %{
+        type: "content_block_delta",
+        index: 1,
+        delta: %{type: "signature_delta", signature: signature}
+      }),
+      sse("content_block_stop", %{type: "content_block_stop", index: 1}),
+      sse("content_block_start", %{
+        type: "content_block_start",
+        index: 2,
+        content_block: %{type: "tool_use", id: "toolu_bytes", name: "read", input: %{}}
+      }),
+      sse("content_block_delta", %{
+        type: "content_block_delta",
+        index: 2,
+        delta: %{type: "input_json_delta", partial_json: nil}
+      }),
+      sse("content_block_delta", %{
+        type: "content_block_delta",
+        index: 2,
+        delta: %{type: "input_json_delta", partial_json: partial_json}
+      }),
+      sse("content_block_stop", %{type: "content_block_stop", index: 2}),
+      sse("message_delta", %{type: "message_delta", delta: %{stop_reason: "end_turn"}})
+    ]
+
+    assert {:ok, result} =
+             Anthropic.stream(request(),
+               api_key: "sk-ant-test",
+               transport: canned(chunks),
+               on_delta: fn delta -> send(parent, {:delta, delta}) end
+             )
+
+    assert result.text == text
+    assert result.reasoning == "fallback-" <> thinking
+
+    assert [
+             %{
+               "thinking" => "prefix-fallback-" <> ^thinking,
+               "signature" => "prefix-" <> ^signature
+             }
+           ] =
+             result.reasoning_items
+
+    assert [%{call_id: "toolu_bytes", name: "read", args: %{"path" => ^argument}}] =
+             result.function_calls
+
+    assert_received {:delta, {:text_delta, ^text}}
+    assert_received {:delta, {:reasoning_delta, "fallback-"}}
+    assert_received {:delta, {:reasoning_delta, ^thinking}}
   end
 
   test "max_tokens stop returns partial text with truncation evidence" do
@@ -783,6 +1146,62 @@ defmodule Pixir.Providers.AnthropicTest do
     refute Map.has_key?(details, :err_body_truncated)
   end
 
+  test "non-2xx error-body provenance is exact across cap and chunk boundaries" do
+    for {name, chunks, expected_truncated} <- error_body_cases() do
+      assert {:error,
+              %{
+                error: %{
+                  kind: :provider_http_error,
+                  details: %{status: 500, retryable: true} = details
+                }
+              }} =
+               Anthropic.stream(request(),
+                 api_key: "sk-ant-test",
+                 transport: canned(chunks, 500),
+                 max_retries: 0
+               ),
+             name
+
+      assert Map.has_key?(details, :err_body_truncated) == expected_truncated, name
+      refute Map.has_key?(details, :body), name
+
+      if expected_truncated do
+        assert details.err_body_truncated == true, name
+      end
+    end
+  end
+
+  test "retry starts a fresh error-body capture" do
+    cap = Pixir.Providers.ErrBody.max_bytes()
+    overflow = exact_error_json("api_error", cap + 1)
+    exact = exact_error_json("invalid_request_error", cap)
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :provider_http_error,
+                details:
+                  %{
+                    status: 400,
+                    type: "invalid_request_error",
+                    retryable: false
+                  } = details
+              }
+            }} =
+             Anthropic.stream(request(),
+               api_key: "sk-ant-test",
+               transport: canned_attempts([{[overflow], 500}, {[exact], 400}]),
+               max_retries: 1,
+               sleep: fn _ -> :ok end
+             )
+
+    refute Map.has_key?(details, :err_body_truncated)
+    refute Map.has_key?(details, :body)
+    assert_received {:request, _}
+    assert_received {:request, _}
+    refute_received {:request, _}
+  end
+
   test "terminal 400 does not retry and preserves anthropic error.type" do
     body = Jason.encode!(%{error: %{type: "invalid_request_error", message: "bad request"}})
 
@@ -977,6 +1396,107 @@ defmodule Pixir.Providers.AnthropicTest do
     refute_received :http_attempted
   end
 
+  test "struct-shaped request documents fail closed at the public boundary" do
+    for request <- [URI.parse("https://anthropic.example"), DateTime.utc_now(), MapSet.new()] do
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_args,
+                  details: %{expected: "plain_map"}
+                }
+              }} = Anthropic.stream(request, max_retries: 0)
+    end
+  end
+
+  test "hostile Anthropic body fields fail closed before credential assembly or transport" do
+    previous_api_key = System.get_env("ANTHROPIC_API_KEY")
+    System.delete_env("ANTHROPIC_API_KEY")
+
+    on_exit(fn ->
+      if previous_api_key,
+        do: System.put_env("ANTHROPIC_API_KEY", previous_api_key),
+        else: System.delete_env("ANTHROPIC_API_KEY")
+    end)
+
+    sentinel = "https://user:password@ANTHROPIC_BODY_SECRET.example/path"
+    uri = URI.parse(sentinel)
+
+    malformed = [
+      request(%{
+        messages: nil,
+        history: [%{type: :user_message, data: %{"text" => uri}}]
+      }),
+      request(%{messages: nil, history: [Pixir.Event.user_message("s", "hi") | :improper]}),
+      request(%{
+        messages: nil,
+        history: [
+          Map.put(Pixir.Event.user_message("s", "hi"), :data, %{
+            "text" => ["a" | :improper]
+          })
+        ]
+      }),
+      request(%{tools: [%{"name" => "x", "input_schema" => uri}]}),
+      request(%{tools: [%{"name" => "x", "input_schema" => %{}} | :improper]}),
+      request(%{messages: [%{"role" => "user", "content" => uri}]}),
+      request(%{messages: [%{"role" => "user", "content" => "hi"} | :improper]}),
+      request(%{system: [%{"type" => "text", "text" => uri}]}),
+      request(%{reasoning_effort: uri}),
+      request(%{prompt_mode: uri}),
+      request(%{previous_turn_boundary_seq: uri}),
+      request(%{
+        prompt_mode: :build,
+        messages: [%{"role" => "user", "content" => %{"unexpected" => "map"}}]
+      }),
+      request(%{model: <<255>>})
+    ]
+
+    for hostile_request <- malformed do
+      assert {:error, %{error: %{kind: :invalid_args}} = error} =
+               Anthropic.stream(hostile_request,
+                 max_retries: 0,
+                 transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+               )
+
+      refute inspect(error) =~ "ANTHROPIC_BODY_SECRET"
+      refute inspect(error) =~ "user:password"
+      assert {:ok, _json} = Jason.encode(error)
+    end
+  end
+
+  test "Anthropic body-field authority collisions fail closed" do
+    for field <- [
+          :model,
+          :messages,
+          :history,
+          :system,
+          :system_prompt,
+          :tools,
+          :developer_context,
+          :agent_instructions,
+          :skills_index,
+          :prompt_mode,
+          :previous_turn_boundary_seq,
+          :max_tokens,
+          :reasoning_effort,
+          :web_search,
+          :hosted_tools,
+          :output_schema
+        ] do
+      hostile_request =
+        request()
+        |> Map.put(field, "atom")
+        |> Map.put(Atom.to_string(field), "string")
+
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_args,
+                  details: %{field: ^field, reason: "normalized_key_collision"}
+                }
+              }} = Anthropic.stream(hostile_request, max_retries: 0)
+    end
+  end
+
   test "idle timeout cuts a stalled stream with StreamIdle error shape" do
     transport = fn _http_request, acc, _fun ->
       Process.sleep(:infinity)
@@ -996,6 +1516,92 @@ defmodule Pixir.Providers.AnthropicTest do
                stream_idle_timeout_ms: 1,
                max_retries: 0
              )
+  end
+
+  test "non-structured transport failures cannot echo the Anthropic API key" do
+    sentinel = "ANTHROPIC_SECRET_TRANSPORT_SENTINEL"
+    transport = fn request, acc, _fun -> {:error, {:echo, request}, acc} end
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :network,
+                details: %{reason: :transport_failure}
+              }
+            } = error} =
+             Anthropic.stream(request(),
+               api_key: sentinel,
+               transport: transport,
+               max_retries: 0
+             )
+
+    refute inspect(error) =~ sentinel
+  end
+
+  test "structured transport failures cannot echo the Anthropic API key" do
+    sentinel = "ANTHROPIC_SECRET_STRUCTURED_TRANSPORT_SENTINEL"
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+    transport = fn request, acc, _fun ->
+      Agent.update(attempts, &(&1 + 1))
+
+      error =
+        Pixir.Tool.error(:provider_http_error, "transport echoed #{sentinel}", %{
+          request: request
+        })
+
+      {:error, error, acc}
+    end
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :provider_http_error,
+                message: "Provider transport returned an error.",
+                details: %{}
+              }
+            } = error} =
+             Anthropic.stream(request(),
+               api_key: sentinel,
+               transport: transport,
+               max_retries: 2,
+               sleep: fn _ -> :ok end
+             )
+
+    refute inspect(error) =~ sentinel
+    assert Agent.get(attempts, & &1) == 1
+  end
+
+  test "explicit snapshotted retries do not eagerly reread Config" do
+    chunks = [sse(%{type: "message_delta", delta: %{stop_reason: "end_turn"}})]
+    tracer = spawn_link(fn -> trace_counter(0) end)
+
+    Code.ensure_loaded!(Pixir.Config)
+    assert 1 = :erlang.trace_pattern({Pixir.Config, :max_retries, 0}, true, [:local])
+    assert 1 = :erlang.trace(self(), true, [:call, {:tracer, tracer}])
+
+    try do
+      assert {:ok, _result} =
+               Anthropic.stream(request(),
+                 api_key: "sk-ant-test",
+                 transport: canned(chunks),
+                 max_retries: 0
+               )
+
+      assert trace_count(self(), tracer) == 0
+
+      assert {:ok, _result} =
+               Anthropic.stream(request(),
+                 api_key: "sk-ant-test",
+                 transport: canned(chunks)
+               )
+
+      assert trace_count(self(), tracer) == 1
+    after
+      :erlang.trace(self(), false, [:call])
+      :erlang.trace_pattern({Pixir.Config, :max_retries, 0}, false, [:local])
+      send(tracer, :stop)
+    end
   end
 
   test "reasoning_effort maps to output_config and rejected OpenAI-shaped keys are absent" do
@@ -1049,5 +1655,29 @@ defmodule Pixir.Providers.AnthropicTest do
     refute Map.has_key?(decoded, "text_verbosity")
     refute Map.has_key?(decoded, "prompt_cache_key")
     refute Map.has_key?(decoded, "prompt_cache_retention")
+  end
+
+  defp trace_count(tracee, tracer) do
+    delivery_ref = :erlang.trace_delivered(tracee)
+    assert_receive {:trace_delivered, ^tracee, ^delivery_ref}, 1_000
+
+    snapshot_ref = make_ref()
+    send(tracer, {:snapshot, self(), snapshot_ref})
+    assert_receive {:trace_count, ^snapshot_ref, count}, 1_000
+    count
+  end
+
+  defp trace_counter(count) do
+    receive do
+      {:trace, _pid, :call, {Pixir.Config, :max_retries, []}} ->
+        trace_counter(count + 1)
+
+      {:snapshot, caller, ref} ->
+        send(caller, {:trace_count, ref, count})
+        trace_counter(count)
+
+      :stop ->
+        :ok
+    end
   end
 end

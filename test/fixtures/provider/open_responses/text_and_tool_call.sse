@@ -1,0 +1,41 @@
+: pinned Open Responses text and tool-call fixture
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"msg_fixture","type":"message","status":"in_progress","content":[],"role":"assistant"}}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","sequence_number":2,"item_id":"msg_fixture","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"text":""}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_fixture","output_index":0,"content_index":0,"delta":"fixture ","logprobs":[]}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_fixture",
+data: "output_index":0,"content_index":0,"delta":"text","logprobs":[]}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","sequence_number":5,"item_id":"msg_fixture","output_index":0,"content_index":0,"text":"fixture text","logprobs":[]}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","sequence_number":6,"item_id":"msg_fixture","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"text":"fixture text"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":7,"output_index":0,"item":{"id":"msg_fixture","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"text":"fixture text"}],"role":"assistant"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":8,"output_index":1,"item":{"type":"function_call","id":"fc_fixture","call_id":"call_fixture","name":"pixir_open_responses_probe","arguments":"","status":"in_progress"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":9,"item_id":"fc_fixture","output_index":1,"delta":"{\"probe\":\"ok\"}"}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","sequence_number":10,"item_id":"fc_fixture","output_index":1,"name":"pixir_open_responses_probe","arguments":"{\"probe\":\"ok\"}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":11,"output_index":1,"item":{"type":"function_call","id":"fc_fixture","call_id":"call_fixture","name":"pixir_open_responses_probe","arguments":"{\"probe\":\"ok\"}","status":"completed"}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":12,"response":{"id":"resp_fixture","object":"response","created_at":1,"completed_at":2,"status":"completed","incomplete_details":null,"model":"fixture-model","previous_response_id":null,"instructions":"fixture instructions","output":[{"id":"msg_fixture","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"text":"fixture text"}],"role":"assistant"},{"type":"function_call","id":"fc_fixture","call_id":"call_fixture","name":"pixir_open_responses_probe","arguments":"{\"probe\":\"ok\"}","status":"completed"}],"error":null,"tools":[],"tool_choice":"auto","truncation":"disabled","parallel_tool_calls":true,"text":{"format":{"type":"text"}},"top_p":1,"presence_penalty":0,"frequency_penalty":0,"top_logprobs":0,"temperature":1,"reasoning":null,"usage":{"input_tokens":7,"output_tokens":5,"total_tokens":12,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}},"max_output_tokens":null,"max_tool_calls":null,"store":false,"background":false,"service_tier":"default","metadata":{},"safety_identifier":null,"prompt_cache_key":null}}
+
+data: [DONE]
+
+: fixture-eof

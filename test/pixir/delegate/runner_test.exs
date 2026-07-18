@@ -341,6 +341,59 @@ defmodule Pixir.Delegate.RunnerTest do
     end)
   end
 
+  test "child projection preserves validated pre-bound output warning reasons" do
+    with_pixir_home("pixir-delegate-output-reasons-home", fn ->
+      ws = tmp_workspace("pixir-delegate-output-reasons")
+      child_sid = "child_output_reasons"
+
+      warnings =
+        for seq <- 1..64 do
+          %{
+            "kind" => "provider_output_truncated",
+            "severity" => "warning",
+            "child_session_id" => child_sid,
+            "provider_usage_event_id" => "evt_#{seq}",
+            "provider_usage_seq" => seq,
+            "reason" => "provider_output_limit",
+            "provider_reason" => "max_tokens",
+            "call_role" => "intermediate"
+          }
+        end
+
+      child = %{
+        "id" => "subagent_output_reasons",
+        "child_session_id" => child_sid,
+        "agent" => "explorer",
+        "status" => "completed",
+        "summary" => "done",
+        "task" => "inspect",
+        "workspace_mode" => "shared",
+        "workspace" => ws,
+        "child_log_path" => Path.join(ws, "child.ndjson"),
+        "next_actions" => [],
+        "output_warning_count" => 65,
+        "output_warnings" => warnings,
+        "output_warning_reasons" => [
+          "provider_output_limit",
+          "provider_content_filter",
+          "unsafe"
+        ],
+        "output_warnings_truncated" => true
+      }
+
+      projected = run_child_projection(ws, child, "read_only")
+
+      assert projected["output_warning_count"] == 65
+      assert length(projected["output_warnings"]) == 64
+
+      assert projected["output_warning_reasons"] == [
+               "provider_output_limit",
+               "provider_content_filter",
+               "unsafe"
+             ]
+    end)
+  end
+
   test "bounded_write workflow runtime pairs auto permission mode with the write policy" do
     with_pixir_home("pixir-delegate-runner-home", fn ->
       ws = tmp_workspace("pixir-delegate-runner-workflow-write")
@@ -688,6 +741,31 @@ defmodule Pixir.Delegate.RunnerTest do
       assert Keyword.fetch!(opts, :permission_mode) == :read_only
       assert Keyword.fetch!(opts, :write_policy) == nil
     end)
+  end
+
+  test "direct Runner validation preserves shared read_set location and reason" do
+    ws = tmp_workspace("pixir-delegate-runner-unsafe-read-set")
+
+    spec = %{
+      "contract_version" => 1,
+      "strategy" => "subagents",
+      "task" => "produce a virtual diff",
+      "mode" => "read_only",
+      "subagents" => %{
+        "workspace_mode" => "virtual_overlay",
+        "read_set" => ["mix.exs", "lib/../**/*"]
+      }
+    }
+
+    spec_meta = %{"strategy" => "subagents", "planned_child_count" => 1}
+
+    assert {:error, error} = Runner.start(%{workspace: ws}, spec, spec_meta)
+    assert error["kind"] == "invalid_spec"
+    assert error["details"]["field"] == "subagents.read_set[2]"
+    assert error["details"]["json_pointer"] == "/subagents/read_set/1"
+    assert error["details"]["path"] == ["subagents", "read_set", 1]
+    assert error["details"]["index"] == 1
+    assert error["details"]["reason"] == "parent_component"
   end
 
   test "virtual child result projects artifact and explicit apply affordance" do

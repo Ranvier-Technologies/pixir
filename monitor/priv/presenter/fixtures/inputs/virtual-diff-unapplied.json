@@ -1,0 +1,117 @@
+{
+  "fixture_schema": "pixir.presenter.fixture",
+  "fixture_version": 1,
+  "scenario": "virtual-diff-unapplied",
+  "source_class": "synthetic_from_workflow_contract",
+  "observed_at": "2026-07-10T19:50:03Z",
+  "inputs": {
+    "terminal_envelope": {
+      "kind": "delegate_result",
+      "delegate_id": "dlg-virtual",
+      "parent_session_id": "parent-virtual",
+      "strategy": "workflow",
+      "mode": "read_only",
+      "workflow_id": "wf-virtual",
+      "status": "completed"
+    },
+    "delegate_snapshot": null,
+    "parent_log": [
+      {
+        "seq": 0,
+        "ts": "2026-07-10T19:50:00Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "workflow_started",
+          "workflow_id": "wf-virtual",
+          "workflow_name": "Virtual proposal",
+          "graph": {
+            "steps": [
+              {
+                "id": "propose",
+                "agent": "default",
+                "depends_on": [],
+                "execution_kind": "virtual_overlay",
+                "workspace_mode": "virtual_overlay",
+                "posture": "virtual_scratch"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "seq": 1,
+        "ts": "2026-07-10T19:50:01Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "step_scheduled",
+          "workflow_id": "wf-virtual",
+          "step_id": "propose",
+          "wave": 1,
+          "execution_kind": "virtual_overlay"
+        }
+      },
+      {
+        "seq": 2,
+        "ts": "2026-07-10T19:50:02Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "checkpoint_decided",
+          "workflow_id": "wf-virtual",
+          "step_id": "propose",
+          "execution_kind": "virtual_overlay",
+          "checkpoint_status": "checkpoint_ready",
+          "dependent_safe": true,
+          "checkpoint": {
+            "known_limitations": [
+              "virtual_diff_not_applied"
+            ],
+            "artifact_refs": [
+              {
+                "kind": "virtual_diff",
+                "version": 1,
+                "hash": "sha256:virtual-only",
+                "workspace_strategy": "virtual_overlay"
+              }
+            ],
+            "virtual_diff": {
+              "apply": {
+                "status": "not_applied",
+                "requires_explicit_apply": true,
+                "tool": "apply_virtual_diff"
+              }
+            }
+          }
+        }
+      },
+      {
+        "seq": 3,
+        "ts": "2026-07-10T19:50:03Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "workflow_finished",
+          "workflow_id": "wf-virtual",
+          "status": "completed",
+          "ok": true
+        }
+      }
+    ],
+    "parent_log_origin": "fixture",
+    "child_logs": {},
+    "runtime_diagnostics": null,
+    "owner_state": {
+      "state": "snapshot_only",
+      "reachable": false
+    },
+    "evidence_mirror": null
+  },
+  "completeness": {
+    "parent_log": "complete",
+    "child_logs": "not_applicable"
+  },
+  "sanitization": {
+    "absolute_paths_removed": true,
+    "identifiers_replaced": true,
+    "model_content_minimized": true,
+    "secrets_removed": true
+  }
+}

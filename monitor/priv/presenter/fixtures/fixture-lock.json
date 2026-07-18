@@ -1,0 +1,153 @@
+{
+  "lock_schema": "pixir.presenter.fixture-lock",
+  "lock_version": 1,
+  "algorithm": "sha256",
+  "digest_scope": "raw_utf8_bytes",
+  "files": [
+    {
+      "path": "schema/pixir.presenter.fixture.v1.schema.json",
+      "bytes": 9749,
+      "sha256": "sha256:8daa4c77e5d9642a3377902da204978cff5fdf18d1ef5e81667f71ad5281474d"
+    },
+    {
+      "path": "schema/pixir.presenter.run.v1.schema.json",
+      "bytes": 19616,
+      "sha256": "sha256:b50f41fe4cbbf6e5b02dc70b74a6c53c9626d1f23c28876115328a779045ab17"
+    },
+    {
+      "path": "fixtures/manifest.json",
+      "bytes": 5392,
+      "sha256": "sha256:644df7105c6ccb8c0d8b1b02c4325f3424d7b12bef9c25eab498e3bdc41a7742"
+    },
+    {
+      "path": "fixtures/inputs/evidence-mirror-canonical-conflict.json",
+      "bytes": 3011,
+      "sha256": "sha256:f9e77bd5f68586812e70b04bf8d874bf4337119bc9c5ca34cd0fd824a1c29fd2"
+    },
+    {
+      "path": "fixtures/inputs/f4-advisory-retry-reconstructed.json",
+      "bytes": 10552,
+      "sha256": "sha256:17fc0b89b147c389111c4094cc6aeaf30519fd007ef0c951a617e99b6a49baf7"
+    },
+    {
+      "path": "fixtures/inputs/held-missing-child-log.json",
+      "bytes": 4244,
+      "sha256": "sha256:08c8f4c51c1b9672fcd5bb36337ec17ecbae1dcb8f484e192010c1e0524c9c63"
+    },
+    {
+      "path": "fixtures/inputs/invalid-model-advisory.json",
+      "bytes": 2432,
+      "sha256": "sha256:62cc640f9eb95aece113ffa3e31365c9975e0d1c5378120753fb66ea989f00a4"
+    },
+    {
+      "path": "fixtures/inputs/live-runtime-only-no-log.json",
+      "bytes": 1459,
+      "sha256": "sha256:c17c001437e90b18627c42b1109b511f6c2cbc9c1a20796ba3c23e52c9dc11f8"
+    },
+    {
+      "path": "fixtures/inputs/mixed-running-current.json",
+      "bytes": 3059,
+      "sha256": "sha256:f85ed4db46cb8314f0973007874330719907fedda6c3155ad58b9144a431c9bb"
+    },
+    {
+      "path": "fixtures/inputs/partial-write-indeterminate.json",
+      "bytes": 3383,
+      "sha256": "sha256:da337aff00ac838b602ee5995c548bcaf788d04247d0cf58e6bf3eabb80e7da1"
+    },
+    {
+      "path": "fixtures/inputs/resume-reused-child-session.json",
+      "bytes": 3179,
+      "sha256": "sha256:5472ec466f2abfb15e3e4061be6749968f909ae658782bdd48914427e3936b80"
+    },
+    {
+      "path": "fixtures/inputs/stale-running-no-owner.json",
+      "bytes": 1297,
+      "sha256": "sha256:3456d06c222285cee0c23c79cf03caab98931374a96891b34cdfb54d49e4a288"
+    },
+    {
+      "path": "fixtures/inputs/timeout-needs-orchestrator.json",
+      "bytes": 3637,
+      "sha256": "sha256:00d8fc843e91dceb85369e5eeafd33de94eaae2a9992077f0118d6c62c5e5bfd"
+    },
+    {
+      "path": "fixtures/inputs/virtual-diff-unapplied.json",
+      "bytes": 3176,
+      "sha256": "sha256:4f996341891f82f0555820e9f7ae9781016bf08ce03b186125fc98b319047a2f"
+    },
+    {
+      "path": "fixtures/inputs/wave1-parallel-audit-reconstructed.json",
+      "bytes": 6897,
+      "sha256": "sha256:dd6b7d00f6d5baf1de9bf5d371f25e5a5ea6b7332ec86e3ce9311c1f71f562fb"
+    },
+    {
+      "path": "fixtures/inputs/wave3-transport-failure-reconstructed.json",
+      "bytes": 3559,
+      "sha256": "sha256:f63d6d7ad5e68ae803f002e9bb918a42e9cbdbfdb0adc4b4bd4649080f5e17a1"
+    },
+    {
+      "path": "fixtures/golden/evidence-mirror-canonical-conflict.json",
+      "bytes": 4214,
+      "sha256": "sha256:b6b07baa5786fd6f42c6cf3f84df1672b85b782f708b21b755f74f7cd565cdf8"
+    },
+    {
+      "path": "fixtures/golden/f4-advisory-retry-reconstructed.json",
+      "bytes": 16855,
+      "sha256": "sha256:b9b8e127729451266e72d3b41602800b32db9747cf5137f8ea25689d3210296f"
+    },
+    {
+      "path": "fixtures/golden/held-missing-child-log.json",
+      "bytes": 9410,
+      "sha256": "sha256:507eed2ec0d132043b0b38315d80f26eb7c9b4b529bf43634c7bd1a5fca9efaa"
+    },
+    {
+      "path": "fixtures/golden/invalid-model-advisory.json",
+      "bytes": 5146,
+      "sha256": "sha256:38b93c1d38de0b076bd1ce9e3ac369798a19ac6a1cedbe5f4abae1fbc1edbae9"
+    },
+    {
+      "path": "fixtures/golden/live-runtime-only-no-log.json",
+      "bytes": 5868,
+      "sha256": "sha256:f996a46b7811749658b2abc420d53726b575865bcde5f360a0e69d0eae96afb6"
+    },
+    {
+      "path": "fixtures/golden/mixed-running-current.json",
+      "bytes": 7376,
+      "sha256": "sha256:8caee217f097d1a27da7a455294b30cf710f9ff88a3fbcf3ee6564dce40a0bc4"
+    },
+    {
+      "path": "fixtures/golden/partial-write-indeterminate.json",
+      "bytes": 7906,
+      "sha256": "sha256:f71b90133a00969b9b9395a3a829f4f133093997c1712b740526c1506ff3cdd2"
+    },
+    {
+      "path": "fixtures/golden/resume-reused-child-session.json",
+      "bytes": 7436,
+      "sha256": "sha256:350e472f32d9ec9321b44d61dd73bd933cac86c6fb7a7ce14e9e14e016cfe0f2"
+    },
+    {
+      "path": "fixtures/golden/stale-running-no-owner.json",
+      "bytes": 4048,
+      "sha256": "sha256:d2ac2fef8ea23bd22f798e0cb60a29f033b671fc8d166b0654b8b9cf6ec0dbd7"
+    },
+    {
+      "path": "fixtures/golden/timeout-needs-orchestrator.json",
+      "bytes": 7960,
+      "sha256": "sha256:c069fad0284b3a43faf1e5a137d4eac314732e354704ffc86300bce0fa0a30d4"
+    },
+    {
+      "path": "fixtures/golden/virtual-diff-unapplied.json",
+      "bytes": 6293,
+      "sha256": "sha256:282f5c17fc58a831c1cd1ce24e3fbec9dda6196d36399d3f664f2e783314a7ef"
+    },
+    {
+      "path": "fixtures/golden/wave1-parallel-audit-reconstructed.json",
+      "bytes": 13564,
+      "sha256": "sha256:4660c217ece2910cb6b87bab84b653046c0dd4616ef477240ef91b51a81c4447"
+    },
+    {
+      "path": "fixtures/golden/wave3-transport-failure-reconstructed.json",
+      "bytes": 10536,
+      "sha256": "sha256:87fdb7f86eca7a559a9ddb2e6328f3e2d0ef3f22e8e92c4dfa47fa60429b6f75"
+    }
+  ]
+}

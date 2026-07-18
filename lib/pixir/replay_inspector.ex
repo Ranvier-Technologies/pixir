@@ -10,11 +10,15 @@ defmodule Pixir.ReplayInspector do
   """
 
   alias Pixir.{Log, Provider, Tool}
+  alias Pixir.Provider.OutputTruncationSummary
 
   @type inspect_opts :: [
           workspace: String.t(),
           after_seq: non_neg_integer() | nil,
-          model: String.t() | nil
+          model: term(),
+          config_path: String.t(),
+          raw_config: map(),
+          request_snapshot_loader: (keyword() -> term())
         ]
 
   @doc """
@@ -29,19 +33,24 @@ defmodule Pixir.ReplayInspector do
   def inspect(session_id, opts) when is_binary(session_id) do
     workspace = Keyword.get(opts, :workspace, File.cwd!())
 
-    if Log.exists?(session_id, workspace: workspace) do
-      with {:ok, history} <- Log.fold(session_id, workspace: workspace),
-           {:ok, after_seq} <- validate_after_seq(Keyword.get(opts, :after_seq)),
-           scoped_history <- scope_history(history, after_seq),
-           {:ok, body} <- provider_body(session_id, scoped_history, opts, workspace) do
-        {:ok, report(session_id, workspace, history, scoped_history, body, after_seq)}
-      end
-    else
-      {:error,
-       Tool.error(:not_found, "session log not found", %{
-         session_id: session_id,
-         path: Log.path(session_id, workspace: workspace)
-       })}
+    case Log.exists(session_id, workspace: workspace) do
+      {:ok, true} ->
+        with {:ok, history} <- Log.fold(session_id, workspace: workspace),
+             {:ok, after_seq} <- validate_after_seq(Keyword.get(opts, :after_seq)),
+             scoped_history <- scope_history(history, after_seq),
+             {:ok, body} <- provider_body(session_id, scoped_history, opts, workspace) do
+          {:ok, report(session_id, workspace, history, scoped_history, body, after_seq)}
+        end
+
+      {:ok, false} ->
+        {:error,
+         Tool.error(:not_found, "session log not found", %{
+           session_id: session_id,
+           path: Log.path(session_id, workspace: workspace)
+         })}
+
+      {:error, _error} = error ->
+        error
     end
   end
 
@@ -62,17 +71,23 @@ defmodule Pixir.ReplayInspector do
   defp event_seq_lte?(_event, _after_seq), do: true
 
   defp provider_body(session_id, history, opts, workspace) do
-    model = Keyword.get(opts, :model) || Provider.default_model()
+    request = %{
+      workspace: workspace,
+      history: history,
+      system_prompt: "Replay inspection only.",
+      developer_context: "Replay inspection for session #{session_id} in #{workspace}."
+    }
+
+    request =
+      case Keyword.fetch(opts, :model) do
+        :error -> request
+        {:ok, nil} -> request
+        {:ok, model} -> Map.put(request, :model, model)
+      end
 
     Provider.request_body_preview(
-      %{
-        model: model,
-        workspace: workspace,
-        history: history,
-        system_prompt: "Replay inspection only.",
-        developer_context: "Replay inspection for session #{session_id} in #{workspace}."
-      },
-      model: model
+      request,
+      Keyword.take(opts, [:config_path, :raw_config, :request_snapshot_loader])
     )
   end
 
@@ -105,6 +120,7 @@ defmodule Pixir.ReplayInspector do
         "balanced" => missing_output_ids == [] and extra_output_ids == []
       },
       "replay_contract" => replay_contract_summary(scoped_history, assistant_messages),
+      "output_truncation" => OutputTruncationSummary.summarize(scoped_history),
       "continuation" => continuation_summary(scoped_history)
     }
   end

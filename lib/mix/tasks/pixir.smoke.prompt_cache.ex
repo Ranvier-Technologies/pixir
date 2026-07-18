@@ -33,7 +33,7 @@ defmodule Mix.Tasks.Pixir.Smoke.PromptCache do
 
   use Mix.Task
 
-  alias Pixir.{Auth, Event, Provider, Tool}
+  alias Pixir.{Event, Provider, Tool}
   alias Pixir.Provider.Cache
 
   @command "mix pixir.smoke.prompt_cache"
@@ -85,7 +85,6 @@ defmodule Mix.Tasks.Pixir.Smoke.PromptCache do
       :ok
     else
       Mix.Task.run("app.start")
-      ensure_auth!(json?)
       run_probe!(config, json?)
       :ok
     end
@@ -305,23 +304,6 @@ defmodule Mix.Tasks.Pixir.Smoke.PromptCache do
     1..34
     |> Enum.map(fn i -> "Block #{String.pad_leading(to_string(i), 2, "0")}. #{paragraph}" end)
     |> Enum.join("\n")
-  end
-
-  defp ensure_auth!(json?) do
-    if Auth.authenticated?() do
-      :ok
-    else
-      fail!(
-        :not_authenticated,
-        "No Pixir credential is available.",
-        %{},
-        [
-          "Run `mix pixir.smoke.login --wait` and approve the device-code flow.",
-          "Alternatively set OPENAI_API_KEY for this shell."
-        ],
-        json?
-      )
-    end
   end
 
   defp print_success(payload, true), do: print_json(payload)

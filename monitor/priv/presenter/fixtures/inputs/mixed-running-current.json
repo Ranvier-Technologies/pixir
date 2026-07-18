@@ -1,0 +1,113 @@
+{
+  "fixture_schema": "pixir.presenter.fixture",
+  "fixture_version": 1,
+  "scenario": "mixed-running-current",
+  "source_class": "synthetic_from_runtime_contract",
+  "observed_at": "2026-07-10T19:00:05Z",
+  "inputs": {
+    "terminal_envelope": null,
+    "delegate_snapshot": {
+      "kind": "delegate_status",
+      "delegate_id": "dlg-mixed",
+      "parent_session_id": "parent-mixed",
+      "strategy": "subagents",
+      "mode": "read_only",
+      "status": "running"
+    },
+    "parent_log": [
+      {
+        "seq": 0,
+        "ts": "2026-07-10T19:00:00Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "started",
+          "status": "running",
+          "subagent_id": "sub-live",
+          "child_session_id": "child-live",
+          "agent": "explorer",
+          "workspace_mode": "shared"
+        }
+      }
+    ],
+    "parent_log_origin": "fixture",
+    "child_logs": {
+      "child-live": [
+        {
+          "seq": 1,
+          "ts": "2026-07-10T19:00:01Z",
+          "type": "provider_usage",
+          "data": {
+            "provider": "openai",
+            "model": "gpt-test",
+            "usage_summary": {
+              "input_tokens": 1000,
+              "output_tokens": 100,
+              "reasoning_tokens": 20,
+              "total_tokens": 1100,
+              "cached_tokens": 500,
+              "cache": {
+                "creation_tokens": 0,
+                "read_tokens": 500
+              }
+            }
+          }
+        },
+        {
+          "seq": 2,
+          "ts": "2026-07-10T19:00:04Z",
+          "type": "provider_usage",
+          "data": {
+            "provider": "openai",
+            "model": "gpt-test",
+            "usage_summary": {
+              "input_tokens": 1200,
+              "output_tokens": 150,
+              "reasoning_tokens": 50,
+              "total_tokens": 1350,
+              "cached_tokens": 600,
+              "cache": {
+                "creation_tokens": 0,
+                "read_tokens": 600
+              }
+            }
+          }
+        }
+      ]
+    },
+    "runtime_diagnostics": {
+      "parent_session_id": "parent-mixed",
+      "observed_at": "2026-07-10T19:00:05Z",
+      "running_count": 1,
+      "subagents": [
+        {
+          "id": "sub-live",
+          "child_session_id": "child-live",
+          "status": "running",
+          "child_indexed": true,
+          "child_pid_alive": true,
+          "last_seen_child_event_seq": 2,
+          "last_seen_child_event_type": "provider_usage",
+          "last_seen_child_event_ts": "2026-07-10T19:00:04Z"
+        }
+      ],
+      "runtime_gaps": []
+    },
+    "owner_state": {
+      "state": "live_delegate_owner",
+      "reachable": true,
+      "delegate_owner": true
+    },
+    "evidence_mirror": null
+  },
+  "completeness": {
+    "parent_log": "complete",
+    "child_logs": "complete",
+    "runtime_diagnostics": "complete_snapshot"
+  },
+  "sanitization": {
+    "absolute_paths_removed": true,
+    "identifiers_replaced": true,
+    "model_content_minimized": true,
+    "secrets_removed": true
+  }
+}

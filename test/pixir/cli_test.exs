@@ -70,6 +70,73 @@ defmodule Pixir.CLITest do
     end
   end
 
+  defmodule UsageAbsentFallbackProvider do
+    def stream(_request, opts) do
+      sid = Keyword.fetch!(opts, :session_id)
+
+      Pixir.Session.emit(
+        sid,
+        Pixir.Event.assistant_message(sid, "",
+          metadata: %{
+            "output_truncation" => %{
+              "status" => "truncated",
+              "reason" => "provider_content_filter",
+              "provider_reason" => "content_filter",
+              "provider_usage_event_id" => "evt_usage_absent",
+              "provider_usage_seq" => 77,
+              "call_role" => "final_answer"
+            }
+          }
+        )
+      )
+
+      Keyword.fetch!(opts, :on_delta).({:text_delta, "final authoritative"})
+
+      {:ok,
+       %{
+         text: "final authoritative",
+         reasoning: "",
+         function_calls: [],
+         finish_reason: :stop,
+         output_truncation: %{status: :not_truncated, provider_reason: "fixture_done"}
+       }}
+    end
+  end
+
+  defmodule PartialUsageAbsentFallbackProvider do
+    def stream(_request, opts) do
+      sid = Keyword.fetch!(opts, :session_id)
+
+      Pixir.Session.emit(
+        sid,
+        Pixir.Event.assistant_message(sid, "",
+          metadata: %{
+            "partial" => true,
+            "output_truncation" => %{
+              "status" => "truncated",
+              "reason" => "provider_content_filter",
+              "provider_reason" => "content_filter",
+              "provider_usage_event_id" => "evt_partial_fallback",
+              "provider_usage_seq" => 77,
+              "call_role" => "final_answer"
+            }
+          }
+        )
+      )
+
+      Keyword.fetch!(opts, :on_delta).({:text_delta, "final authoritative"})
+
+      {:ok,
+       %{
+         text: "final authoritative",
+         reasoning: "",
+         function_calls: [],
+         finish_reason: :stop,
+         output_truncation: %{status: :not_truncated, provider_reason: "fixture_done"}
+       }}
+    end
+  end
+
   defmodule WebSearchCaptureProvider do
     def stream(request, opts) do
       send(Keyword.fetch!(opts, :test_pid), {:web_search_request, Map.get(request, :web_search)})
@@ -1377,7 +1444,7 @@ defmodule Pixir.CLITest do
                   "status" => "completed",
                   "kind" => "delegate_result",
                   "contract_version" => 1,
-                  "schema_version" => 4,
+                  "schema_version" => 5,
                   "schema" => "pixir.delegate.envelope.v1",
                   "command_ok" => true,
                   "work_complete" => true,
@@ -1594,7 +1661,7 @@ defmodule Pixir.CLITest do
 
           payload = Jason.decode!(stdout)
           assert payload["status"] == "completed"
-          assert payload["schema_version"] == 4
+          assert payload["schema_version"] == 5
           assert payload["command_ok"] == true
           assert payload["work_complete"] == true
           assert payload["outcome"] == "completed"
@@ -1772,7 +1839,7 @@ defmodule Pixir.CLITest do
                 "ok" => true,
                 "status" => "completed",
                 "kind" => "delegate_status",
-                "schema_version" => 4,
+                "schema_version" => 5,
                 "schema" => "pixir.delegate.envelope.v1",
                 "command_ok" => true,
                 "work_complete" => true,
@@ -1816,7 +1883,7 @@ defmodule Pixir.CLITest do
                "ok" => false,
                "status" => "rejected",
                "kind" => "not_found",
-               "schema_version" => 4,
+               "schema_version" => 5,
                "command_ok" => false,
                "work_complete" => false,
                "outcome" => "rejected",
@@ -1864,7 +1931,7 @@ defmodule Pixir.CLITest do
                 "ok" => true,
                 "status" => "running",
                 "kind" => "delegate_attach",
-                "schema_version" => 4,
+                "schema_version" => 5,
                 "schema" => "pixir.delegate.envelope.v1",
                 "command_ok" => true,
                 "work_complete" => false,
@@ -2692,6 +2759,59 @@ defmodule Pixir.CLITest do
     )
   end
 
+  test "failed legacy-root attestation stops the started Session and releases its lease" do
+    with_cli_provider([stop("must not run")], fn ->
+      in_tmp_workspace("pixir-cli-attestation-lease-cleanup", fn ws ->
+        sid = "legacy-attestation-failure"
+
+        event =
+          Event.tool_call(sid, "legacy-write", "write", %{
+            "path" => "blocked.txt",
+            "content" => "x"
+          })
+          |> Event.with_seq(0)
+
+        assert {:ok, [_]} = Log.create_session(sid, [event], workspace: ws)
+        test_pid = self()
+
+        Application.put_env(:pixir, :cli_attestation_recorder, fn session_id, _event ->
+          send(
+            test_pid,
+            {:attestation_attempt, File.exists?(Paths.session_lease(session_id, ws))}
+          )
+
+          {:error, Pixir.Tool.error(:log_write_failed, "injected attestation failure", %{})}
+        end)
+
+        try do
+          capture_io(fn ->
+            capture_io(:stderr, fn ->
+              assert {:error, 1} =
+                       CLI.route(
+                         [
+                           "--json",
+                           "resume",
+                           "--assume-legacy-root",
+                           "--legacy-root-reason",
+                           "test injection",
+                           sid,
+                           "continue"
+                         ],
+                         :read_only
+                       )
+            end)
+          end)
+
+          assert_receive {:attestation_attempt, true}
+          refute File.exists?(Paths.session_lease(sid, ws))
+          assert Registry.lookup(Pixir.Sessions.Registry, sid) == []
+        after
+          Application.delete_env(:pixir, :cli_attestation_recorder)
+        end
+      end)
+    end)
+  end
+
   test "resume with no id is a usage error (exit code 2)" do
     err = capture_io(:stderr, fn -> assert {:error, 2} = CLI.route(["resume"]) end)
     assert err =~ "usage: pixir resume"
@@ -3504,5 +3624,325 @@ defmodule Pixir.CLITest do
         assert Enum.any?(history, &(&1.type == :turn_failed))
       end)
     end)
+  end
+
+  test "one-shot JSON lets Turn profile preflight govern before CLI Auth" do
+    profiles = [{%{"mode" => "future"}, "invalid_config", "unknown_mode"}]
+
+    for {profile, expected_kind, expected_reason} <- profiles do
+      with_cli_turn_opts(
+        [
+          config_opts: [
+            raw_config: %{
+              "model" => "gpt-5.4-mini",
+              "responses_backend" => profile
+            }
+          ],
+          provider_opts: [
+            auth: :missing_cli_profile_auth,
+            transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+          ]
+        ],
+        fn ->
+          in_tmp_workspace("pixir-cli-profile-preflight", fn ws ->
+            out =
+              capture_io(fn ->
+                assert {:error, 1} = CLI.route(["--json", "profile preflight"])
+              end)
+
+            payload = Jason.decode!(out)
+            assert payload["kind"] == "one_shot_turn"
+            assert payload["status"] == "error"
+            assert payload["exit_code"] == 1
+            assert payload["terminal_status"] == "configuration_error"
+            assert payload["error_kind"] == expected_kind
+
+            assert payload["details"] == %{
+                     "field" =>
+                       if(expected_kind == "invalid_config",
+                         do: "mode",
+                         else: "responses_backend"
+                       ),
+                     "reason" => expected_reason
+                   }
+
+            sid = payload["session_id"]
+            assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+            assert Enum.map(Enum.take(history, -2), & &1.type) == [
+                     :user_message,
+                     :turn_failed
+                   ]
+
+            assert hd(history).type in [:permission_posture, :subagent_event]
+
+            refute inspect(payload) =~ "stage.example"
+            refute inspect(history) =~ "stage.example"
+          end)
+        end
+      )
+    end
+  end
+
+  test "one-shot JSON bounds Provider-output warnings at 255/256/257 with honest totals" do
+    for count <- [255, 256, 257] do
+      script = truncation_script(count, "exact answer #{count}")
+
+      with_cli_provider(script, fn ->
+        in_tmp_workspace("pixir-cli-output-truncation-#{count}", fn _ws ->
+          File.write!("fixture.txt", "fixture\n")
+
+          output =
+            capture_io(fn ->
+              assert :ok = CLI.route(["--json", "read repeatedly"])
+            end)
+
+          payload = Jason.decode!(output)
+          assert payload["output"] == "exact answer #{count}"
+          assert payload["output_truncation"]["status"] == "truncated"
+          assert payload["warning_count"] == count
+          assert length(payload["warnings"]) == min(count, 256)
+          assert payload["warnings_truncated"] == (count == 257)
+
+          assert Enum.map(payload["warnings"], & &1["provider_usage_seq"]) ==
+                   Enum.sort(Enum.map(payload["warnings"], & &1["provider_usage_seq"]))
+        end)
+      end)
+    end
+  end
+
+  test "one-shot human output stays exact and emits one suppression footer at 257" do
+    with_cli_provider(truncation_script(257, "exact provider bytes"), fn ->
+      in_tmp_workspace("pixir-cli-output-truncation-human", fn _ws ->
+        File.write!("fixture.txt", "fixture\n")
+
+        stderr =
+          capture_io(:stderr, fn ->
+            stdout = capture_io(fn -> assert :ok = CLI.route(["read repeatedly"]) end)
+            send(self(), {:truncation_stdout, stdout})
+          end)
+
+        assert_received {:truncation_stdout, "exact provider bytes\n"}
+
+        assert length(Regex.scan(~r/warning: provider output was truncated/, stderr)) == 256
+
+        assert length(
+                 Regex.scan(
+                   ~r/warning: additional provider-output truncation notices suppressed/,
+                   stderr
+                 )
+               ) == 1
+
+        assert stderr =~ "(total=257, shown=256)"
+      end)
+    end)
+  end
+
+  test "empty and whitespace final output preserve exit 6 with additive neutral evidence" do
+    for {output, reasoning} <- [{"", ""}, {"   ", ""}, {"", "reasoning-only"}] do
+      result =
+        truncated_stop(output)
+        |> then(fn {:ok, result} -> {:ok, %{result | reasoning: reasoning}} end)
+
+      with_cli_provider([result], fn ->
+        in_tmp_workspace("pixir-cli-empty-output-truncation", fn _ws ->
+          json =
+            capture_io(fn ->
+              assert {:error, 6} = CLI.route(["--json", "empty"])
+            end)
+
+          payload = Jason.decode!(json)
+          assert payload["status"] == "incomplete"
+          assert payload["ok"] == false
+          assert payload["output_truncation"]["status"] == "truncated"
+          assert payload["warning_count"] == 1
+          assert payload["warnings_truncated"] == false
+        end)
+      end)
+    end
+  end
+
+  test "both built-in Provider paths preserve empty whitespace and reasoning-only exit 6" do
+    in_tmp_workspace("pixir-cli-built-in-empty", fn ws ->
+      auth_name = :"cli_empty_auth_#{System.unique_integer([:positive])}"
+
+      {:ok, auth_pid} =
+        Pixir.Auth.start_link(
+          name: auth_name,
+          store_path: Path.join(ws, "isolated-auth.json"),
+          env_api_key: "sk-cli"
+        )
+
+      on_exit(fn -> if Process.alive?(auth_pid), do: GenServer.stop(auth_pid) end)
+
+      for fixture <- [:empty, :whitespace, :reasoning_only] do
+        openai_events =
+          case fixture do
+            :empty -> []
+            :whitespace -> [%{type: "response.output_text.delta", delta: "   "}]
+            :reasoning_only -> [%{type: "response.reasoning_summary_text.delta", delta: "think"}]
+          end
+
+        openai_events =
+          openai_events ++
+            [
+              %{
+                type: "response.incomplete",
+                response: %{
+                  status: "incomplete",
+                  incomplete_details: %{reason: "max_output_tokens"}
+                }
+              }
+            ]
+
+        openai_transport = fn _request, acc, fun ->
+          acc = fun.({:status, 200}, acc)
+
+          acc =
+            Enum.reduce(openai_events, acc, fn event, current ->
+              fun.({:data, "data: " <> Jason.encode!(event) <> "\n\n"}, current)
+            end)
+
+          {:ok, acc}
+        end
+
+        anthropic_events =
+          case fixture do
+            :empty ->
+              []
+
+            :whitespace ->
+              [
+                {"content_block_delta",
+                 %{
+                   type: "content_block_delta",
+                   index: 0,
+                   delta: %{type: "text_delta", text: "   "}
+                 }}
+              ]
+
+            :reasoning_only ->
+              [
+                {"content_block_delta",
+                 %{
+                   type: "content_block_delta",
+                   index: 0,
+                   delta: %{type: "thinking_delta", thinking: "think"}
+                 }}
+              ]
+          end
+
+        anthropic_events =
+          anthropic_events ++
+            [{"message_delta", %{type: "message_delta", delta: %{stop_reason: "max_tokens"}}}]
+
+        anthropic_transport = fn _request, acc, fun ->
+          acc = fun.({:status, 200}, acc)
+
+          acc =
+            Enum.reduce(anthropic_events, acc, fn {name, event}, current ->
+              chunk = "event: #{name}\ndata: " <> Jason.encode!(event) <> "\n\n"
+              fun.({:data, chunk}, current)
+            end)
+
+          {:ok, acc}
+        end
+
+        rows = [
+          {Pixir.Provider, [auth: auth_name, transport: openai_transport, max_retries: 0]},
+          {Pixir.Providers.Anthropic,
+           [api_key: "fixture-token", transport: anthropic_transport, max_retries: 0]}
+        ]
+
+        for {provider, provider_opts} <- rows do
+          with_cli_turn_opts(
+            [provider: provider, provider_opts: provider_opts, skip_auth?: true],
+            fn ->
+              json =
+                capture_io(fn ->
+                  assert {:error, 6} = CLI.route(["--json", "#{fixture} built-in"])
+                end)
+
+              payload = Jason.decode!(json)
+              assert payload["status"] == "incomplete"
+              assert payload["output_truncation"]["status"] == "truncated"
+              assert payload["warning_count"] == 1
+            end
+          )
+        end
+      end
+    end)
+  end
+
+  test "one-shot JSON counts a validated usage-absent assistant fallback once" do
+    with_cli_turn_opts([provider: UsageAbsentFallbackProvider, skip_auth?: true], fn ->
+      in_tmp_workspace("pixir-cli-output-truncation-fallback", fn _ws ->
+        output = capture_io(fn -> assert :ok = CLI.route(["--json", "fallback"]) end)
+        payload = Jason.decode!(output)
+
+        assert payload["output"] == "final authoritative"
+        assert payload["output_truncation"]["status"] == "not_truncated"
+        assert payload["warning_count"] == 1
+        assert [%{"provider_usage_event_id" => "evt_usage_absent"}] = payload["warnings"]
+        assert payload["warnings_truncated"] == false
+      end)
+    end)
+  end
+
+  test "one-shot JSON rejects a partial usage-absent assistant fallback" do
+    with_cli_turn_opts([provider: PartialUsageAbsentFallbackProvider, skip_auth?: true], fn ->
+      in_tmp_workspace("pixir-cli-output-truncation-partial-fallback", fn _ws ->
+        output = capture_io(fn -> assert :ok = CLI.route(["--json", "fallback"]) end)
+        payload = Jason.decode!(output)
+
+        assert payload["output"] == "final authoritative"
+        assert payload["output_truncation"]["status"] == "not_truncated"
+        assert payload["warning_count"] == 0
+        assert payload["warnings"] == []
+        refute inspect(payload) =~ "evt_partial_fallback"
+      end)
+    end)
+  end
+
+  defp truncation_script(count, final_text) do
+    intermediate =
+      for index <- 1..max(count - 1, 0) do
+        call = %{
+          call_id: "call_#{index}",
+          name: "read",
+          args: %{"path" => "fixture.txt"}
+        }
+
+        {:ok,
+         %{
+           text: "",
+           reasoning: "",
+           function_calls: [call],
+           output_items: [{:function_call, call}],
+           finish_reason: :tool_calls,
+           output_truncation: truncated_evidence()
+         }}
+      end
+
+    intermediate ++ [truncated_stop(final_text)]
+  end
+
+  defp truncated_stop(text) do
+    {:ok,
+     %{
+       text: text,
+       reasoning: "",
+       function_calls: [],
+       finish_reason: :stop,
+       output_truncation: truncated_evidence()
+     }}
+  end
+
+  defp truncated_evidence do
+    %{
+      status: :truncated,
+      reason: :provider_output_limit,
+      provider_reason: "fixture_limit"
+    }
   end
 end

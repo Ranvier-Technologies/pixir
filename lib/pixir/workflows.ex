@@ -27,6 +27,7 @@ defmodule Pixir.Workflows do
     Event,
     Permissions.WritePolicy,
     Session,
+    SessionId,
     SessionResources,
     Skills,
     Subagents,
@@ -154,7 +155,8 @@ defmodule Pixir.Workflows do
   def run(parent_session_id, spec, opts \\ [])
 
   def run(parent_session_id, spec, opts) when is_binary(parent_session_id) and is_map(spec) do
-    with {:ok, workflow} <- normalize(spec, opts),
+    with :ok <- SessionId.validate(parent_session_id),
+         {:ok, workflow} <- normalize(spec, opts),
          {:ok, state} <- WorkflowRun.new(workflow),
          :ok <-
            record_workflow_event(
@@ -610,53 +612,58 @@ defmodule Pixir.Workflows do
   end
 
   defp normalize_read_set(raw, _read_only?, "virtual_overlay", id) do
-    cond do
-      not has_field?(raw, "read_set") ->
-        {:error,
-         Tool.error(:invalid_args, "virtual_overlay workflow step requires read_set", %{
-           "id" => id,
-           "field" => "read_set"
-         })}
+    if has_field?(raw, "read_set") do
+      case field(raw, "read_set") do
+        value when is_list(value) or is_binary(value) ->
+          read_set = if is_binary(value), do: [value], else: value
 
-      true ->
-        case field(raw, "read_set") do
-          value when is_list(value) or is_binary(value) ->
-            read_set = normalize_set(value)
+          case VirtualOverlay.validate_read_set(read_set) do
+            :ok ->
+              {:ok, read_set |> Enum.map(&String.trim/1) |> Enum.uniq()}
 
-            cond do
-              read_set == [] ->
-                {:error,
-                 Tool.error(:invalid_args, "virtual_overlay workflow step requires read_set", %{
-                   "id" => id,
-                   "field" => "read_set"
-                 })}
+            {:error, :read_set_required} ->
+              {:error,
+               Tool.error(:invalid_args, "virtual_overlay workflow step requires read_set", %{
+                 "id" => id,
+                 "field" => "read_set"
+               })}
 
-              @wildcard in read_set ->
-                {:error,
-                 Tool.error(:invalid_args, "virtual_overlay read_set cannot import wildcard", %{
-                   "id" => id,
-                   "field" => "read_set",
-                   "read_set" => read_set,
-                   "next_actions" => ["provide_bounded_read_set"]
-                 })}
+            {:error, %{index: index, reason: reason, kind: kind}} ->
+              {:error,
+               Tool.error(:invalid_args, workflow_read_set_message(kind), %{
+                 "id" => id,
+                 "field" => "read_set",
+                 "index" => index,
+                 "reason" => reason,
+                 "value" => inspect(Enum.at(read_set, index)),
+                 "next_actions" => ["provide_bounded_read_set"]
+               })}
+          end
 
-              true ->
-                {:ok, read_set}
-            end
-
-          value ->
-            {:error,
-             Tool.error(:invalid_args, "virtual_overlay read_set must be a string or list", %{
-               "id" => id,
-               "field" => "read_set",
-               "value" => inspect(value)
-             })}
-        end
+        value ->
+          {:error,
+           Tool.error(:invalid_args, "virtual_overlay read_set must be a string or list", %{
+             "id" => id,
+             "field" => "read_set",
+             "value" => inspect(value)
+           })}
+      end
+    else
+      {:error,
+       Tool.error(:invalid_args, "virtual_overlay workflow step requires read_set", %{
+         "id" => id,
+         "field" => "read_set"
+       })}
     end
   end
 
   defp normalize_read_set(raw, read_only?, _workspace_mode, _id),
     do: {:ok, normalize_set(field(raw, "read_set", if(read_only?, do: [@wildcard], else: [])))}
+
+  defp workflow_read_set_message(:unbounded_read_set),
+    do: "virtual_overlay read_set cannot import the whole workspace"
+
+  defp workflow_read_set_message(_kind), do: "virtual_overlay read_set entry is invalid"
 
   defp normalize_virtual_commands(raw, "virtual_overlay", id) do
     case field(raw, "virtual_commands") do

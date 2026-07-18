@@ -1,0 +1,35 @@
+{
+  "schema": "pixir.presenter.run", "schema_version": 1, "projection_id": "projection:evidence-mirror-canonical-conflict", "projected_at": "2026-07-10T20:30:06Z",
+  "run": {"id": "dlg-conflict", "delegate_id": "dlg-conflict", "parent_session_id": "parent-conflict", "workflow_id": "wf-conflict", "strategy": "workflow", "mode": "read_only", "title": "Mirror conflict", "evidence_refs": ["e-envelope-conflict"]},
+  "source": {"mode": "reconstructed", "durable_origin": "workspace_log", "as_of_seq": 2, "last_durable_at": "2026-07-10T20:30:05Z", "live_observed_at": null, "freshness": "terminal", "limitations": ["canonical_source_conflict"]},
+  "execution": {"state": "completed", "terminal": true, "basis": "workflow_event_fold", "evidence_refs": ["e-primary-2", "e-mirror-2"]},
+  "liveness": {"state": "not_applicable", "reachable": false, "basis": "terminal_execution", "observed_at": null, "evidence_refs": []},
+  "counts": {"planned_units": 1, "observed_units": 1, "running_units": 0, "completed_units": 1, "attention_units": 1},
+  "graph": {"waves": [["workflow:wf-conflict:step:check"]], "edges": []},
+  "units": [{
+    "logical_id": "workflow:wf-conflict:step:check", "unit_kind": "workflow_step", "materialization": "durable", "label": "check", "agent": null, "execution_kind": "unknown", "workspace_mode": "shared", "posture": "read_only", "depends_on": [],
+    "execution": {"state": "completed", "terminal": true, "basis": "workflow_event_fold", "evidence_refs": ["e-primary-2", "e-mirror-2"]},
+    "liveness": {"state": "not_applicable", "reachable": false, "basis": "terminal_execution", "observed_at": null, "evidence_refs": []},
+    "gate": {"state": "checkpoint_ready", "dependent_safe": true, "basis": "workflow_event", "evidence_refs": ["e-primary-1", "e-mirror-1"]},
+    "advisory": {"present": false, "verdict": "unknown", "mergeable": null, "declared_gate": null, "parse_status": "not_present", "summary": null, "major_count": null, "minor_count": null, "evidence_refs": []},
+    "attempts": [], "artifacts": [],
+    "usage": {"source": "none", "complete": true, "calls": 0, "groups": [], "evidence_refs": [], "limitations": []},
+    "mutation": {"status": "read_only", "observed_paths": [], "observed_semantics": "none", "evidence_refs": ["e-envelope-conflict"], "limitations": []},
+    "attention": {"required": true, "reasons": ["canonical_source_conflict"], "evidence_refs": ["e-primary-1", "e-primary-2", "e-mirror-1", "e-mirror-2"]},
+    "safe_actions": [],
+    "evidence_refs": ["e-envelope-conflict", "e-primary-0", "e-primary-1", "e-primary-2", "e-mirror-1", "e-mirror-2"],
+    "limitations": ["canonical_source_conflict"]
+  }],
+  "usage": {"source": "none", "complete": true, "calls": 0, "groups": [], "evidence_refs": [], "limitations": []},
+  "mutation": {"status": "read_only", "observed_paths": [], "observed_semantics": "none", "evidence_refs": ["e-envelope-conflict"], "limitations": []},
+  "safe_actions": [],
+  "evidence": [
+    {"id": "e-envelope-conflict", "authority": "derived", "source_kind": "terminal_envelope", "session_id": "parent-conflict", "seq": null, "description": "Envelope supplies run identity and read-only mode."},
+    {"id": "e-primary-0", "authority": "canonical", "source_kind": "parent_log", "session_id": "parent-conflict", "seq": 0, "description": "Primary workspace Log defines the workflow graph."},
+    {"id": "e-primary-1", "authority": "canonical", "source_kind": "parent_log", "session_id": "parent-conflict", "seq": 1, "description": "Primary workspace Log records checkpoint_ready."},
+    {"id": "e-primary-2", "authority": "canonical", "source_kind": "parent_log", "session_id": "parent-conflict", "seq": 2, "description": "Primary workspace Log records completed."},
+    {"id": "e-mirror-1", "authority": "canonical", "source_kind": "evidence_mirror", "session_id": "parent-conflict", "seq": 1, "description": "Retained mirror copy conflicts with the primary checkpoint."},
+    {"id": "e-mirror-2", "authority": "canonical", "source_kind": "evidence_mirror", "session_id": "parent-conflict", "seq": 2, "description": "Retained mirror copy conflicts with the primary terminal state."}
+  ],
+  "limitations": ["canonical_source_conflict"]
+}

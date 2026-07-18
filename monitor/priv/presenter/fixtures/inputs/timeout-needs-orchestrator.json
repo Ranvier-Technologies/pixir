@@ -1,0 +1,135 @@
+{
+  "fixture_schema": "pixir.presenter.fixture",
+  "fixture_version": 1,
+  "scenario": "timeout-needs-orchestrator",
+  "source_class": "synthetic_from_workflow_contract",
+  "observed_at": "2026-07-10T19:30:05Z",
+  "inputs": {
+    "terminal_envelope": {
+      "kind": "delegate_result",
+      "delegate_id": "dlg-timeout",
+      "parent_session_id": "parent-timeout",
+      "strategy": "workflow",
+      "mode": "read_only",
+      "workflow_id": "wf-timeout",
+      "status": "partial",
+      "safe_next_actions": [
+        "ask_user_or_orchestrator"
+      ]
+    },
+    "delegate_snapshot": null,
+    "parent_log": [
+      {
+        "seq": 0,
+        "ts": "2026-07-10T19:30:00Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "workflow_started",
+          "workflow_id": "wf-timeout",
+          "workflow_name": "Timeout recovery",
+          "graph": {
+            "steps": [
+              {
+                "id": "worker",
+                "agent": "worker",
+                "depends_on": [],
+                "execution_kind": "subagent",
+                "workspace_mode": "shared",
+                "posture": "read_only"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "seq": 1,
+        "ts": "2026-07-10T19:30:01Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "started",
+          "status": "running",
+          "subagent_id": "sub-timeout",
+          "child_session_id": "child-timeout",
+          "agent": "worker",
+          "delegation_context": {
+            "step_id": "worker"
+          }
+        }
+      },
+      {
+        "seq": 2,
+        "ts": "2026-07-10T19:30:03Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "timed_out",
+          "status": "timed_out",
+          "subagent_id": "sub-timeout",
+          "child_session_id": "child-timeout",
+          "agent": "worker",
+          "reason": "close_failed_after_workflow_timeout",
+          "next_actions": [
+            "inspect_timed_out_step",
+            "ask_user_or_orchestrator"
+          ],
+          "delegation_context": {
+            "step_id": "worker"
+          }
+        }
+      },
+      {
+        "seq": 3,
+        "ts": "2026-07-10T19:30:04Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "checkpoint_decided",
+          "workflow_id": "wf-timeout",
+          "step_id": "worker",
+          "child_session_id": "child-timeout",
+          "checkpoint_status": "needs_orchestrator",
+          "dependent_safe": false,
+          "checkpoint": {
+            "known_limitations": [
+              "subagent_close_failed",
+              "subagent_may_still_be_running"
+            ]
+          }
+        }
+      },
+      {
+        "seq": 4,
+        "ts": "2026-07-10T19:30:05Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "workflow_finished",
+          "workflow_id": "wf-timeout",
+          "status": "partial",
+          "ok": false,
+          "safe_next_actions": [
+            "ask_user_or_orchestrator"
+          ]
+        }
+      }
+    ],
+    "parent_log_origin": "fixture",
+    "child_logs": {
+      "child-timeout": []
+    },
+    "runtime_diagnostics": null,
+    "owner_state": {
+      "state": "stale_handle",
+      "reachable": false,
+      "reason": "durable active evidence without a live owner handle"
+    },
+    "evidence_mirror": null
+  },
+  "completeness": {
+    "parent_log": "complete",
+    "child_logs": "present_empty"
+  },
+  "sanitization": {
+    "absolute_paths_removed": true,
+    "identifiers_replaced": true,
+    "model_content_minimized": true,
+    "secrets_removed": true
+  }
+}

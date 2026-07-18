@@ -1,0 +1,102 @@
+{
+  "schema_version": 2,
+  "profile": "open_responses",
+  "upstream": {
+    "repository": "openresponses/openresponses",
+    "commit": "cd31bc2060a27ee87a05ec97f49c84027eb6c3ba",
+    "tree": "d9c5969e195f1b1b8cd57df37f51e88079ed28ab",
+    "blobs": {
+      "public/openapi/openapi.json": "f8a773dd0a754d01975d6730af4f8ec50b63d593",
+      "src/pages/specification.mdx": "c96a9352ff5961913bddddeef3479a90035ace27",
+      "src/lib/compliance-tests.ts": "b1d972d68bd55cadc7ae920bdd46dbdbf6707e9a",
+      "bin/compliance-test.ts": "1cddf965b8dc65bae27c76db2b1fc826c682945a"
+    }
+  },
+  "request": {
+    "path": "request.json",
+    "sha256": "77c5fc8270adfcb769fc7b5ce5336037cae6c089424e54ff2c86f107e0ce3037",
+    "schema_pointers": [
+      "#/components/schemas/CreateResponseBody",
+      "#/components/schemas/UserMessageItemParam",
+      "#/components/schemas/DeveloperMessageItemParam",
+      "#/components/schemas/SystemMessageItemParam",
+      "#/components/schemas/AssistantMessageItemParam",
+      "#/components/schemas/FunctionToolParam"
+    ]
+  },
+  "fixture": {
+    "path": "text_and_tool_call.sse",
+    "sha256": "781a7e3e47252167c4b626585525c20a63b472f21b03a6188507d801f976cea5",
+    "event_count": 12,
+    "schema_pointers": [
+      "#/components/schemas/ResponseOutputItemAddedStreamingEvent",
+      "#/components/schemas/ResponseContentPartAddedStreamingEvent",
+      "#/components/schemas/ResponseOutputTextDeltaStreamingEvent",
+      "#/components/schemas/ResponseOutputTextDoneStreamingEvent",
+      "#/components/schemas/ResponseContentPartDoneStreamingEvent",
+      "#/components/schemas/ResponseFunctionCallArgumentsDeltaStreamingEvent",
+      "#/components/schemas/ResponseFunctionCallArgumentsDoneStreamingEvent",
+      "#/components/schemas/ResponseOutputItemDoneStreamingEvent",
+      "#/components/schemas/ResponseCompletedStreamingEvent"
+    ]
+  },
+  "error_fixture": {
+    "path": "error_and_failed.sse",
+    "sha256": "c36d91c2a6e0f3cc95a0f770a4ffeb3804b28d647bbdb8c215115140337edb46",
+    "event_count": 2,
+    "schema_pointers": [
+      "#/components/schemas/ErrorStreamingEvent",
+      "#/components/schemas/ErrorPayload",
+      "#/components/schemas/ResponseFailedStreamingEvent",
+      "#/components/schemas/Error"
+    ]
+  },
+  "probe": {
+    "version": 1,
+    "combined_sha256": "20270837368a5d833f1a4e49a60a43f38388ac4e25bf243f5d3e16ee846d499e"
+  },
+  "mechanical_validation": {
+    "validator": "jsonschema Draft 2020-12 against pinned OpenAPI",
+    "request_count": 1,
+    "message_roles": ["assistant", "developer", "system", "user"],
+    "event_count": 12,
+    "error_event_count": 2,
+    "total_event_count": 14,
+    "result": "pass"
+  },
+  "structural_validation": {
+    "profile": "all_pinned_http_sse_roots",
+    "root_count": 24,
+    "reachable_schema_count": 69,
+    "response_resource_required_property_count": 31,
+    "subset": {
+      "path": "schema_subset.json",
+      "sha256": "51efcd4dbda82362587c2a45bab9b075a2c18c1a074868bb810e13d2d947e87a"
+    },
+    "corpus": {
+      "path": "schema_corpus.jsonl",
+      "encoding": "base-event-recipe-v1",
+      "sha256": "d59da37189f085d2c7e51a3b0dc5f82311b2d8a643bf17ab76fda7acd2e6ec8f",
+      "expanded_sha256": "9086178b3da309c81c5442b1370675c7ca1cb7850cd53b79d0e28902ac7ca761",
+      "row_count": 14235,
+      "counts": {
+        "invalid": 12588,
+        "portable": 443,
+        "ignored-safe": 289,
+        "unsupported": 868,
+        "local-limit": 47
+      }
+    },
+    "corpus_bases": {
+      "path": "schema_corpus_bases.json",
+      "sha256": "add8d9a8eeb347b42d5028798a070448e6ad0615873ccd0249610a9f84a28df3"
+    },
+    "manifest": {
+      "path": "schema_manifest.json",
+      "sha256": "384bad2a793b579bb662ba3ab41b546dfb9a9db7d323ff219e19784eedc4764e"
+    },
+    "independent_oracle": "jsonschema Draft 2020-12 against pinned full OpenAPI",
+    "oracle_mismatches": 0,
+    "duplicate_expanded_identity_count": 0
+  }
+}

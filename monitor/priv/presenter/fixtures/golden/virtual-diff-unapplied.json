@@ -1,0 +1,252 @@
+{
+  "schema": "pixir.presenter.run",
+  "schema_version": 1,
+  "projection_id": "projection:virtual-diff-unapplied",
+  "projected_at": "2026-07-10T19:50:03Z",
+  "run": {
+    "id": "dlg-virtual",
+    "delegate_id": "dlg-virtual",
+    "parent_session_id": "parent-virtual",
+    "workflow_id": "wf-virtual",
+    "strategy": "workflow",
+    "mode": "read_only",
+    "title": "Virtual proposal",
+    "evidence_refs": [
+      "e-envelope-virtual"
+    ]
+  },
+  "source": {
+    "mode": "reconstructed",
+    "durable_origin": "fixture",
+    "as_of_seq": 3,
+    "last_durable_at": "2026-07-10T19:50:03Z",
+    "live_observed_at": null,
+    "freshness": "terminal",
+    "limitations": []
+  },
+  "execution": {
+    "state": "completed",
+    "terminal": true,
+    "basis": "workflow_event_fold",
+    "evidence_refs": [
+      "e-parent-3"
+    ]
+  },
+  "liveness": {
+    "state": "not_applicable",
+    "reachable": false,
+    "basis": "terminal_execution",
+    "observed_at": null,
+    "evidence_refs": []
+  },
+  "counts": {
+    "planned_units": 1,
+    "observed_units": 1,
+    "running_units": 0,
+    "completed_units": 1,
+    "attention_units": 1
+  },
+  "graph": {
+    "waves": [
+      [
+        "workflow:wf-virtual:step:propose"
+      ]
+    ],
+    "edges": []
+  },
+  "units": [
+    {
+      "logical_id": "workflow:wf-virtual:step:propose",
+      "unit_kind": "workflow_step",
+      "label": "propose",
+      "agent": "default",
+      "execution_kind": "virtual_overlay",
+      "workspace_mode": "virtual_overlay",
+      "posture": "virtual_scratch",
+      "depends_on": [],
+      "execution": {
+        "state": "completed",
+        "terminal": true,
+        "basis": "workflow_event_fold",
+        "evidence_refs": [
+          "e-parent-2"
+        ]
+      },
+      "liveness": {
+        "state": "not_applicable",
+        "reachable": false,
+        "basis": "terminal_execution",
+        "observed_at": null,
+        "evidence_refs": []
+      },
+      "gate": {
+        "state": "checkpoint_ready",
+        "dependent_safe": true,
+        "basis": "workflow_event",
+        "evidence_refs": [
+          "e-parent-2"
+        ]
+      },
+      "advisory": {
+        "present": false,
+        "verdict": "unknown",
+        "mergeable": null,
+        "declared_gate": null,
+        "parse_status": "not_present",
+        "summary": null,
+        "major_count": null,
+        "minor_count": null,
+        "evidence_refs": []
+      },
+      "attempts": [],
+      "artifacts": [
+        {
+          "kind": "virtual_diff",
+          "version": 1,
+          "hash": "sha256:virtual-only",
+          "status": "produced",
+          "workspace_strategy": "virtual_overlay",
+          "evidence_refs": [
+            "e-parent-2",
+            "e-artifact-virtual"
+          ],
+          "producer_unit_id": "workflow:wf-virtual:step:propose",
+          "source_artifact_hash": "sha256:virtual-only",
+          "application_state": "not_applied",
+          "applied_by_unit_id": null,
+          "correlation": "not_applicable"
+        }
+      ],
+      "usage": {
+        "source": "none",
+        "complete": true,
+        "calls": 0,
+        "groups": [],
+        "evidence_refs": [],
+        "limitations": []
+      },
+      "mutation": {
+        "status": "isolated_only",
+        "observed_paths": [],
+        "observed_semantics": "none",
+        "evidence_refs": [
+          "e-parent-2",
+          "e-artifact-virtual"
+        ],
+        "limitations": []
+      },
+      "safe_actions": [
+        {
+          "id": "apply_virtual_diff",
+          "scope": "workflow:wf-virtual:step:propose",
+          "kind": "apply",
+          "effect": "mutating",
+          "presentation": "informational",
+          "command": null,
+          "evidence_refs": [
+            "e-artifact-virtual"
+          ],
+          "source_field": "virtual_diff_apply_hint"
+        }
+      ],
+      "evidence_refs": [
+        "e-parent-0",
+        "e-parent-2",
+        "e-artifact-virtual"
+      ],
+      "limitations": [
+        "virtual_diff_not_applied"
+      ],
+      "materialization": "durable",
+      "attention": {
+        "required": true,
+        "reasons": [
+          "virtual_diff_unapplied"
+        ],
+        "evidence_refs": [
+          "e-parent-2",
+          "e-artifact-virtual"
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "source": "none",
+    "complete": true,
+    "calls": 0,
+    "groups": [],
+    "evidence_refs": [],
+    "limitations": []
+  },
+  "mutation": {
+    "status": "not_applied",
+    "observed_paths": [],
+    "observed_semantics": "none",
+    "evidence_refs": [
+      "e-parent-2",
+      "e-artifact-virtual"
+    ],
+    "limitations": [
+      "virtual_diff_not_applied"
+    ]
+  },
+  "safe_actions": [
+    {
+      "id": "apply_virtual_diff",
+      "scope": "workflow:wf-virtual:step:propose",
+      "kind": "apply",
+      "effect": "mutating",
+      "presentation": "informational",
+      "command": null,
+      "evidence_refs": [
+        "e-artifact-virtual"
+      ],
+      "source_field": "virtual_diff_apply_hint"
+    }
+  ],
+  "evidence": [
+    {
+      "id": "e-envelope-virtual",
+      "authority": "derived",
+      "source_kind": "terminal_envelope",
+      "session_id": "parent-virtual",
+      "seq": null,
+      "description": "Terminal envelope confirms read-only run mode."
+    },
+    {
+      "id": "e-parent-0",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-virtual",
+      "seq": 0,
+      "description": "Workflow graph defines a virtual overlay proposal."
+    },
+    {
+      "id": "e-parent-2",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-virtual",
+      "seq": 2,
+      "description": "Checkpoint is ready but artifact remains unapplied."
+    },
+    {
+      "id": "e-artifact-virtual",
+      "authority": "artifact",
+      "source_kind": "artifact",
+      "session_id": "parent-virtual",
+      "seq": 2,
+      "description": "Virtual diff requires a separate explicit apply decision."
+    },
+    {
+      "id": "e-parent-3",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-virtual",
+      "seq": 3,
+      "description": "Workflow finished completed without parent mutation."
+    }
+  ],
+  "limitations": [
+    "virtual_diff_not_applied"
+  ]
+}

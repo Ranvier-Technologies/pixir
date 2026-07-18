@@ -6,11 +6,47 @@ defmodule Pixir.Providers.RegistryTest do
   defmodule UnknownProvider do
   end
 
+  defmodule CallableProvider do
+    def stream(_request, _opts), do: {:error, :not_called}
+  end
+
   test "resolve routes claude model ids to Anthropic and everything else to OpenAI" do
     assert Registry.resolve("claude-fable-5").provider == Pixir.Providers.Anthropic
     assert Registry.resolve("gpt-5.5").provider == Pixir.Provider
     assert Registry.resolve("unknown-model").provider == Pixir.Provider
     assert Registry.resolve(nil).provider == Pixir.Provider
+  end
+
+  test "canonical request selection rejects non-callable explicit Provider identities" do
+    selection = fn provider_intent ->
+      %{provider_intent: provider_intent, request: %{}, provider_opts: []}
+    end
+
+    invalid = [
+      {:explicit, nil},
+      {:explicit, false},
+      {:explicit, true},
+      {:explicit, :not_a_real_module_atom},
+      {:direct, Pixir.Issue317UnloadedProvider}
+    ]
+
+    for provider_intent <- invalid do
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_config,
+                  details: %{field: :provider, reason: :invalid_resolved_request}
+                }
+              }} = Registry.resolve_request(selection.(provider_intent), raw_config: %{})
+    end
+
+    assert {:ok, resolved} =
+             Registry.resolve_request(
+               selection.({:explicit, CallableProvider}),
+               raw_config: %{}
+             )
+
+    assert Pixir.Providers.ResolvedProviderRequest.provider(resolved) == CallableProvider
   end
 
   test "entry_for resolves known providers and falls back for unknown modules" do

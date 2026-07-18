@@ -135,13 +135,38 @@ defmodule Pixir.Subagents.ValidateOnlyTest do
   end
 
   test "virtual-overlay children may rehearse but may not really spawn", context do
-    virtual_context = Map.put(context, :virtual_overlay, %{"read_set" => []})
+    virtual_context = Map.put(context, :virtual_overlay, %{"read_set" => ["source.txt"]})
 
     assert {:ok, %{"plan" => _plan}} =
              run_spawn(virtual_context, %{"task" => "inspect", "validate_only" => true})
 
     assert {:error, %{error: %{kind: :permission_denied}}} =
              run_spawn(virtual_context, %{"task" => "spawn"})
+  end
+
+  test "Manager uses the shared read_set reason and index for rehearsal and spawn", context do
+    alias_entry = "lib/../**/*"
+
+    opts =
+      manager_opts(context) ++
+        [
+          permission_mode: :read_only,
+          virtual_overlay: %{read_set: ["source.txt", alias_entry], limits: nil}
+        ]
+
+    args = %{"task" => "inspect", "workspace_mode" => "virtual_overlay"}
+
+    assert {:error, %{error: validation_error}} =
+             Manager.validate_spawn(context.session_id, args, opts)
+
+    assert {:error, %{error: spawn_error}} =
+             Subagents.spawn_agent(context.session_id, args, opts)
+
+    assert validation_error.kind == :invalid_args
+    assert validation_error.details == spawn_error.details
+    assert validation_error.details["field"] == "virtual_overlay.read_set"
+    assert validation_error.details["index"] == 1
+    assert validation_error.details["reason"] == "parent_component"
   end
 
   test "malformed validate_only values are invalid_args and never spawn", context do

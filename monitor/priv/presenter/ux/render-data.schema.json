@@ -1,0 +1,665 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pixir.local/schema/pixir.presenter.render-data.v1.schema.json",
+  "title": "Pixir Presenter deterministic render data v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "projection_schema",
+    "generated_from",
+    "derivations",
+    "presentation",
+    "screens",
+    "variable_manifest"
+  ],
+  "properties": {
+    "schema": {"const": "pixir.presenter.render-data"},
+    "schema_version": {"const": 1},
+    "projection_schema": {"const": "pixir.presenter.run.v1"},
+    "generated_from": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixture_manifest", "scenario_count", "projected_at_max"],
+      "properties": {
+        "fixture_manifest": {"const": "../fixtures/manifest.json"},
+        "scenario_count": {"const": 13},
+        "projected_at_max": {"type": "string", "format": "date-time"}
+      }
+    },
+    "derivations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "display_labels",
+        "run_grouping",
+        "run_sort",
+        "gate_summary",
+        "advisory_summary",
+        "title_fallback",
+        "evidence_join"
+        ,"attempt_display_number"
+      ],
+      "properties": {
+        "display_labels": {"const": "pixir.presenter.ui.display-labels.v1"},
+        "run_grouping": {"const": "pixir.presenter.ui.run-group.v1"},
+        "run_sort": {"const": "pixir.presenter.ui.run-sort.v1"},
+        "gate_summary": {"const": "pixir.presenter.ui.gate-summary.v1"},
+        "advisory_summary": {"const": "pixir.presenter.ui.advisory-summary.v1"},
+        "title_fallback": {"const": "pixir.presenter.ui.title-fallback.v1"},
+        "evidence_join": {"const": "pixir.presenter.ui.evidence-join.v1"}
+        ,"attempt_display_number": {"const": "pixir.presenter.ui.attempt-display-number.v1"}
+      }
+    },
+    "presentation": {"$ref": "#/$defs/presentation"},
+    "screens": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runs", "run_detail", "unit_inspector"],
+      "properties": {
+        "runs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["groups"],
+          "properties": {
+            "groups": {
+              "type": "array",
+              "minItems": 3,
+              "maxItems": 3,
+              "prefixItems": [
+                {"$ref": "#/$defs/needsAttentionGroup"},
+                {"$ref": "#/$defs/activeGroup"},
+                {"$ref": "#/$defs/recentGroup"}
+              ],
+              "items": false
+            }
+          }
+        },
+        "run_detail": {"$ref": "#/$defs/runDetail"},
+        "unit_inspector": {"$ref": "#/$defs/unitInspector"}
+      }
+    },
+    "variable_manifest": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "display"],
+        "properties": {
+          "key": {"type": "string", "minLength": 1},
+          "display": {"type": "string"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "filterOption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "label"],
+      "properties": {
+        "value": {"type": "string", "minLength": 1},
+        "label": {"type": "string", "minLength": 1}
+      }
+    },
+    "presentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filters", "tones"],
+      "properties": {
+        "filters": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy", "execution", "liveness", "source"],
+          "properties": {
+            "strategy": {
+              "type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true,
+              "items": {"enum": [
+                {"value": "workflow", "label": "Workflow"},
+                {"value": "subagents", "label": "Fan-out"},
+                {"value": "unknown", "label": "Unknown"}
+              ]}
+            },
+            "execution": {
+              "type": "array", "minItems": 12, "maxItems": 12, "uniqueItems": true,
+              "items": {"enum": [
+                {"value": "planned", "label": "Planned"},
+                {"value": "queued", "label": "Queued"},
+                {"value": "running", "label": "Running"},
+                {"value": "completed", "label": "Completed"},
+                {"value": "partial", "label": "Partial"},
+                {"value": "failed", "label": "Failed"},
+                {"value": "timed_out", "label": "Timed out"},
+                {"value": "cancelled", "label": "Cancelled"},
+                {"value": "detached", "label": "Detached"},
+                {"value": "closed", "label": "Closed"},
+                {"value": "held", "label": "Held"},
+                {"value": "unknown", "label": "Unknown"}
+              ]}
+            },
+            "liveness": {
+              "type": "array", "minItems": 5, "maxItems": 5, "uniqueItems": true,
+              "items": {"enum": [
+                {"value": "live", "label": "Live"},
+                {"value": "stale_handle", "label": "Stale handle"},
+                {"value": "owner_unavailable", "label": "Owner unavailable"},
+                {"value": "not_applicable", "label": "Not applicable"},
+                {"value": "unknown", "label": "Unknown"}
+              ]}
+            },
+            "source": {
+              "type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true,
+              "items": {"enum": [
+                {"value": "live", "label": "Live"},
+                {"value": "reconstructed", "label": "Reconstructed"},
+                {"value": "mixed", "label": "Mixed"}
+              ]}
+            }
+          }
+        },
+        "tones": {
+          "type": "object",
+          "minProperties": 21,
+          "maxProperties": 21,
+          "propertyNames": {"enum": [
+            "planned", "queued", "running", "completed", "partial", "failed",
+            "timed_out", "cancelled", "detached", "closed", "held", "unknown",
+            "live", "stale_handle", "owner_unavailable", "not_applicable",
+            "checkpoint_ready", "needs_orchestrator", "pass", "stop", "needs_review"
+          ]},
+          "additionalProperties": {"enum": ["good", "warning", "danger", "muted", "active"]}
+        }
+      }
+    },
+    "sourceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scenario_id", "pointer"],
+      "properties": {
+        "scenario_id": {"type": "string", "minLength": 1},
+        "pointer": {"type": "string", "pattern": "^/"}
+      }
+    },
+    "datum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "value", "display", "sources", "derivation"],
+      "properties": {
+        "key": {"type": "string", "minLength": 1},
+        "value": {"type": ["string", "integer", "boolean", "null"]},
+        "display": {"type": "string"},
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/sourceRef"}
+        },
+        "derivation": {"type": ["string", "null"]}
+      }
+    },
+    "gateBucket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "count"],
+      "properties": {
+        "state": {"$ref": "#/$defs/datum"},
+        "count": {"$ref": "#/$defs/datum"}
+      }
+    },
+    "advisoryBucket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "count"],
+      "properties": {
+        "verdict": {"$ref": "#/$defs/datum"},
+        "count": {"$ref": "#/$defs/datum"}
+      }
+    },
+    "advisorySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "present_count",
+        "attention_count",
+        "invalid_count",
+        "highest_verdict",
+        "by_verdict"
+      ],
+      "properties": {
+        "present_count": {"$ref": "#/$defs/datum"},
+        "attention_count": {"$ref": "#/$defs/datum"},
+        "invalid_count": {"$ref": "#/$defs/datum"},
+        "highest_verdict": {"$ref": "#/$defs/datum"},
+        "by_verdict": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/advisoryBucket"}
+        }
+      }
+    },
+    "progress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["completed", "planned", "observed"],
+      "properties": {
+        "completed": {"$ref": "#/$defs/datum"},
+        "planned": {"$ref": "#/$defs/datum"},
+        "observed": {"$ref": "#/$defs/datum"}
+      }
+    },
+    "mutationSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "semantics"],
+      "properties": {
+        "status": {"$ref": "#/$defs/datum"},
+        "semantics": {"$ref": "#/$defs/datum"}
+      }
+    },
+    "runRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario_id",
+        "group",
+        "title",
+        "run_id",
+        "strategy",
+        "execution",
+        "terminal",
+        "liveness",
+        "reachable",
+        "source_mode",
+        "freshness",
+        "sort_at",
+        "progress",
+        "attention_count",
+        "gate_summary",
+        "advisory_summary",
+        "mutation",
+        "limitations"
+      ],
+      "properties": {
+        "scenario_id": {"type": "string", "minLength": 1},
+        "group": {"enum": ["needs_attention", "active", "recent"]},
+        "title": {"$ref": "#/$defs/datum"},
+        "run_id": {"$ref": "#/$defs/datum"},
+        "strategy": {"$ref": "#/$defs/datum"},
+        "execution": {"$ref": "#/$defs/datum"},
+        "terminal": {"$ref": "#/$defs/datum"},
+        "liveness": {"$ref": "#/$defs/datum"},
+        "reachable": {"$ref": "#/$defs/datum"},
+        "source_mode": {"$ref": "#/$defs/datum"},
+        "freshness": {"$ref": "#/$defs/datum"},
+        "sort_at": {"$ref": "#/$defs/datum"},
+        "progress": {"$ref": "#/$defs/progress"},
+        "attention_count": {"$ref": "#/$defs/datum"},
+        "gate_summary": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/gateBucket"}
+        },
+        "advisory_summary": {"$ref": "#/$defs/advisorySummary"},
+        "mutation": {"$ref": "#/$defs/mutationSummary"},
+        "limitations": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/datum"}
+        }
+      }
+    },
+    "runGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label", "rows"],
+      "properties": {
+        "id": {"enum": ["needs_attention", "active", "recent"]},
+        "label": {"type": "string", "minLength": 1},
+        "rows": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/runRow"}
+        }
+      }
+    },
+    "needsAttentionGroup": {
+      "allOf": [
+        {"$ref": "#/$defs/runGroup"},
+        {"properties": {"id": {"const": "needs_attention"}, "label": {"const": "Needs attention"}}}
+      ]
+    },
+    "activeGroup": {
+      "allOf": [
+        {"$ref": "#/$defs/runGroup"},
+        {"properties": {"id": {"const": "active"}, "label": {"const": "Active"}}}
+      ]
+    },
+    "recentGroup": {
+      "allOf": [
+        {"$ref": "#/$defs/runGroup"},
+        {"properties": {"id": {"const": "recent"}, "label": {"const": "Recent"}}}
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "authority", "source_kind", "session_id", "seq", "description"],
+      "properties": {
+        "id": {"$ref": "#/$defs/datum"},
+        "authority": {"$ref": "#/$defs/datum"},
+        "source_kind": {"$ref": "#/$defs/datum"},
+        "session_id": {"$ref": "#/$defs/datum"},
+        "seq": {"$ref": "#/$defs/datum"},
+        "description": {"$ref": "#/$defs/datum"}
+      }
+    },
+    "usageGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "model",
+        "calls",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+        "cached_tokens",
+        "cache_creation_tokens",
+        "cache_read_tokens"
+      ],
+      "properties": {
+        "provider": {"$ref": "#/$defs/datum"},
+        "model": {"$ref": "#/$defs/datum"},
+        "calls": {"$ref": "#/$defs/datum"},
+        "input_tokens": {"$ref": "#/$defs/datum"},
+        "output_tokens": {"$ref": "#/$defs/datum"},
+        "reasoning_tokens": {"$ref": "#/$defs/datum"},
+        "total_tokens": {"$ref": "#/$defs/datum"},
+        "cached_tokens": {"$ref": "#/$defs/datum"},
+        "cache_creation_tokens": {"$ref": "#/$defs/datum"},
+        "cache_read_tokens": {"$ref": "#/$defs/datum"}
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "complete", "calls", "groups", "limitations"],
+      "properties": {
+        "source": {"$ref": "#/$defs/datum"},
+        "complete": {"$ref": "#/$defs/datum"},
+        "calls": {"$ref": "#/$defs/datum"},
+        "groups": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/usageGroup"}
+        },
+        "limitations": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/datum"}
+        }
+      }
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempt_id",
+        "ordinal",
+        "relation",
+        "predecessor_attempt_id",
+        "child_session_id",
+        "status",
+        "started_at",
+        "ended_at",
+        "error_kind",
+        "summary",
+        "materialization",
+        "status_basis",
+        "display_number",
+        "usage",
+        "activity",
+        "limitations"
+      ],
+      "properties": {
+        "attempt_id": {"$ref": "#/$defs/datum"},
+        "ordinal": {"$ref": "#/$defs/datum"},
+        "relation": {"$ref": "#/$defs/datum"},
+        "predecessor_attempt_id": {"$ref": "#/$defs/datum"},
+        "child_session_id": {"$ref": "#/$defs/datum"},
+        "status": {"$ref": "#/$defs/datum"},
+        "started_at": {"$ref": "#/$defs/datum"},
+        "ended_at": {"$ref": "#/$defs/datum"},
+        "error_kind": {"$ref": "#/$defs/datum"},
+        "summary": {"$ref": "#/$defs/datum"},
+        "materialization": {"$ref": "#/$defs/datum"},
+        "status_basis": {"$ref": "#/$defs/datum"},
+        "display_number": {"$ref": "#/$defs/datum"},
+        "usage": {"$ref": "#/$defs/usage"},
+        "activity": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/evidence"}
+        },
+        "limitations": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/datum"}
+        }
+      }
+    },
+    "graphNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "logical_id",
+        "label",
+        "execution_kind",
+        "execution",
+        "gate",
+        "advisory_present",
+        "advisory_verdict",
+        "mutation_status"
+      ],
+      "properties": {
+        "logical_id": {"$ref": "#/$defs/datum"},
+        "label": {"$ref": "#/$defs/datum"},
+        "execution_kind": {"$ref": "#/$defs/datum"},
+        "execution": {"$ref": "#/$defs/datum"},
+        "gate": {"$ref": "#/$defs/datum"},
+        "advisory_present": {"$ref": "#/$defs/datum"},
+        "advisory_verdict": {"$ref": "#/$defs/datum"},
+        "mutation_status": {"$ref": "#/$defs/datum"}
+      }
+    },
+    "graphEdge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to", "state"],
+      "properties": {
+        "from": {"$ref": "#/$defs/datum"},
+        "to": {"$ref": "#/$defs/datum"},
+        "state": {"$ref": "#/$defs/datum"}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "hash",
+        "status",
+        "workspace_strategy",
+        "producer_unit_id",
+        "source_artifact_hash",
+        "application_state",
+        "applied_by_unit_id",
+        "correlation"
+      ],
+      "properties": {
+        "kind": {"$ref": "#/$defs/datum"},
+        "hash": {"$ref": "#/$defs/datum"},
+        "status": {"$ref": "#/$defs/datum"},
+        "workspace_strategy": {"$ref": "#/$defs/datum"},
+        "producer_unit_id": {"$ref": "#/$defs/datum"},
+        "source_artifact_hash": {"$ref": "#/$defs/datum"},
+        "application_state": {"$ref": "#/$defs/datum"},
+        "applied_by_unit_id": {"$ref": "#/$defs/datum"},
+        "correlation": {"$ref": "#/$defs/datum"}
+      }
+    },
+    "selectedUnit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "logical_id",
+        "label",
+        "gate",
+        "advisory_verdict",
+        "mergeable",
+        "declared_gate",
+        "summary",
+        "attempts",
+        "evidence"
+      ],
+      "properties": {
+        "logical_id": {"$ref": "#/$defs/datum"},
+        "label": {"$ref": "#/$defs/datum"},
+        "gate": {"$ref": "#/$defs/datum"},
+        "advisory_verdict": {"$ref": "#/$defs/datum"},
+        "mergeable": {"$ref": "#/$defs/datum"},
+        "declared_gate": {"$ref": "#/$defs/datum"},
+        "summary": {"$ref": "#/$defs/datum"},
+        "attempts": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {"$ref": "#/$defs/attempt"}
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/evidence"}
+        }
+      }
+    },
+    "runDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scenario_id", "selected_unit_id", "run", "graph", "selected_unit", "artifacts"],
+      "properties": {
+        "scenario_id": {"const": "f4-advisory-retry-reconstructed"},
+        "selected_unit_id": {"const": "workflow:wf-f4:step:review"},
+        "run": {"$ref": "#/$defs/runRow"},
+        "graph": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["waves", "nodes", "edges"],
+          "properties": {
+            "waves": {
+              "type": "array",
+              "minItems": 3,
+              "maxItems": 3,
+              "items": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string"}
+              }
+            },
+            "nodes": {
+              "type": "array",
+              "minItems": 3,
+              "maxItems": 3,
+              "items": {"$ref": "#/$defs/graphNode"}
+            },
+            "edges": {
+              "type": "array",
+              "minItems": 3,
+              "maxItems": 3,
+              "items": {"$ref": "#/$defs/graphEdge"}
+            }
+          }
+        },
+        "selected_unit": {"$ref": "#/$defs/selectedUnit"},
+        "artifacts": {
+          "type": "array",
+          "minItems": 2,
+          "items": {"$ref": "#/$defs/artifact"}
+        }
+      }
+    },
+    "inspectorHeader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "logical_id",
+        "label",
+        "agent",
+        "posture",
+        "execution_kind",
+        "workspace_mode",
+        "execution",
+        "liveness",
+        "gate",
+        "advisory_verdict",
+        "mutation_status",
+        "source_mode"
+      ],
+      "properties": {
+        "logical_id": {"$ref": "#/$defs/datum"},
+        "label": {"$ref": "#/$defs/datum"},
+        "agent": {"$ref": "#/$defs/datum"},
+        "posture": {"$ref": "#/$defs/datum"},
+        "execution_kind": {"$ref": "#/$defs/datum"},
+        "workspace_mode": {"$ref": "#/$defs/datum"},
+        "execution": {"$ref": "#/$defs/datum"},
+        "liveness": {"$ref": "#/$defs/datum"},
+        "gate": {"$ref": "#/$defs/datum"},
+        "advisory_verdict": {"$ref": "#/$defs/datum"},
+        "mutation_status": {"$ref": "#/$defs/datum"},
+        "source_mode": {"$ref": "#/$defs/datum"}
+      }
+    },
+    "unitInspector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario_id",
+        "unit_id",
+        "header",
+        "attempts",
+        "attention_reasons",
+        "limitations",
+        "advisory",
+        "safe_actions"
+      ],
+      "properties": {
+        "scenario_id": {"const": "f4-advisory-retry-reconstructed"},
+        "unit_id": {"const": "workflow:wf-f4:step:review"},
+        "header": {"$ref": "#/$defs/inspectorHeader"},
+        "attempts": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {"$ref": "#/$defs/attempt"}
+        },
+        "attention_reasons": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/datum"}
+        },
+        "limitations": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/datum"}
+        },
+        "advisory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mergeable", "declared_gate", "summary"],
+          "properties": {
+            "mergeable": {"$ref": "#/$defs/datum"},
+            "declared_gate": {"$ref": "#/$defs/datum"},
+            "summary": {"$ref": "#/$defs/datum"}
+          }
+        },
+        "safe_actions": {"type": "array", "maxItems": 0}
+      }
+    }
+  }
+}

@@ -106,7 +106,7 @@ reviews:
 
   auto_review:
     enabled: true
-    auto_incremental_review: true
+    auto_incremental_review: false
     drafts: false
 
   # Codex implements, Fable audits, CodeRabbit reviews. Stacked PRs generated

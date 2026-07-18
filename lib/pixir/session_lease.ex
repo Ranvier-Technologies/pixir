@@ -12,9 +12,14 @@ defmodule Pixir.SessionLease do
   to answer "may this process write now?" Snapshot readers do not need a lease. Stale or
   ambiguous leases fail closed until an explicit forced-release path records a diagnostic
   release entry under `.pixir/session_leases/releases/`.
+
+  Lease operations validate the Session id and `lstat` every existing Pixir-owned path
+  component below the trusted Workspace root. Existing and dangling symlinks fail with
+  `unsafe_state_path`. This static preflight does not close a same-UID replacement race
+  between the check and the subsequent file operation.
   """
 
-  alias Pixir.Paths
+  alias Pixir.{Paths, SessionId}
 
   @version 1
   @heartbeat_interval_ms 1_000
@@ -25,40 +30,47 @@ defmodule Pixir.SessionLease do
 
   @doc "Acquire the writer lease for a Session using atomic exclusive file creation."
   @spec acquire(String.t(), keyword()) :: {:ok, lease()} | {:error, map()}
-  def acquire(session_id, opts \\ []) when is_binary(session_id) do
-    workspace = workspace(opts)
+  def acquire(session_id, opts \\ []) do
+    with :ok <- SessionId.validate(session_id) do
+      workspace = workspace(opts)
 
-    with :ok <- maybe_force_release(session_id, workspace, opts) do
-      do_acquire(session_id, workspace)
+      with :ok <- maybe_force_release(session_id, workspace, opts) do
+        do_acquire(session_id, workspace)
+      end
     end
   end
 
   @doc "Return a parseable Session writer lease status snapshot."
   @spec status(String.t(), keyword()) :: {:ok, map()} | {:error, map()}
-  def status(session_id, opts \\ []) when is_binary(session_id) do
-    workspace = workspace(opts)
-    path = Paths.session_lease(session_id, workspace)
+  def status(session_id, opts \\ []) do
+    with :ok <- SessionId.validate(session_id) do
+      workspace = workspace(opts)
+      path = Paths.session_lease(session_id, workspace)
 
-    case read_lease(path) do
-      {:ok, nil} ->
-        {:ok,
-         %{
-           "state" => "available",
-           "session_id" => session_id,
-           "workspace" => workspace,
-           "lease_path" => path,
-           "writer_present" => false
-         }}
+      case read_lease(path, workspace) do
+        {:ok, nil} ->
+          {:ok,
+           %{
+             "state" => "available",
+             "session_id" => session_id,
+             "workspace" => workspace,
+             "lease_path" => path,
+             "writer_present" => false
+           }}
 
-      {:ok, lease} ->
-        {:ok, classify_lease(session_id, workspace, path, lease, now_ms())}
+        {:ok, lease} ->
+          {:ok, classify_lease(session_id, workspace, path, lease, now_ms())}
 
-      {:error, reason} ->
-        {:ok,
-         ambiguous_status(session_id, workspace, path, %{
-           "reason" => inspect(reason),
-           "next_actions" => ambiguous_next_actions()
-         })}
+        {:error, %{error: %{kind: :unsafe_state_path}} = error} ->
+          {:error, error}
+
+        {:error, reason} ->
+          {:ok,
+           ambiguous_status(session_id, workspace, path, %{
+             "reason" => inspect(reason),
+             "next_actions" => ambiguous_next_actions()
+           })}
+      end
     end
   end
 
@@ -69,80 +81,91 @@ defmodule Pixir.SessionLease do
   leases require the matching holder passed as `writer_lease: lease`.
   """
   @spec authorize_append(String.t(), keyword()) :: :ok | {:error, map()}
-  def authorize_append(session_id, opts \\ []) when is_binary(session_id) do
-    workspace = workspace(opts)
+  def authorize_append(session_id, opts \\ []) do
+    with :ok <- SessionId.validate(session_id) do
+      workspace = workspace(opts)
 
-    case Keyword.get(opts, :writer_lease) do
-      nil -> authorize_without_holder(session_id, workspace)
-      %{} = lease -> authorize_holder(session_id, workspace, lease)
-      _other -> {:error, error(:session_writer_ambiguous, "writer lease option is invalid", %{})}
+      case Keyword.get(opts, :writer_lease) do
+        nil ->
+          authorize_without_holder(session_id, workspace)
+
+        %{} = lease ->
+          authorize_holder(session_id, workspace, lease)
+
+        _other ->
+          {:error, error(:session_writer_ambiguous, "writer lease option is invalid", %{})}
+      end
     end
   end
 
   @doc "Refresh the lease heartbeat for a live Session writer."
   @spec heartbeat(lease()) :: {:ok, lease()} | {:error, map()}
   def heartbeat(%{"session_id" => session_id, "workspace" => workspace} = lease) do
-    path = Paths.session_lease(session_id, workspace)
-    expected_holder_id = lease["holder_id"]
+    with :ok <- SessionId.validate(session_id) do
+      path = Paths.session_lease(session_id, workspace)
+      expected_holder_id = lease["holder_id"]
 
-    case read_lease(path) do
-      {:ok, %{"holder_id" => ^expected_holder_id}} ->
-        updated =
-          lease
-          |> Map.put("heartbeat_at_ms", now_ms())
-          |> Map.put("heartbeat_at", now_iso())
+      case read_lease(path, workspace) do
+        {:ok, %{"holder_id" => ^expected_holder_id}} ->
+          updated =
+            lease
+            |> Map.put("heartbeat_at_ms", now_ms())
+            |> Map.put("heartbeat_at", now_iso())
 
-        with :ok <- write_json_atomic(path, updated) do
-          {:ok, updated}
-        end
+          with :ok <- write_json_atomic(path, updated, workspace, :replace) do
+            {:ok, updated}
+          end
 
-      {:ok, nil} ->
-        {:error,
-         error(:session_writer_lost, "Session writer lease disappeared", %{
-           "session_id" => session_id,
-           "workspace" => workspace,
-           "lease_path" => path,
-           "next_actions" => ["stop_current_session", "inspect_session_writer_lease"]
-         })}
+        {:ok, nil} ->
+          {:error,
+           error(:session_writer_lost, "Session writer lease disappeared", %{
+             "session_id" => session_id,
+             "workspace" => workspace,
+             "lease_path" => path,
+             "next_actions" => ["stop_current_session", "inspect_session_writer_lease"]
+           })}
 
-      {:ok, current} ->
-        {:error,
-         error(:session_writer_lost, "Session writer lease is held by another writer", %{
-           "session_id" => session_id,
-           "workspace" => workspace,
-           "lease_path" => path,
-           "current_holder" => safe_holder(current),
-           "expected_holder_id" => expected_holder_id,
-           "next_actions" => ["stop_current_session", "inspect_session_writer_lease"]
-         })}
+        {:ok, current} ->
+          {:error,
+           error(:session_writer_lost, "Session writer lease is held by another writer", %{
+             "session_id" => session_id,
+             "workspace" => workspace,
+             "lease_path" => path,
+             "current_holder" => safe_holder(current),
+             "expected_holder_id" => expected_holder_id,
+             "next_actions" => ["stop_current_session", "inspect_session_writer_lease"]
+           })}
 
-      {:error, reason} ->
-        {:error,
-         error(:session_writer_ambiguous, "Session writer lease could not be refreshed", %{
-           "session_id" => session_id,
-           "workspace" => workspace,
-           "lease_path" => path,
-           "reason" => inspect(reason),
-           "next_actions" => ambiguous_next_actions()
-         })}
+        {:error, %{error: %{kind: :unsafe_state_path}} = error} ->
+          {:error, error}
+
+        {:error, reason} ->
+          {:error,
+           error(:session_writer_ambiguous, "Session writer lease could not be refreshed", %{
+             "session_id" => session_id,
+             "workspace" => workspace,
+             "lease_path" => path,
+             "reason" => inspect(reason),
+             "next_actions" => ambiguous_next_actions()
+           })}
+      end
     end
   end
 
   @doc "Release a writer lease if the current holder still owns it."
-  @spec release(lease() | nil) :: :ok
+  @spec release(lease() | nil) :: :ok | {:error, map()}
   def release(nil), do: :ok
 
   def release(%{"session_id" => session_id, "workspace" => workspace} = lease) do
-    path = Paths.session_lease(session_id, workspace)
-    expected_holder_id = lease["holder_id"]
+    with :ok <- SessionId.validate(session_id) do
+      path = Paths.session_lease(session_id, workspace)
+      expected_holder_id = lease["holder_id"]
 
-    case read_lease(path) do
-      {:ok, %{"holder_id" => ^expected_holder_id}} ->
-        _ = File.rm(path)
-        :ok
-
-      _other ->
-        :ok
+      case read_lease(path, workspace) do
+        {:ok, %{"holder_id" => ^expected_holder_id}} -> remove_lease(path, workspace)
+        {:ok, _other} -> :ok
+        {:error, _error} = error -> error
+      end
     end
   end
 
@@ -154,36 +177,38 @@ defmodule Pixir.SessionLease do
   state, not ordinary startup cleanup.
   """
   @spec force_release(String.t(), keyword()) :: {:ok, map()} | {:error, map()}
-  def force_release(session_id, opts \\ []) when is_binary(session_id) do
-    workspace = workspace(opts)
-    reason = Keyword.get(opts, :reason) || "operator_forced_session_writer_lease_release"
+  def force_release(session_id, opts \\ []) do
+    with :ok <- SessionId.validate(session_id) do
+      workspace = workspace(opts)
+      reason = Keyword.get(opts, :reason) || "operator_forced_session_writer_lease_release"
 
-    with {:ok, status} <- status(session_id, workspace: workspace) do
-      case status["state"] do
-        "available" ->
-          {:ok,
-           %{
-             "released" => false,
-             "state_before" => status,
-             "reason" => "no_writer_lease_present"
-           }}
-
-        "active" ->
-          {:error, status_error(status)}
-
-        state when state in ["stale", "ambiguous"] ->
-          release_record = release_record(session_id, workspace, status, reason)
-
-          with {:ok, release_path} <- write_release_record(workspace, release_record),
-               :ok <- remove_lease(status["lease_path"]) do
+      with {:ok, status} <- status(session_id, workspace: workspace) do
+        case status["state"] do
+          "available" ->
             {:ok,
              %{
-               "released" => true,
+               "released" => false,
                "state_before" => status,
-               "release_record_path" => release_path,
-               "reason" => reason
+               "reason" => "no_writer_lease_present"
              }}
-          end
+
+          "active" ->
+            {:error, status_error(status)}
+
+          state when state in ["stale", "ambiguous"] ->
+            release_record = release_record(session_id, workspace, status, reason)
+
+            with {:ok, release_path} <- write_release_record(workspace, release_record),
+                 :ok <- remove_lease(status["lease_path"], workspace) do
+              {:ok,
+               %{
+                 "released" => true,
+                 "state_before" => status,
+                 "release_record_path" => release_path,
+                 "reason" => reason
+               }}
+            end
+        end
       end
     end
   end
@@ -202,28 +227,31 @@ defmodule Pixir.SessionLease do
   end
 
   defp do_acquire(session_id, workspace) do
-    Paths.ensure_session_leases_dir(workspace)
     path = Paths.session_lease(session_id, workspace)
     lease = new_lease(session_id, workspace, path)
 
-    case File.open(path, [:write, :exclusive], fn io -> IO.write(io, encode!(lease)) end) do
-      {:ok, :ok} ->
-        {:ok, lease}
+    with {:ok, _dir} <-
+           Paths.ensure_state_dir(workspace, Paths.session_leases_dir(workspace)),
+         :ok <- Paths.preflight_state_path(workspace, path, expected: :regular) do
+      case File.open(path, [:write, :exclusive], fn io -> IO.write(io, encode!(lease)) end) do
+        {:ok, :ok} ->
+          {:ok, lease}
 
-      {:error, :eexist} ->
-        with {:ok, status} <- status(session_id, workspace: workspace) do
-          {:error, status_error(status)}
-        end
+        {:error, :eexist} ->
+          with {:ok, status} <- status(session_id, workspace: workspace) do
+            {:error, status_error(status)}
+          end
 
-      {:error, reason} ->
-        {:error,
-         error(:session_writer_ambiguous, "Session writer lease could not be acquired", %{
-           "session_id" => session_id,
-           "workspace" => workspace,
-           "lease_path" => path,
-           "reason" => inspect(reason),
-           "next_actions" => ambiguous_next_actions()
-         })}
+        {:error, reason} ->
+          {:error,
+           error(:session_writer_ambiguous, "Session writer lease could not be acquired", %{
+             "session_id" => session_id,
+             "workspace" => workspace,
+             "lease_path" => path,
+             "reason" => inspect(reason),
+             "next_actions" => ambiguous_next_actions()
+           })}
+      end
     end
   end
 
@@ -240,7 +268,7 @@ defmodule Pixir.SessionLease do
     path = Paths.session_lease(session_id, workspace)
     expected_holder_id = lease["holder_id"]
 
-    case read_lease(path) do
+    case read_lease(path, workspace) do
       {:ok, %{"holder_id" => ^expected_holder_id}} ->
         :ok
 
@@ -263,6 +291,9 @@ defmodule Pixir.SessionLease do
            "expected_holder_id" => expected_holder_id,
            "next_actions" => ambiguous_next_actions()
          })}
+
+      {:error, %{error: %{kind: :unsafe_state_path}} = error} ->
+        {:error, error}
 
       {:error, reason} ->
         {:error,
@@ -388,6 +419,7 @@ defmodule Pixir.SessionLease do
     lease["version"] != @version or
       lease["purpose"] != "session_writer" or
       lease["session_id"] != session_id or
+      not is_binary(lease["workspace"]) or
       Path.expand(lease["workspace"] || "") != workspace or
       not is_binary(lease["holder_id"])
   end
@@ -429,55 +461,98 @@ defmodule Pixir.SessionLease do
   end
 
   defp write_release_record(workspace, record) do
-    dir = Paths.ensure_session_lease_releases_dir(workspace)
-    path = Path.join(dir, release_filename(record["session_id"]))
+    dir = Paths.session_lease_releases_dir(workspace)
 
-    with :ok <- write_json_atomic(path, record) do
+    with {:ok, ^dir} <- Paths.ensure_state_dir(workspace, dir),
+         path = Path.join(dir, release_filename(record["session_id"])),
+         :ok <- write_json_atomic(path, record, workspace, :create) do
       {:ok, path}
     end
   end
 
   defp release_filename(session_id) do
-    safe_id = String.replace(session_id, ~r/[^A-Za-z0-9_.-]/, "_")
+    digest =
+      session_id
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 16)
+
     timestamp = DateTime.utc_now() |> Calendar.strftime("%Y%m%dT%H%M%S")
-    "#{timestamp}-#{safe_id}-#{Base.encode16(:crypto.strong_rand_bytes(3), case: :lower)}.json"
+    "#{timestamp}-#{digest}-#{Base.encode16(:crypto.strong_rand_bytes(3), case: :lower)}.json"
   end
 
-  defp remove_lease(path) do
-    case File.rm(path) do
-      :ok -> :ok
-      {:error, :enoent} -> :ok
-      {:error, reason} -> {:error, write_error(:session_writer_ambiguous, path, reason)}
-    end
-  end
+  defp remove_lease(path, workspace) do
+    case Paths.inspect_state_path(workspace, path, expected: :regular) do
+      {:ok, %{state: :missing}} ->
+        :ok
 
-  defp read_lease(path) do
-    case File.read(path) do
-      {:ok, raw} ->
-        case Jason.decode(raw) do
-          {:ok, lease} when is_map(lease) -> {:ok, lease}
-          {:ok, other} -> {:error, {:invalid_shape, inspect(other)}}
-          {:error, error} -> {:error, {:invalid_json, Exception.message(error)}}
+      {:ok, %{state: :regular}} ->
+        case File.rm(path) do
+          :ok -> :ok
+          {:error, :enoent} -> :ok
+          {:error, reason} -> {:error, write_error(:session_writer_ambiguous, path, reason)}
         end
 
-      {:error, :enoent} ->
-        {:ok, nil}
-
-      {:error, reason} ->
-        {:error, reason}
+      {:error, _error} = error ->
+        error
     end
   end
 
-  defp write_json_atomic(path, value) do
+  defp read_lease(path, workspace) do
+    with {:ok, status} <- Paths.inspect_state_path(workspace, path, expected: :regular) do
+      case status.state do
+        :missing ->
+          {:ok, nil}
+
+        :regular ->
+          case File.read(path) do
+            {:ok, raw} ->
+              case Jason.decode(raw) do
+                {:ok, lease} when is_map(lease) -> {:ok, lease}
+                {:ok, other} -> {:error, {:invalid_shape, inspect(other)}}
+                {:error, error} -> {:error, {:invalid_json, Exception.message(error)}}
+              end
+
+            {:error, :enoent} ->
+              {:ok, nil}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+      end
+    end
+  end
+
+  defp write_json_atomic(path, value, workspace, mode) when mode in [:create, :replace] do
     tmp = path <> ".tmp-" <> Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)
 
-    with :ok <- File.write(tmp, encode!(value)),
+    with :ok <- Paths.preflight_new_state_path(workspace, tmp),
+         :ok <- File.write(tmp, encode!(value)),
+         :ok <- Paths.preflight_state_path(workspace, tmp, expected: :regular),
+         :ok <- preflight_atomic_target(workspace, path, mode),
          :ok <- File.rename(tmp, path) do
       :ok
     else
+      {:error, %{error: _} = error} ->
+        safe_remove_temp(tmp, workspace)
+        {:error, error}
+
       {:error, reason} ->
-        _ = File.rm(tmp)
+        safe_remove_temp(tmp, workspace)
         {:error, write_error(:session_writer_ambiguous, path, reason)}
+    end
+  end
+
+  defp preflight_atomic_target(workspace, path, :create),
+    do: Paths.preflight_new_state_path(workspace, path)
+
+  defp preflight_atomic_target(workspace, path, :replace),
+    do: Paths.preflight_state_path(workspace, path, expected: :regular)
+
+  defp safe_remove_temp(tmp, workspace) do
+    case Paths.inspect_state_path(workspace, tmp, expected: :regular) do
+      {:ok, %{state: :regular}} -> File.rm(tmp)
+      _other -> :ok
     end
   end
 

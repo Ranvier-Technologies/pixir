@@ -11,9 +11,14 @@ defmodule Pixir.Log do
   and a single Session process serializes writes). When a Session writer lease exists,
   appends must present the matching holder; raw append remains available only for cold
   fixture/import paths where no writer lease is active. Ephemeral Events are never logged.
+
+  Public Log operations validate the Session id and `lstat` the Pixir-owned path below
+  the trusted Workspace root before use. Existing and dangling symlinks are refused.
+  The check is a deterministic preflight, not protection against a same-UID process
+  replacing a component between check and use.
   """
 
-  alias Pixir.{Event, Paths, SessionLease}
+  alias Pixir.{Event, Paths, SessionId, SessionLease}
 
   @type history :: [Event.t()]
 
@@ -22,9 +27,31 @@ defmodule Pixir.Log do
   def path(session_id, opts \\ []),
     do: Paths.session_log(session_id, workspace(opts))
 
-  @doc "Whether a Log file exists for this Session yet."
+  @doc "Whether a Log file exists for this Session yet (compatibility boolean)."
   @spec exists?(String.t(), keyword()) :: boolean()
-  def exists?(session_id, opts \\ []), do: File.exists?(path(session_id, opts))
+  def exists?(session_id, opts \\ []) do
+    case exists(session_id, opts) do
+      {:ok, exists?} -> exists?
+      {:error, _error} -> false
+    end
+  end
+
+  @doc """
+  Return structured Session Log existence.
+
+  Unlike `exists?/2`, this preserves invalid-id and unsafe-state-path errors so public
+  callers do not collapse confinement failures into a misleading `not_found` result.
+  """
+  @spec exists(String.t(), keyword()) :: {:ok, boolean()} | {:error, map()}
+  def exists(session_id, opts \\ []) do
+    workspace = workspace(opts)
+
+    with :ok <- SessionId.validate(session_id),
+         {:ok, status} <-
+           Paths.inspect_state_path(workspace, path(session_id, opts), expected: :regular) do
+      {:ok, status.state == :regular}
+    end
+  end
 
   @doc """
   Create a new Session Log from canonical Events in one atomic write (temp + rename).
@@ -35,25 +62,35 @@ defmodule Pixir.Log do
   @spec create_session(String.t(), [Event.t()], keyword()) ::
           {:ok, [Event.t()]} | {:error, map()}
   def create_session(session_id, events, opts \\ []) when is_list(events) do
-    if exists?(session_id, opts) do
-      {:error,
-       %{
-         ok: false,
-         error: %{
-           kind: :already_exists,
-           message: "session log already exists",
-           details: %{session_id: session_id, path: path(session_id, opts)}
-         }
-       }}
-    else
-      file = path(session_id, opts)
-      Paths.ensure_sessions_dir(workspace(opts))
+    with :ok <- SessionId.validate(session_id) do
+      do_create_session(session_id, events, opts)
+    end
+  end
 
-      with :ok <- SessionLease.authorize_append(session_id, opts),
-           {:ok, body} <- encode_lines(events, opts),
-           :ok <- atomic_create(file, body) do
-        {:ok, events}
-      end
+  defp do_create_session(session_id, events, opts) do
+    workspace = workspace(opts)
+    file = path(session_id, opts)
+
+    with {:ok, false} <- exists(session_id, opts),
+         {:ok, _dir} <- Paths.ensure_state_dir(workspace, Paths.sessions_dir(workspace)),
+         :ok <- SessionLease.authorize_append(session_id, opts),
+         {:ok, body} <- encode_lines(events, opts),
+         :ok <- atomic_create(file, body, workspace) do
+      {:ok, events}
+    else
+      {:ok, true} ->
+        {:error,
+         %{
+           ok: false,
+           error: %{
+             kind: :already_exists,
+             message: "session log already exists",
+             details: %{session_id: session_id, path: file}
+           }
+         }}
+
+      {:error, _error} = error ->
+        error
     end
   end
 
@@ -67,40 +104,57 @@ defmodule Pixir.Log do
   def append(event, opts \\ [])
 
   def append(%{type: type} = event, opts) do
-    cond do
-      not Event.canonical?(event) ->
-        {:error,
-         %{
-           ok: false,
-           error: %{
-             kind: :ephemeral_not_loggable,
-             message: "refusing to persist a non-canonical event",
-             details: %{type: type}
-           }
-         }}
+    with :ok <- SessionId.validate(event.session_id) do
+      cond do
+        not Event.canonical?(event) ->
+          {:error,
+           %{
+             ok: false,
+             error: %{
+               kind: :ephemeral_not_loggable,
+               message: "refusing to persist a non-canonical event",
+               details: %{type: type}
+             }
+           }}
 
-      true ->
-        Paths.ensure_sessions_dir(workspace(opts))
+        true ->
+          workspace = workspace(opts)
+          file = path(event.session_id, opts)
 
-        with :ok <- SessionLease.authorize_append(event.session_id, opts),
-             {:ok, line} <- encode_event(event, opts) do
-          case File.write(path(event.session_id, opts), line, [:append]) do
-            :ok ->
-              {:ok, event}
+          with {:ok, _dir} <- Paths.ensure_state_dir(workspace, Paths.sessions_dir(workspace)),
+               :ok <- SessionLease.authorize_append(event.session_id, opts),
+               {:ok, line} <- encode_event(event, opts),
+               :ok <- Paths.preflight_state_path(workspace, file, expected: :regular) do
+            case File.write(file, line, [:append]) do
+              :ok ->
+                {:ok, event}
 
-            {:error, posix} ->
-              {:error,
-               %{
-                 ok: false,
-                 error: %{
-                   kind: :log_write_failed,
-                   message: "could not append to session log",
-                   details: %{reason: posix, path: path(event.session_id, opts)}
-                 }
-               }}
+              {:error, posix} ->
+                {:error,
+                 %{
+                   ok: false,
+                   error: %{
+                     kind: :log_write_failed,
+                     message: "could not append to session log",
+                     details: %{reason: posix, path: file}
+                   }
+                 }}
+            end
           end
-        end
+      end
     end
+  end
+
+  def append(_event, _opts) do
+    {:error,
+     %{
+       ok: false,
+       error: %{
+         kind: :invalid_args,
+         message: "log append requires an Event with a Session id",
+         details: %{}
+       }
+     }}
   end
 
   @doc """
@@ -109,28 +163,7 @@ defmodule Pixir.Log do
   unparseable.
   """
   @spec fold(String.t(), keyword()) :: {:ok, history()} | {:error, map()}
-  def fold(session_id, opts \\ []) do
-    file = path(session_id, opts)
-
-    case File.read(file) do
-      {:error, :enoent} ->
-        {:ok, []}
-
-      {:error, posix} ->
-        {:error,
-         %{
-           ok: false,
-           error: %{
-             kind: :log_read_failed,
-             message: "could not read session log",
-             details: %{reason: posix, path: file}
-           }
-         }}
-
-      {:ok, contents} ->
-        decode_all(contents, file)
-    end
-  end
+  def fold(session_id, opts \\ []), do: read_and_decode(session_id, opts, :seq_order)
 
   @doc """
   Fold the Log in physical append order.
@@ -140,26 +173,44 @@ defmodule Pixir.Log do
   which preserves the canonical seq-ordered replay contract.
   """
   @spec fold_append_order(String.t(), keyword()) :: {:ok, history()} | {:error, map()}
-  def fold_append_order(session_id, opts \\ []) do
+  def fold_append_order(session_id, opts \\ []),
+    do: read_and_decode(session_id, opts, :append_order)
+
+  defp read_and_decode(session_id, opts, order) do
+    with :ok <- SessionId.validate(session_id) do
+      do_read_and_decode(session_id, opts, order)
+    end
+  end
+
+  defp do_read_and_decode(session_id, opts, order) do
+    workspace = workspace(opts)
     file = path(session_id, opts)
 
-    case File.read(file) do
-      {:error, :enoent} ->
-        {:ok, []}
+    with {:ok, status} <- Paths.inspect_state_path(workspace, file, expected: :regular) do
+      case status.state do
+        :missing ->
+          {:ok, []}
 
-      {:error, posix} ->
-        {:error,
-         %{
-           ok: false,
-           error: %{
-             kind: :log_read_failed,
-             message: "could not read session log",
-             details: %{reason: posix, path: file}
-           }
-         }}
+        :regular ->
+          case File.read(file) do
+            {:error, :enoent} ->
+              {:ok, []}
 
-      {:ok, contents} ->
-        decode_all(contents, file, :append_order)
+            {:error, posix} ->
+              {:error,
+               %{
+                 ok: false,
+                 error: %{
+                   kind: :log_read_failed,
+                   message: "could not read session log",
+                   details: %{reason: posix, path: file}
+                 }
+               }}
+
+            {:ok, contents} ->
+              decode_all(contents, file, order)
+          end
+      end
     end
   end
 
@@ -179,15 +230,22 @@ defmodule Pixir.Log do
     end
   end
 
-  defp atomic_create(file, body) do
+  defp atomic_create(file, body, workspace) do
     tmp = file <> ".tmp-" <> Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)
 
-    with :ok <- File.write(tmp, body),
+    with :ok <- Paths.preflight_new_state_path(workspace, tmp),
+         :ok <- File.write(tmp, body),
+         :ok <- Paths.preflight_state_path(workspace, tmp, expected: :regular),
+         :ok <- Paths.preflight_new_state_path(workspace, file),
          :ok <- File.rename(tmp, file) do
       :ok
     else
+      {:error, %{error: _} = error} ->
+        safe_remove_temp(tmp, workspace)
+        {:error, error}
+
       {:error, reason} ->
-        _ = File.rm(tmp)
+        safe_remove_temp(tmp, workspace)
 
         {:error,
          %{
@@ -198,6 +256,13 @@ defmodule Pixir.Log do
              details: %{reason: reason, path: file}
            }
          }}
+    end
+  end
+
+  defp safe_remove_temp(tmp, workspace) do
+    case Paths.inspect_state_path(workspace, tmp, expected: :regular) do
+      {:ok, %{state: :regular}} -> File.rm(tmp)
+      _other -> :ok
     end
   end
 
@@ -240,7 +305,7 @@ defmodule Pixir.Log do
        }}
   end
 
-  defp decode_all(contents, file, order \\ :seq_order) do
+  defp decode_all(contents, file, order) do
     contents
     |> String.split("\n", trim: true)
     |> Enum.reduce_while([], fn line, acc ->

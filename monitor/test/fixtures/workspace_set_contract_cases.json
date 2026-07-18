@@ -1,0 +1,31 @@
+{
+  "positive": [
+    "ws-two-healthy",
+    "ws-zero-observed",
+    "ws-zero-absent",
+    "ws-sid-collision",
+    "ws-truncated-source",
+    "ws-passthrough-parity",
+    "ws-failure-isolation"
+  ],
+  "negative": [
+    "set-frame-missing-workspace",
+    "single-frame-carrying-workspace",
+    "frame-extra-key",
+    "frame-unknown-workspace",
+    "envelope-missing-provenance",
+    "envelope-invalid-provenance",
+    "envelope-extra-key",
+    "shell-wrong-cardinality",
+    "shell-duplicate-key",
+    "shell-unknown-mode",
+    "unscoped-route-in-set-mode",
+    "scoped-route-in-single-mode",
+    "absolute-path-disclosure",
+    "stale-deep-view",
+    "unavailability-is-never-zero",
+    "no-set-sums",
+    "collision-honesty"
+  ],
+  "note": "Cases are executed behaviorally by workspace_set_contract_test.exs; this fixture is not used as a name-membership proxy for coverage."
+}

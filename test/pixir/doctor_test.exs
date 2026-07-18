@@ -1,7 +1,7 @@
 defmodule Pixir.DoctorTest do
   use ExUnit.Case, async: true
 
-  alias Pixir.Doctor
+  alias Pixir.{Doctor, Paths}
 
   test "reports source-install readiness with auth warning and next actions" do
     workspace = tmp_dir("doctor-ready")
@@ -71,6 +71,35 @@ defmodule Pixir.DoctorTest do
     assert workspace_check["details"]["kind"] == "workspace_not_writable"
   end
 
+  test "workspace probe refuses a symlinked sessions directory without touching its target" do
+    workspace = tmp_dir("doctor-symlinked-sessions")
+    outside = tmp_dir("doctor-symlink-target")
+
+    on_exit(fn ->
+      File.rm_rf!(workspace)
+      File.rm_rf!(outside)
+    end)
+
+    sentinel = Path.join(outside, "sentinel")
+    File.write!(sentinel, "unchanged")
+    File.mkdir_p!(Paths.project_root(workspace))
+    File.ln_s!(outside, Paths.sessions_dir(workspace))
+
+    result =
+      Doctor.run(
+        workspace: workspace,
+        binary_path: Path.join(workspace, "missing-pixir"),
+        config_path: Path.join(workspace, "missing-config.json"),
+        auth_status: %{authenticated?: true, kind: :api_key},
+        model: "gpt-5.5"
+      )
+
+    assert check(result, "workspace")["status"] == "failed"
+    assert check(result, "workspace")["details"]["cause"]["kind"] == "unsafe_state_path"
+    assert File.read!(sentinel) == "unchanged"
+    assert File.ls!(outside) == ["sentinel"]
+  end
+
   test "doctor --json reports effective config and warnings for invalid fields" do
     workspace = tmp_dir("doctor-config-effective")
     config_path = Path.join(workspace, "config.json")
@@ -107,7 +136,13 @@ defmodule Pixir.DoctorTest do
   test "invalid config json blocks readiness with structured details" do
     workspace = tmp_dir("doctor-invalid-config")
     config_path = Path.join(workspace, "config.json")
-    File.write!(config_path, "{not-json")
+    endpoint_sentinel = "https://SECRET.example/v1/responses"
+    token_sentinel = "TOKEN_SECRET_SENTINEL"
+
+    File.write!(
+      config_path,
+      ~s({"responses_backend":{"responses_url":"#{endpoint_sentinel}","token":"#{token_sentinel}"})
+    )
 
     result =
       Doctor.run(
@@ -124,6 +159,14 @@ defmodule Pixir.DoctorTest do
     config = check(result, "config")
     assert config["status"] == "failed"
     assert config["details"]["path"] == config_path
+
+    assert %{kind: :invalid_json, position: position} = config["details"]["reason"]
+
+    assert is_integer(position) and position >= 0
+    assert "config" in result["judge_checks"]
+    assert match?({:ok, _}, Jason.encode(result))
+    refute inspect(result) =~ endpoint_sentinel
+    refute inspect(result) =~ token_sentinel
     assert Enum.any?(result["next_actions"], &String.contains?(&1, "remove the file"))
   end
 
