@@ -1,7 +1,7 @@
 defmodule Pixir.EventsTest do
   use ExUnit.Case, async: false
 
-  alias Pixir.{Event, Events}
+  alias Pixir.{Conversation, Event, Events}
 
   setup do
     # Unique session id per test so duplicate-keyed Registry entries don't leak.
@@ -46,5 +46,33 @@ defmodule Pixir.EventsTest do
     assert Events.subscriber_count(sid) == 0
     :ok = Events.subscribe(sid)
     assert Events.subscriber_count(sid) == 1
+  end
+
+  test "invalid Session ids are refused before event Registry operations" do
+    hostile = "../events-registry;PWN"
+
+    for result <- [
+          Events.subscribe(hostile),
+          Conversation.subscribe(hostile),
+          Events.unsubscribe(hostile),
+          Events.subscriber_count(hostile),
+          Events.publish(Event.status(hostile, "must not dispatch"))
+        ] do
+      assert {:error, %{error: %{kind: :invalid_args}} = error} = result
+      refute inspect(error) =~ hostile
+    end
+
+    assert Registry.lookup(Pixir.Events.Registry, hostile) == []
+
+    # Register directly only as an observation seam: a missing validation in
+    # publish/1 would dispatch to this otherwise-unreachable hostile key.
+    assert {:ok, _owner} =
+             Registry.register(Pixir.Events.Registry, hostile, %{only: :all})
+
+    assert {:error, %{error: %{kind: :invalid_args}}} =
+             Events.publish(Event.status(hostile, "still must not dispatch"))
+
+    refute_receive {:pixir_event, _event}, 50
+    Registry.unregister(Pixir.Events.Registry, hostile)
   end
 end

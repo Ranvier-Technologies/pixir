@@ -31,7 +31,7 @@ defmodule Pixir.Session do
 
   use GenServer
 
-  alias Pixir.{Event, Events, Fork, Log, SessionLease}
+  alias Pixir.{Event, Events, Fork, Log, SessionId, SessionLease}
 
   @registry Pixir.Sessions.Registry
   @turn_supervisor Pixir.TurnSupervisor
@@ -61,7 +61,10 @@ defmodule Pixir.Session do
 
   def start_link(opts) do
     id = Keyword.fetch!(opts, :id)
-    GenServer.start_link(__MODULE__, opts, name: via(id))
+
+    with :ok <- SessionId.validate(id) do
+      GenServer.start_link(__MODULE__, opts, name: via(id))
+    end
   end
 
   @doc "Generate a sortable, filename-safe Session id."
@@ -74,23 +77,23 @@ defmodule Pixir.Session do
   # ── public API ────────────────────────────────────────────────────────────
 
   @doc "Snapshot of Session metadata (id, workspace, role, next seq, turn state)."
-  @spec info(String.t()) :: map()
-  def info(session_id), do: GenServer.call(via(session_id), :info)
+  @spec info(String.t()) :: map() | {:error, map()}
+  def info(session_id), do: call_session(session_id, :info)
 
   @doc "Reconstruct History by folding the Log (the source of truth)."
   @spec history(String.t()) :: {:ok, Log.history()} | {:error, map()}
-  def history(session_id), do: GenServer.call(via(session_id), :history)
+  def history(session_id), do: call_session(session_id, :history)
 
   @doc """
   Record a canonical Event: stamp `seq`, append to the Log, then publish. Returns the
   stamped Event, or a structured error if it was not canonical / failed to persist.
   """
   @spec record(String.t(), Event.t()) :: {:ok, Event.t()} | {:error, map()}
-  def record(session_id, event), do: GenServer.call(via(session_id), {:record, event})
+  def record(session_id, event), do: call_session(session_id, {:record, event})
 
   @doc "Publish an ephemeral Event (live display only; never persisted)."
-  @spec emit(String.t(), Event.t()) :: :ok
-  def emit(session_id, event), do: GenServer.cast(via(session_id), {:emit, event})
+  @spec emit(String.t(), Event.t()) :: :ok | {:error, map()}
+  def emit(session_id, event), do: cast_session(session_id, {:emit, event})
 
   @doc """
   Start a Turn: run `turn_fun.(ctx)` in a supervised Task. Returns `{:ok, ref}` or
@@ -101,15 +104,15 @@ defmodule Pixir.Session do
   @spec start_turn(String.t(), (ctx() -> any())) ::
           {:ok, reference()} | {:error, :busy} | {:error, map()}
   def start_turn(session_id, turn_fun) when is_function(turn_fun, 1),
-    do: GenServer.call(via(session_id), {:start_turn, turn_fun})
+    do: call_session(session_id, {:start_turn, turn_fun})
 
   @doc "Kill the currently running Turn's Task, if any."
   @spec interrupt(String.t()) :: :ok | {:error, :no_turn} | {:error, map()}
-  def interrupt(session_id), do: GenServer.call(via(session_id), :interrupt)
+  def interrupt(session_id), do: call_session(session_id, :interrupt)
 
   @doc "Whether a Turn is currently running."
-  @spec turn_running?(String.t()) :: boolean()
-  def turn_running?(session_id), do: GenServer.call(via(session_id), :turn_running?)
+  @spec turn_running?(String.t()) :: boolean() | {:error, map()}
+  def turn_running?(session_id), do: call_session(session_id, :turn_running?)
 
   @doc """
   Hysteresis gate for context-pressure warnings (ADR 0020): returns `{:ok, :warn}`
@@ -122,7 +125,19 @@ defmodule Pixir.Session do
   @spec register_pressure_warning(String.t(), integer() | nil, String.t()) ::
           {:ok, :warn | :already_warned}
   def register_pressure_warning(session_id, checkpoint_to_seq, tier) when is_binary(tier) do
-    GenServer.call(via(session_id), {:register_pressure_warning, checkpoint_to_seq, tier})
+    call_session(session_id, {:register_pressure_warning, checkpoint_to_seq, tier})
+  end
+
+  defp call_session(session_id, message) do
+    with :ok <- SessionId.validate(session_id) do
+      GenServer.call(via(session_id), message)
+    end
+  end
+
+  defp cast_session(session_id, message) do
+    with :ok <- SessionId.validate(session_id) do
+      GenServer.cast(via(session_id), message)
+    end
   end
 
   # ── callbacks ───────────────────────────────────────────────────────────
@@ -135,36 +150,55 @@ defmodule Pixir.Session do
     workspace = Keyword.get(opts, :workspace) || File.cwd!()
     role = Keyword.get(opts, :role, :build)
 
-    with {:writer_lease, {:ok, writer_lease}} <-
-           {:writer_lease,
-            SessionLease.acquire(id,
-              workspace: workspace,
-              force_release?: Keyword.get(opts, :force_release_writer_lease?, false),
-              force_release_reason: Keyword.get(opts, :force_release_reason)
-            )},
-         {:log, {:ok, history}} <- {:log, Log.fold(id, workspace: workspace)} do
-      state =
-        %{
-          id: id,
-          workspace: workspace,
-          role: role,
-          seq: next_seq(history),
-          fork_root_session_id: Fork.fork_root_session_id(history, id),
-          turn: nil,
-          pressure_warnings: MapSet.new(),
-          writer_lease: writer_lease,
-          writer_lease_timer_ref: nil,
-          writer_lease_error: nil
-        }
-        |> schedule_writer_lease_heartbeat()
-
-      {:ok, state}
+    with :ok <- SessionId.validate(id) do
+      init_valid_session(id, workspace, role, opts)
     else
-      {:writer_lease, {:error, err}} ->
-        {:stop, {:session_writer_lease, err}}
+      {:error, error} -> {:stop, {:invalid_session_id, error}}
+    end
+  end
 
-      {:log, {:error, err}} ->
-        {:stop, {:corrupt_log, err}}
+  defp init_valid_session(id, workspace, role, opts) do
+    case Log.exists(id, workspace: workspace) do
+      {:ok, _exists?} -> acquire_and_fold(id, workspace, role, opts)
+      {:error, error} -> {:stop, {:corrupt_log, error}}
+    end
+  end
+
+  defp acquire_and_fold(id, workspace, role, opts) do
+    case SessionLease.acquire(id,
+           workspace: workspace,
+           force_release?: Keyword.get(opts, :force_release_writer_lease?, false),
+           force_release_reason: Keyword.get(opts, :force_release_reason)
+         ) do
+      {:ok, writer_lease} ->
+        case Log.fold(id, workspace: workspace) do
+          {:ok, history} ->
+            state =
+              %{
+                id: id,
+                workspace: workspace,
+                role: role,
+                seq: next_seq(history),
+                fork_root_session_id: Fork.fork_root_session_id(history, id),
+                turn: nil,
+                pressure_warnings: MapSet.new(),
+                writer_lease: writer_lease,
+                writer_lease_timer_ref: nil,
+                writer_lease_error: nil
+              }
+              |> schedule_writer_lease_heartbeat()
+
+            {:ok, state}
+
+          {:error, error} ->
+            # OTP does not invoke terminate/2 when init/1 stops before a state exists.
+            # This explicit cleanup owns the acquire-then-fold failure seam.
+            _ = SessionLease.release(writer_lease)
+            {:stop, {:corrupt_log, error}}
+        end
+
+      {:error, error} ->
+        {:stop, {:session_writer_lease, error}}
     end
   end
 

@@ -1,6 +1,6 @@
 ---
 name: pixir-delegate-codex
-description: "Use when a Codex CLI/Desktop root should fan out subagents, delegate to Pixir workers, run parallel workers, or manage a resident delegation daemon via Pixir Delegate; covers Codex preflight, AGENTS.md, approvals/sandbox, dry-run, daemon start/status/attach/cancel, and closure evidence."
+description: "Use when a Codex CLI/Desktop root should fan out subagents, delegate to Pixir workers, run parallel workers, or manage a resident delegation daemon via Pixir Delegate; covers Codex preflight, AGENTS.md, approvals/sandbox, dry-run, daemon start/status/attach/cancel, closure evidence, and audited single-run execution (one bounded pixir run with an evidence bundle and verdict)."
 ---
 
 # Pixir Delegate Codex — Pixir workers from a Codex root
@@ -194,3 +194,70 @@ Include, briefly:
 - Side effects: files changed or confirmed none; approvals/sandbox posture used.
 - Daemon, if used: foreground daemon status, attach mode observed, fallback or
   owner_unavailable states, and stop/status result if stopped.
+
+## Audited single-run mode
+
+Use this mode when the root delegates ONE bounded task as a plain `pixir` or
+`pixir resume` invocation instead of a delegate fan-out, and wants an
+independent, auditable Pixir Log plus an artifact bundle. The root remains the
+meta-orchestrator and auditor: assistant summaries are not primary evidence,
+and if a summary contradicts the Pixir Logs or diagnostic output, trust the
+Logs and classify the summary as narrative error.
+
+Good fits: dogfooding on real bounded tasks, evidence-led research or repo
+audits, and any run where an independent Log matters. Do not use it for
+trivial shell commands, unbounded work without a clear artifact, or commits
+and pushes without a separate root review.
+
+Create one local bundle per delegated run:
+
+```text
+/tmp/pixir-run-<timestamp>-<slug>/
+├── INDEX.md
+├── prompt.md          # objective, scope, output path under artifacts/,
+│                      # constraints, what not to change, completion signal
+├── command.txt        # the exact command the root will run
+├── session-id.txt
+├── doctor.json
+├── session-diagnosis.json
+├── inspect-replay.json
+├── tree.json
+├── artifacts/
+└── codex-verdict.md
+```
+
+Preflight is the same as above (absolute binary path, `doctor --json`,
+readiness classification). Launch with a prompt that forces durable output
+into the bundle:
+
+```bash
+BUNDLE=/tmp/pixir-run-<timestamp>-<slug>   # the bundle dir laid out above
+mkdir -p "$BUNDLE/artifacts"
+<PIXIR_BIN> "$(cat "$BUNDLE/prompt.md")"
+<PIXIR_BIN> resume <session-id> "$(cat "$BUNDLE/prompt.md")"   # continuing a Session
+```
+
+Capture the Session id into `session-id.txt` (if not obvious from stdout,
+locate it under `.pixir/sessions/` by timestamp and confirm against the Log).
+After the run, collect the audit evidence:
+
+```bash
+<PIXIR_BIN> diagnose session <session-id> --json > "$BUNDLE/session-diagnosis.json"
+<PIXIR_BIN> inspect-replay <session-id> --json > "$BUNDLE/inspect-replay.json"
+<PIXIR_BIN> tree <session-id> --json > "$BUNDLE/tree.json"
+```
+
+Routine audit collection stays in this Skill; if any audit command reveals
+missing tool output, replay drift, inconsistent lifecycle state, or
+UI/projection disagreement, switch to `pixir-diagnostics` and classify the
+incident before accepting the run.
+
+Close with `codex-verdict.md`: a status of `ACCEPT`, `ACCEPT_WITH_WARNINGS`,
+`REJECT`, or `INCONCLUSIVE`; the evidence paths; and a claims table where each
+claim is `proved`, `weak`, `missing`, or `contradicted`. Do not mark the run
+accepted unless the task artifact exists and the diagnostic evidence is
+adequate for the requested work.
+
+Boundaries: the root decides commits; the child may create or modify files
+only within the requested scope; never push to upstream remotes as part of an
+audited run; prefer small runs and split large objectives into waves.

@@ -1,0 +1,123 @@
+{
+  "fixture_schema": "pixir.presenter.fixture",
+  "fixture_version": 1,
+  "scenario": "wave3-transport-failure-reconstructed",
+  "source_class": "real_minimized",
+  "observed_at": "2026-07-10T18:31:41.544246Z",
+  "inputs": {
+    "terminal_envelope": {
+      "kind": "delegate_result",
+      "delegate_id": "dlg-wave3",
+      "parent_session_id": "parent-wave3",
+      "strategy": "subagents",
+      "mode": "bounded_write",
+      "status": "failed",
+      "children": [
+        {
+          "subagent_id": "sub-worker",
+          "child_session_id": "child-wave3",
+          "agent": "worker",
+          "status": "failed",
+          "workspace_mode": "shared",
+          "summary": "WebSocket closed before response.completed.",
+          "next_actions": [
+            "inspect_child_session_log",
+            "rerun_subagent_after_fixing_provider_error"
+          ],
+          "recovery": {
+            "kind": "resume_suggested",
+            "reason": "terminal transport error: websocket_closed"
+          },
+          "resume_command": "pixir resume child-wave3 \"<operator prompt>\"",
+          "diagnose_command": "pixir diagnose session child-wave3 --json"
+        }
+      ]
+    },
+    "delegate_snapshot": null,
+    "parent_log": [
+      {
+        "seq": 0,
+        "ts": "2026-07-10T18:28:40.721108Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "started",
+          "status": "running",
+          "subagent_id": "sub-worker",
+          "child_session_id": "child-wave3",
+          "agent": "worker",
+          "workspace_mode": "shared"
+        }
+      },
+      {
+        "seq": 1,
+        "ts": "2026-07-10T18:31:41.544246Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "failed",
+          "status": "failed",
+          "subagent_id": "sub-worker",
+          "child_session_id": "child-wave3",
+          "agent": "worker",
+          "workspace_mode": "shared",
+          "summary": "WebSocket closed before response.completed.",
+          "reason": "provider_error"
+        }
+      }
+    ],
+    "parent_log_origin": "fixture",
+    "child_logs": {
+      "child-wave3": [
+        {
+          "seq": 1,
+          "ts": "2026-07-10T18:28:46.781245Z",
+          "type": "provider_usage",
+          "data": {
+            "model": "gpt-5.6-sol",
+            "usage_summary": {
+              "input_tokens": 4415,
+              "output_tokens": 107,
+              "reasoning_tokens": 75,
+              "total_tokens": 4522,
+              "cached_tokens": 0,
+              "cache": {
+                "creation_tokens": 0,
+                "read_tokens": 0
+              }
+            }
+          }
+        },
+        {
+          "seq": 107,
+          "ts": "2026-07-10T18:31:41.537647Z",
+          "type": "turn_failed",
+          "data": {
+            "terminal_status": "provider_error",
+            "error_kind": "websocket_closed",
+            "error_message": "WebSocket closed before response.completed."
+          }
+        }
+      ]
+    },
+    "runtime_diagnostics": null,
+    "owner_state": {
+      "state": "snapshot_only",
+      "reachable": false,
+      "capabilities": [
+        "durable_status",
+        "snapshot_attach"
+      ]
+    },
+    "evidence_mirror": null
+  },
+  "completeness": {
+    "terminal_envelope": "minimized",
+    "parent_log": "complete_for_contract_scenario",
+    "child_logs": "provider_usage_sampled"
+  },
+  "sanitization": {
+    "absolute_paths_removed": true,
+    "identifiers_replaced": true,
+    "model_content_minimized": true,
+    "secrets_removed": true
+  }
+}

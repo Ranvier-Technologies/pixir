@@ -1,0 +1,40 @@
+{
+  "fixture_schema": "pixir.presenter.fixture",
+  "fixture_version": 1,
+  "scenario": "evidence-mirror-canonical-conflict",
+  "source_class": "synthetic_from_projection_contract",
+  "observed_at": "2026-07-10T20:30:06Z",
+  "inputs": {
+    "terminal_envelope": {"kind": "delegate_result", "delegate_id": "dlg-conflict", "parent_session_id": "parent-conflict", "strategy": "workflow", "mode": "read_only", "status": "completed", "workflow_id": "wf-conflict"},
+    "delegate_snapshot": null,
+    "parent_log": [
+      {"seq": 0, "ts": "2026-07-10T20:30:00Z", "type": "workflow_event", "data": {"kind": "workflow_started", "workflow_id": "wf-conflict", "workflow_name": "Mirror conflict", "graph": {"steps": [{"id": "check", "agent": null, "depends_on": [], "execution_kind": "unknown", "workspace_mode": "shared", "posture": "read_only"}]}}},
+      {"seq": 1, "ts": "2026-07-10T20:30:04Z", "type": "workflow_event", "data": {"kind": "checkpoint_decided", "workflow_id": "wf-conflict", "step_id": "check", "checkpoint_status": "checkpoint_ready", "dependent_safe": true}},
+      {"seq": 2, "ts": "2026-07-10T20:30:05Z", "type": "workflow_event", "data": {"kind": "workflow_finished", "workflow_id": "wf-conflict", "status": "completed", "ok": true}}
+    ],
+    "parent_log_origin": "workspace_log",
+    "child_logs": {},
+    "runtime_diagnostics": null,
+    "owner_state": {"state": "snapshot_only", "reachable": false},
+    "evidence_mirror": {
+      "status": "source_diverged_mirror_retained",
+      "captured_at": "2026-07-10T20:30:06Z",
+      "logs": [
+        {
+          "role": "parent",
+          "session_id": "parent-conflict",
+          "status": "source_diverged_mirror_retained",
+          "reported_source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "reported_mirror_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "events": [
+            {"seq": 0, "ts": "2026-07-10T20:30:00Z", "type": "workflow_event", "data": {"kind": "workflow_started", "workflow_id": "wf-conflict", "workflow_name": "Mirror conflict", "graph": {"steps": [{"id": "check", "agent": null, "depends_on": [], "execution_kind": "unknown", "workspace_mode": "shared", "posture": "read_only"}]}}},
+            {"seq": 1, "ts": "2026-07-10T20:30:04Z", "type": "workflow_event", "data": {"kind": "checkpoint_decided", "workflow_id": "wf-conflict", "step_id": "check", "checkpoint_status": "failed", "dependent_safe": false}},
+            {"seq": 2, "ts": "2026-07-10T20:30:05Z", "type": "workflow_event", "data": {"kind": "workflow_finished", "workflow_id": "wf-conflict", "status": "failed", "ok": false}}
+          ]
+        }
+      ]
+    }
+  },
+  "completeness": {"terminal_envelope": "complete_for_contract_scenario", "parent_log": "complete", "child_logs": "not_applicable", "evidence_mirror": "complete"},
+  "sanitization": {"absolute_paths_removed": true, "identifiers_replaced": true, "model_content_minimized": true, "secrets_removed": true}
+}

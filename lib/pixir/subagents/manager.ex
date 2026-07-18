@@ -10,6 +10,7 @@ defmodule Pixir.Subagents.Manager do
     Log,
     Paths,
     Session,
+    SessionId,
     SessionSupervisor,
     Subagents,
     Subagents.DelegationContext,
@@ -17,14 +18,15 @@ defmodule Pixir.Subagents.Manager do
     Subagents.WorkspaceSnapshot,
     Tool,
     Turn,
+    VirtualOverlay,
     WorkspaceStrategy
   }
 
   alias Pixir.Permissions.WritePolicy
-  alias Pixir.Provider.HostedTools
+  alias Pixir.Provider.{HostedTools, OutputTruncation, OutputTruncationSummary}
 
   @server __MODULE__
-  @manager_child_event_types ~w(assistant_message status turn_failed)a
+  @manager_child_event_types ~w(assistant_message provider_usage status turn_failed)a
   @retry_jitter_ceiling_ms 60_000
   # Erlang timers reject delays above 2^32 - 1 ms (~49.7 days); clamp every
   # Process.send_after delay so an oversized accepted value degrades to the
@@ -52,7 +54,9 @@ defmodule Pixir.Subagents.Manager do
   def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: @server)
 
   def spawn_agent(parent_session_id, args, opts \\ []) do
-    GenServer.call(@server, {:spawn_agent, parent_session_id, args, opts}, 30_000)
+    with :ok <- SessionId.validate(parent_session_id) do
+      GenServer.call(@server, {:spawn_agent, parent_session_id, args, opts}, 30_000)
+    end
   end
 
   @doc false
@@ -64,40 +68,57 @@ defmodule Pixir.Subagents.Manager do
   end
 
   def send_input(parent_session_id, subagent_id, prompt, opts \\ []) do
-    GenServer.call(@server, {:send_input, parent_session_id, subagent_id, prompt, opts}, 30_000)
+    with :ok <- SessionId.validate(parent_session_id) do
+      GenServer.call(@server, {:send_input, parent_session_id, subagent_id, prompt, opts}, 30_000)
+    end
   end
 
   def wait(parent_session_id, ids, timeout_ms, opts \\ []) do
-    timeout_ms = clamp_timer_ms(timeout_ms, @erlang_timer_max_ms - 1_000)
+    with :ok <- SessionId.validate(parent_session_id) do
+      timeout_ms = clamp_timer_ms(timeout_ms, @erlang_timer_max_ms - 1_000)
 
-    GenServer.call(@server, {:wait, parent_session_id, ids, timeout_ms, opts}, timeout_ms + 1_000)
+      GenServer.call(
+        @server,
+        {:wait, parent_session_id, ids, timeout_ms, opts},
+        timeout_ms + 1_000
+      )
+    end
   catch
     :exit, {:timeout, _} ->
       {:error, Tool.error(:timeout, "wait_agent timed out", %{timeout_ms: timeout_ms})}
   end
 
   def wait_outcome(parent_session_id, ids, timeout_ms, opts \\ []) do
-    timeout_ms = clamp_timer_ms(timeout_ms, @erlang_timer_max_ms - 1_000)
+    with :ok <- SessionId.validate(parent_session_id) do
+      timeout_ms = clamp_timer_ms(timeout_ms, @erlang_timer_max_ms - 1_000)
 
-    GenServer.call(
-      @server,
-      {:wait_outcome, parent_session_id, ids, timeout_ms, opts},
-      timeout_ms + 1_000
-    )
+      GenServer.call(
+        @server,
+        {:wait_outcome, parent_session_id, ids, timeout_ms, opts},
+        timeout_ms + 1_000
+      )
+    end
   catch
     :exit, {:timeout, _} ->
       {:error, Tool.error(:timeout, "wait_agent timed out", %{timeout_ms: timeout_ms})}
   end
 
   def close(parent_session_id, subagent_id, opts \\ []) do
-    GenServer.call(@server, {:close, parent_session_id, subagent_id, opts}, 30_000)
+    with :ok <- SessionId.validate(parent_session_id) do
+      GenServer.call(@server, {:close, parent_session_id, subagent_id, opts}, 30_000)
+    end
   end
 
-  def list(parent_session_id, opts \\ []),
-    do: GenServer.call(@server, {:list, parent_session_id, opts})
+  def list(parent_session_id, opts \\ []) do
+    with :ok <- SessionId.validate(parent_session_id) do
+      GenServer.call(@server, {:list, parent_session_id, opts})
+    end
+  end
 
   def diagnostics(parent_session_id, opts \\ []) do
-    GenServer.call(@server, {:diagnostics, parent_session_id, opts})
+    with :ok <- SessionId.validate(parent_session_id) do
+      GenServer.call(@server, {:diagnostics, parent_session_id, opts})
+    end
   catch
     :exit, {:noproc, _} ->
       {:error,
@@ -497,7 +518,7 @@ defmodule Pixir.Subagents.Manager do
 
     with true <- is_binary(child_sid) and child_sid != "",
          true <- is_binary(child_workspace) and child_workspace != "",
-         true <- Log.exists?(child_sid, workspace: child_workspace),
+         {:ok, true} <- Log.exists(child_sid, workspace: child_workspace),
          {:ok, history} <- Log.fold(child_sid, workspace: child_workspace) do
       not virtual_retry_evidence?(history)
     else
@@ -565,7 +586,8 @@ defmodule Pixir.Subagents.Manager do
     agent_name = Map.get(args, "agent", "default")
     agents_opts = Keyword.get(opts, :agents_opts, [])
 
-    with {:ok, agent_config} <- Agents.get(agent_name, workspace, agents_opts) do
+    with :ok <- SessionId.validate(parent_sid),
+         {:ok, agent_config} <- Agents.get(agent_name, workspace, agents_opts) do
       limits = Subagents.default_limits()
       max_threads = Map.get(args, "max_threads", limits.max_threads)
       max_depth = Map.get(args, "max_depth", limits.max_depth)
@@ -672,6 +694,12 @@ defmodule Pixir.Subagents.Manager do
       last_seen_child_event_seq: nil,
       last_seen_child_event_type: nil,
       last_seen_child_event_ts: nil,
+      output_truncation: nil,
+      output_warning_count: 0,
+      output_warnings: [],
+      output_warning_keys: MapSet.new(),
+      output_warning_reasons: MapSet.new(),
+      output_latest_warning_order_key: nil,
       created_at: now(),
       updated_at: now()
     })
@@ -794,22 +822,9 @@ defmodule Pixir.Subagents.Manager do
     read_set = manager_virtual_overlay_field(config, :read_set, "read_set")
     limits = manager_virtual_overlay_field(config, :limits, "limits")
 
-    cond do
-      not (is_list(read_set) and read_set != [] and
-               Enum.all?(read_set, &manager_virtual_read_set_entry?/1)) ->
-        {:error,
-         Tool.error(:invalid_args, "virtual_overlay requires a non-empty read_set", %{
-           "field" => "virtual_overlay.read_set"
-         })}
-
-      not (is_nil(limits) or is_map(limits)) ->
-        {:error,
-         Tool.error(:invalid_args, "virtual_overlay limits must be a map", %{
-           "field" => "virtual_overlay.limits"
-         })}
-
-      true ->
-        {:ok, %{read_set: read_set, limits: limits}}
+    with :ok <- manager_validate_read_set(read_set),
+         :ok <- manager_validate_virtual_limits(limits) do
+      {:ok, %{read_set: read_set, limits: limits}}
     end
   end
 
@@ -820,15 +835,44 @@ defmodule Pixir.Subagents.Manager do
      })}
   end
 
+  defp manager_validate_read_set(read_set) do
+    case VirtualOverlay.validate_read_set(read_set) do
+      :ok ->
+        :ok
+
+      {:error, %{index: index, reason: reason}} ->
+        {:error,
+         Tool.error(:invalid_args, "virtual_overlay read_set entry is unsafe", %{
+           "field" => "virtual_overlay.read_set",
+           "index" => index,
+           "reason" => reason
+         })}
+
+      {:error, _reason} ->
+        {:error,
+         Tool.error(:invalid_args, "virtual_overlay requires a non-empty read_set", %{
+           "field" => "virtual_overlay.read_set"
+         })}
+    end
+  end
+
+  defp manager_validate_virtual_limits(limits) do
+    if is_nil(limits) or is_map(limits) do
+      :ok
+    else
+      {:error,
+       Tool.error(:invalid_args, "virtual_overlay limits must be a map", %{
+         "field" => "virtual_overlay.limits"
+       })}
+    end
+  end
+
   defp manager_virtual_overlay_field(config, atom_key, string_key) do
     case Map.fetch(config, atom_key) do
       {:ok, value} -> value
       :error -> Map.get(config, string_key)
     end
   end
-
-  defp manager_virtual_read_set_entry?(value),
-    do: is_binary(value) and String.trim(value) != ""
 
   defp normalize_subagent_workspace_mode(workspace_mode, nil),
     do: WorkspaceStrategy.normalize_runtime_mode(workspace_mode, "subagent")
@@ -909,6 +953,12 @@ defmodule Pixir.Subagents.Manager do
             elapsed_ms: nil,
             timeout_reason: nil,
             next_actions: [],
+            output_truncation: nil,
+            output_warning_count: 0,
+            output_warnings: [],
+            output_warning_keys: MapSet.new(),
+            output_warning_reasons: MapSet.new(),
+            output_latest_warning_order_key: nil,
             updated_at: now()
         }
 
@@ -1125,13 +1175,40 @@ defmodule Pixir.Subagents.Manager do
 
   # ── child event handling ────────────────────────────────────────────────
 
+  defp handle_child_event(parent_sid, id, %{type: :provider_usage} = event, state) do
+    {:ok, agent} = fetch_agent(state, parent_sid, id)
+    projection = OutputTruncationSummary.project(event)
+    warning = OutputTruncationSummary.warning(event)
+
+    agent =
+      if projection["call_role"] == "final_answer" do
+        %{agent | output_truncation: projection}
+      else
+        agent
+      end
+
+    agent = if warning, do: track_child_warning(agent, event, warning), else: agent
+    {:noreply, put_agent(state, %{agent | updated_at: now()})}
+  end
+
   defp handle_child_event(
          parent_sid,
          id,
-         %{type: :assistant_message, data: %{"text" => text} = data},
+         %{type: :assistant_message, data: %{"text" => text} = data} = event,
          state
        ) do
     {:ok, agent} = fetch_agent(state, parent_sid, id)
+
+    agent =
+      case OutputTruncationSummary.assistant_fallback(event) do
+        {:ok, projection, warning} ->
+          agent
+          |> Map.put(:output_truncation, projection)
+          |> track_child_warning(event, warning)
+
+        :error ->
+          agent
+      end
 
     summary =
       if partial_assistant?(data) do
@@ -1226,6 +1303,42 @@ defmodule Pixir.Subagents.Manager do
   end
 
   defp handle_child_event(_parent_sid, _id, _event, state), do: {:noreply, state}
+
+  defp track_child_warning(agent, event, warning) do
+    key = {event.session_id, warning["provider_usage_event_id"]}
+    order_key = {warning["provider_usage_seq"], warning["provider_usage_event_id"]}
+
+    cond do
+      MapSet.member?(agent.output_warning_keys, key) ->
+        agent
+
+      not is_nil(agent.output_latest_warning_order_key) and
+          order_key <= agent.output_latest_warning_order_key ->
+        agent
+
+      MapSet.size(agent.output_warning_keys) < 64 ->
+        child_warning =
+          warning
+          |> Map.put("child_session_id", event.session_id)
+
+        %{
+          agent
+          | output_warning_count: agent.output_warning_count + 1,
+            output_warnings: agent.output_warnings ++ [child_warning],
+            output_warning_keys: MapSet.put(agent.output_warning_keys, key),
+            output_warning_reasons: MapSet.put(agent.output_warning_reasons, warning["reason"]),
+            output_latest_warning_order_key: order_key
+        }
+
+      true ->
+        %{
+          agent
+          | output_warning_count: agent.output_warning_count + 1,
+            output_warning_reasons: MapSet.put(agent.output_warning_reasons, warning["reason"]),
+            output_latest_warning_order_key: order_key
+        }
+    end
+  end
 
   defp finish_completed_agent(_parent_sid, agent, state) do
     if Subagents.terminal?(agent.status) do
@@ -1529,6 +1642,7 @@ defmodule Pixir.Subagents.Manager do
   defp restored_agent(parent_sid, data, workspace) do
     terminal = restored_terminal(data)
     task = data["task"] || ""
+    output = OutputTruncationSummary.normalize_child_output(data)
 
     %{
       id: data["id"] || data["subagent_id"],
@@ -1546,6 +1660,12 @@ defmodule Pixir.Subagents.Manager do
       source_status: data["status"],
       status: terminal.status,
       summary: terminal.summary,
+      output_truncation: restored_output_truncation(output, terminal.status),
+      output_warning_count: output["output_warning_count"],
+      output_warnings: output["output_warnings"],
+      output_warning_keys: restored_warning_keys(output),
+      output_warning_reasons: MapSet.new(output["output_warning_reasons"]),
+      output_latest_warning_order_key: output["output_latest_warning_order_key"],
       depth: data["depth"] || 1,
       max_threads: 0,
       max_depth: data["max_depth"] || 0,
@@ -2056,6 +2176,12 @@ defmodule Pixir.Subagents.Manager do
         "workspace_mode" => agent.workspace_mode,
         "workspace" => agent.child_workspace || agent.workspace,
         "summary" => agent.summary,
+        "output_truncation" => agent.output_truncation,
+        "output_warning_count" => agent.output_warning_count,
+        "output_warnings" => agent.output_warnings,
+        "output_warning_reasons" =>
+          agent.output_warning_reasons |> MapSet.to_list() |> Enum.sort(),
+        "output_warnings_truncated" => agent.output_warning_count > length(agent.output_warnings),
         "parent_log_path" => parent_log_path(agent)
       }
       |> maybe_put_event("index", Map.get(agent, :index))
@@ -2225,6 +2351,11 @@ defmodule Pixir.Subagents.Manager do
       "task" => agent.task,
       "status" => agent.status,
       "summary" => agent.summary,
+      "output_truncation" => agent.output_truncation,
+      "output_warning_count" => agent.output_warning_count,
+      "output_warnings" => agent.output_warnings,
+      "output_warning_reasons" => agent.output_warning_reasons |> MapSet.to_list() |> Enum.sort(),
+      "output_warnings_truncated" => agent.output_warning_count > length(agent.output_warnings),
       "depth" => agent.depth,
       "max_depth" => agent.max_depth,
       "timeout_ms" => agent.timeout_ms,
@@ -2341,6 +2472,29 @@ defmodule Pixir.Subagents.Manager do
 
   defp partial_assistant?(%{"metadata" => %{"partial" => true}}), do: true
   defp partial_assistant?(_data), do: false
+
+  defp restored_output_truncation(%{"output_truncation" => evidence}, _status)
+       when is_map(evidence),
+       do: evidence
+
+  defp restored_output_truncation(_output, "completed"),
+    do: OutputTruncation.to_event_data(OutputTruncation.unknown(:historical_evidence_absent))
+
+  defp restored_output_truncation(_output, _status), do: nil
+
+  defp restored_warning_keys(data) do
+    data
+    |> Map.get("output_warnings", [])
+    |> Enum.reduce(MapSet.new(), fn warning, keys ->
+      case {warning["child_session_id"], warning["provider_usage_event_id"]} do
+        {sid, event_id} when is_binary(sid) and is_binary(event_id) ->
+          MapSet.put(keys, {sid, event_id})
+
+        _ ->
+          keys
+      end
+    end)
+  end
 
   defp failure_field(nil, _field, default), do: default
   defp failure_field(%{data: data}, field, default), do: data[field] || default

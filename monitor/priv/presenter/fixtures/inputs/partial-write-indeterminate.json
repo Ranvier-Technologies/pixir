@@ -1,0 +1,125 @@
+{
+  "fixture_schema": "pixir.presenter.fixture",
+  "fixture_version": 1,
+  "scenario": "partial-write-indeterminate",
+  "source_class": "synthetic_from_delegate_contract",
+  "observed_at": "2026-07-10T19:40:04Z",
+  "inputs": {
+    "terminal_envelope": {
+      "kind": "delegate_result",
+      "delegate_id": "dlg-partial-write",
+      "parent_session_id": "parent-partial-write",
+      "strategy": "subagents",
+      "mode": "bounded_write",
+      "status": "failed",
+      "write_destination": {
+        "writes_applied_to": "workspace",
+        "contract_status": "partial_repo_mutation",
+        "observed_applied_writes": [
+          "lib/pixir/example.ex"
+        ],
+        "observed_writes_source": "child_log",
+        "observed_writes_semantics": "at_least"
+      },
+      "children": [
+        {
+          "subagent_id": "sub-writer",
+          "child_session_id": "child-writer",
+          "agent": "worker",
+          "status": "failed",
+          "workspace_mode": "shared",
+          "observed_applied_writes": [
+            "lib/pixir/example.ex"
+          ],
+          "observed_writes_semantics": "at_least",
+          "next_actions": [
+            "inspect_child_session_log",
+            "inspect_partial_writes_before_retry"
+          ]
+        }
+      ]
+    },
+    "delegate_snapshot": null,
+    "parent_log": [
+      {
+        "seq": 0,
+        "ts": "2026-07-10T19:40:00Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "started",
+          "status": "running",
+          "subagent_id": "sub-writer",
+          "child_session_id": "child-writer",
+          "agent": "worker",
+          "workspace_mode": "shared"
+        }
+      },
+      {
+        "seq": 1,
+        "ts": "2026-07-10T19:40:04Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "failed",
+          "status": "failed",
+          "subagent_id": "sub-writer",
+          "child_session_id": "child-writer",
+          "agent": "worker",
+          "workspace_mode": "shared",
+          "summary": "Provider failed after one observed write."
+        }
+      }
+    ],
+    "parent_log_origin": "fixture",
+    "child_logs": {
+      "child-writer": [
+        {
+          "seq": 1,
+          "ts": "2026-07-10T19:40:01Z",
+          "type": "tool_call",
+          "data": {
+            "call_id": "call-write",
+            "name": "write",
+            "args": {
+              "path": "lib/pixir/example.ex"
+            }
+          }
+        },
+        {
+          "seq": 2,
+          "ts": "2026-07-10T19:40:02Z",
+          "type": "tool_result",
+          "data": {
+            "call_id": "call-write",
+            "ok": true
+          }
+        },
+        {
+          "seq": 3,
+          "ts": "2026-07-10T19:40:03Z",
+          "type": "turn_failed",
+          "data": {
+            "terminal_status": "provider_error",
+            "error_kind": "websocket_closed"
+          }
+        }
+      ]
+    },
+    "runtime_diagnostics": null,
+    "owner_state": {
+      "state": "snapshot_only",
+      "reachable": false
+    },
+    "evidence_mirror": null
+  },
+  "completeness": {
+    "parent_log": "complete",
+    "child_logs": "complete",
+    "terminal_envelope": "complete_for_contract_scenario"
+  },
+  "sanitization": {
+    "absolute_paths_removed": true,
+    "identifiers_replaced": true,
+    "model_content_minimized": true,
+    "secrets_removed": true
+  }
+}

@@ -27,7 +27,7 @@ defmodule Pixir.Conversation do
   socket).
   """
 
-  alias Pixir.{Event, Events, Log, Session, SessionSupervisor, Turn}
+  alias Pixir.{Event, Events, Log, Session, SessionId, SessionSupervisor, Turn}
   alias Pixir.Permissions.WritePolicy
 
   @type session_id :: String.t()
@@ -52,8 +52,13 @@ defmodule Pixir.Conversation do
     start_opts = writer_lease_opts(opts)
 
     case Keyword.get(opts, :id) do
-      nil -> start_new(workspace, role, start_opts, opts)
-      id -> resume(id, workspace, role, start_opts)
+      nil ->
+        start_new(workspace, role, start_opts, opts)
+
+      id ->
+        with :ok <- SessionId.validate(id) do
+          resume(id, workspace, role, start_opts)
+        end
     end
   end
 
@@ -105,13 +110,20 @@ defmodule Pixir.Conversation do
   end
 
   defp resume(id, workspace, role, start_opts) do
-    if Log.exists?(id, workspace: workspace) do
-      do_start([id: id, workspace: workspace, role: role] ++ start_opts, id)
-    else
-      {:error,
-       error(:not_found, "no session #{id} in this workspace (looked in .pixir/sessions/)", %{
-         id: id
-       })}
+    case Log.exists(id, workspace: workspace) do
+      {:ok, true} ->
+        do_start([id: id, workspace: workspace, role: role] ++ start_opts, id)
+
+      {:ok, false} ->
+        {:error,
+         error(
+           :not_found,
+           "no session #{id} in this workspace (looked in .pixir/sessions/)",
+           %{id: id}
+         )}
+
+      {:error, _error} = error ->
+        error
     end
   end
 
@@ -219,7 +231,7 @@ defmodule Pixir.Conversation do
   end
 
   @doc "Subscribe the calling process to the Session's event bus (pass-through)."
-  @spec subscribe(session_id()) :: :ok
+  @spec subscribe(session_id()) :: :ok | {:error, map()}
   def subscribe(session_id), do: Events.subscribe(session_id)
 
   @doc "Interrupt the running Turn, if any (pass-through to `Session`)."

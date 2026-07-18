@@ -37,6 +37,7 @@ defmodule Mix.Tasks.Pixir.Smoke.WorkflowsReal do
   use Mix.Task
 
   alias Pixir.{Auth, Log, SessionSupervisor, Workflows}
+  alias Pixir.Providers.{Registry, ResolvedProviderRequest, ResponsesBackend}
 
   @command "mix pixir.smoke.workflows_real"
   @schema_version 1
@@ -90,8 +91,43 @@ defmodule Mix.Tasks.Pixir.Smoke.WorkflowsReal do
     end
 
     Mix.Task.run("app.start")
+    preflight_profile!(config, json?)
     ensure_auth!(json?)
     run_real!(config, json?)
+  end
+
+  defp preflight_profile!(config, json?) do
+    request = if config.model, do: %{model: config.model}, else: %{}
+
+    case Registry.resolve_request(
+           %{provider_intent: {:direct, Pixir.Provider}, request: request, provider_opts: []},
+           []
+         ) do
+      {:ok, resolved} ->
+        case ResolvedProviderRequest.responses_backend(resolved) do
+          :not_applicable ->
+            :ok
+
+          backend ->
+            case ResponsesBackend.activation_status(backend) do
+              :ok -> :ok
+              {:error, %{error: error}} -> fail_profile!(error, json?)
+            end
+        end
+
+      {:error, %{error: error}} ->
+        fail_profile!(error, json?)
+    end
+  end
+
+  defp fail_profile!(error, json?) do
+    fail!(
+      error.kind,
+      error.message,
+      error.details,
+      ["Fix the configured Responses backend before running live Workflows."],
+      json?
+    )
   end
 
   defp parse_config!(opts, json?) do

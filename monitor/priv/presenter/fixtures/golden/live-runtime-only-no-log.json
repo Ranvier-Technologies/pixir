@@ -1,0 +1,226 @@
+{
+  "schema": "pixir.presenter.run",
+  "schema_version": 1,
+  "projection_id": "projection:live-runtime-only-no-log",
+  "projected_at": "2026-07-10T19:10:00Z",
+  "run": {
+    "id": "dlg-live-only",
+    "delegate_id": "dlg-live-only",
+    "parent_session_id": "parent-live-only",
+    "workflow_id": null,
+    "strategy": "subagents",
+    "mode": "read_only",
+    "title": null,
+    "evidence_refs": [
+      "e-snapshot-live-only"
+    ]
+  },
+  "source": {
+    "mode": "live",
+    "durable_origin": "none",
+    "as_of_seq": null,
+    "last_durable_at": null,
+    "live_observed_at": "2026-07-10T19:10:00Z",
+    "freshness": "current",
+    "limitations": [
+      "durable_log_unavailable"
+    ]
+  },
+  "execution": {
+    "state": "unknown",
+    "terminal": false,
+    "basis": "unknown",
+    "evidence_refs": []
+  },
+  "liveness": {
+    "state": "live",
+    "reachable": true,
+    "basis": "delegate_owner",
+    "observed_at": "2026-07-10T19:10:00Z",
+    "evidence_refs": [
+      "e-owner-live-only",
+      "e-manager-live-only"
+    ]
+  },
+  "counts": {
+    "planned_units": null,
+    "observed_units": 1,
+    "running_units": 0,
+    "completed_units": 0,
+    "attention_units": 1
+  },
+  "graph": null,
+  "units": [
+    {
+      "logical_id": "delegate:dlg-live-only:subagent:sub-live-only",
+      "unit_kind": "subagent",
+      "label": "explorer",
+      "agent": "explorer",
+      "execution_kind": "subagent",
+      "workspace_mode": "unknown",
+      "posture": "unknown",
+      "depends_on": [],
+      "execution": {
+        "state": "unknown",
+        "terminal": false,
+        "basis": "unknown",
+        "evidence_refs": []
+      },
+      "liveness": {
+        "state": "live",
+        "reachable": true,
+        "basis": "manager_diagnostics",
+        "observed_at": "2026-07-10T19:10:00Z",
+        "evidence_refs": [
+          "e-manager-live-only"
+        ]
+      },
+      "gate": {
+        "state": "not_applicable",
+        "dependent_safe": null,
+        "basis": "not_applicable",
+        "evidence_refs": []
+      },
+      "advisory": {
+        "present": false,
+        "verdict": "unknown",
+        "mergeable": null,
+        "declared_gate": null,
+        "parse_status": "not_present",
+        "summary": null,
+        "major_count": null,
+        "minor_count": null,
+        "evidence_refs": []
+      },
+      "attempts": [
+        {
+          "attempt_id": "delegate:dlg-live-only:subagent:sub-live-only:attempt:provisional:current",
+          "ordinal": null,
+          "relation": "unknown",
+          "predecessor_attempt_id": null,
+          "child_session_id": "child-live-only",
+          "status": "unknown",
+          "started_at": null,
+          "ended_at": null,
+          "error_kind": null,
+          "summary": null,
+          "evidence_refs": [
+            "e-manager-live-only"
+          ],
+          "limitations": [
+            "volatile_attempt_not_durable"
+          ],
+          "materialization": "volatile_only",
+          "status_basis": "volatile_runtime",
+          "child_event_window": {
+            "session_id": "child-live-only",
+            "from_seq": null,
+            "to_seq_exclusive": null,
+            "basis": "unknown",
+            "evidence_refs": [
+              "e-manager-live-only"
+            ]
+          }
+        }
+      ],
+      "artifacts": [],
+      "usage": {
+        "source": "incomplete",
+        "complete": false,
+        "calls": 0,
+        "groups": [],
+        "evidence_refs": [],
+        "limitations": [
+          "usage_incomplete_missing_child_log"
+        ]
+      },
+      "mutation": {
+        "status": "unknown",
+        "observed_paths": [],
+        "observed_semantics": "unknown",
+        "evidence_refs": [],
+        "limitations": [
+          "mutation_evidence_incomplete"
+        ]
+      },
+      "safe_actions": [],
+      "evidence_refs": [
+        "e-snapshot-live-only",
+        "e-manager-live-only",
+        "e-owner-live-only"
+      ],
+      "limitations": [
+        "durable_log_unavailable",
+        "volatile_attempt_not_durable",
+        "usage_incomplete_missing_child_log",
+        "mutation_evidence_incomplete"
+      ],
+      "materialization": "volatile_only",
+      "attention": {
+        "required": true,
+        "reasons": [
+          "execution_unknown",
+          "mutation_unknown",
+          "durable_log_unavailable"
+        ],
+        "evidence_refs": [
+          "e-snapshot-live-only",
+          "e-manager-live-only",
+          "e-owner-live-only"
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "source": "incomplete",
+    "complete": false,
+    "calls": 0,
+    "groups": [],
+    "evidence_refs": [],
+    "limitations": [
+      "usage_incomplete_missing_child_log"
+    ]
+  },
+  "mutation": {
+    "status": "unknown",
+    "observed_paths": [],
+    "observed_semantics": "unknown",
+    "evidence_refs": [],
+    "limitations": [
+      "mutation_evidence_incomplete"
+    ]
+  },
+  "safe_actions": [],
+  "evidence": [
+    {
+      "id": "e-snapshot-live-only",
+      "authority": "derived",
+      "source_kind": "delegate_snapshot",
+      "session_id": "parent-live-only",
+      "seq": null,
+      "description": "Live status snapshot supplies run identity but no durable facts."
+    },
+    {
+      "id": "e-manager-live-only",
+      "authority": "volatile",
+      "source_kind": "manager_diagnostics",
+      "session_id": "parent-live-only",
+      "seq": null,
+      "description": "Manager reports a live indexed child."
+    },
+    {
+      "id": "e-owner-live-only",
+      "authority": "volatile",
+      "source_kind": "delegate_owner",
+      "session_id": "parent-live-only",
+      "seq": null,
+      "description": "Delegate owner is reachable in the current runtime."
+    }
+  ],
+  "limitations": [
+    "durable_log_unavailable",
+    "volatile_attempt_not_durable",
+    "usage_incomplete_missing_child_log",
+    "mutation_evidence_incomplete"
+  ]
+}

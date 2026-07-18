@@ -197,7 +197,8 @@ defmodule Pixir.ModelsRefresh do
 
   defp http_error(status, body) do
     body = if is_binary(body), do: body, else: inspect(body)
-    bounded = ErrBody.append("", body)
+    capture = ErrBody.append(ErrBody.new(), body)
+    bounded = ErrBody.body(capture)
 
     %{
       "status" => "error",
@@ -205,7 +206,7 @@ defmodule Pixir.ModelsRefresh do
       "status_code" => status,
       "err_body" => bounded
     }
-    |> maybe_put("err_body_truncated", ErrBody.truncated?(bounded))
+    |> maybe_put("err_body_truncated", ErrBody.truncated?(capture))
   end
 
   defp default_http(%{url: url, headers: headers}) do

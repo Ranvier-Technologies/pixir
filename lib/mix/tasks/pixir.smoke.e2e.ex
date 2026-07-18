@@ -31,6 +31,7 @@ defmodule Mix.Tasks.Pixir.Smoke.E2e do
 
   alias Pixir.{Auth, Events, Provider, Renderer, Session, SessionSupervisor, Turn}
   alias Pixir.Auth.CodexOAuth
+  alias Pixir.Providers.{Registry, ResolvedProviderRequest, ResponsesBackend}
 
   @default_prompt "Create a file called hello.txt containing exactly 'Hello from Pixir', " <>
                     "then read it back and tell me what it says."
@@ -84,12 +85,37 @@ defmodule Mix.Tasks.Pixir.Smoke.E2e do
 
     Mix.Task.run("app.start")
 
-    with :ok <- ensure_signed_in(opts),
-         :ok <- maybe_probe_model(opts) do
+    with {:ok, resolved} <- explicit_chatgpt_preflight(opts),
+         :ok <- ensure_signed_in(opts),
+         :ok <- maybe_probe_model(opts, resolved) do
       run_turn(opts)
     else
       {:error, %{stage: stage, error: error}} -> fail(stage, error)
       {:error, error} -> fail("could not sign in", error)
+    end
+  end
+
+  defp explicit_chatgpt_preflight(opts) do
+    request = if opts[:model], do: %{model: opts[:model]}, else: %{}
+    profile = %{"mode" => "chatgpt_codex"}
+
+    with {:ok, resolved} <-
+           Registry.resolve_request(
+             %{
+               provider_intent: {:direct, Provider},
+               request: request,
+               provider_opts: [responses_backend: profile]
+             },
+             []
+           ),
+         :ok <-
+           resolved
+           |> ResolvedProviderRequest.responses_backend()
+           |> ResponsesBackend.activation_status() do
+      {:ok, resolved}
+    else
+      {:error, error} ->
+        {:error, %{stage: "responses backend preflight", error: error}}
     end
   end
 
@@ -118,12 +144,12 @@ defmodule Mix.Tasks.Pixir.Smoke.E2e do
 
   # ── optional step: probe the model before spending a full Turn ─────────────
 
-  defp maybe_probe_model(opts) do
+  defp maybe_probe_model(opts, resolved) do
     if opts[:probe_model] do
-      model = opts[:model] || Provider.default_model()
+      model = probe_model(resolved)
       Mix.shell().info("Step 1.5/3 — probing model #{model} …")
 
-      case Provider.probe(probe_opts(opts)) do
+      case Provider.probe(probe_opts(opts, resolved)) do
         {:ok, %{model: m}} ->
           Mix.shell().info("Model #{m} accepted. ✓\n")
           :ok
@@ -145,7 +171,10 @@ defmodule Mix.Tasks.Pixir.Smoke.E2e do
     end
   end
 
-  defp probe_opts(opts), do: if(opts[:model], do: [model: opts[:model]], else: [])
+  defp probe_opts(_opts, resolved), do: [resolved_provider_request: resolved]
+
+  @doc false
+  def probe_model(resolved), do: ResolvedProviderRequest.model(resolved)
 
   # ── step 1: auth ────────────────────────────────────────────────────────
 
@@ -215,7 +244,11 @@ defmodule Mix.Tasks.Pixir.Smoke.E2e do
   end
 
   defp turn_opts(opts) do
-    provider_opts = if opts[:model], do: [model: opts[:model]], else: []
+    provider_opts = [responses_backend: %{"mode" => "chatgpt_codex"}]
+
+    provider_opts =
+      if opts[:model], do: Keyword.put(provider_opts, :model, opts[:model]), else: provider_opts
+
     [provider_opts: provider_opts, dry_run: !!opts[:dry_run_tools]]
   end
 

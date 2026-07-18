@@ -3,6 +3,12 @@ defmodule Pixir.Delegate.CLIContractTest do
 
   alias Pixir.Delegate.CLIContract
 
+  defmodule OutputWarningRunner do
+    def run(_request, _spec, _spec_meta, opts) do
+      {:ok, Keyword.fetch!(opts, :fixture_payload)}
+    end
+  end
+
   defp tmp_workspace(prefix) do
     path =
       Path.join(
@@ -394,10 +400,366 @@ defmodule Pixir.Delegate.CLIContractTest do
     assert Enum.map(children, & &1["task"]) == ["first task", "second task", "third task"]
     assert Enum.map(children, & &1["index"]) == [0, 1, 2]
     assert Enum.map(children, & &1["attachment_count"]) == [0, 2, 0]
-    # Additive envelope key -> schema revision 4 (family v1 unchanged).
-    assert payload["schema_version"] == 4
+    # Additive Provider-output evidence -> schema revision 5 (family v1 unchanged).
+    assert payload["schema_version"] == 5
     assert order_note =~ "unspecified"
     assert order_note =~ "children[].index"
+  end
+
+  test "Delegate schema 5 bounds distinct child/output warnings at 255/256/257" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "fixture"
+      })
+
+    for count <- [255, 256, 257] do
+      children =
+        for index <- 0..(count - 1) do
+          child_session_id = "child_#{index}"
+
+          %{
+            "index" => index,
+            "child_session_id" => child_session_id,
+            "status" => "completed",
+            "summary" => "exact summary #{index}",
+            "output_warning_count" => 1,
+            "output_warnings_truncated" => false,
+            "output_warnings" => [
+              %{
+                "kind" => "provider_output_truncated",
+                "severity" => "warning",
+                "child_session_id" => child_session_id,
+                "provider_usage_event_id" => "evt_shared",
+                "provider_usage_seq" => index + 1,
+                "reason" => "provider_output_limit",
+                "provider_reason" => "max_tokens",
+                "call_role" => "final_answer"
+              }
+            ]
+          }
+        end
+
+      fixture = %{
+        "ok" => true,
+        "status" => "completed",
+        "kind" => "delegate_result",
+        "children" => children,
+        "summary" => "done"
+      }
+
+      assert {:ok, %{payload: payload}} =
+               CLIContract.run(["--spec", "-", "--json"],
+                 read_stdin: fn -> spec end,
+                 runner: OutputWarningRunner,
+                 runtime_opts: [fixture_payload: fixture]
+               )
+
+      assert payload["schema_version"] == 5
+      assert payload["warning_count"] == count
+      assert length(payload["warnings"]) == min(count, 256)
+      assert payload["warnings_truncated"] == (count == 257)
+      assert payload["truncated_child_count"] == count
+      assert length(payload["truncated_children"]) == min(count, 256)
+      assert payload["truncated_children_truncated"] == (count == 257)
+
+      # Same Event id in distinct child Sessions remains distinct.
+      assert Enum.uniq_by(
+               payload["warnings"],
+               &{
+                 &1["child_session_id"],
+                 &1["provider_usage_event_id"]
+               }
+             ) == payload["warnings"]
+
+      assert Enum.map(payload["children"], & &1["summary"]) ==
+               Enum.map(children, & &1["summary"])
+    end
+  end
+
+  test "Delegate warning totals deduplicate the authoritative child-session/Event identity" do
+    spec =
+      Jason.encode!(%{"contract_version" => 1, "strategy" => "subagents", "task" => "fixture"})
+
+    warning = %{
+      "kind" => "provider_output_truncated",
+      "severity" => "warning",
+      "child_session_id" => "child_duplicate",
+      "provider_usage_event_id" => "evt_duplicate",
+      "provider_usage_seq" => 7,
+      "reason" => "provider_output_limit",
+      "provider_reason" => "max_tokens",
+      "call_role" => "final_answer"
+    }
+
+    children =
+      for index <- 0..1 do
+        %{
+          "index" => index,
+          "child_session_id" => "child_duplicate",
+          "status" => "completed",
+          "summary" => "duplicate #{index}",
+          "output_warning_count" => 1,
+          "output_warnings" => [warning],
+          "output_warnings_truncated" => false
+        }
+      end
+
+    fixture = %{
+      "ok" => true,
+      "status" => "completed",
+      "kind" => "delegate_result",
+      "children" => children
+    }
+
+    assert {:ok, %{payload: payload}} =
+             CLIContract.run(["--spec", "-", "--json"],
+               read_stdin: fn -> spec end,
+               runner: OutputWarningRunner,
+               runtime_opts: [fixture_payload: fixture]
+             )
+
+    assert payload["warning_count"] == 1
+    assert length(payload["warnings"]) == 1
+    refute payload["warnings_truncated"]
+    assert payload["truncated_child_count"] == 1
+  end
+
+  test "Delegate ingress bounds oversized child warning arrays before aggregation" do
+    spec =
+      Jason.encode!(%{"contract_version" => 1, "strategy" => "subagents", "task" => "fixture"})
+
+    child_sid = "child_oversized"
+
+    warnings =
+      for seq <- 1..1_000 do
+        %{
+          "kind" => "provider_output_truncated",
+          "severity" => "warning",
+          "child_session_id" => child_sid,
+          "provider_usage_event_id" => "evt_oversized_#{seq}",
+          "provider_usage_seq" => seq,
+          "reason" => "provider_output_limit",
+          "provider_reason" => "max_tokens",
+          "call_role" => "intermediate"
+        }
+      end
+
+    fixture = %{
+      "ok" => true,
+      "status" => "completed",
+      "kind" => "delegate_result",
+      "children" => [
+        %{
+          "index" => 0,
+          "child_session_id" => child_sid,
+          "status" => "completed",
+          "summary" => "oversized",
+          "output_warning_count" => 1_000,
+          "output_warnings" => warnings,
+          "output_warning_reasons" => [
+            "provider_output_limit",
+            "provider_content_filter",
+            "unsafe"
+          ],
+          "output_warnings_truncated" => true
+        }
+      ]
+    }
+
+    assert {:ok, %{payload: payload}} =
+             CLIContract.run(["--spec", "-", "--json"],
+               read_stdin: fn -> spec end,
+               runner: OutputWarningRunner,
+               runtime_opts: [fixture_payload: fixture]
+             )
+
+    assert [child] = payload["children"]
+    assert child["output_warning_count"] == 1_000
+    assert length(child["output_warnings"]) == 64
+
+    assert child["output_warning_reasons"] == [
+             "provider_content_filter",
+             "provider_output_limit"
+           ]
+
+    assert payload["warning_count"] == 1_000
+    assert length(payload["warnings"]) == 64
+    assert payload["warnings_truncated"]
+
+    assert payload["warnings_truncated"] ==
+             payload["warning_count"] > length(payload["warnings"])
+  end
+
+  test "one-shot keeps the validated reason introduced by a suppressed 65th warning" do
+    spec =
+      Jason.encode!(%{"contract_version" => 1, "strategy" => "subagents", "task" => "fixture"})
+
+    child_sid = "child_reason_65"
+
+    warnings =
+      for seq <- 1..64 do
+        %{
+          "child_session_id" => child_sid,
+          "provider_usage_event_id" => "evt_reason_#{seq}",
+          "provider_usage_seq" => seq,
+          "reason" => "provider_output_limit",
+          "provider_reason" => "max_tokens",
+          "call_role" => "intermediate"
+        }
+      end
+
+    fixture = %{
+      "ok" => true,
+      "status" => "completed",
+      "kind" => "delegate_result",
+      "children" => [
+        %{
+          "child_session_id" => child_sid,
+          "status" => "completed",
+          "output_warning_count" => 65,
+          "output_warnings" => warnings,
+          "output_warning_reasons" => [
+            "provider_output_limit",
+            "provider_content_filter"
+          ],
+          "output_warnings_truncated" => true
+        }
+      ]
+    }
+
+    assert {:ok, %{payload: %{"children" => [child]}}} =
+             CLIContract.run(["--spec", "-", "--json"],
+               read_stdin: fn -> spec end,
+               runner: OutputWarningRunner,
+               runtime_opts: [fixture_payload: fixture]
+             )
+
+    assert child["output_warning_count"] == 65
+    assert length(child["output_warnings"]) == 64
+
+    assert child["output_warning_reasons"] == [
+             "provider_content_filter",
+             "provider_output_limit"
+           ]
+  end
+
+  test "Delegate rejects embedded warning child Session mismatches before counting" do
+    spec =
+      Jason.encode!(%{"contract_version" => 1, "strategy" => "subagents", "task" => "fixture"})
+
+    fixture = %{
+      "ok" => true,
+      "status" => "completed",
+      "kind" => "delegate_result",
+      "children" => [
+        %{
+          "index" => 0,
+          "child_session_id" => "child_outer",
+          "status" => "completed",
+          "summary" => "mismatch",
+          "output_warning_count" => 1,
+          "output_warnings_truncated" => false,
+          "output_warnings" => [
+            %{
+              "kind" => "provider_output_truncated",
+              "severity" => "warning",
+              "child_session_id" => "child_other",
+              "provider_usage_event_id" => "evt_mismatch",
+              "provider_usage_seq" => 1,
+              "reason" => "provider_output_limit",
+              "provider_reason" => "max_tokens",
+              "call_role" => "final_answer"
+            }
+          ]
+        }
+      ]
+    }
+
+    assert {:ok, %{payload: payload}} =
+             CLIContract.run(["--spec", "-", "--json"],
+               read_stdin: fn -> spec end,
+               runner: OutputWarningRunner,
+               runtime_opts: [fixture_payload: fixture]
+             )
+
+    assert [child] = payload["children"]
+    assert child["output_warning_count"] == 0
+    assert child["output_warnings"] == []
+    assert payload["warning_count"] == 0
+    assert payload["warnings"] == []
+    refute payload["warnings_truncated"]
+    refute inspect(payload) =~ "child_other"
+  end
+
+  test "Delegate children and warning projections share validated mixed-index ordering" do
+    spec =
+      Jason.encode!(%{"contract_version" => 1, "strategy" => "subagents", "task" => "fixture"})
+
+    rows = [
+      {"child_invalid_first", -2},
+      {"child_b", 2},
+      {"child_missing", nil},
+      {"child_one", 1},
+      {"child_a", 2},
+      {"child_invalid_last", -1}
+    ]
+
+    children =
+      rows
+      |> Enum.with_index()
+      |> Enum.map(fn {{child_sid, index}, position} ->
+        child = %{
+          "child_session_id" => child_sid,
+          "status" => "completed",
+          "summary" => child_sid,
+          "output_warning_count" => 1,
+          "output_warnings_truncated" => false,
+          "output_warnings" => [
+            %{
+              "kind" => "provider_output_truncated",
+              "severity" => "warning",
+              "child_session_id" => child_sid,
+              "provider_usage_event_id" => "evt_#{position}",
+              "provider_usage_seq" => position + 1,
+              "reason" => "provider_output_limit",
+              "provider_reason" => "max_tokens",
+              "call_role" => "final_answer"
+            }
+          ]
+        }
+
+        if is_nil(index), do: child, else: Map.put(child, "index", index)
+      end)
+
+    fixture = %{
+      "ok" => true,
+      "status" => "completed",
+      "kind" => "delegate_result",
+      "children" => children
+    }
+
+    assert {:ok, %{payload: payload}} =
+             CLIContract.run(["--spec", "-", "--json"],
+               read_stdin: fn -> spec end,
+               runner: OutputWarningRunner,
+               runtime_opts: [fixture_payload: fixture]
+             )
+
+    expected = [
+      "child_one",
+      "child_a",
+      "child_b",
+      "child_invalid_first",
+      "child_missing",
+      "child_invalid_last"
+    ]
+
+    assert Enum.map(payload["children"], & &1["child_session_id"]) == expected
+    assert payload["truncated_children"] == expected
+    assert Enum.map(payload["warnings"], & &1["child_session_id"]) == expected
+    assert Enum.map(Enum.take(payload["children"], -3), & &1["index"]) == [-2, nil, -1]
   end
 
   test "bounded_write dry-run exposes verify command count without echoing commands" do
@@ -447,7 +809,7 @@ defmodule Pixir.Delegate.CLIContractTest do
             %{
               payload: %{
                 "status" => "planned",
-                "schema_version" => 4,
+                "schema_version" => 5,
                 "children" => [
                   %{
                     "workspace_mode" => "virtual_overlay",
@@ -526,7 +888,8 @@ defmodule Pixir.Delegate.CLIContractTest do
               payload: %{
                 "kind" => "invalid_spec",
                 "details" => %{
-                  "matched_rule" => "unbounded_read_set",
+                  "matched_rule" => "root_recursive_catch_all",
+                  "reason" => "root_recursive_catch_all",
                   "field" => "subagents.read_set[1]",
                   "json_pointer" => "/subagents/read_set/0"
                 }
@@ -556,7 +919,38 @@ defmodule Pixir.Delegate.CLIContractTest do
                 "details" => %{
                   "field" => "subagents.read_set[2]",
                   "json_pointer" => "/subagents/read_set/1",
-                  "path" => ["subagents", "read_set", 1]
+                  "path" => ["subagents", "read_set", 1],
+                  "reason" => "empty"
+                }
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "virtual_overlay Delegate envelope preserves shared alias reason and index" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "produce a virtual diff",
+        "subagents" => %{
+          "workspace_mode" => "virtual_overlay",
+          "read_set" => ["mix.exs", "lib/../**/*"]
+        }
+      })
+
+    assert {:error,
+            %{
+              payload: %{
+                "kind" => "invalid_spec",
+                "details" => %{
+                  "field" => "subagents.read_set[2]",
+                  "json_pointer" => "/subagents/read_set/1",
+                  "path" => ["subagents", "read_set", 1],
+                  "reason" => "parent_component",
+                  "matched_rule" => "parent_component"
                 }
               }
             }} =

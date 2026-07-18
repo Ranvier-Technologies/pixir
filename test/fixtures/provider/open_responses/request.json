@@ -1,0 +1,43 @@
+{
+  "model": "fixture-model",
+  "store": false,
+  "stream": true,
+  "instructions": "fixture instructions",
+  "input": [
+    {
+      "type": "message",
+      "role": "developer",
+      "content": [{"type": "input_text", "text": "developer fixture"}]
+    },
+    {
+      "type": "message",
+      "role": "system",
+      "content": [{"type": "input_text", "text": "system fixture"}]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{"type": "input_text", "text": "user fixture"}]
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [{"type": "output_text", "text": "assistant fixture"}]
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "pixir_open_responses_probe",
+      "description": "Deterministic fixture function.",
+      "parameters": {
+        "type": "object",
+        "properties": {"probe": {"type": "string"}},
+        "required": ["probe"],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": true
+}

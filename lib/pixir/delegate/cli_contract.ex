@@ -44,15 +44,17 @@ defmodule Pixir.Delegate.CLIContract do
   alias Pixir.Agents
   alias Pixir.Delegate.{Async, DaemonClient, DaemonCommand, Evidence, Progress, Runner}
   alias Pixir.Permissions.WritePolicy
+  alias Pixir.Provider.OutputTruncationSummary
 
   @contract_version 1
+  # Revision 5: additive bounded Provider-output truncation evidence (#268).
   # Revision 4: additive virtual-overlay child artifact/apply projection and
   # dry-run bounded-overlay planning evidence (#284).
   # Revision 3: additive dry-run children[].attachment_count (#250).
   # Revision 2: additive children[].index + children_order envelope keys
   # (#227). The pixir.delegate.envelope.v1 family name is reserved for
   # breaking shape changes; additive keys bump this revision instead.
-  @envelope_schema_version 4
+  @envelope_schema_version 5
   @max_spec_bytes 1_000_000
   @supported_strategies ~w(subagents workflow)
   @supported_modes [nil, "read_only", "bounded_write"]
@@ -386,7 +388,7 @@ defmodule Pixir.Delegate.CLIContract do
 
   defp parse_args([arg | _rest], acc) when is_binary(arg) do
     if String.starts_with?(arg, "-") do
-      {:error, invalid_args("unsupported delegate option", %{"option" => arg}), acc.json?}
+      {:error, invalid_args("unsupported delegate option", %{}), acc.json?}
     else
       {:error, invalid_args("unexpected delegate argument", %{"argument" => arg}), acc.json?}
     end
@@ -519,25 +521,16 @@ defmodule Pixir.Delegate.CLIContract do
       :ok ->
         :ok
 
-      {:error, %{kind: :invalid_read_set_entry, index: index}} ->
+      {:error, %{kind: kind, index: index, reason: reason}}
+      when kind in [:invalid_read_set_entry, :unbounded_read_set] ->
         {:error,
          invalid_spec(
-           "subagents.read_set entries must be non-empty strings",
+           delegate_read_set_message(kind),
            %{
              "observed" => Enum.at(read_set, index),
+             "reason" => reason,
+             "matched_rule" => reason,
              "next_actions" => ["replace_read_set_entry_with_a_bounded_path"]
-           }
-           |> Map.merge(read_set_location_details(index))
-         )}
-
-      {:error, %{kind: :unbounded_read_set, index: index}} ->
-        {:error,
-         invalid_spec(
-           "subagents.read_set cannot import an unbounded workspace",
-           %{
-             "observed" => Enum.at(read_set, index),
-             "matched_rule" => "unbounded_read_set",
-             "next_actions" => ["replace_unbounded_glob_with_bounded_paths"]
            }
            |> Map.merge(read_set_location_details(index))
          )}
@@ -557,6 +550,11 @@ defmodule Pixir.Delegate.CLIContract do
   end
 
   defp validate_virtual_overlay_read_set(_subagents, _workspace_mode), do: :ok
+
+  defp delegate_read_set_message(:unbounded_read_set),
+    do: "subagents.read_set cannot import an unbounded workspace"
+
+  defp delegate_read_set_message(_kind), do: "subagents.read_set entry is invalid"
 
   defp validate_virtual_overlay_limits(subagents, "virtual_overlay") do
     case Map.fetch(subagents, "limits") do
@@ -1170,7 +1168,7 @@ defmodule Pixir.Delegate.CLIContract do
   defp parse_subcommand_args([arg | rest], acc) when is_binary(arg) do
     cond do
       String.starts_with?(arg, "-") ->
-        {:error, invalid_args("unsupported delegate option", %{"option" => arg}), acc.json?}
+        {:error, invalid_args("unsupported delegate option", %{}), acc.json?}
 
       is_nil(acc.session_id) and acc.command in ["status", "attach", "cancel"] ->
         parse_subcommand_args(rest, %{acc | session_id: arg})
@@ -2622,6 +2620,7 @@ defmodule Pixir.Delegate.CLIContract do
     |> Map.put_new("reason_code", reason_code(payload))
     |> Map.put_new("exit_code", exit_code)
     |> put_children_envelope_v1()
+    |> put_output_warning_envelope()
   end
 
   defp put_evidence_metadata(payload) do
@@ -2698,6 +2697,123 @@ defmodule Pixir.Delegate.CLIContract do
   end
 
   defp put_children_envelope_v1(payload), do: payload
+
+  defp put_output_warning_envelope(payload) do
+    raw_children = Map.get(payload, "children", [])
+
+    children =
+      if is_list(raw_children),
+        do: Enum.map(raw_children, &normalize_child_warning_fields/1),
+        else: raw_children
+
+    if is_list(children) do
+      indexed =
+        children
+        |> Enum.with_index()
+        |> Enum.sort_by(&indexed_child_order/1)
+
+      ordered_children = Enum.map(indexed, &elem(&1, 0))
+
+      positive_children =
+        Enum.filter(indexed, fn {child, _position} ->
+          is_list(child["output_warnings"]) and child["output_warnings"] != []
+        end)
+
+      truncated_children =
+        positive_children
+        |> Enum.map(fn {child, _position} -> child["child_session_id"] end)
+        |> Enum.filter(&is_binary/1)
+        |> Enum.uniq()
+
+      all_warnings =
+        positive_children
+        |> Enum.flat_map(fn {child, position} ->
+          child_order = indexed_child_order({child, position})
+
+          Enum.map(child["output_warnings"] || [], fn warning ->
+            {child_order, child["child_session_id"] || "", warning}
+          end)
+        end)
+        |> Enum.uniq_by(fn {_order, child_sid, warning} ->
+          {child_sid, warning["provider_usage_event_id"]}
+        end)
+        |> Enum.sort_by(fn {child_order, child_sid, warning} ->
+          {child_order, child_sid, warning["provider_usage_seq"] || 0,
+           warning["provider_usage_event_id"] || ""}
+        end)
+        |> Enum.map(fn {_order, _child_sid, warning} -> warning end)
+
+      warning_count = authoritative_warning_count(positive_children)
+      warnings = Enum.take(all_warnings, 256)
+
+      payload
+      |> maybe_put_normalized_children(ordered_children)
+      |> Map.put("truncated_child_count", length(truncated_children))
+      |> Map.put("truncated_children", Enum.take(truncated_children, 256))
+      |> Map.put("truncated_children_truncated", length(truncated_children) > 256)
+      |> Map.put("warning_count", warning_count)
+      |> Map.put("warnings", warnings)
+      |> Map.put("warnings_truncated", warning_count > length(warnings))
+    else
+      payload
+    end
+  end
+
+  defp normalize_child_warning_fields(child) when is_map(child) do
+    if Enum.any?(
+         ~w(output_truncation output_warning_count output_warnings output_warning_reasons output_warnings_truncated),
+         &Map.has_key?(child, &1)
+       ) do
+      normalized = OutputTruncationSummary.normalize_child_output(child)
+
+      child
+      |> Map.put("output_truncation", normalized["output_truncation"])
+      |> Map.put("output_warning_count", normalized["output_warning_count"])
+      |> Map.put("output_warnings", normalized["output_warnings"])
+      |> Map.put("output_warning_reasons", normalized["output_warning_reasons"])
+      |> Map.put("output_warnings_truncated", normalized["output_warnings_truncated"])
+    else
+      child
+    end
+  end
+
+  defp normalize_child_warning_fields(child), do: child
+
+  defp indexed_child_order({child, position}) do
+    case child["index"] do
+      index when is_integer(index) and index >= 0 ->
+        {0, index, child["child_session_id"] || "", position}
+
+      _invalid_or_missing ->
+        {1, position, "", position}
+    end
+  end
+
+  defp authoritative_warning_count(indexed_children) do
+    indexed_children
+    |> Enum.group_by(fn {child, _position} -> child["child_session_id"] end)
+    |> Enum.reduce(0, fn {_child_sid, group}, total ->
+      claimed =
+        group
+        |> Enum.map(fn {child, _position} -> child["output_warning_count"] end)
+        |> Enum.filter(&(is_integer(&1) and &1 >= 0))
+        |> Enum.max(fn -> 0 end)
+
+      distinct =
+        group
+        |> Enum.flat_map(fn {child, _position} -> child["output_warnings"] end)
+        |> Enum.uniq_by(& &1["provider_usage_event_id"])
+        |> length()
+
+      total + max(claimed, distinct)
+    end)
+  end
+
+  defp maybe_put_normalized_children(payload, children) do
+    if Map.has_key?(payload, "children"),
+      do: Map.put(payload, "children", children),
+      else: payload
+  end
 
   defp put_child_envelope_v1(%{} = child) do
     child

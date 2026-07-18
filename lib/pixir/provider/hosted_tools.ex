@@ -53,7 +53,22 @@ defmodule Pixir.Provider.HostedTools do
   def web_search(false), do: {:ok, nil}
   def web_search(true), do: web_search(%{})
 
-  def web_search(opts) when is_list(opts) or is_map(opts) do
+  def web_search(opts) when is_list(opts) do
+    normalize_web_search(opts)
+  end
+
+  def web_search(opts) when is_map(opts) and not is_struct(opts) do
+    normalize_web_search(opts)
+  end
+
+  def web_search(other) do
+    {:error,
+     invalid("web_search must be a plain map, keyword list, boolean, or nil.", %{
+       "received_type" => value_type(other)
+     })}
+  end
+
+  defp normalize_web_search(opts) do
     with {:ok, opts} <- safe_normalize_map(opts) do
       if field(opts, "enabled") == false do
         {:ok, nil}
@@ -61,13 +76,6 @@ defmodule Pixir.Provider.HostedTools do
         normalize_web_search_tool(opts, @web_search_config_fields)
       end
     end
-  end
-
-  def web_search(other) do
-    {:error,
-     invalid("web_search must be a map, keyword list, boolean, or nil.", %{
-       "value" => inspect(other)
-     })}
   end
 
   @doc """
@@ -82,7 +90,8 @@ defmodule Pixir.Provider.HostedTools do
   """
   @spec from_request(map()) :: {:ok, [map()]} | {:error, error_reason()}
   def from_request(request) when is_map(request) do
-    with {:ok, raw_tools} <- normalize_hosted_tools(field(request, "hosted_tools") || []),
+    with :ok <- reject_request_key_collisions(request, ["web_search", "hosted_tools"]),
+         {:ok, raw_tools} <- normalize_hosted_tools(field(request, "hosted_tools") || []),
          {:ok, web_search_tool} <- web_search(field(request, "web_search")),
          {:ok, raw_has_web_search?} <- web_search_requested?(raw_tools) do
       tools =
@@ -106,9 +115,12 @@ defmodule Pixir.Provider.HostedTools do
   probe.
   """
   @spec include_fields(map(), [map()]) :: {:ok, [String.t()]} | {:error, error_reason()}
-  def include_fields(request, hosted_tools) when is_map(request) and is_list(hosted_tools) do
-    with {:ok, requested?} <- web_search_requested?(hosted_tools) do
-      if requested? and include_sources?(request) do
+  def include_fields(request, hosted_tools)
+      when is_map(request) and not is_struct(request) and is_list(hosted_tools) do
+    with :ok <- reject_request_key_collisions(request, ["web_search"]),
+         {:ok, requested?} <- web_search_requested?(hosted_tools),
+         {:ok, include_sources?} <- include_sources?(request) do
+      if requested? and include_sources? do
         {:ok, [@source_include]}
       else
         {:ok, []}
@@ -126,30 +138,50 @@ defmodule Pixir.Provider.HostedTools do
   @doc "True when the hosted tool list contains OpenAI web search."
   @spec web_search_requested?([map()]) :: {:ok, boolean()} | {:error, error_reason()}
   def web_search_requested?(hosted_tools) when is_list(hosted_tools) do
-    {:ok, Enum.any?(hosted_tools, &(field(&1, "type") == "web_search"))}
+    if proper_list?(hosted_tools) do
+      {:ok, Enum.any?(hosted_tools, &(field(&1, "type") == "web_search"))}
+    else
+      invalid_hosted_tools_list()
+    end
   end
 
-  def web_search_requested?(_hosted_tools) do
-    {:error, invalid("hosted_tools must be a list.", %{"expected" => "list"})}
-  end
+  def web_search_requested?(_hosted_tools), do: invalid_hosted_tools_list()
 
   defp normalize_hosted_tools(tools) when is_list(tools) do
-    Enum.reduce_while(tools, {:ok, []}, fn tool, {:ok, acc} ->
-      case normalize_hosted_tool(tool) do
-        {:ok, normalized} -> {:cont, {:ok, acc ++ [normalized]}}
-        {:error, reason} -> {:halt, {:error, reason}}
+    if proper_list?(tools) do
+      Enum.reduce_while(tools, {:ok, []}, fn tool, {:ok, acc} ->
+        case normalize_hosted_tool(tool) do
+          {:ok, normalized} -> {:cont, {:ok, [normalized | acc]}}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
+      |> case do
+        {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+        {:error, _} = error -> error
       end
-    end)
+    else
+      invalid_hosted_tools_list()
+    end
   end
 
-  defp normalize_hosted_tools(other) do
+  defp normalize_hosted_tools(_other), do: invalid_hosted_tools_list()
+
+  defp normalize_hosted_tool(tool) when is_list(tool) do
+    normalize_hosted_tool_map(tool)
+  end
+
+  defp normalize_hosted_tool(tool) when is_map(tool) and not is_struct(tool) do
+    normalize_hosted_tool_map(tool)
+  end
+
+  defp normalize_hosted_tool(other) do
     {:error,
-     invalid("hosted_tools must be a list of Provider-hosted tool specs.", %{
-       "value" => inspect(other)
+     invalid("Hosted tool specs must be plain maps or keyword lists.", %{
+       "received_type" => value_type(other)
      })}
   end
 
-  defp normalize_hosted_tool(tool) when is_map(tool) or is_list(tool) do
+  defp normalize_hosted_tool_map(tool) do
     with {:ok, normalized} <- safe_normalize_map(tool) do
       case field(normalized, "type") do
         "web_search" ->
@@ -158,18 +190,11 @@ defmodule Pixir.Provider.HostedTools do
         type ->
           {:error,
            invalid("Unsupported Provider-hosted tool type.", %{
-             "type" => inspect(type),
+             "received_type" => value_type(type),
              "supported" => ["web_search"]
            })}
       end
     end
-  end
-
-  defp normalize_hosted_tool(other) do
-    {:error,
-     invalid("Hosted tool specs must be maps.", %{
-       "value" => inspect(other)
-     })}
   end
 
   defp validate_web_search_tool(tool),
@@ -198,7 +223,7 @@ defmodule Pixir.Provider.HostedTools do
     else
       {:error,
        invalid("web_search contains unsupported field(s).", %{
-         "unsupported" => unsupported,
+         "reason" => "unsupported_fields",
          "supported" => Enum.sort(allowed_fields)
        })}
     end
@@ -213,7 +238,10 @@ defmodule Pixir.Provider.HostedTools do
         :ok
 
       type ->
-        {:error, invalid("web_search.type must be \"web_search\".", %{"value" => inspect(type)})}
+        {:error,
+         invalid("web_search.type must be \"web_search\".", %{
+           "received_type" => value_type(type)
+         })}
     end
   end
 
@@ -226,7 +254,7 @@ defmodule Pixir.Provider.HostedTools do
     {:error,
      invalid(
        "web_search.search_context_size must be one of: #{Enum.join(@valid_search_context_sizes, ", ")}.",
-       %{"value" => inspect(size), "allowed" => @valid_search_context_sizes}
+       %{"received_type" => value_type(size), "allowed" => @valid_search_context_sizes}
      )}
   end
 
@@ -235,11 +263,14 @@ defmodule Pixir.Provider.HostedTools do
       nil ->
         {:ok, acc}
 
-      value when is_map(value) ->
-        {:ok, Map.put(acc, key, value)}
+      value when is_map(value) and not is_struct(value) ->
+        case normalize_json_term(value) do
+          {:ok, normalized} -> {:ok, Map.put(acc, key, normalized)}
+          :error -> invalid_json_field(key, "map")
+        end
 
       value ->
-        {:error, invalid("web_search.#{key} must be a map.", %{"value" => inspect(value)})}
+        invalid_json_field(key, value_type(value))
     end
   end
 
@@ -252,7 +283,10 @@ defmodule Pixir.Provider.HostedTools do
         {:ok, Map.put(acc, key, value)}
 
       value ->
-        {:error, invalid("web_search.#{key} must be a boolean.", %{"value" => inspect(value)})}
+        {:error,
+         invalid("web_search.#{key} must be a boolean.", %{
+           "received_type" => value_type(value)
+         })}
     end
   end
 
@@ -268,7 +302,7 @@ defmodule Pixir.Provider.HostedTools do
         {:error,
          invalid(
            "web_search.return_token_budget must be one of: #{Enum.join(@valid_return_token_budgets, ", ")}.",
-           %{"value" => inspect(value), "allowed" => @valid_return_token_budgets}
+           %{"received_type" => value_type(value), "allowed" => @valid_return_token_budgets}
          )}
     end
   end
@@ -279,16 +313,20 @@ defmodule Pixir.Provider.HostedTools do
         {:ok, acc}
 
       values when is_list(values) ->
-        if Enum.all?(values, &is_binary/1) do
+        if proper_list?(values) and Enum.all?(values, &(is_binary(&1) and String.valid?(&1))) do
           {:ok, Map.put(acc, key, values)}
         else
           {:error,
-           invalid("web_search.#{key} must be a list of strings.", %{"value" => inspect(values)})}
+           invalid("web_search.#{key} must be a list of UTF-8 strings.", %{
+             "received_type" => "list"
+           })}
         end
 
       value ->
         {:error,
-         invalid("web_search.#{key} must be a list of strings.", %{"value" => inspect(value)})}
+         invalid("web_search.#{key} must be a list of UTF-8 strings.", %{
+           "received_type" => value_type(value)
+         })}
     end
   end
 
@@ -298,7 +336,7 @@ defmodule Pixir.Provider.HostedTools do
         include_sources_from_config(config)
 
       _config ->
-        true
+        {:ok, true}
     end
   end
 
@@ -306,59 +344,151 @@ defmodule Pixir.Provider.HostedTools do
     case safe_normalize_map(config) do
       {:ok, web_search_config} ->
         case field(web_search_config, "include_sources") do
-          false -> false
-          _ -> true
+          false -> {:ok, false}
+          _ -> {:ok, true}
         end
 
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp safe_normalize_map(map) when is_map(map) and not is_struct(map),
+    do: normalize_entries(Map.to_list(map))
+
+  defp safe_normalize_map(keyword) when is_list(keyword) do
+    if proper_list?(keyword), do: normalize_entries(keyword), else: invalid_normalized_map()
+  end
+
+  defp safe_normalize_map(_other), do: invalid_normalized_map()
+
+  defp normalize_entries(entries) do
+    Enum.reduce_while(entries, {:ok, %{}}, fn
+      {key, value}, {:ok, acc} ->
+        with {:ok, normalized_key} <- normalize_key(key),
+             false <- Map.has_key?(acc, normalized_key) do
+          {:cont, {:ok, Map.put(acc, normalized_key, value)}}
+        else
+          _ -> {:halt, invalid_normalized_map()}
+        end
+
+      _item, _acc ->
+        {:halt, invalid_normalized_map()}
+    end)
+  end
+
+  defp normalize_key(key) when is_atom(key), do: {:ok, Atom.to_string(key)}
+
+  defp normalize_key(key) when is_binary(key) do
+    if String.valid?(key), do: {:ok, key}, else: :error
+  end
+
+  defp normalize_key(_key), do: :error
+
+  defp reject_request_key_collisions(request, keys) do
+    if Enum.any?(keys, &dual_key?(request, &1)) do
+      {:error,
+       invalid("Provider request contains a normalized-key collision.", %{
+         "reason" => "normalized_key_collision"
+       })}
+    else
+      :ok
+    end
+  end
+
+  defp dual_key?(request, key) do
+    case existing_atom(key) do
+      nil -> false
+      atom_key -> Map.has_key?(request, key) and Map.has_key?(request, atom_key)
+    end
+  end
+
+  defp normalize_json_term(value)
+       when is_nil(value) or is_boolean(value) or is_number(value),
+       do: {:ok, value}
+
+  defp normalize_json_term(value) when is_binary(value) do
+    if String.valid?(value), do: {:ok, value}, else: :error
+  end
+
+  defp normalize_json_term(value) when is_list(value) do
+    if proper_list?(value) do
+      value
+      |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
+        case normalize_json_term(item) do
+          {:ok, normalized} -> {:cont, {:ok, [normalized | acc]}}
+          :error -> {:halt, :error}
+        end
+      end)
+      |> case do
+        {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+        :error -> :error
+      end
+    else
+      :error
+    end
+  end
+
+  defp normalize_json_term(value) when is_map(value) and not is_struct(value) do
+    case safe_normalize_map(value) do
+      {:ok, normalized} ->
+        Enum.reduce_while(normalized, {:ok, %{}}, fn {key, nested}, {:ok, acc} ->
+          case normalize_json_term(nested) do
+            {:ok, normalized_nested} ->
+              {:cont, {:ok, Map.put(acc, key, normalized_nested)}}
+
+            :error ->
+              {:halt, :error}
+          end
+        end)
+
       {:error, _reason} ->
-        true
+        :error
     end
   end
 
-  defp normalize_map(keyword) when is_list(keyword) do
-    Enum.reduce(keyword, %{}, fn
-      {key, value}, acc ->
-        put_normalized_key!(acc, key, value)
+  defp normalize_json_term(_value), do: :error
 
-      item, _acc ->
-        raise ArgumentError,
-              "Provider hosted tool keyword entries must be {key, value}, got: #{inspect(item)}"
-    end)
+  defp proper_list?([]), do: true
+  defp proper_list?([_head | tail]), do: proper_list?(tail)
+  defp proper_list?(_tail), do: false
+
+  defp invalid_normalized_map do
+    {:error,
+     invalid("Provider hosted tool config must be a plain map or proper keyword list.", %{
+       "reason" => "invalid_map"
+     })}
   end
 
-  defp normalize_map(map) when is_map(map) do
-    Enum.reduce(map, %{}, fn {key, value}, acc ->
-      put_normalized_key!(acc, key, value)
-    end)
+  defp invalid_hosted_tools_list do
+    {:error,
+     invalid("hosted_tools must be a proper list of Provider-hosted tool specs.", %{
+       "expected" => "proper_list"
+     })}
   end
 
-  defp put_normalized_key!(acc, key, value) do
-    normalized_key = normalize_key!(key)
-
-    if Map.has_key?(acc, normalized_key) do
-      raise ArgumentError,
-            "Provider hosted tool key collision after normalization: #{inspect(normalized_key)}"
-    end
-
-    Map.put(acc, normalized_key, value)
+  defp invalid_json_field(key, received_type) do
+    {:error,
+     invalid("web_search.#{key} must be a JSON-safe plain map.", %{
+       "received_type" => received_type
+     })}
   end
 
-  defp normalize_key!(key) when is_atom(key), do: Atom.to_string(key)
-  defp normalize_key!(key) when is_binary(key), do: key
-
-  defp normalize_key!(key),
-    do:
-      raise(
-        ArgumentError,
-        "Provider hosted tool keys must be strings or atoms, got: #{inspect(key)}"
-      )
-
-  defp safe_normalize_map(map_or_keyword) do
-    {:ok, normalize_map(map_or_keyword)}
-  rescue
-    error in ArgumentError ->
-      {:error, invalid(Exception.message(error), %{})}
-  end
+  defp value_type(nil), do: "nil"
+  defp value_type(value) when is_boolean(value), do: "boolean"
+  defp value_type(value) when is_binary(value), do: "string"
+  defp value_type(value) when is_atom(value), do: "atom"
+  defp value_type(value) when is_integer(value), do: "integer"
+  defp value_type(value) when is_float(value), do: "float"
+  defp value_type(value) when is_list(value), do: "list"
+  defp value_type(value) when is_struct(value), do: "struct"
+  defp value_type(value) when is_map(value), do: "map"
+  defp value_type(value) when is_tuple(value), do: "tuple"
+  defp value_type(value) when is_function(value), do: "function"
+  defp value_type(value) when is_pid(value), do: "pid"
+  defp value_type(value) when is_reference(value), do: "reference"
+  defp value_type(value) when is_port(value), do: "port"
+  defp value_type(_value), do: "other"
 
   defp field(map, key) when is_map(map) do
     case Map.fetch(map, key) do

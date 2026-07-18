@@ -1,0 +1,25 @@
+{
+  "fixture_schema": "pixir.presenter.fixture",
+  "fixture_version": 1,
+  "scenario": "invalid-model-advisory",
+  "source_class": "synthetic_from_projection_contract",
+  "observed_at": "2026-07-10T20:40:05Z",
+  "inputs": {
+    "terminal_envelope": {"kind": "delegate_result", "delegate_id": "dlg-invalid-advisory", "parent_session_id": "parent-invalid-advisory", "strategy": "workflow", "mode": "read_only", "status": "completed", "workflow_id": "wf-invalid-advisory"},
+    "delegate_snapshot": null,
+    "parent_log": [
+      {"seq": 0, "ts": "2026-07-10T20:40:00Z", "type": "workflow_event", "data": {"kind": "workflow_started", "workflow_id": "wf-invalid-advisory", "workflow_name": "Invalid advisory", "graph": {"steps": [{"id": "review", "agent": "reviewer", "depends_on": [], "execution_kind": "subagent", "workspace_mode": "shared", "posture": "read_only"}]}}},
+      {"seq": 1, "ts": "2026-07-10T20:40:01Z", "type": "subagent_event", "data": {"event": "started", "subagent_id": "sub-invalid-review", "child_session_id": "child-invalid-review", "agent": "reviewer", "status": "running", "delegation_context": {"step_id": "review"}}},
+      {"seq": 2, "ts": "2026-07-10T20:40:03Z", "type": "subagent_event", "data": {"event": "finished", "subagent_id": "sub-invalid-review", "child_session_id": "child-invalid-review", "agent": "reviewer", "status": "completed", "summary": "{\"mergeable\":false,\"summary\":\"stop\"", "delegation_context": {"step_id": "review"}}},
+      {"seq": 3, "ts": "2026-07-10T20:40:04Z", "type": "workflow_event", "data": {"kind": "checkpoint_decided", "workflow_id": "wf-invalid-advisory", "step_id": "review", "child_session_id": "child-invalid-review", "checkpoint_status": "checkpoint_ready", "dependent_safe": true}},
+      {"seq": 4, "ts": "2026-07-10T20:40:05Z", "type": "workflow_event", "data": {"kind": "workflow_finished", "workflow_id": "wf-invalid-advisory", "status": "completed", "ok": true}}
+    ],
+    "parent_log_origin": "fixture",
+    "child_logs": {"child-invalid-review": []},
+    "runtime_diagnostics": null,
+    "owner_state": {"state": "snapshot_only", "reachable": false},
+    "evidence_mirror": null
+  },
+  "completeness": {"terminal_envelope": "complete_for_contract_scenario", "parent_log": "complete", "child_logs": "complete"},
+  "sanitization": {"absolute_paths_removed": true, "identifiers_replaced": true, "model_content_minimized": true, "secrets_removed": true}
+}

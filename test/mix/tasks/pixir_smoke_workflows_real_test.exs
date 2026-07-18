@@ -69,4 +69,46 @@ defmodule Mix.Tasks.Pixir.Smoke.WorkflowsRealTest do
     assert payload["error"]["details"]["scenario"] == "big_repo"
     assert Enum.any?(payload["next_steps"], &String.contains?(&1, "--dry-run --json"))
   end
+
+  test "malformed command profile preflight blocks before Auth and workflow fan-out" do
+    for {profile, kind} <- profile_cases() do
+      with_profile(profile, fn ->
+        payload =
+          capture_io(:stderr, fn ->
+            assert catch_exit(SmokeTask.run(["--json"])) == {:shutdown, 1}
+          end)
+          |> Jason.decode!()
+
+        assert payload["ok"] == false
+        assert payload["schema_version"] == 1
+        assert payload["command"] == "mix pixir.smoke.workflows_real"
+        assert payload["error"]["kind"] == kind
+        assert payload["next_steps"] != []
+      end)
+    end
+  end
+
+  defp profile_cases do
+    [{%{"mode" => "future"}, "invalid_config"}]
+  end
+
+  defp with_profile(profile, fun) do
+    home =
+      Path.join(System.tmp_dir!(), "pixir-workflow-profile-#{System.unique_integer([:positive])}")
+
+    prior_home = System.get_env("PIXIR_HOME")
+    File.mkdir_p!(home)
+    File.write!(Path.join(home, "config.json"), Jason.encode!(%{"responses_backend" => profile}))
+    System.put_env("PIXIR_HOME", home)
+
+    try do
+      fun.()
+    after
+      if prior_home,
+        do: System.put_env("PIXIR_HOME", prior_home),
+        else: System.delete_env("PIXIR_HOME")
+
+      File.rm_rf!(home)
+    end
+  end
 end

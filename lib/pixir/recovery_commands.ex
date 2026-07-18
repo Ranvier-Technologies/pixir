@@ -8,7 +8,7 @@ defmodule Pixir.RecoveryCommands do
   contract.
   """
 
-  alias Pixir.Tool
+  alias Pixir.SessionId
 
   @safe_resume_prompt "Continue from the latest incomplete turn. Inspect the Log first, avoid duplicating completed writes, and report what you resumed."
 
@@ -26,19 +26,14 @@ defmodule Pixir.RecoveryCommands do
 
   @doc "Build the standard diagnose/resume commands for a Session id."
   @spec commands(String.t()) :: {:ok, %{required(String.t()) => String.t()}} | {:error, map()}
-  def commands(session_id) when is_binary(session_id) and byte_size(session_id) > 0 do
-    {:ok,
-     %{
-       "diagnose_command" => "pixir diagnose session #{session_id} --json",
-       "resume_command" => ~s(pixir resume #{session_id} "#{@safe_resume_prompt}")
-     }}
-  end
-
-  def commands(_session_id) do
-    {:error,
-     Tool.error(:invalid_args, "session id must be a non-empty string", %{
-       "next_actions" => ["pass_a_valid_session_id"]
-     })}
+  def commands(session_id) do
+    with :ok <- SessionId.validate(session_id) do
+      {:ok,
+       %{
+         "diagnose_command" => "pixir diagnose session #{session_id} --json",
+         "resume_command" => ~s(pixir resume #{session_id} "#{@safe_resume_prompt}")
+       }}
+    end
   end
 
   @doc "Build strategy-aware recovery guidance without changing the standard commands."

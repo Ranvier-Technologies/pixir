@@ -21,6 +21,7 @@ defmodule Pixir.ACP.Translate do
   """
 
   alias Pixir.Event
+  alias Pixir.Provider.OutputTruncationSummary
 
   @type acp_sid :: String.t()
   @type await_outcome :: :done | :error | :interrupted | :timeout
@@ -134,6 +135,13 @@ defmodule Pixir.ACP.Translate do
     end
   end
 
+  def update(%{type: :provider_usage} = event, acp_sid, _opts) do
+    case OutputTruncationSummary.warning(event) do
+      nil -> nil
+      warning -> output_warning_update(warning, acp_sid)
+    end
+  end
+
   # assistant_message / reasoning / user_message / permission_decision / status: no direct
   # wire form (context_pressure is handled above). assistant_message is handled only
   # by the Server's no-deltas fallback; status drives the stopReason via await's
@@ -170,6 +178,8 @@ defmodule Pixir.ACP.Translate do
     wrap(acp_sid, %{"sessionUpdate" => "agent_message_chunk", "content" => text_block(text)})
   end
 
+  def replay(%{type: :provider_usage} = event, acp_sid, opts), do: update(event, acp_sid, opts)
+
   # tool_call / tool_result / subagent_event replay identically to the live wire form.
   def replay(%{type: type} = event, acp_sid, opts)
       when type in [:tool_call, :tool_result, :subagent_event] do
@@ -190,6 +200,50 @@ defmodule Pixir.ACP.Translate do
   @spec message_chunk(String.t(), acp_sid()) :: map()
   def message_chunk(text, acp_sid) when is_binary(text) do
     wrap(acp_sid, %{"sessionUpdate" => "agent_message_chunk", "content" => text_block(text)})
+  end
+
+  @doc "Build the pinned schema-valid, non-transcript ACP warning update."
+  @spec output_warning_update(map(), acp_sid()) :: map()
+  def output_warning_update(warning, acp_sid) do
+    wrap(acp_sid, %{
+      "sessionUpdate" => "session_info_update",
+      "_meta" => %{
+        "pixir" => %{
+          "schemaVersion" => 1,
+          "presentation" => %{"type" => "provider_output_warning"},
+          "warning" =>
+            %{
+              "kind" => warning["kind"],
+              "severity" => warning["severity"],
+              "providerUsageEventId" => warning["provider_usage_event_id"],
+              "providerUsageSeq" => warning["provider_usage_seq"],
+              "reason" => warning["reason"],
+              "providerReason" => warning["provider_reason"],
+              "callRole" => warning["call_role"]
+            }
+            |> Map.reject(fn {_key, value} -> is_nil(value) end)
+        }
+      }
+    })
+  end
+
+  @doc "Build the terminal ACP summary after the 256-notice cap was exceeded."
+  @spec output_warning_summary(non_neg_integer(), acp_sid()) :: map()
+  def output_warning_summary(total, acp_sid) do
+    wrap(acp_sid, %{
+      "sessionUpdate" => "session_info_update",
+      "_meta" => %{
+        "pixir" => %{
+          "schemaVersion" => 1,
+          "presentation" => %{"type" => "provider_output_warning_summary"},
+          "warningSummary" => %{
+            "warningCount" => total,
+            "warningsShown" => 256,
+            "warningsTruncated" => true
+          }
+        }
+      }
+    })
   end
 
   @doc """

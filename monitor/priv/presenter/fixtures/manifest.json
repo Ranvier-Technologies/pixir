@@ -1,0 +1,149 @@
+{
+  "fixture_schema": "pixir.presenter.fixture-manifest",
+  "fixture_version": 1,
+  "input_schema": "pixir.presenter.fixture.v1",
+  "projection_schema": "pixir.presenter.run.v1",
+  "sanitization_contract": {
+    "absolute_paths": "replace with portable labels",
+    "identifiers": "replace with stable scenario-local ids",
+    "model_content": "minimize to contract-relevant fields",
+    "secrets_and_headers": "remove",
+    "private_tracker_links": "remove",
+    "timestamps": "retain or normalize when needed for ordering",
+    "semantic_invariants": [
+      "event order",
+      "status and checkpoint disagreement",
+      "attempt lineage",
+      "source authority",
+      "usage counters",
+      "mutation uncertainty",
+      "safe action provenance",
+      "attention reasons",
+      "volatile versus durable materialization",
+      "child event windows",
+      "virtual diff application correlation"
+    ]
+  },
+  "scenarios": [
+    {
+      "id": "f4-advisory-retry-reconstructed",
+      "class": "real_minimized",
+      "source_refs": [
+        "<private-repo>/outputs/f4-propose-review-apply/envelope-round2.json",
+        "<private-repo>/.pixir/sessions/<parent-f4>.ndjson",
+        "<private-repo>/.pixir/sessions/<child-f4-b>.ndjson"
+      ],
+      "proves": [
+        "workflow engine-only steps",
+        "two attempts under one logical unit",
+        "runtime gate versus model advisory disagreement",
+        "provider_usage derivation",
+        "workspace apply evidence"
+      ]
+    },
+    {
+      "id": "wave3-transport-failure-reconstructed",
+      "class": "real_minimized",
+      "source_refs": [
+        "<private-repo>/outputs/wave3-288/envelope-288-r2.json",
+        "<evidence-mirror>/sessions/<parent-wave3>.ndjson",
+        "<evidence-mirror>/sessions/<child-wave3>.ndjson"
+      ],
+      "proves": [
+        "terminal transport failure",
+        "guided resume as informational action",
+        "terminal liveness normalized to not_applicable",
+        "complete registered recovery actions",
+        "durable usage before failure"
+      ]
+    },
+    {
+      "id": "wave1-parallel-audit-reconstructed",
+      "class": "real_minimized",
+      "source_refs": [
+        "<private-repo>/outputs/wave1/release-audit-019-r3-envelope.json"
+      ],
+      "proves": [
+        "parallel workflow wave",
+        "fan-in dependency edges",
+        "read-only mutation projection"
+      ]
+    },
+    {
+      "id": "mixed-running-current",
+      "class": "synthetic_from_runtime_contract",
+      "source_refs": ["Subagents.Manager.diagnostics/2 contract"],
+      "proves": ["mixed source mode", "durable execution plus volatile liveness"]
+    },
+    {
+      "id": "live-runtime-only-no-log",
+      "class": "synthetic_from_runtime_contract",
+      "source_refs": ["Delegate Owner live-state contract"],
+      "proves": ["live-only degradation", "durable_log_unavailable limitation"]
+    },
+    {
+      "id": "held-missing-child-log",
+      "class": "synthetic_from_workflow_contract",
+      "source_refs": ["Workflow held and SessionTree missing-log contracts"],
+      "proves": ["held dependency", "missing child Log", "usage incompleteness"]
+    },
+    {
+      "id": "timeout-needs-orchestrator",
+      "class": "synthetic_from_workflow_contract",
+      "source_refs": ["Workflow timeout close-failure contract"],
+      "proves": ["needs_orchestrator gate", "uncertain child liveness"]
+    },
+    {
+      "id": "partial-write-indeterminate",
+      "class": "synthetic_from_delegate_contract",
+      "source_refs": ["bounded_write partial-write envelope contract"],
+      "proves": ["lower-bound observed writes", "indeterminate mutation"]
+    },
+    {
+      "id": "virtual-diff-unapplied",
+      "class": "synthetic_from_workflow_contract",
+      "source_refs": ["Virtual Overlay and virtual_diff artifact contracts"],
+      "proves": ["artifact produced", "parent workspace not mutated"]
+    },
+    {
+      "id": "resume-reused-child-session",
+      "class": "synthetic_from_runtime_contract",
+      "source_refs": ["Subagents.Manager input/resume and child Turn contracts"],
+      "proves": [
+        "resume creates a new attempt while reusing child_session_id",
+        "child user_message epochs partition provider usage",
+        "root usage deduplicates event identities"
+      ]
+    },
+    {
+      "id": "stale-running-no-owner",
+      "class": "synthetic_from_runtime_contract",
+      "source_refs": ["Delegate Owner snapshot-only and stale-handle contracts"],
+      "proves": [
+        "durable running state remains running",
+        "snapshot-only Owner state normalizes to stale_handle",
+        "source freshness stale requires attention"
+      ]
+    },
+    {
+      "id": "evidence-mirror-canonical-conflict",
+      "class": "synthetic_from_projection_contract",
+      "source_refs": ["write-capable evidence mirror divergence contract"],
+      "proves": [
+        "workspace Log remains primary",
+        "mirror disagreement stays visible",
+        "canonical_source_conflict requires attention"
+      ]
+    },
+    {
+      "id": "invalid-model-advisory",
+      "class": "synthetic_from_projection_contract",
+      "source_refs": ["model advisory parsing contract"],
+      "proves": [
+        "invalid JSON cannot change runtime gate",
+        "bounded raw excerpt remains advisory",
+        "model_advisory_unparseable requires attention"
+      ]
+    }
+  ]
+}

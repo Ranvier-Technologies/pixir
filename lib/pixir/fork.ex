@@ -6,7 +6,7 @@ defmodule Pixir.Fork do
   canonical History. The parent Log is never mutated.
   """
 
-  alias Pixir.{BranchSummary, Event, Log, Session, SessionResources, Tool}
+  alias Pixir.{BranchSummary, Event, Log, Session, SessionId, SessionResources, Tool}
 
   @strategy "replay_v1"
 
@@ -40,18 +40,24 @@ defmodule Pixir.Fork do
   @spec plan(String.t(), keyword()) :: {:ok, map()} | {:error, map()}
   def plan(parent_session_id, opts \\ [])
 
-  def plan(parent_session_id, opts) when is_binary(parent_session_id) do
+  def plan(parent_session_id, opts) do
+    with :ok <- SessionId.validate(parent_session_id) do
+      do_plan(parent_session_id, opts)
+    end
+  end
+
+  defp do_plan(parent_session_id, opts) do
     workspace = workspace(opts)
     summarize? = Keyword.get(opts, :summarize, false)
+    child_session_id = Keyword.get_lazy(opts, :child_session_id, &Session.gen_id/0)
 
-    with {:ok, to_seq} <- resolve_to_seq(parent_session_id, workspace, opts),
+    with :ok <- SessionId.validate(child_session_id),
+         {:ok, to_seq} <- resolve_to_seq(parent_session_id, workspace, opts),
          {:ok, history} <- Log.fold(parent_session_id, workspace: workspace),
          :ok <- ensure_parent_history(history, parent_session_id, workspace),
          replay_events <- {:ok, select_replay_events(history, to_seq)},
          {:ok, replay_events} <- replay_events,
          fork_root = fork_root_session_id(history, parent_session_id) do
-      child_session_id = Keyword.get_lazy(opts, :child_session_id, &Session.gen_id/0)
-
       {:ok,
        %{
          "ok" => true,
@@ -73,14 +79,6 @@ defmodule Pixir.Fork do
          "resume_command" => resume_command(child_session_id)
        }}
     end
-  end
-
-  def plan(parent_session_id, _opts) do
-    {:error,
-     Tool.error(:invalid_args, "parent_session_id must be a string", %{
-       parent_session_id: parent_session_id,
-       next_actions: ["pass a valid session id string"]
-     })}
   end
 
   @doc "Canonical event types copied into a child fork Log."
@@ -107,25 +105,30 @@ defmodule Pixir.Fork do
   defp write_child_log(plan, workspace) do
     child_session_id = plan["child_session_id"]
 
-    if Log.exists?(child_session_id, workspace: workspace) do
-      {:error,
-       Tool.error(:already_exists, "child session log already exists", %{
-         child_session_id: child_session_id,
-         log_path: plan["child_log_path"],
-         next_actions: ["pick a new child session id", "remove the existing log if safe"]
-       })}
-    else
-      with {:ok, events} <- build_child_events(child_session_id, plan, workspace),
-           :ok <-
-             SessionResources.copy_referenced_resources(
-               plan["parent_session_id"],
-               child_session_id,
-               events,
-               workspace: workspace
-             ),
-           {:ok, _} <- Log.create_session(child_session_id, events, workspace: workspace) do
-        {:ok, child_session_id}
-      end
+    case Log.exists(child_session_id, workspace: workspace) do
+      {:ok, true} ->
+        {:error,
+         Tool.error(:already_exists, "child session log already exists", %{
+           child_session_id: child_session_id,
+           log_path: plan["child_log_path"],
+           next_actions: ["pick a new child session id", "remove the existing log if safe"]
+         })}
+
+      {:ok, false} ->
+        with {:ok, events} <- build_child_events(child_session_id, plan, workspace),
+             :ok <-
+               SessionResources.copy_referenced_resources(
+                 plan["parent_session_id"],
+                 child_session_id,
+                 events,
+                 workspace: workspace
+               ),
+             {:ok, _} <- Log.create_session(child_session_id, events, workspace: workspace) do
+          {:ok, child_session_id}
+        end
+
+      {:error, _error} = error ->
+        error
     end
   end
 

@@ -1,0 +1,68 @@
+{
+  "fixture_schema": "pixir.presenter.fixture",
+  "fixture_version": 1,
+  "scenario": "resume-reused-child-session",
+  "source_class": "synthetic_from_runtime_contract",
+  "observed_at": "2026-07-10T20:10:10Z",
+  "inputs": {
+    "terminal_envelope": {
+      "kind": "delegate_result",
+      "delegate_id": "dlg-resume-reuse",
+      "parent_session_id": "parent-resume-reuse",
+      "strategy": "subagents",
+      "mode": "read_only",
+      "status": "completed",
+      "children": [
+        {
+          "subagent_id": "sub-reuse",
+          "child_session_id": "child-reused",
+          "agent": "worker",
+          "status": "completed"
+        }
+      ]
+    },
+    "delegate_snapshot": null,
+    "parent_log": [
+      {
+        "seq": 0,
+        "ts": "2026-07-10T20:00:00Z",
+        "type": "subagent_event",
+        "data": {"event": "started", "subagent_id": "sub-reuse", "child_session_id": "child-reused", "agent": "worker", "status": "running"}
+      },
+      {
+        "seq": 1,
+        "ts": "2026-07-10T20:00:10Z",
+        "type": "subagent_event",
+        "data": {"event": "finished", "subagent_id": "sub-reuse", "child_session_id": "child-reused", "agent": "worker", "status": "completed", "summary": "First turn complete."}
+      },
+      {
+        "seq": 2,
+        "ts": "2026-07-10T20:10:00Z",
+        "type": "subagent_event",
+        "data": {"event": "input", "subagent_id": "sub-reuse", "child_session_id": "child-reused", "agent": "worker", "status": "running"}
+      },
+      {
+        "seq": 3,
+        "ts": "2026-07-10T20:10:10Z",
+        "type": "subagent_event",
+        "data": {"event": "finished", "subagent_id": "sub-reuse", "child_session_id": "child-reused", "agent": "worker", "status": "completed", "summary": "Resumed turn complete."}
+      }
+    ],
+    "parent_log_origin": "fixture",
+    "child_logs": {
+      "child-reused": [
+        {"seq": 0, "ts": "2026-07-10T20:00:00Z", "type": "user_message", "data": {"text": "first turn"}},
+        {"seq": 1, "ts": "2026-07-10T20:00:05Z", "type": "provider_usage", "data": {"model": "gpt-test", "usage_summary": {"input_tokens": 100, "output_tokens": 10, "reasoning_tokens": 0, "total_tokens": 110, "cached_tokens": 20}}},
+        {"seq": 2, "ts": "2026-07-10T20:00:10Z", "type": "assistant_message", "data": {"text": "done"}},
+        {"seq": 3, "ts": "2026-07-10T20:10:00Z", "type": "user_message", "data": {"text": "resume turn"}},
+        {"seq": 4, "ts": "2026-07-10T20:10:05Z", "type": "provider_usage", "data": {"model": "gpt-test", "usage_summary": {"input_tokens": 200, "output_tokens": 20, "reasoning_tokens": 0, "total_tokens": 220, "cached_tokens": 40}}},
+        {"seq": 5, "ts": "2026-07-10T20:10:10Z", "type": "assistant_message", "data": {"text": "done again"}}
+      ]
+    },
+    "runtime_diagnostics": null,
+    "owner_state": {"state": "snapshot_only", "reachable": false},
+    "evidence_mirror": null
+  },
+  "completeness": {"terminal_envelope": "complete_for_contract_scenario", "parent_log": "complete", "child_logs": "complete"},
+  "sanitization": {"absolute_paths_removed": true, "identifiers_replaced": true, "model_content_minimized": true, "secrets_removed": true}
+}

@@ -58,6 +58,70 @@ pixir login
 Follow the printed device-code instructions. The subscription credential is stored under
 `~/.pixir/auth.json` with local file permissions. As a fallback, set `OPENAI_API_KEY`.
 
+### Open Responses Profile (Experimental)
+
+Pixir's default remains the `chatgpt_codex` Responses backend. Source-checkout users may
+explicitly select the first conservative `open_responses` HTTP/SSE profile in
+`~/.pixir/config.json`:
+
+```json
+{
+  "model": "vendor-model",
+  "responses_backend": {
+    "mode": "open_responses",
+    "responses_url": "https://vendor.invalid/v1/responses",
+    "auth": {"policy": "bearer_env", "env_var": "VENDOR_API_KEY"}
+  }
+}
+```
+
+Use a real validated endpoint in local config; diagnostics retain only redacted route
+and auth summaries. Literal loopback HTTP may use `{"policy":"none"}`. Bearer
+credentials require HTTPS or literal loopback and are read only for the request.
+
+The initial profile deliberately preserves `store: false`, uses HTTP/SSE only, adds
+the required `type: "message"` discriminator, omits optional cache/encrypted-reasoning
+and OpenAI-hosted-tool extensions, and rejects requested reasoning plus schema-valid
+nonportable streamed content. Its strict decoder covers the pinned Open
+Responses/WHATWG framing surface. Every known HTTP/SSE event is validated first against
+a checked-in module generated from the exact pinned OpenAPI closure (24 roots, 69
+reachable schemas); runtime validation loads no schema, file, dependency, or network
+resource. Unknown event types stay opaque, while malformed known types fail before
+reduction. This is experimental bounded interoperability, not universal or full
+compliance. Explicitly certified custom Provider modules receive the active opaque
+backend selection but own their wire and inherit no Pixir conformance claim.
+
+Runtime validation fails closed after depth 64 or 250,000 schema/instance evaluations.
+Consequently, a Draft-valid but adversarially large event may return the fixed
+`validation_budget_exceeded` reason instead of being reduced; this is an intentional
+denial-of-service bound, not a claim that the pinned schema rejected the event.
+
+Maintainers can reproduce the generated subset and 14,235-row logical differential
+corpus from a local copy of the pinned OpenAPI, without network access. The checked-in
+corpus deduplicates canonical root events into independently reconstructable mutation
+recipes; its manifest pins both stored and expanded digests:
+
+```bash
+uv run python bin/generate-open-responses-schema \
+  --input /path/to/pinned/public/openapi/openapi.json --check --json
+uv run --with jsonschema python bin/verify-open-responses-schema-corpus \
+  --input /path/to/pinned/public/openapi/openapi.json --json
+```
+
+From a source checkout, validate without credentials or network first:
+
+```bash
+mix pixir.smoke.open_responses --help
+mix pixir.smoke.open_responses --dry-run --json
+```
+
+The opt-in live command makes at most two Provider calls, executes no model-selected
+tool, and writes a bounded redacted evidence envelope:
+
+```bash
+mix pixir.smoke.open_responses --json
+```
+
 ## Run A First Turn
 
 From a project directory:

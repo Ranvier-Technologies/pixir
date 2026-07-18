@@ -116,15 +116,16 @@ defmodule Pixir.Provider.TransportPolicy do
       Enum.empty?(acc[:output_items] || []) and is_nil(acc[:usage])
   end
 
-  defp error_kind(%{error: %{kind: kind}}), do: Atom.to_string(kind)
-  defp error_kind(error), do: inspect(error)
+  defp error_kind(%{error: %{kind: kind}}) when is_atom(kind), do: Atom.to_string(kind)
+  defp error_kind(_error), do: "websocket_failed"
 
-  defp error_message(%{error: %{message: message}}) when is_binary(message), do: message
-  defp error_message(error), do: inspect(error)
+  defp error_message(_error), do: "WebSocket transport failed."
 
   defp policy(opts) do
     opts
-    |> Keyword.get(:provider_transport, Application.get_env(:pixir, :provider_transport, :auto))
+    |> Keyword.get_lazy(:provider_transport, fn ->
+      Application.get_env(:pixir, :provider_transport, :auto)
+    end)
     |> normalize_policy()
   end
 

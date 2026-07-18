@@ -13,7 +13,12 @@ defmodule Pixir.Delegate.Handle do
   reversible `dlg1_...` wrapper around `parent_session_id`. Future owner-backed service
   mode may move this mapping into a durable index, but it must continue exposing the
   parent Session id instead of hiding Log truth behind an opaque service id.
+
+  Bare and decoded parent Session ids use `Pixir.SessionId` exactly as supplied. This
+  boundary never trims or otherwise normalizes an invalid id before validation.
   """
+
+  alias Pixir.SessionId
 
   @prefix "dlg1_"
   @version 1
@@ -22,12 +27,8 @@ defmodule Pixir.Delegate.Handle do
   @spec build(String.t(), keyword()) :: {:ok, map()} | {:error, map()}
   def build(parent_session_id, opts \\ [])
 
-  def build(parent_session_id, _opts) when is_binary(parent_session_id) do
-    parent_session_id = String.trim(parent_session_id)
-
-    if parent_session_id == "" do
-      {:error, invalid_handle("parent_session_id must be a non-empty string", %{})}
-    else
+  def build(parent_session_id, _opts) do
+    with :ok <- SessionId.validate(parent_session_id) do
       {:ok,
        %{
          "delegate_id" => encode_parent_session_id(parent_session_id),
@@ -36,9 +37,6 @@ defmodule Pixir.Delegate.Handle do
        }}
     end
   end
-
-  def build(_parent_session_id, _opts),
-    do: {:error, invalid_handle("parent_session_id must be a string", %{})}
 
   @doc """
   Resolve either a Delegate id or a parent Session id into the stable handle shape.
@@ -51,24 +49,18 @@ defmodule Pixir.Delegate.Handle do
   def resolve(handle_or_session_id, opts \\ [])
 
   def resolve(handle_or_session_id, _opts) when is_binary(handle_or_session_id) do
-    handle_or_session_id = String.trim(handle_or_session_id)
-
-    cond do
-      handle_or_session_id == "" ->
-        {:error, invalid_handle("delegate handle must be a non-empty string", %{})}
-
-      String.starts_with?(handle_or_session_id, @prefix) ->
+    case handle_or_session_id do
+      <<"dlg1_", _encoded::binary>> ->
         resolve_delegate_id(handle_or_session_id)
 
-      true ->
+      _bare_session_id ->
         with {:ok, handle} <- build(handle_or_session_id) do
           {:ok, Map.put(handle, "input_kind", "parent_session_id")}
         end
     end
   end
 
-  def resolve(_handle_or_session_id, _opts),
-    do: {:error, invalid_handle("delegate handle must be a string", %{})}
+  def resolve(handle_or_session_id, _opts), do: build(handle_or_session_id)
 
   defp resolve_delegate_id(delegate_id) do
     encoded = String.replace_prefix(delegate_id, @prefix, "")

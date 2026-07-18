@@ -1,0 +1,253 @@
+{
+  "fixture_schema": "pixir.presenter.fixture",
+  "fixture_version": 1,
+  "scenario": "wave1-parallel-audit-reconstructed",
+  "source_class": "real_minimized",
+  "observed_at": "2026-07-10T16:33:35.108886Z",
+  "inputs": {
+    "terminal_envelope": {
+      "kind": "delegate_result",
+      "delegate_id": "dlg-wave1",
+      "parent_session_id": "parent-wave1",
+      "strategy": "workflow",
+      "mode": "read_only",
+      "workflow_id": "wf-wave1",
+      "status": "completed",
+      "workflow": {
+        "waves": [
+          [
+            "claims",
+            "mechanics"
+          ],
+          [
+            "synthesis"
+          ]
+        ]
+      }
+    },
+    "delegate_snapshot": null,
+    "parent_log": [
+      {
+        "seq": 0,
+        "ts": "2026-07-10T16:22:05.653339Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "workflow_started",
+          "workflow_id": "wf-wave1",
+          "workflow_name": "Release audit 0.1.9",
+          "graph": {
+            "steps": [
+              {
+                "id": "claims",
+                "agent": "reviewer",
+                "depends_on": [],
+                "execution_kind": "subagent",
+                "workspace_mode": "shared",
+                "posture": "read_only"
+              },
+              {
+                "id": "mechanics",
+                "agent": "reviewer",
+                "depends_on": [],
+                "execution_kind": "subagent",
+                "workspace_mode": "shared",
+                "posture": "read_only"
+              },
+              {
+                "id": "synthesis",
+                "agent": "reviewer",
+                "depends_on": [
+                  "claims",
+                  "mechanics"
+                ],
+                "execution_kind": "subagent",
+                "workspace_mode": "shared",
+                "posture": "read_only"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "seq": 1,
+        "ts": "2026-07-10T16:22:05.653799Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "step_scheduled",
+          "workflow_id": "wf-wave1",
+          "step_id": "claims",
+          "wave": 1,
+          "execution_kind": "subagent"
+        }
+      },
+      {
+        "seq": 2,
+        "ts": "2026-07-10T16:22:05.657624Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "started",
+          "status": "running",
+          "subagent_id": "sub-claims",
+          "child_session_id": "child-claims",
+          "agent": "reviewer"
+        }
+      },
+      {
+        "seq": 3,
+        "ts": "2026-07-10T16:22:05.661051Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "step_scheduled",
+          "workflow_id": "wf-wave1",
+          "step_id": "mechanics",
+          "wave": 1,
+          "execution_kind": "subagent"
+        }
+      },
+      {
+        "seq": 4,
+        "ts": "2026-07-10T16:22:05.664830Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "started",
+          "status": "running",
+          "subagent_id": "sub-mechanics",
+          "child_session_id": "child-mechanics",
+          "agent": "reviewer"
+        }
+      },
+      {
+        "seq": 5,
+        "ts": "2026-07-10T16:25:10.991382Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "finished",
+          "status": "completed",
+          "subagent_id": "sub-mechanics",
+          "child_session_id": "child-mechanics",
+          "agent": "reviewer",
+          "summary": "Mechanical checks passed."
+        }
+      },
+      {
+        "seq": 6,
+        "ts": "2026-07-10T16:25:11.029358Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "checkpoint_decided",
+          "workflow_id": "wf-wave1",
+          "step_id": "mechanics",
+          "child_session_id": "child-mechanics",
+          "checkpoint_status": "checkpoint_ready",
+          "dependent_safe": true
+        }
+      },
+      {
+        "seq": 7,
+        "ts": "2026-07-10T16:31:55.674706Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "finished",
+          "status": "completed",
+          "subagent_id": "sub-claims",
+          "child_session_id": "child-claims",
+          "agent": "reviewer",
+          "summary": "Claims checked against code."
+        }
+      },
+      {
+        "seq": 8,
+        "ts": "2026-07-10T16:31:55.676866Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "checkpoint_decided",
+          "workflow_id": "wf-wave1",
+          "step_id": "claims",
+          "child_session_id": "child-claims",
+          "checkpoint_status": "checkpoint_ready",
+          "dependent_safe": true
+        }
+      },
+      {
+        "seq": 9,
+        "ts": "2026-07-10T16:31:55.677787Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "step_scheduled",
+          "workflow_id": "wf-wave1",
+          "step_id": "synthesis",
+          "wave": 2,
+          "execution_kind": "subagent"
+        }
+      },
+      {
+        "seq": 10,
+        "ts": "2026-07-10T16:31:55.681081Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "started",
+          "status": "running",
+          "subagent_id": "sub-synthesis",
+          "child_session_id": "child-synthesis",
+          "agent": "reviewer"
+        }
+      },
+      {
+        "seq": 11,
+        "ts": "2026-07-10T16:33:35.106949Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "finished",
+          "status": "completed",
+          "subagent_id": "sub-synthesis",
+          "child_session_id": "child-synthesis",
+          "agent": "reviewer",
+          "summary": "Release audit is mergeable."
+        }
+      },
+      {
+        "seq": 12,
+        "ts": "2026-07-10T16:33:35.108278Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "checkpoint_decided",
+          "workflow_id": "wf-wave1",
+          "step_id": "synthesis",
+          "child_session_id": "child-synthesis",
+          "checkpoint_status": "checkpoint_ready",
+          "dependent_safe": true
+        }
+      },
+      {
+        "seq": 13,
+        "ts": "2026-07-10T16:33:35.108886Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "workflow_finished",
+          "workflow_id": "wf-wave1",
+          "status": "completed",
+          "ok": true
+        }
+      }
+    ],
+    "parent_log_origin": "fixture",
+    "child_logs": {},
+    "runtime_diagnostics": null,
+    "owner_state": {
+      "state": "snapshot_only",
+      "reachable": false
+    },
+    "evidence_mirror": null
+  },
+  "completeness": {
+    "terminal_envelope": "minimized",
+    "parent_log": "complete_for_contract_scenario",
+    "child_logs": "not_retained"
+  },
+  "sanitization": {
+    "absolute_paths_removed": true,
+    "identifiers_replaced": true,
+    "model_content_minimized": true,
+    "secrets_removed": true
+  }
+}

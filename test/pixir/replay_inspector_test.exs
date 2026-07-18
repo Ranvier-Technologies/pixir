@@ -1,7 +1,7 @@
 defmodule Pixir.ReplayInspectorTest do
   use ExUnit.Case, async: true
 
-  alias Pixir.{Event, Log, ReplayInspector}
+  alias Pixir.{Event, Log, Provider, ReplayInspector}
 
   test "reports balanced function calls for paired tool history" do
     ws = tmp_ws()
@@ -102,6 +102,55 @@ defmodule Pixir.ReplayInspectorTest do
            }
   end
 
+  test "reports scoped 63/64/65 truncation evidence with the shared most-recent window" do
+    ws = tmp_ws()
+    sid = "inspect-output-truncation-window"
+
+    events =
+      for index <- 0..64 do
+        id = "evt_#{String.pad_leading(Integer.to_string(index), 3, "0")}"
+
+        Event.provider_usage(
+          sid,
+          %{
+            "output_truncation" => %{
+              "status" => "truncated",
+              "reason" => "provider_output_limit",
+              "provider_reason" => "max_tokens",
+              "provider_usage_event_id" => id,
+              "call_role" => if(index == 64, do: "final_answer", else: "intermediate")
+            }
+          },
+          id: id
+        )
+      end
+
+    append_all(ws, sid, events)
+    on_exit(fn -> File.rm_rf!(ws) end)
+
+    for {after_seq, expected_count, expected_truncated} <- [
+          {62, 63, false},
+          {63, 64, false},
+          {64, 65, true}
+        ] do
+      assert {:ok, result} =
+               ReplayInspector.inspect(sid, workspace: ws, after_seq: after_seq)
+
+      summary = result["output_truncation"]
+      assert summary["counts"]["truncated"] == expected_count
+      assert summary["positive_count"] == expected_count
+      assert length(summary["positive_refs"]) == min(expected_count, 64)
+      assert summary["positive_refs_truncated"] == expected_truncated
+      assert summary["latest"]["provider_usage_seq"] == after_seq
+    end
+
+    assert {:ok, full} = ReplayInspector.inspect(sid, workspace: ws)
+    refs = full["output_truncation"]["positive_refs"]
+    assert hd(refs)["provider_usage_seq"] == 1
+    assert List.last(refs)["provider_usage_seq"] == 64
+    assert full["replay_contract"]["provider_usage_events_excluded"] == 65
+  end
+
   test "after_seq inspects replay state after a given event seq" do
     ws = tmp_ws()
     sid = "inspect-after-seq"
@@ -122,6 +171,146 @@ defmodule Pixir.ReplayInspectorTest do
     assert result["events"]["to_seq"] == 2
     assert result["events"]["tool_calls"] == 1
     assert result["provider_input"]["synthetic_orphan_closures"] == []
+  end
+
+  test "implicit models resolve centrally while malformed profiles fail and open profiles preview" do
+    ws = tmp_ws()
+    sid = "inspect-profile-preflight"
+    append_all(ws, sid, [Event.user_message(sid, "inspect")])
+    on_exit(fn -> File.rm_rf!(ws) end)
+
+    assert {:ok, result} =
+             ReplayInspector.inspect(sid,
+               workspace: ws,
+               raw_config: %{"model" => "gpt-5.4-mini"}
+             )
+
+    assert result["ok"]
+
+    assert {:error, %{error: %{kind: :invalid_config, details: %{reason: :unknown_mode}}}} =
+             ReplayInspector.inspect(sid,
+               workspace: ws,
+               raw_config: %{"responses_backend" => %{"mode" => "future"}}
+             )
+
+    assert {:ok, open_result} =
+             ReplayInspector.inspect(sid,
+               workspace: ws,
+               raw_config: %{
+                 "responses_backend" => %{
+                   "mode" => "open_responses",
+                   "responses_url" => "https://private.example/v1/responses",
+                   "auth" => %{"policy" => "none"}
+                 }
+               }
+             )
+
+    assert open_result["ok"]
+    refute inspect(open_result) =~ "private.example"
+  end
+
+  test "explicit model values are preserved once for canonical validation" do
+    ws = tmp_ws()
+    sid = "inspect-explicit-model-validation"
+    append_all(ws, sid, [Event.user_message(sid, "inspect")])
+    on_exit(fn -> File.rm_rf!(ws) end)
+
+    for model <- [123, "", "   "] do
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_config,
+                  details: %{field: :model, reason: :invalid_type}
+                }
+              }} = ReplayInspector.inspect(sid, workspace: ws, model: model)
+    end
+
+    assert {:ok, implicit} =
+             ReplayInspector.inspect(sid,
+               workspace: ws,
+               model: nil,
+               raw_config: %{"model" => "gpt-5.4-mini"}
+             )
+
+    assert implicit["ok"]
+
+    assert {:ok, explicit} =
+             ReplayInspector.inspect(sid,
+               workspace: ws,
+               model: "gpt-explicit",
+               raw_config: %{"model" => "must-not-win"}
+             )
+
+    assert explicit["ok"]
+  end
+
+  test "preview ingress receives explicit models once and omits nil or implicit models" do
+    ws = tmp_ws()
+    sid = "inspect-preview-model-evidence"
+    append_all(ws, sid, [Event.user_message(sid, "inspect")])
+    on_exit(fn -> File.rm_rf!(ws) end)
+
+    Code.ensure_loaded!(Provider)
+    traced = self()
+    tracer = spawn_link(fn -> forward_preview_traces(traced) end)
+    :erlang.trace(traced, true, [:call, {:tracer, tracer}])
+    assert :erlang.trace_pattern({Provider, :request_body_preview, 2}, true, []) == 1
+
+    on_exit(fn ->
+      :erlang.trace_pattern({Provider, :request_body_preview, 2}, false, [])
+      Process.exit(tracer, :kill)
+    end)
+
+    assert {:ok, _report} =
+             ReplayInspector.inspect(sid,
+               workspace: ws,
+               model: "gpt-explicit",
+               raw_config: %{"model" => "gpt-configured"}
+             )
+
+    assert_receive {:captured_preview_trace,
+                    {:trace, _pid, :call,
+                     {Provider, :request_body_preview, [explicit_request, explicit_opts]}}}
+
+    assert explicit_request.model == "gpt-explicit"
+    refute Keyword.has_key?(explicit_opts, :model)
+
+    implicit_calls =
+      for model_opts <- [[], [model: nil]] do
+        assert {:ok, _report} =
+                 ReplayInspector.inspect(
+                   sid,
+                   [workspace: ws, raw_config: %{"model" => "gpt-configured"}] ++ model_opts
+                 )
+
+        assert_receive {:captured_preview_trace,
+                        {:trace, _pid, :call, {Provider, :request_body_preview, [request, opts]}}}
+
+        refute Map.has_key?(request, :model)
+        refute Keyword.has_key?(opts, :model)
+        {request, opts}
+      end
+
+    :erlang.trace(traced, false, [:call])
+    :erlang.trace_pattern({Provider, :request_body_preview, 2}, false, [])
+
+    assert {:ok, explicit_body} =
+             Provider.request_body_preview(explicit_request, explicit_opts)
+
+    assert explicit_body["model"] == "gpt-explicit"
+
+    for {request, opts} <- implicit_calls do
+      assert {:ok, body} = Provider.request_body_preview(request, opts)
+      assert body["model"] == "gpt-configured"
+    end
+  end
+
+  defp forward_preview_traces(test) do
+    receive do
+      message ->
+        send(test, {:captured_preview_trace, message})
+        forward_preview_traces(test)
+    end
   end
 
   defp tmp_ws do

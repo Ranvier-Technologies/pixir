@@ -14,7 +14,7 @@ defmodule Pixir.Provider.Connection do
 
   use GenServer
 
-  alias Pixir.Provider.WebSocketClient
+  alias Pixir.Provider.{TransportError, WebSocketClient}
   alias Pixir.Tool
 
   @registry Pixir.Provider.ConnectionRegistry
@@ -70,6 +70,10 @@ defmodule Pixir.Provider.Connection do
                   )
 
                 {:error, error, acc}
+
+              :exit, reason ->
+                if Process.alive?(pid), do: Process.exit(pid, :kill)
+                {:error, TransportError.project({:exit, reason}), acc}
             end
 
           {:error, error} ->
@@ -79,7 +83,7 @@ defmodule Pixir.Provider.Connection do
       {:error, reason} ->
         error =
           Tool.error(:websocket_start_failed, "WebSocket connection process could not start.", %{
-            reason: inspect(reason),
+            reason: TransportError.reason(reason),
             key: inspect(key)
           })
 
@@ -302,9 +306,15 @@ defmodule Pixir.Provider.Connection do
         {:error, error, acc} ->
           {:error, error, acc, state}
       end
+    rescue
+      exception ->
+        {:error, TransportError.project(exception), acc, %{state | initial_buffer: ""}}
     catch
       {@callback_failure_tag, error, failed_acc} ->
         {:error, error, failed_acc, %{state | initial_buffer: ""}}
+
+      kind, reason ->
+        {:error, TransportError.project({kind, reason}), acc, %{state | initial_buffer: ""}}
     end
   end
 
@@ -342,8 +352,8 @@ defmodule Pixir.Provider.Connection do
       "Provider stream callback failed before the stream completed.",
       %{
         reason: "stream_callback_failed",
-        exit_kind: inspect(kind),
-        exit_reason: safe_inspect(reason),
+        exit_kind: kind,
+        exit_reason: TransportError.reason(reason),
         continuation_reset_reason: "stream_callback_failed",
         next_actions: ["retry_turn", "inspect_session_lifecycle", "fall_back_to_full_replay"]
       }
@@ -435,23 +445,31 @@ defmodule Pixir.Provider.Connection do
 
     close_socket(state)
 
-    case client.connect(endpoint, headers, opts) do
-      {:ok, socket, initial_buffer, _handshake} ->
-        {:ok,
-         state
-         |> reset_continuation(reconnect_reset_reason(state, endpoint, headers_fingerprint))
-         |> Map.merge(%{
-           socket: socket,
-           initial_buffer: initial_buffer,
-           endpoint: endpoint,
-           headers_fingerprint: headers_fingerprint,
-           idle_timer: nil,
-           keepalive_timer: nil,
-           websocket_client: client
-         })}
+    try do
+      case client.connect(endpoint, headers, opts) do
+        {:ok, socket, initial_buffer, _handshake} ->
+          {:ok,
+           state
+           |> reset_continuation(reconnect_reset_reason(state, endpoint, headers_fingerprint))
+           |> Map.merge(%{
+             socket: socket,
+             initial_buffer: initial_buffer,
+             endpoint: endpoint,
+             headers_fingerprint: headers_fingerprint,
+             idle_timer: nil,
+             keepalive_timer: nil,
+             websocket_client: client
+           })}
 
-      {:error, error} ->
-        {:error, error}
+        {:error, error} ->
+          {:error, error}
+      end
+    rescue
+      exception ->
+        {:error, TransportError.project(exception)}
+    catch
+      kind, reason ->
+        {:error, TransportError.project({kind, reason})}
     end
   end
 
@@ -810,12 +828,16 @@ defmodule Pixir.Provider.Connection do
   defp degraded?(_state), do: false
 
   defp safe_endpoint(endpoint) when is_binary(endpoint) do
-    endpoint
-    |> String.replace(~r/(authorization|access_token|api_key|token)=([^&]+)/i, "\\1=<redacted>")
-    |> String.replace(~r/(chatgpt-account-id)=([^&]+)/i, "\\1=<redacted>")
+    case URI.parse(endpoint).scheme do
+      scheme when scheme in ["http", "https", "ws", "wss"] -> "<#{scheme}_endpoint>"
+      _scheme -> "<configured_endpoint>"
+    end
+  rescue
+    _error -> "<configured_endpoint>"
   end
 
-  defp safe_endpoint(endpoint), do: endpoint
+  defp safe_endpoint(nil), do: nil
+  defp safe_endpoint(_endpoint), do: "<configured_endpoint>"
 
   defp safe_inspect(value) do
     value

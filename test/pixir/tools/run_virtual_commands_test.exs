@@ -193,6 +193,30 @@ defmodule Pixir.Tools.RunVirtualCommandsTest do
              run(context, "read_only", %{"commands" => []})
   end
 
+  test "Tool boundary rechecks operator-owned read_set with shared classification", %{
+    context: context
+  } do
+    context =
+      Map.put(context, :virtual_overlay, %{
+        read_set: ["src.txt", "lib/../**/*"],
+        limits: nil
+      })
+
+    for checked_context <- [context, Map.put(context, :dry_run, true)] do
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_args,
+                  details: %{
+                    "field" => "virtual_overlay.read_set",
+                    "index" => 1,
+                    "reason" => "parent_component"
+                  }
+                }
+              }} = run(checked_context, "unsafe_context", %{"commands" => []})
+    end
+  end
+
   test "Executor dry-run is effect-free and echoes the operator plan", %{
     context: context,
     workspace: workspace

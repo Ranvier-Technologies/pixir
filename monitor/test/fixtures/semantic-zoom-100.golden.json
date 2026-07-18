@@ -1,0 +1,33 @@
+{
+  "fixture_id": "semantic-zoom-100-seed-348",
+  "wave_sizes": [30, 40, 20, 10],
+  "windows": [
+    {
+      "start": 0,
+      "entities": [
+        {"key": "wave:0:bucket:0", "wave": 0, "offset": 0, "size": 15},
+        {"key": "wave:0:bucket:1", "wave": 0, "offset": 15, "size": 15},
+        {"key": "wave:1:bucket:0", "wave": 1, "offset": 0, "size": 20},
+        {"key": "wave:1:bucket:1", "wave": 1, "offset": 20, "size": 20},
+        {"key": "wave:2:bucket:0", "wave": 2, "offset": 0, "size": 20},
+        {"key": "wave:3:bucket:0", "wave": 3, "offset": 0, "size": 10}
+      ],
+      "arcs": [
+        {"from": "wave:0:bucket:0", "to": "wave:1:bucket:0", "edge_count": 11},
+        {"from": "wave:0:bucket:1", "to": "wave:1:bucket:0", "edge_count": 9},
+        {"from": "wave:0:bucket:0", "to": "wave:1:bucket:1", "edge_count": 9},
+        {"from": "wave:0:bucket:1", "to": "wave:1:bucket:1", "edge_count": 11},
+        {"from": "wave:0:bucket:0", "to": "wave:2:bucket:0", "edge_count": 5},
+        {"from": "wave:0:bucket:1", "to": "wave:2:bucket:0", "edge_count": 2},
+        {"from": "wave:1:bucket:0", "to": "wave:2:bucket:0", "edge_count": 11},
+        {"from": "wave:1:bucket:1", "to": "wave:2:bucket:0", "edge_count": 9},
+        {"from": "wave:1:bucket:0", "to": "wave:3:bucket:0", "edge_count": 1},
+        {"from": "wave:1:bucket:1", "to": "wave:3:bucket:0", "edge_count": 3},
+        {"from": "wave:2:bucket:0", "to": "wave:3:bucket:0", "edge_count": 10}
+      ]
+    }
+  ],
+  "member_page_size": 12,
+  "edge_page_size": 100,
+  "maximum_clusters_per_window": 6
+}

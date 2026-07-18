@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pixir.dev/schemas/pixir.presenter.workspace_set.v1.schema.json",
+  "title": "Pixir Presenter Workspace Set v1",
+  "description": "Two-workspace Workspace Overview surfaces: bootstrap shell embed, scoped snapshot envelopes (list and detail), scoped error envelope, and set-mode SSE invalidation frame. Each envelope embeds the corresponding single-mode document verbatim: the pixir.monitor.runs v1 list document on the list route, the pixir.presenter.run.v1 document on the detail route. Frozen on #339; consumers #349 and #340.",
+  "oneOf": [
+    { "$ref": "#/$defs/shell_config" },
+    { "$ref": "#/$defs/scoped_list_snapshot" },
+    { "$ref": "#/$defs/scoped_run_snapshot" },
+    { "$ref": "#/$defs/scoped_error" },
+    { "$ref": "#/$defs/invalidation_frame" }
+  ],
+  "$defs": {
+    "workspace_key": {
+      "description": "Operator-assigned source key, declared at serve time as --workspace <key>=<path>. Exact UnitIdentity safe-component rule; ASCII-only, so the code-point bound equals the 256-byte bound. Doubles as the operator-facing label; no separate display-name in v1.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "maxLength": 256
+    },
+    "shell_config": {
+      "description": "Embedded by the set-mode bootstrap shell (GET /) as HTML-attribute-escaped JSON in a data-workspace-set attribute on the shell's <main> element — no new inline script; the hashed bootstrap script and CSP are unchanged. The SPA reads and strictly validates it once at boot: present and valid = set mode; absent = single mode; present but malformed = explicit boot error, never a silent fallback. Single-workspace shells embed nothing and stay byte-identical to today. Keys are listed in declaration order, which is the stable section order everywhere.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "workspaces"],
+      "properties": {
+        "mode": { "const": "workspace_set" },
+        "workspaces": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/workspace_key" }
+        }
+      }
+    },
+    "source_facts": {
+      "description": "New per-source facts introduced by the set. sessions_directory is the provenance fact for zero (#365 decision 6): 'observed' means the .pixir/sessions directory exists and counts are real observations (including a real 0); 'absent' means no sessions directory was observed, making a mistyped root diagnosable instead of a silent zero. Carries no judgment and is never an attention condition. The envelope adds NO timestamp: the per-source observed-at is client-held receipt state, outside this schema.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessions_directory"],
+      "properties": {
+        "sessions_directory": { "enum": ["observed", "absent"] }
+      }
+    },
+    "runs_list_document": {
+      "description": "The pixir.monitor.runs v1 list document exactly as single-workspace GET /api/runs produces it. It has no standalone JSON Schema today; this def pins the top-level discriminators, the required inventory quartet, and the projection-metadata keys production always enriches (projected_runs, non_parent_logs, dropped_logs — optional here because bare-rows providers synthesize only the quartet). Row shape stays owned by the list producer; the inventory metadata is the wire home of the per-source confessions and passes through verbatim.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "schema_version", "runs", "inventory"],
+      "properties": {
+        "schema": { "const": "pixir.monitor.runs" },
+        "schema_version": { "const": 1 },
+        "runs": { "type": "array", "items": { "type": "object" } },
+        "inventory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["total", "selected", "truncated", "limitations"],
+          "properties": {
+            "total": { "type": "integer", "minimum": 0 },
+            "selected": { "type": "integer", "minimum": 0 },
+            "truncated": { "type": "boolean" },
+            "limitations": { "type": "array", "items": { "type": "object" } },
+            "projected_runs": { "type": "integer", "minimum": 0 },
+            "non_parent_logs": { "type": "integer", "minimum": 0 },
+            "dropped_logs": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "scoped_list_snapshot": {
+      "description": "200 body of GET /api/workspaces/:key/runs. snapshot embeds the pixir.monitor.runs v1 list document verbatim — structurally identical to the single-mode response after normalizing the volatile clock stamps (projected_at/observed_at) via the projector's test seams, per the fixture sanitization contract (ws-passthrough-parity). The envelope adds scope and never re-derives.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspace", "source", "snapshot"],
+      "properties": {
+        "workspace": { "$ref": "#/$defs/workspace_key" },
+        "source": { "$ref": "#/$defs/source_facts" },
+        "snapshot": { "$ref": "#/$defs/runs_list_document" }
+      }
+    },
+    "scoped_run_snapshot": {
+      "description": "200 body of GET /api/workspaces/:key/runs/:id. snapshot embeds the pixir.presenter.run.v1 document verbatim, pinned by $ref to the untouched run.v1 schema; parity with single mode is defined modulo the same clock-stamp normalization.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspace", "source", "snapshot"],
+      "properties": {
+        "workspace": { "$ref": "#/$defs/workspace_key" },
+        "source": { "$ref": "#/$defs/source_facts" },
+        "snapshot": {
+          "$ref": "https://pixir.dev/schemas/pixir.presenter.run.v1.schema.json"
+        }
+      }
+    },
+    "scoped_error": {
+      "description": "Non-200 JSON body on set-mode API routes. Per-source failure isolation: a failed source answers 503 on its own scoped routes only; there is no set-level 503. Closed kind enum with per-kind details requirements (encoded below): workspace_unavailable (503) requires details.workspace, optional sanitized details.reason; run_not_found (404) requires details.workspace and details.run_id; workspace_not_found (404) requires details.workspace (the charset-validated requested key); invalid_run_id (400) requires details.workspace, allows details.max_bytes; invalid_workspace_key (400) and unscoped_route_unavailable (404) carry no details (a charset-invalid key is never echoed). details.workspace is always the declared label — never a basename or path fragment. Single-workspace mode keeps its post-#371 workspace_basename shape, untouched, as a separate contract case.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "message"],
+          "properties": {
+            "kind": {
+              "enum": [
+                "workspace_unavailable",
+                "run_not_found",
+                "workspace_not_found",
+                "invalid_run_id",
+                "invalid_workspace_key",
+                "unscoped_route_unavailable"
+              ]
+            },
+            "message": { "type": "string", "minLength": 1 },
+            "details": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "workspace": { "$ref": "#/$defs/workspace_key" },
+                "reason": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "maxLength": 64
+                },
+                "run_id": { "type": "string", "minLength": 1 },
+                "max_bytes": { "type": "integer", "minimum": 1 }
+              }
+            }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "kind": { "const": "workspace_unavailable" } } },
+              "then": {
+                "required": ["details"],
+                "properties": { "details": { "required": ["workspace"] } }
+              }
+            },
+            {
+              "if": { "properties": { "kind": { "const": "run_not_found" } } },
+              "then": {
+                "required": ["details"],
+                "properties": { "details": { "required": ["workspace", "run_id"] } }
+              }
+            },
+            {
+              "if": { "properties": { "kind": { "const": "workspace_not_found" } } },
+              "then": {
+                "required": ["details"],
+                "properties": { "details": { "required": ["workspace"] } }
+              }
+            },
+            {
+              "if": { "properties": { "kind": { "const": "invalid_run_id" } } },
+              "then": {
+                "required": ["details"],
+                "properties": { "details": { "required": ["workspace"] } }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "kind": {
+                    "enum": ["invalid_workspace_key", "unscoped_route_unavailable"]
+                  }
+                }
+              },
+              "then": { "not": { "required": ["details"] } }
+            }
+          ]
+        }
+      }
+    },
+    "invalidation_frame": {
+      "description": "data payload of the set-mode SSE frame on the ONE shared /api/events stream. Strict frame-shape change: the client validates by exact key set projection_id,type,workspace (mirroring today's projection_id,type). The single-mode frame {type, projection_id} is untouched and is a separate contract case; crossed negative fixtures pin both directions. A valid frame invalidates the named source only; any anomaly (malformed frame, unknown workspace key, duplicate sequence id, reorder, gap) forces an authoritative refetch of all declared sources and never creates a source section.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "workspace", "projection_id"],
+      "properties": {
+        "type": { "const": "projection_changed" },
+        "workspace": { "$ref": "#/$defs/workspace_key" },
+        "projection_id": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

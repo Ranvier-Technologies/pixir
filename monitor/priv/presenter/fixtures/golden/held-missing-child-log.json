@@ -1,0 +1,384 @@
+{
+  "schema": "pixir.presenter.run",
+  "schema_version": 1,
+  "projection_id": "projection:held-missing-child-log",
+  "projected_at": "2026-07-10T19:20:06Z",
+  "run": {
+    "id": "dlg-held",
+    "delegate_id": "dlg-held",
+    "parent_session_id": "parent-held",
+    "workflow_id": "wf-held",
+    "strategy": "workflow",
+    "mode": "read_only",
+    "title": "Held dependency",
+    "evidence_refs": [
+      "e-envelope-held"
+    ]
+  },
+  "source": {
+    "mode": "reconstructed",
+    "durable_origin": "fixture",
+    "as_of_seq": 6,
+    "last_durable_at": "2026-07-10T19:20:06Z",
+    "live_observed_at": null,
+    "freshness": "terminal",
+    "limitations": [
+      "child_log_missing"
+    ]
+  },
+  "execution": {
+    "state": "partial",
+    "terminal": true,
+    "basis": "workflow_event_fold",
+    "evidence_refs": [
+      "e-parent-6"
+    ]
+  },
+  "liveness": {
+    "state": "not_applicable",
+    "reachable": false,
+    "basis": "terminal_execution",
+    "observed_at": null,
+    "evidence_refs": []
+  },
+  "counts": {
+    "planned_units": 2,
+    "observed_units": 2,
+    "running_units": 0,
+    "completed_units": 0,
+    "attention_units": 2
+  },
+  "graph": {
+    "waves": [
+      [
+        "workflow:wf-held:step:producer"
+      ],
+      [
+        "workflow:wf-held:step:consumer"
+      ]
+    ],
+    "edges": [
+      {
+        "from": "workflow:wf-held:step:producer",
+        "to": "workflow:wf-held:step:consumer",
+        "state": "blocked"
+      }
+    ]
+  },
+  "units": [
+    {
+      "logical_id": "workflow:wf-held:step:producer",
+      "unit_kind": "workflow_step",
+      "label": "producer",
+      "agent": "worker",
+      "execution_kind": "subagent",
+      "workspace_mode": "shared",
+      "posture": "read_only",
+      "depends_on": [],
+      "execution": {
+        "state": "failed",
+        "terminal": true,
+        "basis": "subagent_event_fold",
+        "evidence_refs": [
+          "e-parent-3"
+        ]
+      },
+      "liveness": {
+        "state": "not_applicable",
+        "reachable": false,
+        "basis": "terminal_execution",
+        "observed_at": null,
+        "evidence_refs": []
+      },
+      "gate": {
+        "state": "failed",
+        "dependent_safe": false,
+        "basis": "workflow_event",
+        "evidence_refs": [
+          "e-parent-4"
+        ]
+      },
+      "advisory": {
+        "present": false,
+        "verdict": "unknown",
+        "mergeable": null,
+        "declared_gate": null,
+        "parse_status": "not_present",
+        "summary": null,
+        "major_count": null,
+        "minor_count": null,
+        "evidence_refs": []
+      },
+      "attempts": [
+        {
+          "attempt_id": "workflow:wf-held:step:producer:attempt:0",
+          "ordinal": 0,
+          "relation": "fresh",
+          "predecessor_attempt_id": null,
+          "child_session_id": "child-missing",
+          "status": "failed",
+          "started_at": "2026-07-10T19:20:02Z",
+          "ended_at": "2026-07-10T19:20:03Z",
+          "error_kind": null,
+          "summary": "Provider failed.",
+          "evidence_refs": [
+            "e-parent-2",
+            "e-parent-3"
+          ],
+          "limitations": [
+            "child_log_missing"
+          ],
+          "materialization": "durable",
+          "status_basis": "parent_log",
+          "child_event_window": {
+            "session_id": "child-missing",
+            "from_seq": null,
+            "to_seq_exclusive": null,
+            "basis": "whole_child_log_single_attempt",
+            "evidence_refs": []
+          }
+        }
+      ],
+      "artifacts": [],
+      "usage": {
+        "source": "incomplete",
+        "complete": false,
+        "calls": 0,
+        "groups": [],
+        "evidence_refs": [],
+        "limitations": [
+          "usage_incomplete_missing_child_log"
+        ]
+      },
+      "mutation": {
+        "status": "read_only",
+        "observed_paths": [],
+        "observed_semantics": "none",
+        "evidence_refs": [
+          "e-envelope-held"
+        ],
+        "limitations": []
+      },
+      "safe_actions": [],
+      "evidence_refs": [
+        "e-parent-0",
+        "e-parent-2",
+        "e-parent-3",
+        "e-parent-4"
+      ],
+      "limitations": [
+        "child_log_missing",
+        "usage_incomplete_missing_child_log"
+      ],
+      "materialization": "durable",
+      "attention": {
+        "required": true,
+        "reasons": [
+          "execution_failed",
+          "gate_failed",
+          "child_log_missing"
+        ],
+        "evidence_refs": [
+          "e-parent-0",
+          "e-parent-2",
+          "e-parent-3",
+          "e-parent-4"
+        ]
+      }
+    },
+    {
+      "logical_id": "workflow:wf-held:step:consumer",
+      "unit_kind": "workflow_step",
+      "label": "consumer",
+      "agent": "reviewer",
+      "execution_kind": "subagent",
+      "workspace_mode": "shared",
+      "posture": "read_only",
+      "depends_on": [
+        "workflow:wf-held:step:producer"
+      ],
+      "execution": {
+        "state": "held",
+        "terminal": true,
+        "basis": "workflow_event_fold",
+        "evidence_refs": [
+          "e-parent-5"
+        ]
+      },
+      "liveness": {
+        "state": "not_applicable",
+        "reachable": false,
+        "basis": "terminal_execution",
+        "observed_at": null,
+        "evidence_refs": []
+      },
+      "gate": {
+        "state": "held",
+        "dependent_safe": false,
+        "basis": "workflow_event",
+        "evidence_refs": [
+          "e-parent-5"
+        ]
+      },
+      "advisory": {
+        "present": false,
+        "verdict": "unknown",
+        "mergeable": null,
+        "declared_gate": null,
+        "parse_status": "not_present",
+        "summary": null,
+        "major_count": null,
+        "minor_count": null,
+        "evidence_refs": []
+      },
+      "attempts": [],
+      "artifacts": [],
+      "usage": {
+        "source": "none",
+        "complete": true,
+        "calls": 0,
+        "groups": [],
+        "evidence_refs": [],
+        "limitations": []
+      },
+      "mutation": {
+        "status": "read_only",
+        "observed_paths": [],
+        "observed_semantics": "none",
+        "evidence_refs": [
+          "e-envelope-held"
+        ],
+        "limitations": []
+      },
+      "safe_actions": [
+        {
+          "id": "rerun_after_dependencies_checkpoint_ready",
+          "scope": "workflow:wf-held:step:consumer",
+          "kind": "retry",
+          "effect": "mutating",
+          "presentation": "informational",
+          "command": null,
+          "evidence_refs": [
+            "e-parent-6"
+          ],
+          "source_field": "safe_next_actions"
+        }
+      ],
+      "evidence_refs": [
+        "e-parent-0",
+        "e-parent-5"
+      ],
+      "limitations": [
+        "dependency_not_checkpoint_ready"
+      ],
+      "materialization": "durable",
+      "attention": {
+        "required": true,
+        "reasons": [
+          "execution_held",
+          "gate_held"
+        ],
+        "evidence_refs": [
+          "e-parent-0",
+          "e-parent-5"
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "source": "incomplete",
+    "complete": false,
+    "calls": 0,
+    "groups": [],
+    "evidence_refs": [],
+    "limitations": [
+      "usage_incomplete_missing_child_log"
+    ]
+  },
+  "mutation": {
+    "status": "read_only",
+    "observed_paths": [],
+    "observed_semantics": "none",
+    "evidence_refs": [
+      "e-envelope-held"
+    ],
+    "limitations": []
+  },
+  "safe_actions": [
+    {
+      "id": "rerun_after_dependencies_checkpoint_ready",
+      "scope": "workflow:wf-held:step:consumer",
+      "kind": "retry",
+      "effect": "mutating",
+      "presentation": "informational",
+      "command": null,
+      "evidence_refs": [
+        "e-parent-6"
+      ],
+      "source_field": "safe_next_actions"
+    }
+  ],
+  "evidence": [
+    {
+      "id": "e-envelope-held",
+      "authority": "derived",
+      "source_kind": "terminal_envelope",
+      "session_id": "parent-held",
+      "seq": null,
+      "description": "Terminal envelope confirms read-only mode."
+    },
+    {
+      "id": "e-parent-0",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-held",
+      "seq": 0,
+      "description": "Workflow graph."
+    },
+    {
+      "id": "e-parent-2",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-held",
+      "seq": 2,
+      "description": "Producer started."
+    },
+    {
+      "id": "e-parent-3",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-held",
+      "seq": 3,
+      "description": "Producer failed."
+    },
+    {
+      "id": "e-parent-4",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-held",
+      "seq": 4,
+      "description": "Producer checkpoint failed."
+    },
+    {
+      "id": "e-parent-5",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-held",
+      "seq": 5,
+      "description": "Consumer held by dependency."
+    },
+    {
+      "id": "e-parent-6",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-held",
+      "seq": 6,
+      "description": "Workflow finished partial with safe next action."
+    }
+  ],
+  "limitations": [
+    "child_log_missing",
+    "usage_incomplete_missing_child_log",
+    "dependency_not_checkpoint_ready"
+  ]
+}

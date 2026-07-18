@@ -1,7 +1,9 @@
 defmodule Pixir.ProviderTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Pixir.{Auth, Event, Provider}
+
+  @default_body_golden ~S({"include":["reasoning.encrypted_content"],"input":[],"instructions":"You are a helpful coding assistant.","model":"gpt-5.5","parallel_tool_calls":true,"store":false,"stream":true,"tool_choice":"auto"})
 
   setup do
     name = :"auth_#{System.unique_integer([:positive])}"
@@ -21,6 +23,36 @@ defmodule Pixir.ProviderTest do
 
   defmodule NoOAuth do
     def refresh_skew_ms, do: 60_000
+  end
+
+  defmodule RotatingHeaderAuth do
+    use GenServer
+
+    def start_link(tokens), do: GenServer.start_link(__MODULE__, tokens)
+    def init(tokens), do: {:ok, tokens}
+
+    def handle_call(:request_headers, _from, [token | rest]) do
+      {:reply, {:ok, [{"authorization", "Bearer " <> token}]}, rest}
+    end
+  end
+
+  defmodule StaticHeaderAuth do
+    use GenServer
+
+    def start_link(headers), do: GenServer.start_link(__MODULE__, headers)
+    def init(headers), do: {:ok, headers}
+    def handle_call(:request_headers, _from, headers), do: {:reply, {:ok, headers}, headers}
+  end
+
+  defmodule UnloadedInspectProvider do
+    @on_load :mark_loaded
+
+    def mark_loaded do
+      :persistent_term.put({__MODULE__, :loaded}, true)
+      :ok
+    end
+
+    def stream(_request, _opts), do: {:error, :not_called}
   end
 
   # A transport that records the request and replays canned SSE blocks.
@@ -55,6 +87,26 @@ defmodule Pixir.ProviderTest do
       acc = Enum.reduce(chunks, acc, fn chunk, a -> fun.({:data, chunk}, a) end)
       {:ok, acc}
     end
+  end
+
+  defp error_body_cases do
+    cap = Pixir.Providers.ErrBody.max_bytes()
+
+    [
+      {"under", [String.duplicate("u", cap - 1)], false},
+      {"exact", [String.duplicate("e", cap)], false},
+      {"exact_chunked", [String.duplicate("c", div(cap, 2)), String.duplicate("d", div(cap, 2))],
+       false},
+      {"exact_then_empty", [String.duplicate("z", cap), ""], false},
+      {"exact_then_one", [String.duplicate("y", cap), "x"], true},
+      {"over_then_empty", [String.duplicate("p", cap - 1), "qr", ""], true},
+      {"over_chunked", [String.duplicate("p", cap - 1), "qr", "later"], true}
+    ]
+  end
+
+  defp expected_error_prefix(chunks) do
+    body = IO.iodata_to_binary(chunks)
+    binary_part(body, 0, min(byte_size(body), Pixir.Providers.ErrBody.max_bytes()))
   end
 
   defp sse(map), do: "data: " <> Jason.encode!(map) <> "\n\n"
@@ -432,6 +484,51 @@ defmodule Pixir.ProviderTest do
              )
 
     refute Map.has_key?(details, :err_body_truncated)
+  end
+
+  test "non-2xx error-body provenance is exact across cap and chunk boundaries", %{auth: auth} do
+    for {name, chunks, expected_truncated} <- error_body_cases() do
+      assert {:error, %{error: %{kind: :provider_http_error, details: details}}} =
+               Provider.stream(%{history: []},
+                 auth: auth,
+                 transport: canned(chunks, 500),
+                 max_retries: 0
+               ),
+             name
+
+      assert details.body == expected_error_prefix(chunks), name
+      assert byte_size(details.body) <= Pixir.Providers.ErrBody.max_bytes(), name
+      assert Map.has_key?(details, :err_body_truncated) == expected_truncated, name
+
+      if expected_truncated do
+        assert details.err_body_truncated == true, name
+      end
+    end
+  end
+
+  test "retry starts a fresh error-body capture", %{auth: auth} do
+    cap = Pixir.Providers.ErrBody.max_bytes()
+    overflow = String.duplicate("x", cap + 1)
+    exact = String.duplicate("e", cap)
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :provider_http_error,
+                details: %{status: 400, body: ^exact} = details
+              }
+            }} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned_attempts([{[overflow], 500}, {[exact], 400}]),
+               max_retries: 1,
+               sleep: fn _ -> :ok end
+             )
+
+    refute Map.has_key?(details, :err_body_truncated)
+    assert_received {:request, _}
+    assert_received {:request, _}
+    refute_received {:request, _}
   end
 
   test "folds History into Responses input items", %{auth: auth} do
@@ -1369,12 +1466,229 @@ defmodule Pixir.ProviderTest do
     assert is_binary(message)
   end
 
+  test "Provider-hosted web_search rejects hostile shapes before body, Auth, or transport" do
+    sentinel = "https://HOSTED_TOOLS_SECRET.example/?token=1"
+    uri = URI.parse(sentinel)
+
+    malformed = [
+      uri,
+      DateTime.utc_now(),
+      MapSet.new([:invalid]),
+      %{"filters" => uri},
+      %{"filters" => %{"endpoint" => uri}},
+      %{"filters" => MapSet.new([1])},
+      %{"user_location" => %{"city" => DateTime.utc_now()}},
+      %{"user_location" => %{"city" => [1 | :improper]}},
+      %{"search_content_types" => ["text" | :improper]}
+    ]
+
+    for web_search <- malformed do
+      assert {:error, %{kind: :invalid_args} = error} =
+               Provider.request_body_preview(%{history: [], web_search: web_search})
+
+      refute inspect(error) =~ sentinel
+      assert {:ok, _json} = Jason.encode(error)
+    end
+
+    assert {:error, %{ok: false, error: %{kind: :invalid_args}} = error} =
+             Provider.stream(
+               %{history: [], web_search: %{"filters" => %{"endpoint" => uri}}},
+               auth: :missing_hosted_tools_auth,
+               transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+             )
+
+    refute inspect(error) =~ sentinel
+  end
+
+  test "raw hosted_tools reject hostile values with bounded redacted errors" do
+    sentinel = "https://RAW_HOSTED_TOOLS_SECRET.example/?token=1"
+    uri = URI.parse(sentinel)
+
+    malformed = [
+      uri,
+      [uri],
+      [%{"type" => "web_search", "filters" => %{"endpoint" => uri}}],
+      [%{"type" => "web_search"} | :improper]
+    ]
+
+    for hosted_tools <- malformed do
+      assert {:error, %{kind: :invalid_args} = error} =
+               Provider.request_body_preview(%{history: [], hosted_tools: hosted_tools})
+
+      refute inspect(error) =~ sentinel
+      assert {:ok, _json} = Jason.encode(error)
+    end
+  end
+
+  test "hostile local body fields fail closed before Auth or transport" do
+    sentinel = "https://LOCAL_BODY_SECRET.example/?token=1"
+    uri = URI.parse(sentinel)
+
+    malformed = [
+      {:tools, [1 | :improper]},
+      {:tools, [uri]},
+      {:tools, [%{"parameters" => %{"required" => ["path" | :improper]}}]},
+      {:system_prompt, uri},
+      {:developer_context, uri},
+      {:workspace, uri},
+      {:output_schema, %{"name" => "result", "schema" => uri}},
+      {:output_schema, %{"name" => "result", "schema" => %{"required" => ["value" | :improper]}}},
+      {:prompt_cache_key, <<255>>},
+      {:prompt_cache_retention, uri}
+    ]
+
+    for {field, value} <- malformed do
+      request = Map.put(%{history: []}, field, value)
+
+      assert {:error,
+              %{
+                kind: :invalid_args,
+                details: %{"field" => error_field}
+              } = preview_error} = Provider.request_body_preview(request, raw_config: %{})
+
+      assert error_field == Atom.to_string(field)
+      refute inspect(preview_error) =~ sentinel
+      assert {:ok, _json} = Jason.encode(preview_error)
+
+      assert {:error, %{ok: false, error: %{kind: :invalid_args}} = stream_error} =
+               Provider.stream(request,
+                 raw_config: %{},
+                 max_retries: 0,
+                 auth: :missing_local_body_auth,
+                 transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+               )
+
+      refute inspect(stream_error) =~ sentinel
+      assert {:ok, _json} = Jason.encode(stream_error)
+    end
+  end
+
+  test "local body field atom/string collisions fail closed" do
+    values = %{
+      system_prompt: "system",
+      developer_context: "developer",
+      workspace: File.cwd!(),
+      tools: [],
+      output_schema: %{},
+      prompt_cache_key: "px:test",
+      prompt_cache_retention: "in_memory"
+    }
+
+    for {field, value} <- values do
+      request =
+        %{history: []}
+        |> Map.put(field, value)
+        |> Map.put(Atom.to_string(field), value)
+
+      assert {:error,
+              %{
+                kind: :invalid_args,
+                details: %{
+                  "field" => error_field,
+                  "reason" => "normalized_key_collision"
+                }
+              }} = Provider.request_body_preview(request, raw_config: %{})
+
+      assert error_field == Atom.to_string(field)
+    end
+  end
+
+  test "valid local body fields preserve the Responses request shape" do
+    tool = %{
+      "type" => "function",
+      "name" => "read",
+      "description" => "Read a file",
+      "parameters" => %{"type" => "object"}
+    }
+
+    output_schema = %{
+      "name" => "result",
+      "strict" => true,
+      "schema" => %{"type" => "object", "required" => ["value"]}
+    }
+
+    assert {:ok, body} =
+             Provider.request_body_preview(
+               %{
+                 history: [],
+                 system_prompt: "system",
+                 developer_context: "developer",
+                 workspace: File.cwd!(),
+                 tools: [tool],
+                 output_schema: output_schema,
+                 prompt_cache_key: "px:test"
+               },
+               raw_config: %{}
+             )
+
+    assert body["instructions"] == "system"
+    assert [%{"role" => "developer"}] = body["input"]
+    assert body["tools"] == [tool]
+    assert body["text"]["format"]["schema"] == output_schema["schema"]
+    assert body["prompt_cache_key"] == "px:test"
+  end
+
+  test "include_fields fails closed when include_sources config cannot normalize" do
+    tools = [%{"type" => "web_search"}]
+
+    for web_search <- [
+          %{:include_sources => false, "include_sources" => false},
+          [include_sources: false] ++ [:invalid]
+        ] do
+      assert {:error, %{kind: :invalid_args}} =
+               Pixir.Provider.HostedTools.include_fields(%{"web_search" => web_search}, tools)
+    end
+  end
+
+  test "request-level atom/string hosted-tool keys fail closed before body construction" do
+    dual_web_search = %{
+      "web_search" => %{"search_context_size" => "high"},
+      history: [],
+      web_search: false
+    }
+
+    dual_hosted_tools = %{
+      "hosted_tools" => [%{"type" => "web_search"}],
+      history: [],
+      hosted_tools: []
+    }
+
+    for request <- [dual_web_search, dual_hosted_tools] do
+      assert {:error,
+              %{
+                kind: :invalid_args,
+                details: %{"reason" => "normalized_key_collision"}
+              }} = Provider.request_body_preview(request)
+    end
+
+    assert {:error, %{kind: :invalid_args}} =
+             Pixir.Provider.HostedTools.include_fields(dual_web_search, [
+               %{"type" => "web_search"}
+             ])
+  end
+
+  test "request-level atom/string model authority fails before body construction" do
+    request = %{
+      "model" => "claude-sonnet-5",
+      history: [],
+      model: "gpt-5.5"
+    }
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :invalid_config,
+                details: %{field: :model, reason: :invalid_type}
+              }
+            }} = Provider.request_body_preview(request, raw_config: %{})
+  end
+
   test "unsupported Provider-hosted web_search fields return structured invalid_args" do
     assert {:error,
             %{
               kind: :invalid_args,
               message: message,
-              details: %{"unsupported" => ["surprise_policy"]}
+              details: %{"reason" => "unsupported_fields", "supported" => supported}
             }} =
              Provider.request_body_preview(%{
                history: [],
@@ -1382,6 +1696,7 @@ defmodule Pixir.ProviderTest do
              })
 
     assert is_binary(message)
+    assert "search_context_size" in supported
   end
 
   test "request_body_preview rejects non-map requests with structured invalid_args" do
@@ -1389,10 +1704,128 @@ defmodule Pixir.ProviderTest do
             %{
               kind: :invalid_args,
               message: message,
-              details: %{"expected" => "map"}
+              details: %{"expected" => "plain_map"}
             }} = Provider.request_body_preview("not a request")
 
     assert is_binary(message)
+  end
+
+  test "whole-document request structs fail closed across preview and stream" do
+    sentinel = "https://WHOLE_REQUEST_SECRET.example/v1"
+
+    for request <- [URI.parse(sentinel), DateTime.utc_now(), MapSet.new()] do
+      assert {:error,
+              %{kind: :invalid_args, details: %{"expected" => "plain_map"}} = preview_error} =
+               Provider.request_body_preview(request)
+
+      refute inspect(preview_error) =~ sentinel
+
+      assert {:error,
+              %{
+                ok: false,
+                error: %{kind: :invalid_args, details: %{expected: "plain_map"}}
+              } = stream_error} =
+               Provider.stream(request,
+                 auth: :missing_whole_request_auth,
+                 transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+               )
+
+      refute inspect(stream_error) =~ sentinel
+    end
+  end
+
+  test "hostile history fails closed before Auth, body, or transport" do
+    base = Event.user_message("s", "base")
+
+    malformed = [
+      URI.parse("https://history.example"),
+      [1 | :improper],
+      [%{}],
+      [%{type: :unknown_history_type, data: %{}}],
+      [Map.put(Event.user_message("s", "hi"), :data, %{"value" => DateTime.utc_now()})],
+      [
+        %{
+          base
+          | type: :tool_call,
+            data: %{
+              "call_id" => "c1",
+              "name" => "bash",
+              "args" => %{"cmd" => ["echo" | "SECRET"]}
+            }
+        }
+      ],
+      [
+        %{
+          base
+          | type: :reasoning,
+            data: %{
+              "item" => %{"id" => "rs_1", "payload" => [1 | nil]},
+              "model" => "gpt-5.5",
+              "dialect" => "openai"
+            }
+        }
+      ]
+    ]
+
+    for history <- malformed do
+      assert {:error,
+              %{
+                kind: :invalid_args,
+                details: %{"field" => "history", "reason" => "invalid_event_list"}
+              }} = Provider.request_body_preview(%{history: history})
+
+      assert {:error, %{ok: false, error: %{kind: :invalid_args}}} =
+               Provider.stream(%{history: history},
+                 auth: :missing_history_auth,
+                 transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+               )
+    end
+  end
+
+  test "history request and event-envelope atom/string authority collisions fail closed" do
+    request = %{
+      "history" => [Event.user_message("string", "string")],
+      history: [Event.user_message("atom", "atom")]
+    }
+
+    assert {:error,
+            %{
+              kind: :invalid_args,
+              details: %{"field" => "history", "reason" => "normalized_key_collision"}
+            }} = Provider.request_body_preview(request)
+
+    sentinel = "HISTORY_ENVELOPE_SECRET"
+    event = Event.user_message("event", "safe")
+
+    for field <- [:type, :data, :seq, :session_id, :id, :ts] do
+      history = [Map.put(event, Atom.to_string(field), sentinel)]
+
+      assert {:error,
+              %{
+                kind: :invalid_args,
+                details: %{"field" => "history", "reason" => "normalized_key_collision"}
+              } = preview_error} = Provider.request_body_preview(%{history: history})
+
+      refute inspect(preview_error) =~ sentinel
+
+      assert {:error, %{ok: false, error: %{kind: :invalid_args}} = stream_error} =
+               Provider.stream(%{history: history},
+                 raw_config: %{},
+                 auth: :missing_history_collision_auth,
+                 transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+               )
+
+      refute inspect(stream_error) =~ sentinel
+    end
+  end
+
+  test "include_fields rejects whole-document request structs" do
+    for request <- [URI.parse("https://include.example"), DateTime.utc_now(), MapSet.new()] do
+      assert {:error, %{kind: :invalid_args}} =
+               Pixir.Provider.HostedTools.include_fields(request, [
+                 %{"type" => "web_search"}
+               ])
+    end
   end
 
   test "Provider-hosted web_search config rejects normalized key collisions" do
@@ -1417,7 +1850,7 @@ defmodule Pixir.ProviderTest do
     refute Map.has_key?(Jason.decode!(body), "prompt_cache_retention")
   end
 
-  test "sends prompt_cache_retention on non-ChatGPT backend when explicitly requested", %{
+  test "a legacy URL cannot enable a backend-denied prompt_cache_retention extension", %{
     auth: auth
   } do
     {:ok, _} =
@@ -1428,7 +1861,7 @@ defmodule Pixir.ProviderTest do
       )
 
     assert_received {:request, %{body: body}}
-    assert Jason.decode!(body)["prompt_cache_retention"] == "24h"
+    refute Map.has_key?(Jason.decode!(body), "prompt_cache_retention")
   end
 
   test "an invalid reasoning_effort is dropped (model default)", %{auth: auth} do
@@ -1725,8 +2158,130 @@ defmodule Pixir.ProviderTest do
               }
             }} = Provider.stream(%{history: []}, auth: auth, transport: transport, max_retries: 0)
 
-    assert reason =~ "Finch.TransportError"
-    assert reason =~ "timeout"
+    assert reason == :timeout
+  end
+
+  test "transport crashes cannot echo request credentials through errors or logs" do
+    sentinel = "SECRET_SENTINEL_319_FUNCTION_CLAUSE"
+    {:ok, auth} = RotatingHeaderAuth.start_link([sentinel])
+
+    transport = fn %{headers: [{"never-matches", _value}]}, acc, _fun -> {:ok, acc} end
+
+    parent = self()
+
+    logs =
+      ExUnit.CaptureLog.capture_log(fn ->
+        send(
+          parent,
+          {:transport_crash_result,
+           Provider.stream(%{history: []},
+             auth: auth,
+             transport: transport,
+             max_retries: 0
+           )}
+        )
+      end)
+
+    assert_receive {:transport_crash_result,
+                    {:error,
+                     %{
+                       error: %{
+                         kind: :network,
+                         details: %{reason: :function_clause, transport: "http_sse"}
+                       }
+                     } = error}}
+
+    refute inspect(error) =~ sentinel
+    refute logs =~ sentinel
+  end
+
+  test "disabled idle watchdogs still contain transport crashes and credentials" do
+    for timeout <- [0, :infinity] do
+      sentinel = "SECRET_SENTINEL_319_DISABLED_WATCHDOG_#{timeout}"
+      {:ok, auth} = RotatingHeaderAuth.start_link([sentinel])
+
+      transport = fn %{headers: [{"never-matches", _value}]}, acc, _fun -> {:ok, acc} end
+      parent = self()
+
+      logs =
+        ExUnit.CaptureLog.capture_log(fn ->
+          send(
+            parent,
+            {:disabled_watchdog_result, timeout,
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: transport,
+               stream_idle_timeout_ms: timeout,
+               max_retries: 0
+             )}
+          )
+        end)
+
+      assert_receive {:disabled_watchdog_result, ^timeout,
+                      {:error,
+                       %{
+                         error: %{
+                           kind: :network,
+                           details: %{reason: :function_clause, transport: "http_sse"}
+                         }
+                       } = error}}
+
+      refute inspect(error) =~ sentinel
+      refute logs =~ sentinel
+    end
+  end
+
+  test "non-structured transport failures cannot echo the authenticated request" do
+    sentinel = "SECRET_SENTINEL_319_RETURNED_ERROR"
+    {:ok, auth} = RotatingHeaderAuth.start_link([sentinel])
+
+    transport = fn request, acc, _fun -> {:error, {:echo, request}, acc} end
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :network,
+                details: %{reason: :transport_failure, status: nil}
+              }
+            } = error} =
+             Provider.stream(%{history: []}, auth: auth, transport: transport, max_retries: 0)
+
+    refute inspect(error) =~ sentinel
+  end
+
+  test "structured transport failures cannot echo the authenticated request" do
+    sentinel = "SECRET_SENTINEL_319_STRUCTURED_ERROR"
+    {:ok, auth} = RotatingHeaderAuth.start_link([sentinel])
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+    transport = fn request, acc, _fun ->
+      Agent.update(attempts, &(&1 + 1))
+
+      error =
+        Pixir.Tool.error(:provider_http_error, "transport echoed #{sentinel}", %{
+          request: request
+        })
+
+      {:error, error, acc}
+    end
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :provider_http_error,
+                message: "Provider transport returned an error.",
+                details: %{}
+              }
+            } = error} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: transport,
+               max_retries: 2,
+               sleep: fn _ -> :ok end
+             )
+
+    refute inspect(error) =~ sentinel
+    assert Agent.get(attempts, & &1) == 1
   end
 
   test "probe returns the model when the backend accepts the request", %{auth: auth} do
@@ -1980,5 +2535,699 @@ defmodule Pixir.ProviderTest do
 
     assert {:error, %{error: %{kind: :not_authenticated}}} =
              Provider.stream(%{history: []}, auth: name, transport: canned([]))
+  end
+
+  test "blank overrides never become the Provider or catalog default" do
+    home =
+      Path.join(
+        System.tmp_dir!(),
+        "pixir-provider-blank-model-#{System.unique_integer([:positive])}"
+      )
+
+    prior_home = System.get_env("PIXIR_HOME")
+    prior_env = System.get_env("PIXIR_MODEL")
+    prior_app = Application.get_env(:pixir, :model)
+    File.mkdir_p!(home)
+    System.put_env("PIXIR_HOME", home)
+    System.put_env("PIXIR_MODEL", "   ")
+    Application.put_env(:pixir, :model, "")
+
+    on_exit(fn ->
+      if prior_home,
+        do: System.put_env("PIXIR_HOME", prior_home),
+        else: System.delete_env("PIXIR_HOME")
+
+      if prior_env,
+        do: System.put_env("PIXIR_MODEL", prior_env),
+        else: System.delete_env("PIXIR_MODEL")
+
+      if prior_app,
+        do: Application.put_env(:pixir, :model, prior_app),
+        else: Application.delete_env(:pixir, :model)
+
+      File.rm_rf!(home)
+    end)
+
+    File.write!(Path.join(home, "config.json"), Jason.encode!(%{"model" => " file-model "}))
+    assert Provider.default_model() == "file-model"
+
+    models = Provider.models()
+    assert Enum.count(models, & &1["default"]) == 1
+    assert Enum.find(models, & &1["default"])["id"] == "file-model"
+    refute Enum.any?(models, &(&1["id"] in ["", "   "]))
+
+    File.write!(Path.join(home, "config.json"), Jason.encode!(%{"model" => "   "}))
+    assert Provider.default_model() == "gpt-5.5"
+    assert Enum.find(Provider.models(), & &1["default"])["id"] == "gpt-5.5"
+  end
+
+  test "malformed profiles fail before body, Auth, or transport" do
+    sentinel = "https://stage.example/v1/responses"
+
+    profiles = [{%{"mode" => "future", "responses_url" => sentinel}, :invalid_config}]
+
+    for {profile, kind} <- profiles do
+      opts = [
+        raw_config: %{"model" => "gpt-5.4-mini", "responses_backend" => profile},
+        auth: :missing_issue_317_auth_process,
+        transport: fn _request, _acc, _fun -> flunk("transport must not run") end,
+        max_retries: 0
+      ]
+
+      assert {:error,
+              %{
+                ok: false,
+                error: %{kind: ^kind, details: %{field: field, reason: reason}}
+              } = payload} = Provider.stream(%{history: []}, opts)
+
+      assert field in [:mode, :responses_backend]
+      assert reason == :unknown_mode
+      refute inspect(payload) =~ sentinel
+
+      assert {:error, %{error: %{kind: ^kind}}} =
+               Provider.request_body_preview(%{history: []}, opts)
+    end
+  end
+
+  test "default routing preserves exact ChatGPT body bytes and ordered auth headers", %{
+    auth: auth
+  } do
+    subscription_headers = [
+      {"authorization", "Bearer subscription-token"},
+      {"chatgpt-account-id", "account-id"}
+    ]
+
+    {:ok, subscription_auth} = StaticHeaderAuth.start_link(subscription_headers)
+
+    for {auth_source, auth_headers} <- [
+          {auth, [{"authorization", "Bearer sk-test"}]},
+          {subscription_auth, subscription_headers}
+        ] do
+      assert {:ok, _result} =
+               Provider.stream(%{history: []},
+                 raw_config: %{},
+                 auth: auth_source,
+                 transport: canned([sse(%{type: "response.completed"})])
+               )
+
+      assert_received {:request, request}
+
+      assert request.url == "https://chatgpt.com/backend-api/codex/responses"
+      assert request.body == @default_body_golden
+
+      assert request.headers ==
+               [
+                 {"content-type", "application/json"},
+                 {"accept", "text/event-stream"},
+                 {"openai-beta", "responses=experimental"},
+                 {"originator", "pixir"}
+               ] ++ auth_headers
+    end
+  end
+
+  test "routing preflight rejects an incompatible injected WebSocket seam before body or Auth" do
+    transport = fn _request, _acc, _fun -> flunk("transport must not run") end
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :invalid_args,
+                details: %{field: :transport, reason: :incompatible_transport_seam}
+              }
+            }} =
+             Provider.stream(%{history: []},
+               responses_backend: %{"mode" => "chatgpt_codex"},
+               provider_transport: :websocket,
+               auth: :must_not_be_called,
+               transport: transport
+             )
+
+    refute_received {:request, _request}
+  end
+
+  test "request_body_preview applies explicit routing validation without resolving Auth" do
+    assert {:error,
+            %{
+              error: %{
+                kind: :invalid_config,
+                details: %{field: :provider_transport, reason: :invalid_transport}
+              }
+            }} =
+             Provider.request_body_preview(%{history: []},
+               responses_backend: %{"mode" => "chatgpt_codex"},
+               provider_transport: :future,
+               auth: :must_not_be_called
+             )
+  end
+
+  test "outer retries resolve fresh auth while reusing the frozen route" do
+    {:ok, auth} = RotatingHeaderAuth.start_link(["first-token", "second-token"])
+
+    transport =
+      canned_attempts([
+        {["{}"], 503},
+        {[sse(%{type: "response.completed"})], 200}
+      ])
+
+    assert {:ok, _result} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: transport,
+               sleep: fn _ -> :ok end,
+               max_retries: 1
+             )
+
+    assert_received {:request, first_request}
+    assert_received {:request, second_request}
+
+    assert first_request.url == second_request.url
+
+    assert List.keyfind(first_request.headers, "authorization", 0) ==
+             {"authorization", "Bearer first-token"}
+
+    assert List.keyfind(second_request.headers, "authorization", 0) ==
+             {"authorization", "Bearer second-token"}
+  end
+
+  test "struct-shaped profiles fail closed before preview body construction" do
+    sentinel = "https://SECRET.example/v1/responses"
+
+    for profile <- [URI.parse(sentinel), DateTime.utc_now(), MapSet.new([:invalid])] do
+      assert {:error, %{error: %{kind: :invalid_config}} = payload} =
+               Provider.request_body_preview(%{history: []}, responses_backend: profile)
+
+      refute inspect(payload) =~ sentinel
+    end
+  end
+
+  test "improper-list Config values do not escape the canonical preview barrier" do
+    assert {:ok, body} =
+             Provider.request_body_preview(%{history: []},
+               raw_config: %{
+                 "web_search" => [{"enabled", true} | :secret_tail],
+                 "models" => ["gpt-5.5" | :secret_tail]
+               }
+             )
+
+    assert body["model"] == "gpt-5.5"
+    refute Map.has_key?(body, "tools")
+  end
+
+  test "request_body_preview resolves the Config model once when request omits it" do
+    assert {:ok, body} =
+             Provider.request_body_preview(%{history: []},
+               raw_config: %{"model" => "gpt-5.4-mini"}
+             )
+
+    assert body["model"] == "gpt-5.4-mini"
+  end
+
+  test "direct preview applies snapshotted reasoning and text defaults with caller precedence" do
+    raw = %{
+      "reasoning" => %{"effort" => "low"},
+      "text" => %{"verbosity" => "high"}
+    }
+
+    assert {:ok, configured} =
+             Provider.request_body_preview(%{history: []}, raw_config: raw)
+
+    assert configured["reasoning"] == %{"effort" => "low"}
+    assert configured["text"] == %{"verbosity" => "high"}
+
+    assert {:ok, overridden} =
+             Provider.request_body_preview(%{history: []},
+               raw_config: raw,
+               reasoning_effort: "xhigh",
+               text_verbosity: "medium"
+             )
+
+    assert overridden["reasoning"] == %{"effort" => "xhigh"}
+    assert overridden["text"] == %{"verbosity" => "medium"}
+  end
+
+  test "Config ingress seams are consumed before runtime for new and reused resolutions", %{
+    auth: auth
+  } do
+    alias Pixir.Provider.StreamIdle
+
+    Code.ensure_loaded!(StreamIdle)
+    traced = self()
+
+    tracer =
+      spawn_link(fn ->
+        forward_traces(traced)
+      end)
+
+    :erlang.trace(traced, true, [:call, {:tracer, tracer}])
+    assert :erlang.trace_pattern({StreamIdle, :run, 3}, true, []) == 1
+
+    on_exit(fn ->
+      :erlang.trace_pattern({StreamIdle, :run, 3}, false, [])
+      Process.exit(tracer, :kill)
+    end)
+
+    loader = fn _opts ->
+      {:ok,
+       %{
+         present?: true,
+         origin: :programmatic,
+         document: %{"model" => "gpt-5.4-mini"}
+       }}
+    end
+
+    transport = canned([sse(%{type: "response.completed"})])
+
+    assert {:ok, _result} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: transport,
+               config_path: "/tmp/config-seam-sentinel",
+               request_snapshot_loader: loader
+             )
+
+    assert_receive {:captured_trace,
+                    {:trace, _pid, :call, {StreamIdle, :run, [_stream_fn, runtime_opts, _label]}}}
+
+    refute Enum.any?(
+             [:config_path, :raw_config, :request_snapshot_loader],
+             &Keyword.has_key?(runtime_opts, &1)
+           )
+
+    assert {:ok, resolved} =
+             Pixir.Providers.Registry.resolve_request(
+               %{provider_intent: {:direct, Provider}, request: %{}, provider_opts: []},
+               raw_config: %{"model" => "gpt-5.4-mini"}
+             )
+
+    assert {:ok, _result} =
+             Provider.stream(%{history: []},
+               resolved_provider_request: resolved,
+               auth: auth,
+               transport: transport,
+               config_path: "/tmp/reused-config-seam-sentinel",
+               raw_config: %{"model" => "must-not-survive"},
+               request_snapshot_loader: fn _ ->
+                 flunk("reused resolution must not reload Config")
+               end
+             )
+
+    assert_receive {:captured_trace,
+                    {:trace, _pid, :call, {StreamIdle, :run, [_stream_fn, runtime_opts, _label]}}}
+
+    refute Enum.any?(
+             [:config_path, :raw_config, :request_snapshot_loader],
+             &Keyword.has_key?(runtime_opts, &1)
+           )
+  end
+
+  defp forward_traces(test) do
+    receive do
+      message ->
+        send(test, {:captured_trace, message})
+        forward_traces(test)
+    end
+  end
+
+  test "Provider rejects a pre-resolved Anthropic identity before body construction" do
+    assert {:ok, anthropic} =
+             Pixir.Providers.Registry.resolve_request(
+               %{provider_intent: :auto, request: %{}, provider_opts: []},
+               raw_config: %{"model" => "claude-fable-5"}
+             )
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :invalid_config,
+                details: %{
+                  field: :resolved_provider_request,
+                  reason: :invalid_resolved_request
+                }
+              }
+            }} =
+             Provider.request_body_preview(%{history: []},
+               resolved_provider_request: anthropic
+             )
+  end
+
+  test "Provider rejects a fabricated resolved value with an invalid model" do
+    assert {:ok, resolved} =
+             Pixir.Providers.Registry.resolve_request(
+               %{provider_intent: {:direct, Provider}, request: %{}, provider_opts: []},
+               raw_config: %{}
+             )
+
+    fabricated = struct(resolved, model: "")
+
+    assert {:error,
+            %{error: %{kind: :invalid_config, details: %{reason: :invalid_resolved_request}}}} =
+             Provider.request_body_preview(%{history: []},
+               resolved_provider_request: fabricated
+             )
+  end
+
+  test "Provider rejects and redacts invalid UTF-8 models before body or Auth" do
+    assert {:ok, resolved} =
+             Pixir.Providers.Registry.resolve_request(
+               %{provider_intent: {:direct, Provider}, request: %{}, provider_opts: []},
+               raw_config: %{}
+             )
+
+    invalid = <<255>>
+    fabricated = struct(resolved, model: invalid)
+    projection = inspect(fabricated)
+    refute projection =~ inspect(invalid)
+    refute projection =~ "Inspect.Error"
+
+    opts = [
+      resolved_provider_request: fabricated,
+      auth: :missing_utf8_model_auth,
+      transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+    ]
+
+    assert {:error, %{error: %{kind: :invalid_config}}} =
+             Provider.request_body_preview(%{history: []}, opts)
+
+    assert {:error, %{error: %{kind: :invalid_config}}} =
+             Provider.stream(%{history: []}, opts)
+
+    assert {:ok, unicode_body} =
+             Provider.request_body_preview(%{history: [], model: "modelo-ñ"}, raw_config: %{})
+
+    assert unicode_body["model"] == "modelo-ñ"
+  end
+
+  test "Provider rejects fabricated private defaults before attaching them" do
+    assert {:ok, resolved} =
+             Pixir.Providers.Registry.resolve_request(
+               %{provider_intent: {:direct, Provider}, request: %{}, provider_opts: []},
+               raw_config: %{}
+             )
+
+    fabricated = struct(resolved, provider_defaults: %{})
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :invalid_config,
+                details: %{
+                  field: :resolved_provider_request,
+                  reason: :invalid_resolved_request
+                }
+              }
+            }} =
+             Provider.request_body_preview(%{history: []},
+               resolved_provider_request: fabricated
+             )
+  end
+
+  test "Provider rejects unsafe web_search defaults before body or Auth" do
+    assert {:ok, resolved} =
+             Pixir.Providers.Registry.resolve_request(
+               %{provider_intent: {:direct, Provider}, request: %{}, provider_opts: []},
+               raw_config: %{}
+             )
+
+    defaults = Map.fetch!(Map.from_struct(resolved), :provider_defaults)
+    sentinel = "WEB_SEARCH_DEFAULTS_SECRET"
+    invalid_utf8 = <<255>>
+
+    malformed = [
+      %{"unknown" => sentinel},
+      %{"filters" => %{"callback" => fn -> sentinel end}},
+      %{"filters" => %{"ids" => {:secret, sentinel}}},
+      %{"user_location" => [sentinel]},
+      %{"search_content_types" => ["text" | {:secret, sentinel}]},
+      %{"filters" => %{invalid_utf8 => "value"}},
+      %{"filters" => %{"id" => invalid_utf8}},
+      %{"filters" => Date.utc_today()}
+    ]
+
+    for web_search <- malformed do
+      fabricated = struct(resolved, provider_defaults: %{defaults | web_search: web_search})
+      refute Pixir.Providers.ResolvedProviderRequest.provider_defaults_valid?(fabricated)
+      refute inspect(fabricated) =~ sentinel
+
+      opts = [
+        resolved_provider_request: fabricated,
+        auth: :missing_web_search_defaults_auth,
+        transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+      ]
+
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_config,
+                  details: %{
+                    field: :resolved_provider_request,
+                    reason: :invalid_resolved_request
+                  }
+                }
+              }} = Provider.request_body_preview(%{history: []}, opts)
+
+      assert {:error, %{error: %{kind: :invalid_config}}} =
+               Provider.stream(%{history: []}, opts)
+    end
+  end
+
+  test "Provider rejects fabricated Responses capabilities before body or Auth" do
+    assert {:ok, resolved} =
+             Pixir.Providers.Registry.resolve_request(
+               %{provider_intent: {:direct, Provider}, request: %{}, provider_opts: []},
+               raw_config: %{}
+             )
+
+    capabilities = Pixir.Providers.ResolvedProviderRequest.capabilities(resolved)
+
+    sentinel = "CAPABILITIES_SECRET"
+
+    malformed = [
+      struct(resolved, capabilities: %{}),
+      struct(resolved, capabilities: %{capabilities | tool_dialect: :anthropic}),
+      struct(resolved, capabilities: %{capabilities | prompt_cache: :cache_control}),
+      struct(resolved, capabilities: %{secret: sentinel})
+    ]
+
+    for fabricated <- malformed do
+      refute inspect(fabricated) =~ sentinel
+
+      opts = [
+        resolved_provider_request: fabricated,
+        auth: :missing_capabilities_auth,
+        transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+      ]
+
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_config,
+                  details: %{
+                    field: :resolved_provider_request,
+                    reason: :invalid_resolved_request
+                  }
+                }
+              }} = Provider.request_body_preview(%{history: []}, opts)
+
+      assert {:error, %{error: %{kind: :invalid_config}}} =
+               Provider.stream(%{history: []}, opts)
+    end
+  end
+
+  test "Provider rejects and redacts fabricated source evidence before body or Auth" do
+    assert {:ok, resolved} =
+             Pixir.Providers.Registry.resolve_request(
+               %{provider_intent: {:direct, Provider}, request: %{}, provider_opts: []},
+               raw_config: %{}
+             )
+
+    sentinel = "SOURCE_EVIDENCE_SECRET"
+
+    malformed = [
+      %{
+        provider: :direct,
+        model: :default,
+        responses_backend: :absent,
+        extra: sentinel
+      },
+      %{provider: sentinel, model: :default, responses_backend: :absent},
+      %{provider: :direct, model: sentinel, responses_backend: :absent},
+      %{provider: :direct, model: :default, responses_backend: sentinel}
+    ]
+
+    for source_evidence <- malformed do
+      fabricated = struct(resolved, source_evidence: source_evidence)
+      refute inspect(fabricated) =~ sentinel
+
+      opts = [
+        resolved_provider_request: fabricated,
+        auth: :missing_source_evidence_auth,
+        transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+      ]
+
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_config,
+                  details: %{
+                    field: :resolved_provider_request,
+                    reason: :invalid_resolved_request
+                  }
+                }
+              }} = Provider.request_body_preview(%{history: []}, opts)
+
+      assert {:error, %{error: %{kind: :invalid_config}}} =
+               Provider.stream(%{history: []}, opts)
+    end
+  end
+
+  test "Provider rejects and redacts fabricated backend values before body or Auth" do
+    assert {:ok, resolved} =
+             Pixir.Providers.Registry.resolve_request(
+               %{provider_intent: {:direct, Provider}, request: %{}, provider_opts: []},
+               raw_config: %{}
+             )
+
+    sentinel = "BACKEND_SENTINEL"
+    default_backend = Pixir.Providers.ResponsesBackend.default()
+
+    malformed = [
+      %{token: sentinel},
+      struct(default_backend, auth_policy: {:bearer_env, sentinel})
+    ]
+
+    for backend <- malformed do
+      fabricated = struct(resolved, responses_backend: backend)
+      projection = inspect(fabricated)
+      refute projection =~ sentinel
+      refute projection =~ "provider_defaults"
+      refute projection =~ "Inspect.Error"
+
+      opts = [
+        resolved_provider_request: fabricated,
+        auth: :missing_backend_auth,
+        transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+      ]
+
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_config,
+                  details: %{
+                    field: :resolved_provider_request,
+                    reason: :invalid_resolved_request
+                  }
+                }
+              }} = Provider.request_body_preview(%{history: []}, opts)
+
+      assert {:error, %{error: %{kind: :invalid_config}}} =
+               Provider.stream(%{history: []}, opts)
+    end
+  end
+
+  test "Provider rejects and redacts fabricated identity values before body or Auth" do
+    assert {:ok, resolved} =
+             Pixir.Providers.Registry.resolve_request(
+               %{provider_intent: {:direct, Provider}, request: %{}, provider_opts: []},
+               raw_config: %{}
+             )
+
+    sentinel = "IDENTITY_SENTINEL"
+
+    malformed = [
+      struct(resolved, provider: sentinel),
+      struct(resolved, model: %{secret: sentinel}),
+      struct(resolved, dialect: sentinel)
+    ]
+
+    for fabricated <- malformed do
+      projection = inspect(fabricated)
+      refute projection =~ sentinel
+      refute projection =~ "provider_defaults"
+      refute projection =~ "Inspect.Error"
+
+      opts = [
+        resolved_provider_request: fabricated,
+        auth: :missing_identity_auth,
+        transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+      ]
+
+      assert {:error,
+              %{
+                error: %{
+                  kind: :invalid_config,
+                  details: %{
+                    field: :resolved_provider_request,
+                    reason: :invalid_resolved_request
+                  }
+                }
+              }} = Provider.request_body_preview(%{history: []}, opts)
+
+      assert {:error, %{error: %{kind: :invalid_config}}} =
+               Provider.stream(%{history: []}, opts)
+    end
+  end
+
+  test "Inspect never loads a fabricated Provider module or runs its on_load callback" do
+    assert {:ok, resolved} =
+             Pixir.Providers.Registry.resolve_request(
+               %{provider_intent: {:direct, Provider}, request: %{}, provider_opts: []},
+               raw_config: %{}
+             )
+
+    unloaded = UnloadedInspectProvider
+    marker = {unloaded, :loaded}
+    :persistent_term.erase(marker)
+    :code.purge(unloaded)
+    :code.delete(unloaded)
+
+    on_exit(fn ->
+      :persistent_term.erase(marker)
+    end)
+
+    refute Code.loaded?(unloaded)
+    fabricated = struct(resolved, provider: unloaded)
+    projection = inspect(fabricated)
+
+    refute projection =~ "UnloadedInspectProvider"
+    refute projection =~ "Inspect.Error"
+    refute Code.loaded?(unloaded)
+    assert :persistent_term.get(marker, :absent) == :absent
+
+    opts = [
+      resolved_provider_request: fabricated,
+      auth: :missing_unloaded_provider_auth,
+      transport: fn _request, _acc, _fun -> flunk("transport must not run") end
+    ]
+
+    assert {:error, %{error: %{kind: :invalid_config}}} =
+             Provider.request_body_preview(%{history: []}, opts)
+
+    assert {:error, %{error: %{kind: :invalid_config}}} =
+             Provider.stream(%{history: []}, opts)
+  end
+
+  test "probe reports the snapshotted model after transport mutates global Config", %{auth: auth} do
+    prior_model = Application.get_env(:pixir, :model)
+
+    on_exit(fn ->
+      if prior_model,
+        do: Application.put_env(:pixir, :model, prior_model),
+        else: Application.delete_env(:pixir, :model)
+    end)
+
+    transport = fn _request, acc, fun ->
+      Application.put_env(:pixir, :model, "gpt-mutated")
+      acc = fun.({:status, 200}, acc)
+      acc = fun.({:data, sse(%{type: "response.completed"})}, acc)
+      {:ok, acc}
+    end
+
+    assert {:ok, %{model: "gpt-5.4-mini"}} =
+             Provider.probe(
+               raw_config: %{"model" => "gpt-5.4-mini"},
+               auth: auth,
+               transport: transport,
+               max_retries: 0
+             )
   end
 end
