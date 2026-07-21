@@ -20,12 +20,14 @@ defmodule PixirMonitor.Projection do
       {:ok, projection}
     end
   rescue
-    exception ->
+    # Projection failures cross the API boundary, and their messages can carry
+    # filesystem paths or URLs. Report a fixed atom instead of Exception.message/1.
+    _exception ->
       {:error,
        %{
          kind: "projection_failed",
          message: "Presenter projection could not be built",
-         details: %{exception: Exception.message(exception)}
+         details: %{exception: :projection_raised}
        }}
   end
 

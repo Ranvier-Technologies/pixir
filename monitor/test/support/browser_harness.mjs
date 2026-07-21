@@ -505,11 +505,14 @@ async function run(options) {
     const fifoCleaned = !existsSync(fifoPath) && !existsSync(dirname(fifoPath));
     if (!fifoCleaned) throw failure("handoff_cleanup_failed", "Monitor did not remove the one-use FIFO handoff directory", "verify_cleanup");
 
+    const launchFragmentCleared = await evaluate(client, sessionId, `!location.hash.startsWith("#launch=")`, "launch_fragment_cleared");
+    if (!launchFragmentCleared) throw failure("launch_fragment_not_cleared", "Launch capability remained in the browser fragment", "verify_launch_fragment");
+
     runResult = {
       ok: true,
       check: "pixir_monitor_browser_story",
       browser: "chrome_devtools_protocol",
-      launch_fragment_cleared: true,
+      launch_fragment_cleared: launchFragmentCleared === true,
       runs_view: true,
       detail_view: true,
       unit_view: true,

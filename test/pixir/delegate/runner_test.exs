@@ -394,6 +394,106 @@ defmodule Pixir.Delegate.RunnerTest do
     end)
   end
 
+  test "nested workflow shell cannot override root max_concurrency during rehearsal" do
+    spec = %{
+      "contract_version" => 1,
+      "strategy" => "workflow",
+      "mode" => "read_only",
+      "max_concurrency" => 2,
+      "workflow" => %{
+        # Invalid if it leaks into Pixir.Workflows normalization.
+        "max_concurrency" => 0,
+        "steps" => [%{"id" => "inspect", "task" => "inspect", "agent" => "explorer"}]
+      }
+    }
+
+    assert {:ok, %{"summary" => %{"max_concurrency" => 2, "steps" => 1}}} =
+             Runner.rehearse_workflow_spec(spec, "read_only")
+  end
+
+  test "nested workflow shell cannot inject template refs during rehearsal" do
+    spec = %{
+      "contract_version" => 1,
+      "strategy" => "workflow",
+      "mode" => "read_only",
+      "workflow" => %{
+        # Triggers template instantiation (and fails on the ghost ref) if it
+        # leaks past the shell-key take into Pixir.Workflows normalization.
+        "template_id" => "ghost-skill/ghost-template",
+        "steps" => [%{"id" => "inspect", "task" => "inspect", "agent" => "explorer"}]
+      }
+    }
+
+    assert {:ok, %{"summary" => %{"steps" => 1}}} =
+             Runner.rehearse_workflow_spec(spec, "read_only")
+  end
+
+  test "root limits knobs drive the normalized wait horizon end to end" do
+    with_pixir_home("pixir-delegate-root-limits-home", fn ->
+      ws = tmp_workspace("pixir-delegate-root-limits")
+      parent = self()
+
+      child = %{
+        "id" => "agent-1",
+        "child_session_id" => "20260721T000000-limits",
+        "agent" => "explorer",
+        "status" => "completed",
+        "summary" => "done",
+        "task" => "inspect timeout configuration",
+        "workspace_mode" => "shared",
+        "workspace" => ws
+      }
+
+      spawn_agent = fn _parent_session_id, _args, _opts -> {:ok, child} end
+
+      wait_outcome = fn _parent_session_id, _ids, timeout_ms, _opts ->
+        send(parent, {:wait_horizon_ms, timeout_ms})
+
+        {:ok,
+         %{
+           "status" => "completed",
+           "complete" => true,
+           "counts" => %{
+             "completed" => 1,
+             "failed" => 0,
+             "timed_out" => 0,
+             "cancelled" => 0,
+             "detached" => 0,
+             "incomplete" => 0
+           },
+           "subagents" => [child],
+           "summary" => "completed"
+         }}
+      end
+
+      base = %{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "mode" => "read_only",
+        "task" => "inspect timeout configuration"
+      }
+
+      run = fn limits ->
+        assert {:ok, _payload} =
+                 Runner.run(
+                   %{workspace: ws},
+                   Map.put(base, "limits", limits),
+                   %{"strategy" => "subagents", "planned_child_count" => 1},
+                   spawn_agent: spawn_agent,
+                   wait_outcome: wait_outcome
+                 )
+      end
+
+      # An explicit wait_horizon_ms knob reaches the wait boundary untouched.
+      run.(%{"wait_horizon_ms" => 55_555})
+      assert_received {:wait_horizon_ms, 55_555}
+
+      # The legacy knob cascades legacy -> delegate -> wait horizon.
+      run.(%{"timeout_ms" => 44_444})
+      assert_received {:wait_horizon_ms, 44_444}
+    end)
+  end
+
   test "bounded_write workflow runtime pairs auto permission mode with the write policy" do
     with_pixir_home("pixir-delegate-runner-home", fn ->
       ws = tmp_workspace("pixir-delegate-runner-workflow-write")

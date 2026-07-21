@@ -52,8 +52,8 @@
     ]
   },
   "probe": {
-    "version": 1,
-    "combined_sha256": "20270837368a5d833f1a4e49a60a43f38388ac4e25bf243f5d3e16ee846d499e"
+    "version": 2,
+    "combined_sha256": "2e3050cfe46c0b9691b445ec1d09a9efaf6b2add6d6b2296bc5433c5d8e23330"
   },
   "mechanical_validation": {
     "validator": "jsonschema Draft 2020-12 against pinned OpenAPI",

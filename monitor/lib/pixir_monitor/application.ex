@@ -20,7 +20,8 @@ defmodule PixirMonitor.Application do
       PixirMonitor.InvalidationHub,
       PixirMonitor.LogWatcher,
       PixirMonitor.Endpoint,
-      PixirMonitor.PortRegistry
+      PixirMonitor.PortRegistry,
+      PixirMonitor.SseDrainer
     ]
 
     Supervisor.start_link(children, strategy: :rest_for_one, name: PixirMonitor.Supervisor)

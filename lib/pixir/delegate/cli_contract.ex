@@ -397,6 +397,12 @@ defmodule Pixir.Delegate.CLIContract do
   # decode_spec/1 guarantees a JSON object, so a map is the only input shape.
   defp validate_strict_spec_keys(%{} = spec, workspace, opts) do
     with :ok <- reject_unknown_keys(spec, @known_spec_keys, [], %{}),
+         :ok <- validate_root_limits_for_strict_keys(spec),
+         :ok <- validate_root_steps_strategy(spec),
+         :ok <- validate_workflow_strategy(spec),
+         :ok <- validate_workflow_steps_exclusivity(spec),
+         :ok <- validate_workflow_shell_for_strict_keys(spec),
+         :ok <- validate_workflow_steps_for_strict_keys(spec),
          :ok <- validate_subagents_shape_for_strict_keys(spec),
          :ok <- validate_task_entries_for_strict_keys(spec),
          :ok <- validate_virtual_overlay_contract(spec),
@@ -562,39 +568,11 @@ defmodule Pixir.Delegate.CLIContract do
         :ok
 
       {:ok, limits} when is_map(limits) ->
-        limits
-        |> Enum.sort_by(fn {key, _value} -> to_string(key) end)
-        |> Enum.reduce_while(:ok, fn {key, value}, :ok ->
-          cond do
-            key not in @virtual_overlay_limit_keys ->
-              {:halt,
-               {:error,
-                invalid_spec(
-                  "subagents.limits contains an unknown key",
-                  %{
-                    "unknown_key" => key,
-                    "accepted_keys" => @virtual_overlay_limit_keys,
-                    "next_actions" => ["remove_unknown_limit", "check_virtual_overlay_limits"]
-                  }
-                  |> Map.merge(object_location_details(["subagents", "limits", key]))
-                )}}
-
-            not is_integer(value) or value < 0 ->
-              {:halt,
-               {:error,
-                invalid_spec(
-                  "virtual_overlay limits must be non-negative integers",
-                  %{
-                    "observed" => value,
-                    "next_actions" => ["set_limit_to_a_non_negative_integer"]
-                  }
-                  |> Map.merge(object_location_details(["subagents", "limits", key]))
-                )}}
-
-            true ->
-              {:cont, :ok}
-          end
-        end)
+        validate_virtual_overlay_limit_values(
+          limits,
+          ["subagents", "limits"],
+          "subagents.limits contains an unknown key"
+        )
 
       {:ok, value} ->
         {:error,
@@ -610,6 +588,42 @@ defmodule Pixir.Delegate.CLIContract do
   end
 
   defp validate_virtual_overlay_limits(_subagents, _workspace_mode), do: :ok
+
+  defp validate_virtual_overlay_limit_values(limits, path, unknown_key_message) do
+    limits
+    |> Enum.sort_by(fn {key, _value} -> to_string(key) end)
+    |> Enum.reduce_while(:ok, fn {key, value}, :ok ->
+      cond do
+        key not in @virtual_overlay_limit_keys ->
+          {:halt,
+           {:error,
+            invalid_spec(
+              unknown_key_message,
+              %{
+                "unknown_key" => key,
+                "accepted_keys" => @virtual_overlay_limit_keys,
+                "next_actions" => ["remove_unknown_limit", "check_virtual_overlay_limits"]
+              }
+              |> Map.merge(object_location_details(path ++ [key]))
+            )}}
+
+        not is_integer(value) or value < 0 ->
+          {:halt,
+           {:error,
+            invalid_spec(
+              "virtual_overlay limits must be non-negative integers",
+              %{
+                "observed" => value,
+                "next_actions" => ["set_limit_to_a_non_negative_integer"]
+              }
+              |> Map.merge(object_location_details(path ++ [key]))
+            )}}
+
+        true ->
+          {:cont, :ok}
+      end
+    end)
+  end
 
   defp validate_virtual_overlay_attachments(spec, "virtual_overlay") do
     case Runner.virtual_overlay_attachment_index(spec) do
@@ -696,6 +710,228 @@ defmodule Pixir.Delegate.CLIContract do
   end
 
   defp effective_spec_workspace(_spec, caller_workspace), do: caller_workspace
+
+  defp validate_root_limits_for_strict_keys(%{"limits" => limits}) when is_map(limits) do
+    accepted_keys = Runner.root_limit_keys()
+
+    limits
+    |> Map.keys()
+    |> Enum.sort_by(&to_string/1)
+    |> Enum.find(&(&1 not in accepted_keys))
+    |> case do
+      nil ->
+        :ok
+
+      key ->
+        {:error,
+         invalid_spec(
+           "delegate spec limits contains an unknown key",
+           %{
+             "unknown_key" => key,
+             "accepted_keys" => accepted_keys,
+             "next_actions" => ["remove_unknown_limit", "check_delegate_timeout_knobs"]
+           }
+           |> Map.merge(object_location_details(["limits", key]))
+         )}
+    end
+  end
+
+  defp validate_root_limits_for_strict_keys(%{"limits" => limits}) do
+    {:error,
+     invalid_spec(
+       "delegate spec limits must be an object",
+       %{
+         "observed" => limits,
+         "next_actions" => ["set_limits_to_an_object_or_remove_it"]
+       }
+       |> Map.merge(object_location_details(["limits"]))
+     )}
+  end
+
+  defp validate_root_limits_for_strict_keys(_spec), do: :ok
+
+  defp validate_root_steps_strategy(spec) do
+    if Map.has_key?(spec, "steps") and Map.get(spec, "strategy") != "workflow" do
+      {:error,
+       invalid_spec(
+         "delegate spec root steps require strategy workflow",
+         %{
+           "observed_strategy" => Map.get(spec, "strategy"),
+           "accepted_values" => ["workflow"],
+           "next_actions" => ["use_workflow_strategy", "remove_steps"]
+         }
+         |> Map.merge(object_location_details(["steps"]))
+       )}
+    else
+      :ok
+    end
+  end
+
+  defp validate_workflow_strategy(spec) do
+    if Map.has_key?(spec, "workflow") and Map.get(spec, "strategy") != "workflow" do
+      {:error,
+       invalid_spec(
+         "delegate spec workflow object requires strategy workflow",
+         %{
+           "observed_strategy" => Map.get(spec, "strategy"),
+           "accepted_values" => ["workflow"],
+           "next_actions" => ["use_workflow_strategy", "remove_workflow"]
+         }
+         |> Map.merge(object_location_details(["workflow"]))
+       )}
+    else
+      :ok
+    end
+  end
+
+  defp validate_workflow_steps_exclusivity(%{"workflow" => %{} = workflow} = spec) do
+    if Map.has_key?(spec, "steps") and Map.has_key?(workflow, "steps") do
+      {:error,
+       invalid_spec(
+         "root steps and workflow.steps are mutually exclusive",
+         %{
+           "next_actions" => ["remove_root_steps", "remove_workflow_steps"]
+         }
+         |> Map.merge(object_location_details(["workflow", "steps"]))
+       )}
+    else
+      :ok
+    end
+  end
+
+  defp validate_workflow_steps_exclusivity(_spec), do: :ok
+
+  defp validate_workflow_shell_for_strict_keys(%{"workflow" => %{} = workflow}) do
+    with :ok <-
+           reject_unknown_keys(
+             workflow,
+             Pixir.Workflows.workflow_shell_keys(),
+             ["workflow"],
+             %{}
+           ),
+         :ok <- validate_workflow_shell_steps_shape(workflow) do
+      :ok
+    end
+  end
+
+  defp validate_workflow_shell_for_strict_keys(%{"workflow" => workflow}) do
+    {:error,
+     invalid_spec(
+       "delegate spec workflow must be an object",
+       %{
+         "observed" => workflow,
+         "next_actions" => ["set_workflow_to_an_object_or_remove_it"]
+       }
+       |> Map.merge(object_location_details(["workflow"]))
+     )}
+  end
+
+  defp validate_workflow_shell_for_strict_keys(_spec), do: :ok
+
+  defp validate_workflow_shell_steps_shape(%{"steps" => steps}) when not is_list(steps) do
+    {:error,
+     invalid_spec(
+       "workflow.steps must be a list",
+       %{
+         "observed" => steps,
+         "next_actions" => ["set_workflow_steps_to_a_list"]
+       }
+       |> Map.merge(object_location_details(["workflow", "steps"]))
+     )}
+  end
+
+  defp validate_workflow_shell_steps_shape(_workflow), do: :ok
+
+  defp validate_workflow_steps_for_strict_keys(%{"strategy" => "workflow"} = spec) do
+    case workflow_steps_with_path(spec) do
+      {steps, path} when is_list(steps) ->
+        steps
+        |> Enum.with_index()
+        |> Enum.reduce_while(:ok, fn
+          {%{} = step, index}, :ok ->
+            with :ok <-
+                   reject_unknown_keys(
+                     step,
+                     Pixir.Workflows.workflow_step_keys(),
+                     path ++ [index],
+                     %{"depend_on" => "depends_on"}
+                   ),
+                 :ok <- validate_workflow_step_limits(step, path ++ [index]) do
+              {:cont, :ok}
+            else
+              {:error, error} -> {:halt, {:error, error}}
+            end
+
+          {_step, _index}, :ok ->
+            {:cont, :ok}
+        end)
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp validate_workflow_steps_for_strict_keys(_spec), do: :ok
+
+  defp validate_workflow_step_limits(step, path) do
+    case Map.fetch(step, "limits") do
+      :error ->
+        :ok
+
+      {:ok, limits} ->
+        if Map.get(step, "workspace_mode") == "virtual_overlay" do
+          if is_map(limits) do
+            validate_virtual_overlay_limit_values(
+              limits,
+              path ++ ["limits"],
+              "workflow step limits contains an unknown key"
+            )
+          else
+            {:error,
+             invalid_spec(
+               "workflow step limits must be an object",
+               %{
+                 "observed" => limits,
+                 "next_actions" => ["set_limits_to_an_object_or_remove_it"]
+               }
+               |> Map.merge(object_location_details(path ++ ["limits"]))
+             )}
+          end
+        else
+          {:error,
+           invalid_spec(
+             "workflow step limits are only valid for virtual_overlay steps",
+             %{
+               "workspace_mode" => Map.get(step, "workspace_mode"),
+               "next_actions" => [
+                 "set_step_workspace_mode_to_virtual_overlay",
+                 "remove_step_limits"
+               ]
+             }
+             |> Map.merge(object_location_details(path ++ ["limits"]))
+           )}
+        end
+    end
+  end
+
+  # Follows workflow_steps/1's effective-steps rule for the reachable shapes: a
+  # top-level list wins; nil/false fall through to the nested shape, so a null
+  # "steps" cannot smuggle a nested list past the walk. For a truthy non-list
+  # top level ({}, string) the two intentionally diverge fail-closed: the walk
+  # validates the nested list while the shape validation rejects the top-level
+  # value, so nothing escapes either way.
+  defp workflow_steps_with_path(spec) do
+    case Map.get(spec, "steps") do
+      steps when is_list(steps) -> {steps, ["steps"]}
+      _other -> nested_workflow_steps_with_path(spec)
+    end
+  end
+
+  defp nested_workflow_steps_with_path(%{"workflow" => %{"steps" => steps}})
+       when is_list(steps),
+       do: {steps, ["workflow", "steps"]}
+
+  defp nested_workflow_steps_with_path(_spec), do: nil
 
   defp validate_subagents_shape_for_strict_keys(%{"subagents" => %{} = subagents}) do
     reject_unknown_keys(subagents, @known_subagents_keys, ["subagents"], %{
@@ -1037,12 +1273,32 @@ defmodule Pixir.Delegate.CLIContract do
   end
 
   defp object_location_details(path) do
-    %{
+    details = %{
       "field" => Enum.join(path, "."),
       "json_pointer" => json_pointer(path),
       "path" => path
     }
+
+    case path do
+      ["steps", step_index | rest] when is_integer(step_index) ->
+        details
+        |> Map.put("field", step_field_label("steps", step_index, rest))
+        |> Map.put("step_index", step_index)
+
+      ["workflow", "steps", step_index | rest] when is_integer(step_index) ->
+        details
+        |> Map.put("field", step_field_label("workflow.steps", step_index, rest))
+        |> Map.put("step_index", step_index)
+
+      _other ->
+        details
+    end
   end
+
+  defp step_field_label(prefix, step_index, []), do: "#{prefix}[#{step_index + 1}]"
+
+  defp step_field_label(prefix, step_index, rest),
+    do: "#{prefix}[#{step_index + 1}].#{Enum.join(rest, ".")}"
 
   defp parse_subcommand_argv(subcommand, argv) do
     parse_subcommand_args(argv, %{

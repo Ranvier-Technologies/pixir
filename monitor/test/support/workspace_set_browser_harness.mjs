@@ -387,7 +387,9 @@ async function run(options) {
     await serving;
     const handoffCleaned = !existsSync(fifoPath) && !existsSync(dirname(fifoPath));
     if (!handoffCleaned) throw failure("handoff_cleanup_failed", "One-use FIFO was not removed", "verify_cleanup");
-    runResult = {ok: true, check: "pixir_monitor_workspace_set_browser_degradation", mode: options.mode, phases, browser: "chrome_devtools_protocol", launch_fragment_cleared: true, handoff_cleaned: true, network_requests: {left: network.records.filter(record => record.workspace === "left").length, right: network.records.filter(record => record.workspace === "right").length}};
+    const launchFragmentCleared = await evaluate(client, sessionId, `!location.hash.startsWith("#launch=")`, "launch_fragment_cleared");
+    if (!launchFragmentCleared) throw failure("launch_fragment_not_cleared", "Launch capability remained in the browser fragment", "verify_launch_fragment");
+    runResult = {ok: true, check: "pixir_monitor_workspace_set_browser_degradation", mode: options.mode, phases, browser: "chrome_devtools_protocol", launch_fragment_cleared: launchFragmentCleared === true, handoff_cleaned: true, network_requests: {left: network.records.filter(record => record.workspace === "left").length, right: network.records.filter(record => record.workspace === "right").length}};
     return runResult;
   } catch (error) {
     runError = error;

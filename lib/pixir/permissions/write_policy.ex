@@ -188,7 +188,7 @@ defmodule Pixir.Permissions.WritePolicy do
   def narrow_to_write_set(policy, write_set) when is_map(policy) and is_list(write_set) do
     rules = Enum.map(write_set, &normalize_rule/1)
 
-    with :ok <- ensure_rules_supported(rules, "write_set"),
+    with :ok <- validate_path_rules(rules, "write_set"),
          :ok <- ensure_rules_narrow(policy, rules) do
       narrowed =
         policy
@@ -533,7 +533,7 @@ defmodule Pixir.Permissions.WritePolicy do
     Enum.any?(rules, &allow_matches?(normalize_rule(&1), rel))
   end
 
-  @doc "Validate a list of allow-style rules against the policy glob grammar."
+  @doc "Validate a list of allow/deny path rules against the policy glob grammar."
   @spec validate_path_rules([String.t()], String.t()) :: :ok | {:error, map()}
   def validate_path_rules(rules, field) when is_list(rules) do
     Enum.reduce_while(rules, :ok, fn rule, :ok ->
@@ -664,15 +664,6 @@ defmodule Pixir.Permissions.WritePolicy do
   end
 
   defp contains_glob?(value), do: String.contains?(value, "*")
-
-  defp ensure_rules_supported(rules, field) do
-    Enum.reduce_while(rules, :ok, fn rule, :ok ->
-      case validate_rule(rule, field) do
-        :ok -> {:cont, :ok}
-        {:error, _} = error -> {:halt, error}
-      end
-    end)
-  end
 
   defp ensure_rules_narrow(policy, rules) do
     Enum.reduce_while(rules, :ok, fn rule, :ok ->
@@ -860,7 +851,7 @@ defmodule Pixir.Permissions.WritePolicy do
              })}
 
           true ->
-            with :ok <- ensure_rules_supported(rules, field), do: {:ok, rules}
+            with :ok <- validate_path_rules(rules, field), do: {:ok, rules}
         end
 
       true ->
@@ -873,7 +864,7 @@ defmodule Pixir.Permissions.WritePolicy do
       {:ok, value} when is_list(value) ->
         rules = Enum.map(value, &normalize_rule/1)
 
-        with :ok <- ensure_rules_supported(rules, field), do: {:ok, rules}
+        with :ok <- validate_path_rules(rules, field), do: {:ok, rules}
 
       {:ok, _value} ->
         {:error, Tool.error(:invalid_args, "bounded write policy #{field} must be a list", %{})}

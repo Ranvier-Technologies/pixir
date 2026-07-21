@@ -92,9 +92,11 @@ defmodule PixirMonitor.Projection.Builder do
       end
     end
   rescue
-    exception ->
+    # Builder failures can flow into API diagnostics, and their messages can carry
+    # filesystem paths or URLs. Report a fixed atom instead of Exception.message/1.
+    _exception ->
       error("projection_build_failed", "Projection evidence could not be folded", %{
-        exception: Exception.message(exception)
+        exception: :projection_build_raised
       })
   end
 

@@ -50,7 +50,9 @@ defmodule PixirMonitor.FifoHandoff do
       {:error, reason} -> {:error, setup_error(reason)}
     end
   rescue
-    error -> {:error, setup_error(Exception.message(error))}
+    # This error is operator-local rather than API-served, but the same boundary
+    # doctrine keeps environment detail out of diagnostics. Report a fixed atom.
+    _error -> {:error, setup_error(:fifo_prepare_raised)}
   end
 
   defp prepare_created(directory, fifo, watchdog_seconds, writer_open_delay_ms) do
@@ -75,9 +77,11 @@ defmodule PixirMonitor.FifoHandoff do
         {:error, setup_error(reason)}
     end
   rescue
-    error ->
+    # This error is operator-local rather than API-served, but the same boundary
+    # doctrine keeps environment detail out of diagnostics. Report a fixed atom.
+    _error ->
       _ = File.rm_rf(directory)
-      {:error, setup_error(Exception.message(error))}
+      {:error, setup_error(:fifo_prepare_created_raised)}
   end
 
   @spec handoff(prepared(), (-> {:ok, String.t()} | {:error, map()}), keyword()) ::

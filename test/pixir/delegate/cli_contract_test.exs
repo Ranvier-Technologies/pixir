@@ -1094,6 +1094,674 @@ defmodule Pixir.Delegate.CLIContractTest do
              )
   end
 
+  test "workflow step keys fail closed with zero-based locations for dry-run and attached requests" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "mode" => "read_only",
+        "steps" => [
+          %{"id" => "inspect", "task" => "inspect"},
+          %{"id" => "summarize", "task" => "summarize", "probe" => true}
+        ]
+      })
+
+    for argv <- [
+          ["--spec", "-", "--dry-run", "--json"],
+          ["--spec", "-", "--json"]
+        ] do
+      assert {:error,
+              %{
+                exit_code: 2,
+                payload: %{
+                  "kind" => "invalid_spec",
+                  "details" => details
+                }
+              }} =
+               CLIContract.run(argv, read_stdin: fn -> spec end)
+
+      assert details["unknown_key"] == "probe"
+      assert details["json_pointer"] == "/steps/1/probe"
+      assert details["path"] == ["steps", 1, "probe"]
+      assert details["field"] == "steps[2].probe"
+      assert details["step_index"] == 1
+    end
+  end
+
+  test "workflow depend_on typo fails closed with a depends_on hint" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "mode" => "read_only",
+        "steps" => [
+          %{"id" => "inspect", "task" => "inspect"},
+          %{"id" => "summarize", "task" => "summarize", "depend_on" => ["inspect"]}
+        ]
+      })
+
+    assert {:error, %{payload: %{"kind" => "invalid_spec", "details" => details}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+
+    assert details["json_pointer"] == "/steps/1/depend_on"
+    assert details["step_index"] == 1
+    assert details["did_you_mean"] == "depends_on"
+    assert "rename_field_to_depends_on" in details["next_actions"]
+  end
+
+  test "workflow strict-key validation accepts every parser-consumed step key" do
+    workspace = tmp_workspace("pixir-delegate-workflow-step-keys")
+    File.write!(Path.join(workspace, "evidence.txt"), "evidence\n")
+
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "mode" => "bounded_write",
+        "write_policy" => %{"version" => 1, "allow_writes" => ["notes/**"]},
+        "steps" => [
+          %{
+            "id" => "inspect",
+            "task" => "inspect evidence",
+            "agent" => "explorer",
+            "workspace_mode" => "shared",
+            "read_set" => ["evidence.txt"],
+            "write_set" => ["notes/ignored.txt"],
+            "model" => "gpt-test",
+            "reasoning_effort" => "high",
+            "attachments" => ["evidence.txt"],
+            "depends_on" => [],
+            "timeout_ms" => 1_000,
+            "permission_mode" => "read_only",
+            "sandbox_mode" => "read-only"
+          },
+          %{
+            "id" => "producer",
+            "task" => "produce a virtual diff",
+            "workspace_mode" => "virtual_overlay",
+            "read_set" => ["evidence.txt"],
+            "virtual_commands" => ["true"],
+            "limits" => %{"max_import_files" => 1},
+            "depends_on" => ["inspect"],
+            "permission_mode" => "read_only"
+          },
+          %{
+            "id" => "apply",
+            "task" => "apply the diff",
+            "apply_from" => "producer",
+            "workspace_mode" => "shared",
+            "write_set" => ["notes/out.txt"],
+            "depends_on" => ["producer"],
+            "timeout_ms" => 1_000
+          }
+        ]
+      })
+
+    assert {:ok, %{payload: %{"status" => "planned", "strategy" => "workflow"}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               workspace: workspace,
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "workflow step key accessor is pinned to normalization reads" do
+    assert Pixir.Workflows.workflow_step_keys() ==
+             ~w(
+               id task agent apply_from workspace_mode read_set virtual_commands limits write_set model
+               reasoning_effort attachments depends_on timeout_ms permission_mode sandbox_mode
+             )
+  end
+
+  test "the accessor matches the step keys the normalizer source actually reads" do
+    source = File.read!(Path.expand("../../../lib/pixir/workflows.ex", __DIR__))
+
+    # Honest-regression pin, source-scrape grade: every step-map read in the
+    # normalizer goes through field/has_field? on a raw step, so scraping those
+    # call sites recovers the true accepted vocabulary. Convention-bound to the
+    # parameter names raw/step; renaming them in workflows.ex must update this
+    # regex or the second subset assert fails loudly on the dropped reads. Adding a read without
+    # updating workflow_step_keys/0 (or vice versa) fails here first.
+    scraped =
+      ~r/(?:field|has_field\?)\(\s*(?:raw|step)\s*,\s*"([a-z_]+)"/
+      |> Regex.scan(source, capture: :all_but_first)
+      |> List.flatten()
+      |> MapSet.new()
+
+    accessor = MapSet.new(Pixir.Workflows.workflow_step_keys())
+
+    assert MapSet.subset?(accessor, scraped),
+           "accessor lists keys the normalizer never reads: #{inspect(MapSet.difference(accessor, scraped) |> Enum.sort())}"
+
+    assert MapSet.subset?(scraped, accessor),
+           "normalizer reads keys missing from workflow_step_keys/0: #{inspect(MapSet.difference(scraped, accessor) |> Enum.sort())}"
+  end
+
+  test "nested workflow.steps entries reject unknown keys with nested pointers" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "workflow" => %{
+          "steps" => [
+            %{"id" => "a", "task" => "t", "permission_mode" => "read_only", "probe" => true}
+          ]
+        }
+      })
+
+    assert {:error, %{payload: %{"kind" => "invalid_spec", "details" => details}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"], read_stdin: fn -> spec end)
+
+    assert details["json_pointer"] == "/workflow/steps/0/probe"
+    assert details["step_index"] == 0
+    assert details["unknown_key"] == "probe"
+    assert details["field"] == "workflow.steps[1].probe"
+  end
+
+  test "root steps and nested workflow.steps are mutually exclusive by key presence" do
+    for root_steps <- [
+          [%{"id" => "root", "task" => "root", "permission_mode" => "read_only"}],
+          nil,
+          []
+        ] do
+      spec =
+        Jason.encode!(%{
+          "contract_version" => 1,
+          "strategy" => "workflow",
+          "mode" => "read_only",
+          "steps" => root_steps,
+          "workflow" => %{
+            "steps" => [%{"id" => "nested", "task" => "nested"}]
+          }
+        })
+
+      for argv <- [
+            ["--spec", "-", "--dry-run", "--json"],
+            ["--spec", "-", "--json"]
+          ] do
+        assert {:error,
+                %{
+                  exit_code: 2,
+                  payload: %{
+                    "kind" => "invalid_spec",
+                    "message" => "root steps and workflow.steps are mutually exclusive",
+                    "details" => details
+                  }
+                }} = CLIContract.run(argv, read_stdin: fn -> spec end)
+
+        assert details["json_pointer"] == "/workflow/steps"
+        assert details["path"] == ["workflow", "steps"]
+        assert details["next_actions"] == ["remove_root_steps", "remove_workflow_steps"]
+      end
+    end
+  end
+
+  test "workflow.steps rejects non-list values at shared spec admission" do
+    for value <- [nil, %{}, "steps"] do
+      spec =
+        Jason.encode!(%{
+          "contract_version" => 1,
+          "strategy" => "workflow",
+          "mode" => "read_only",
+          "workflow" => %{"steps" => value}
+        })
+
+      for argv <- [
+            ["--spec", "-", "--dry-run", "--json"],
+            ["--spec", "-", "--json"]
+          ] do
+        assert {:error,
+                %{
+                  exit_code: 2,
+                  payload: %{
+                    "kind" => "invalid_spec",
+                    "message" => "workflow.steps must be a list",
+                    "details" => details
+                  }
+                }} = CLIContract.run(argv, read_stdin: fn -> spec end)
+
+        assert details["observed"] == value
+        assert details["json_pointer"] == "/workflow/steps"
+        assert details["path"] == ["workflow", "steps"]
+        assert details["next_actions"] == ["set_workflow_steps_to_a_list"]
+      end
+    end
+  end
+
+  test "non-workflow strategy rejects root steps at shared spec admission" do
+    spec =
+      ~s({"contract_version":1,"strategy":"subagents","mode":"read_only","tasks":[{"task":"say hi"}],"steps":[{"id":"stray","task":"this should not be here"}]})
+
+    for argv <- [
+          ["--spec", "-", "--dry-run", "--json"],
+          ["--spec", "-", "--json"]
+        ] do
+      assert {:error,
+              %{
+                exit_code: 2,
+                payload: %{
+                  "kind" => "invalid_spec",
+                  "details" => details
+                }
+              }} = CLIContract.run(argv, read_stdin: fn -> spec end)
+
+      assert details["json_pointer"] == "/steps"
+      assert details["path"] == ["steps"]
+      assert details["observed_strategy"] == "subagents"
+      assert details["accepted_values"] == ["workflow"]
+      assert details["next_actions"] == ["use_workflow_strategy", "remove_steps"]
+    end
+  end
+
+  test "non-workflow strategy rejects a nested workflow object at shared spec admission" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "mode" => "read_only",
+        "tasks" => [%{"task" => "say hi"}],
+        "workflow" => %{
+          "steps" => [%{"id" => "stray", "task" => "this should not be here"}]
+        }
+      })
+
+    for argv <- [
+          ["--spec", "-", "--dry-run", "--json"],
+          ["--spec", "-", "--json"]
+        ] do
+      assert {:error,
+              %{
+                exit_code: 2,
+                payload: %{
+                  "kind" => "invalid_spec",
+                  "details" => details
+                }
+              }} = CLIContract.run(argv, read_stdin: fn -> spec end)
+
+      assert details["json_pointer"] == "/workflow"
+      assert details["path"] == ["workflow"]
+      assert details["observed_strategy"] == "subagents"
+      assert details["accepted_values"] == ["workflow"]
+      assert details["next_actions"] == ["use_workflow_strategy", "remove_workflow"]
+    end
+  end
+
+  test "workflow shell rejects non-object values at shared spec admission" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "mode" => "read_only",
+        "steps" => [%{"id" => "s1", "task" => "noop"}],
+        "workflow" => 5
+      })
+
+    for argv <- [
+          ["--spec", "-", "--dry-run", "--json"],
+          ["--spec", "-", "--json"]
+        ] do
+      assert {:error,
+              %{
+                exit_code: 2,
+                payload: %{
+                  "kind" => "invalid_spec",
+                  "details" => details
+                }
+              }} = CLIContract.run(argv, read_stdin: fn -> spec end)
+
+      assert details["json_pointer"] == "/workflow"
+      assert details["path"] == ["workflow"]
+      assert details["observed"] == 5
+      assert details["next_actions"] == ["set_workflow_to_an_object_or_remove_it"]
+    end
+  end
+
+  test "valid workflow strategy accepts the nested workflow.steps shape" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "mode" => "read_only",
+        "workflow" => %{
+          "steps" => [%{"id" => "s1", "task" => "noop"}]
+        }
+      })
+
+    assert {:ok, %{payload: %{"status" => "planned", "strategy" => "workflow"}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "subagents spec without root steps remains valid" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "mode" => "read_only",
+        "tasks" => [%{"task" => "say hi"}]
+      })
+
+    assert {:ok, %{payload: %{"status" => "planned", "strategy" => "subagents"}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "root limits rejects unknown timeout knobs on dry-run and attached paths" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "mode" => "read_only",
+        "task" => "inspect timeout configuration",
+        "limits" => %{"bogus" => 1}
+      })
+
+    for argv <- [
+          ["--spec", "-", "--dry-run", "--json"],
+          ["--spec", "-", "--json"]
+        ] do
+      assert {:error,
+              %{
+                exit_code: 2,
+                payload: %{
+                  "kind" => "invalid_spec",
+                  "message" => "delegate spec limits contains an unknown key",
+                  "details" => details
+                }
+              }} = CLIContract.run(argv, read_stdin: fn -> spec end)
+
+      assert details["unknown_key"] == "bogus"
+
+      assert details["accepted_keys"] ==
+               ~w(child_timeout_ms delegate_timeout_ms timeout_ms wait_horizon_ms)
+
+      assert details["json_pointer"] == "/limits/bogus"
+      assert details["path"] == ["limits", "bogus"]
+      assert details["field"] == "limits.bogus"
+      assert details["next_actions"] == ["remove_unknown_limit", "check_delegate_timeout_knobs"]
+    end
+  end
+
+  test "root limits rejects non-object values on dry-run and attached paths" do
+    for value <- [nil, 1, [], true, "60000"] do
+      spec =
+        Jason.encode!(%{
+          "contract_version" => 1,
+          "strategy" => "subagents",
+          "task" => "inspect timeout configuration",
+          "limits" => value
+        })
+
+      for argv <- [
+            ["--spec", "-", "--dry-run", "--json"],
+            ["--spec", "-", "--json"]
+          ] do
+        assert {:error,
+                %{
+                  exit_code: 2,
+                  payload: %{
+                    "kind" => "invalid_spec",
+                    "message" => "delegate spec limits must be an object",
+                    "details" => details
+                  }
+                }} = CLIContract.run(argv, read_stdin: fn -> spec end)
+
+        assert details["observed"] == value
+        assert details["json_pointer"] == "/limits"
+        assert details["path"] == ["limits"]
+        assert details["field"] == "limits"
+        assert details["next_actions"] == ["set_limits_to_an_object_or_remove_it"]
+      end
+    end
+  end
+
+  test "root limits accepts every timeout knob and leaves loose legacy timeout_ms valid" do
+    accepted_keys = ~w(child_timeout_ms delegate_timeout_ms timeout_ms wait_horizon_ms)
+
+    all_knobs_spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "inspect timeout configuration",
+        "limits" => Map.new(accepted_keys, &{&1, 1_000})
+      })
+
+    legacy_spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "inspect timeout configuration",
+        "timeout_ms" => 1_000
+      })
+
+    for spec <- [all_knobs_spec, legacy_spec] do
+      assert {:ok, %{payload: %{"status" => "planned", "strategy" => "subagents"}}} =
+               CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+                 read_stdin: fn -> spec end
+               )
+    end
+  end
+
+  test "root limit accessor is pinned to timeout normalization consumption" do
+    assert Pixir.Delegate.Runner.root_limit_keys() ==
+             ~w(child_timeout_ms delegate_timeout_ms timeout_ms wait_horizon_ms)
+
+    source = File.read!(Path.expand("../../../lib/pixir/delegate/runner.ex", __DIR__))
+
+    [normalizer] =
+      ~r/defp normalize_timeouts\(request, spec\) do.*?(?=\n  defp request_timeout_candidate)/s
+      |> Regex.run(source)
+
+    assert normalizer =~ "Map.new(root_limit_keys()"
+    assert normalizer =~ ~s|timeout_candidate(spec, ["limits", key])|
+
+    consumed =
+      ~r/Map\.fetch!\(root_limit_candidates, "([a-z_]+)"\)/
+      |> Regex.scan(normalizer, capture: :all_but_first)
+      |> List.flatten()
+      |> Enum.sort()
+
+    assert consumed == Pixir.Delegate.Runner.root_limit_keys()
+
+    # A fifth knob consumed via a raw literal read (bypassing the accessor
+    # loop) must fail here, not slip past the fetch-set equality above.
+    raw_limit_reads =
+      ~r/timeout_candidate\(spec, \["limits", "/
+      |> Regex.scan(normalizer)
+
+    assert raw_limit_reads == [],
+           "normalize_timeouts reads a limits key outside the root_limit_keys loop: #{inspect(raw_limit_reads)}"
+
+    assert Regex.scan(~r/get_in\(spec, \["limits"/, normalizer) == []
+  end
+
+  test "root workflow step rejects unknown virtual_overlay limit keys" do
+    spec =
+      ~s({"contract_version":1,"strategy":"workflow","mode":"read_only","steps":[{"id":"s1","task":"noop","depends_on":[],"workspace_mode":"virtual_overlay","read_set":["README.md"],"virtual_commands":["mix format --check-formatted"],"limits":{"bogus_limit":3,"max_output_bytes":-5}}]})
+
+    for argv <- [
+          ["--spec", "-", "--dry-run", "--json"],
+          ["--spec", "-", "--json"]
+        ] do
+      assert {:error, %{exit_code: 2, payload: %{"kind" => "invalid_spec", "details" => details}}} =
+               CLIContract.run(argv, read_stdin: fn -> spec end)
+
+      assert details["unknown_key"] == "bogus_limit"
+
+      assert details["accepted_keys"] ==
+               ~w(max_diff_bytes max_file_bytes max_import_bytes max_import_files max_output_bytes max_virtual_commands)
+
+      assert details["json_pointer"] == "/steps/0/limits/bogus_limit"
+      assert details["path"] == ["steps", 0, "limits", "bogus_limit"]
+      assert details["step_index"] == 0
+      assert details["next_actions"] == ["remove_unknown_limit", "check_virtual_overlay_limits"]
+    end
+  end
+
+  test "nested workflow step rejects negative virtual_overlay limit values" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "mode" => "read_only",
+        "workflow" => %{
+          "steps" => [
+            %{
+              "id" => "s1",
+              "task" => "noop",
+              "workspace_mode" => "virtual_overlay",
+              "read_set" => ["README.md"],
+              "virtual_commands" => ["true"],
+              "limits" => %{"max_output_bytes" => -5}
+            }
+          ]
+        }
+      })
+
+    for argv <- [
+          ["--spec", "-", "--dry-run", "--json"],
+          ["--spec", "-", "--json"]
+        ] do
+      assert {:error, %{payload: %{"kind" => "invalid_spec", "details" => details}}} =
+               CLIContract.run(argv, read_stdin: fn -> spec end)
+
+      assert details["observed"] == -5
+      assert details["json_pointer"] == "/workflow/steps/0/limits/max_output_bytes"
+      assert details["field"] == "workflow.steps[1].limits.max_output_bytes"
+      assert details["next_actions"] == ["set_limit_to_a_non_negative_integer"]
+    end
+  end
+
+  test "workflow step limits reject non-overlay steps and non-object overlay values" do
+    cases = [
+      {%{
+         "id" => "shared",
+         "task" => "noop",
+         "workspace_mode" => "shared",
+         "limits" => %{"max_output_bytes" => 1}
+       }, ["set_step_workspace_mode_to_virtual_overlay", "remove_step_limits"]},
+      {%{
+         "id" => "overlay",
+         "task" => "noop",
+         "workspace_mode" => "virtual_overlay",
+         "read_set" => ["README.md"],
+         "virtual_commands" => ["true"],
+         "limits" => 1
+       }, ["set_limits_to_an_object_or_remove_it"]}
+    ]
+
+    for {step, expected_actions} <- cases do
+      spec =
+        Jason.encode!(%{
+          "contract_version" => 1,
+          "strategy" => "workflow",
+          "mode" => "read_only",
+          "steps" => [step]
+        })
+
+      assert {:error, %{payload: %{"kind" => "invalid_spec", "details" => details}}} =
+               CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+                 read_stdin: fn -> spec end
+               )
+
+      assert details["json_pointer"] == "/steps/0/limits"
+      assert details["next_actions"] == expected_actions
+    end
+  end
+
+  test "valid workflow virtual_overlay limits remain accepted" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "mode" => "read_only",
+        "steps" => [
+          %{
+            "id" => "s1",
+            "task" => "noop",
+            "workspace_mode" => "virtual_overlay",
+            "read_set" => ["README.md"],
+            "virtual_commands" => ["true"],
+            "limits" => %{"max_output_bytes" => 4_096, "max_virtual_commands" => 1}
+          }
+        ]
+      })
+
+    assert {:ok, %{payload: %{"status" => "planned", "strategy" => "workflow"}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+  end
+
+  test "workflow object shell rejects unknown keys" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "mode" => "read_only",
+        "workflow" => %{
+          "steps" => [%{"id" => "s1", "task" => "noop"}],
+          "probe" => true
+        }
+      })
+
+    for argv <- [
+          ["--spec", "-", "--dry-run", "--json"],
+          ["--spec", "-", "--json"]
+        ] do
+      assert {:error, %{payload: %{"kind" => "invalid_spec", "details" => details}}} =
+               CLIContract.run(argv, read_stdin: fn -> spec end)
+
+      assert details["unknown_key"] == "probe"
+      assert details["accepted_keys"] == ["steps"]
+      assert details["json_pointer"] == "/workflow/probe"
+      assert details["path"] == ["workflow", "probe"]
+      assert details["next_actions"] == ["remove_unknown_field", "check_delegate_spec_contract"]
+    end
+  end
+
+  test "workflow shell key accessor is pinned to workflow and delegate consumers" do
+    assert Pixir.Workflows.workflow_shell_keys() == ["steps"]
+
+    workflows_source = File.read!(Path.expand("../../../lib/pixir/workflows.ex", __DIR__))
+
+    normalized_shell_reads =
+      ~r/^\s*([a-z_]+) = field\(spec, "([a-z_]+)", \[\]\)$/m
+      |> Regex.scan(workflows_source, capture: :all_but_first)
+      |> Enum.filter(fn [binding, key] -> binding == key end)
+      |> Enum.map(fn [_binding, key] -> key end)
+      |> MapSet.new()
+
+    runner_source = File.read!(Path.expand("../../../lib/pixir/delegate/runner.ex", __DIR__))
+
+    [runner_normalizer] =
+      ~r/defp normalize_workflow_spec\(spec, mode\) do.*?(?=\n  defp force_read_only_step)/s
+      |> Regex.run(runner_source)
+
+    assert runner_normalizer =~
+             "Map.take(nested, Pixir.Workflows.workflow_shell_keys())"
+
+    assert Regex.scan(~r/Map\.([a-z_?]+)\(\s*nested/, runner_normalizer, capture: :all_but_first) ==
+             [["take"]]
+
+    assert length(Regex.scan(~r/\bnested\b/, runner_normalizer)) == 2
+    refute Regex.match?(~r/nested\s*\[/, runner_normalizer)
+
+    delegate_source =
+      File.read!(Path.expand("../../../lib/pixir/delegate/cli_contract.ex", __DIR__))
+
+    assert Regex.match?(
+             ~r/reject_unknown_keys\(\s*workflow,\s*Pixir\.Workflows\.workflow_shell_keys\(\)/s,
+             delegate_source
+           )
+
+    accessor = MapSet.new(Pixir.Workflows.workflow_shell_keys())
+    assert accessor == normalized_shell_reads
+  end
+
   test "unknown top-level delegate spec keys fail closed" do
     spec =
       Jason.encode!(%{

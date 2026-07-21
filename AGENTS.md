@@ -165,6 +165,10 @@ state lives under `~/.pixir/` unless `PIXIR_HOME` overrides it.
    through JSON/NDJSON.
 4. **Bus access goes through `Pixir.Events`.** Do not reach into `Registry` directly.
 5. **Public functions return `{:ok, term} | {:error, term}`.**
+   Two codified exceptions: `?`-suffixed predicates return a bare boolean (they
+   cannot fail), and effect-only successes may return `:ok` when every failure
+   path is a structured `{:error, map()}` (precedent:
+   `InvalidationHub.projection_changed/1,2`).
 6. **Workspace confinement is central.** Tools must not bypass `Pixir.Tools.Executor`
    or `Pixir.Tools.Workspace`.
 7. **Secrets never enter repo, Log, stdout, or diagnostics.** OAuth tokens live in

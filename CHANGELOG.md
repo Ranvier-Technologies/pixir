@@ -9,6 +9,52 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-07-21
+
+The contract-honesty cut: 11 pull requests since 0.1.11. A checked-in CLI
+contract turns the real builders into pinned public evidence and catches three
+product bugs in the process; delegate specification admission now fails closed
+across every known surface; and Open Responses mode is proven live against a
+local open endpoint.
+
+### Added
+- The checked-in CLI contract (#205, PR #423) records four surfaces and 87
+  fields in `docs/cli-contract.md`, with 85 assertions pinned against the real
+  builders. Those pins caught and fixed three product bugs in the same PR:
+  `--json resume` no longer leaks streamed text to stdout before its envelope;
+  pre-session failures in `--json` mode return an envelope instead of a bare
+  human line on stderr; and `run_turn` no longer double-subscribes on a second
+  in-process route and double-delivers output.
+- The first live `mix pixir.smoke.open_responses` run against a local Ollama
+  endpoint (#208, PR #424) proves Open Responses endpoint compatibility. A new
+  `termination` evidence field tolerates and confesses a missing `data: [DONE]`
+  sentinel while `done` remains strict; conformance probe v2 communicates its
+  sentinel and pins its digest at compile time; and the honest claim level is
+  `endpoint_compatibility_observed`.
+
+### Changed
+- Delegate specification admission fails closed (#422/#425, PR #426; #427,
+  PR #429; #428, PR #430): unknown Workflow step keys are rejected with a
+  nested `json_pointer` and a `depend_on` hint; root `steps` requires the
+  Workflow strategy; and the `workflow` shell is a closed, accessor-backed
+  object that rejects non-maps and the wrong strategy while making root and
+  nested steps mutually exclusive. Workflow step `limits` accepts only the
+  virtual-overlay limit keys with non-negative integer values and is rejected
+  outright on non-overlay steps. The root `limits` knob bag accepts only
+  `timeout_ms`, `delegate_timeout_ms`, `child_timeout_ms`, and
+  `wait_horizon_ms`; the runner's nested-shell merge uses the same accessor;
+  and attached-Workflow help now describes the admitted surface truthfully.
+
+### Fixed
+- Monitor hardening drains SSE streams and makes the API fail closed during
+  shutdown (#405, PR #411). Rescue diagnostics serve fixed reasons rather than
+  `Exception.message`, with a source-level boundary test (#414, PR #420). A
+  dead bootstrap catch is replaced by an honest init-failure net, and the Runs
+  list stale banner gains its Retry control with per-view copy (#416/#417,
+  PR #421).
+- Two diagnostics and metadata boundary fixes from the 0.1.11 mirror review
+  harden the release without widening its claims.
+
 ## [0.1.11] - 2026-07-17
 
 The Monitor cut: 42 pull requests since 0.1.10. Pixir Monitor — a read-only,

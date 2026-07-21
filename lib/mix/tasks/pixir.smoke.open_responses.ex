@@ -41,7 +41,7 @@ defmodule Mix.Tasks.Pixir.Smoke.OpenResponses do
 
   @command "mix pixir.smoke.open_responses"
   @schema_version 1
-  @probe_version 1
+  @probe_version 2
   @default_timeout_ms 30_000
   @max_evidence_bytes 32_768
   @evidence_basename "open-responses-evidence.json"
@@ -49,10 +49,25 @@ defmodule Mix.Tasks.Pixir.Smoke.OpenResponses do
   @probe_name "pixir_open_responses_probe"
   @probe_argument "open-responses-v1"
   @final_sentinel "PIXIR_OPEN_RESPONSES_OK_V1"
-  @system_prompt "You are the fixed Pixir Open Responses probe. First call the supplied function exactly once with the required constant. After its successful output, reply with the exact final sentinel and make no further calls."
+  @system_prompt "You are the fixed Pixir Open Responses probe. First call the supplied function exactly once with the required constant. After its successful output, reply with exactly #{@final_sentinel} and make no further calls."
   @user_prompt "Run the fixed Open Responses probe now."
   @synthetic_output %{"ok" => true, "probe" => @probe_argument}
-  @probe_digest_source ~s({"expected_args":{"probe":"open-responses-v1"},"final_sentinel":"PIXIR_OPEN_RESPONSES_OK_V1","probe_name":"pixir_open_responses_probe","probe_version":1,"synthetic_output":{"ok":true,"probe":"open-responses-v1"},"system_prompt":"You are the fixed Pixir Open Responses probe. First call the supplied function exactly once with the required constant. After its successful output, reply with the exact final sentinel and make no further calls.","user_prompt":"Run the fixed Open Responses probe now."})
+  @probe_digest_source ~s({"expected_args":{"probe":"open-responses-v1"},"final_sentinel":"PIXIR_OPEN_RESPONSES_OK_V1","probe_name":"pixir_open_responses_probe","probe_version":2,"synthetic_output":{"ok":true,"probe":"open-responses-v1"},"system_prompt":"You are the fixed Pixir Open Responses probe. First call the supplied function exactly once with the required constant. After its successful output, reply with exactly PIXIR_OPEN_RESPONSES_OK_V1 and make no further calls.","user_prompt":"Run the fixed Open Responses probe now."})
+
+  # Compile-time proof that the byte-pinned digest source IS the live constants
+  # (the #349 lesson: dual-maintained literals drift; this makes drift a compile
+  # error instead of a silent conformance lie).
+  @decoded_probe_source Jason.decode!(@probe_digest_source)
+  true = @decoded_probe_source["system_prompt"] == @system_prompt
+  true = @decoded_probe_source["user_prompt"] == @user_prompt
+  true = @decoded_probe_source["final_sentinel"] == @final_sentinel
+  true = @decoded_probe_source["probe_version"] == @probe_version
+  true = @decoded_probe_source["probe_name"] == @probe_name
+  true = @decoded_probe_source["expected_args"] == %{"probe" => @probe_argument}
+  true = @decoded_probe_source["synthetic_output"] == @synthetic_output
+
+  @doc false
+  def probe_version, do: @probe_version
 
   @switches [
     model: :string,
@@ -327,7 +342,9 @@ defmodule Mix.Tasks.Pixir.Smoke.OpenResponses do
     open = metadata["open_responses"] || %{}
     counts = open["known_event_counts"] || %{}
 
-    if metadata["active_transport"] == "http_sse" and open["done"] == true and
+    terminated? = open["done"] == true or open["termination"] == "eof_after_terminal"
+
+    if metadata["active_transport"] == "http_sse" and terminated? and
          open["event_type_match"] == true and
          is_integer(counts["response.completed"]) and counts["response.completed"] >= 1 do
       :ok
@@ -427,6 +444,8 @@ defmodule Mix.Tasks.Pixir.Smoke.OpenResponses do
       "known_event_counts" => open["known_event_counts"] || %{},
       "other_event_count" => get_in(open, ["known_event_counts", "other"]) || 0,
       "event_type_match" => open["event_type_match"] == true,
+      "termination" => open["termination"],
+      "deviations" => if(open["done"] == true, do: [], else: ["missing_done_sentinel"]),
       "done" => open["done"] == true,
       "terminal" => OutputTruncation.to_result_map(result.output_truncation),
       "usage" => safe_usage(result.usage_summary),
