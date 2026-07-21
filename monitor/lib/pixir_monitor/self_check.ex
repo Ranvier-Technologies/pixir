@@ -30,7 +30,9 @@ defmodule PixirMonitor.SelfCheck do
        }}
     end
   rescue
-    error -> failure("self_check_exception", "Self-check raised unexpectedly", %{exception: Exception.message(error)})
+    # Operator-local surface, but the same boundary doctrine keeps environment
+    # detail out of diagnostics. Report a fixed atom instead of Exception.message/1.
+    _error -> failure("self_check_exception", "Self-check raised unexpectedly", %{exception: :self_check_raised})
   catch
     kind, reason -> failure("self_check_exit", "Self-check terminated unexpectedly", %{kind: inspect(kind), reason: bounded(reason)})
   end

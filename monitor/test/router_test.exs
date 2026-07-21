@@ -11,6 +11,18 @@ defmodule PixirMonitorTest.FailingSource do
   def fetch_run(_), do: {:error, :unavailable}
 end
 
+defmodule PixirMonitorTest.RaisingSource do
+  @behaviour PixirMonitor.RunSource
+  def list_runs, do: raise("source read failed at /private/tmp/pixir-secret/runs.ndjson")
+  def fetch_run(_), do: raise("source read failed at /private/tmp/pixir-secret/runs.ndjson")
+end
+
+defmodule PixirMonitorTest.ThrowingSource do
+  @behaviour PixirMonitor.RunSource
+  def list_runs, do: throw("source threw at /private/tmp/pixir-secret/thrown.ndjson")
+  def fetch_run(_), do: throw("source threw at /private/tmp/pixir-secret/thrown.ndjson")
+end
+
 defmodule PixirMonitorTest.EchoSource do
   @behaviour PixirMonitor.RunSource
   def list_runs, do: {:ok, []}
@@ -150,6 +162,48 @@ defmodule PixirMonitor.RouterTest do
     conn = request(:get, "/api/runs", @host, "", [{"cookie", cookie}, {"sec-fetch-site", "same-origin"}])
     assert conn.status == 503
     assert %{"error" => %{"kind" => "run_source_failed"}} = Jason.decode!(conn.resp_body)
+  end
+
+  test "raised RunSource messages do not reach HTTP diagnostics" do
+    Application.put_env(:pixir_monitor, :run_source, PixirMonitorTest.RaisingSource)
+    cookie = session_cookie()
+    headers = [{"cookie", cookie}, {"sec-fetch-site", "same-origin"}]
+    list = request(:get, "/api/runs", @host, "", headers)
+    detail = request(:get, "/api/runs/run-1", @host, "", headers)
+
+    for conn <- [list, detail] do
+      assert conn.status == 503
+
+      assert %{
+               "error" => %{
+                 "kind" => "run_source_failed",
+                 "details" => %{"exception" => "run_source_raised"}
+               }
+             } = Jason.decode!(conn.resp_body)
+
+      refute conn.resp_body =~ "source read failed at /private/tmp/pixir-secret/runs.ndjson"
+    end
+  end
+
+  test "thrown RunSource terms do not reach HTTP diagnostics" do
+    Application.put_env(:pixir_monitor, :run_source, PixirMonitorTest.ThrowingSource)
+    cookie = session_cookie()
+    headers = [{"cookie", cookie}, {"sec-fetch-site", "same-origin"}]
+    list = request(:get, "/api/runs", @host, "", headers)
+    detail = request(:get, "/api/runs/run-1", @host, "", headers)
+
+    for conn <- [list, detail] do
+      assert conn.status == 503
+
+      assert %{
+               "error" => %{
+                 "kind" => "run_source_failed",
+                 "details" => %{"reason" => "run_source_thrown"}
+               }
+             } = Jason.decode!(conn.resp_body)
+
+      refute conn.resp_body =~ "source threw at /private/tmp/pixir-secret/thrown.ndjson"
+    end
   end
 
   test "security headers are pinned for shell, bootstrap, authenticated API, assets, and rejection routes" do

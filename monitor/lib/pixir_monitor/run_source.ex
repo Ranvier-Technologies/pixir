@@ -26,10 +26,18 @@ defmodule PixirMonitor.RunSource do
       other -> {:error, structured({:invalid_return, other})}
     end
   rescue
-    exception ->
-      {:error, %{kind: "run_source_failed", message: "Run source failed", details: %{exception: Exception.message(exception)}}}
+    # Raised source failures cross the API boundary, and their messages can carry
+    # filesystem paths or URLs. Report a fixed atom instead of Exception.message/1.
+    _exception ->
+      {:error, %{kind: "run_source_failed", message: "Run source failed", details: %{exception: :run_source_raised}}}
   catch
-    kind, reason -> {:error, structured({kind, reason})}
+    # Thrown and exited source terms cross the same API boundary and can carry
+    # filesystem paths or URLs. Report fixed atoms instead of inspecting the terms.
+    :throw, _reason ->
+      {:error, %{kind: "run_source_failed", message: "Run source failed", details: %{reason: :run_source_thrown}}}
+
+    :exit, _reason ->
+      {:error, %{kind: "run_source_failed", message: "Run source failed", details: %{reason: :run_source_exited}}}
   end
 
   defp structured(reason) do

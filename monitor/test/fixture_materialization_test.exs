@@ -99,6 +99,39 @@ defmodule PixirMonitor.FixtureMaterializationTest do
     end
   end
 
+  test "refuses to materialize a Log for a session id that escapes the sessions directory", %{
+    root: root
+  } do
+    workspace = Path.join(root, "traversal")
+
+    for unsafe <- [
+          "../escape",
+          "nested/child",
+          "..",
+          ".",
+          "",
+          "a/../../b",
+          "/etc/passwd",
+          "foo\0bar",
+          "foo∕bar",
+          ".hidden",
+          ".. "
+        ] do
+      input =
+        put_in(
+          SemanticZoomFixture.input(),
+          ["inputs", "terminal_envelope", "parent_session_id"],
+          unsafe
+        )
+
+      assert_raise ArgumentError, fn -> FixtureWorkspace.materialize!(input, workspace) end
+    end
+
+    # Nothing escaped the sessions directory: no stray Log above it, no nested dir.
+    refute File.exists?(Path.join(root, "escape.ndjson"))
+    refute File.dir?(Path.join(workspace, "nested"))
+  end
+
   defp fixture_inputs do
     [{"100", SemanticZoomFixture.input()}, {"500", SemanticZoomFixture.input_500()}]
   end

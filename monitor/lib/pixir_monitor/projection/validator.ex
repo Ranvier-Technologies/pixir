@@ -23,12 +23,14 @@ defmodule PixirMonitor.Projection.Validator do
       end
     end
   rescue
-    exception ->
+    # Validator failures can flow into API diagnostics, and their messages can carry
+    # filesystem paths or URLs. Report a fixed atom instead of Exception.message/1.
+    _exception ->
       {:error,
        %{
          kind: "projection_schema_validation_failed",
          message: "Presenter projection failed schema validation",
-         details: %{exception: Exception.message(exception)}
+         details: %{exception: :projection_schema_validation_raised}
        }}
   end
 

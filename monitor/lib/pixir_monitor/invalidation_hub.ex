@@ -19,6 +19,10 @@ defmodule PixirMonitor.InvalidationHub do
   def unsubscribe, do: GenServer.cast(__MODULE__, {:unsubscribe, self()})
   def ack, do: GenServer.cast(__MODULE__, {:ack, self()})
 
+  @doc "Signals every active SSE subscriber to close its stream."
+  @spec close_all_subscribers() :: :ok
+  def close_all_subscribers, do: GenServer.call(__MODULE__, :close_all_subscribers, 1_000)
+
   @doc "Emits a workspace-labelled ordinary invalidation for a source availability transition."
   @spec source_changed(String.t()) :: :ok | {:error, map()}
   def source_changed(workspace), do: projection_changed(workspace, @source_projection_id)
@@ -63,19 +67,23 @@ defmodule PixirMonitor.InvalidationHub do
   def init(_opts), do: {:ok, %{sequence: 0, subscribers: %{}}}
 
   @impl true
-  def handle_call({:subscribe, pid}, _from, %{subscribers: subscribers} = state)
-      when is_map_key(subscribers, pid) do
-    {:reply, {:ok, state.sequence}, state}
+  def handle_call(:close_all_subscribers, _from, state) do
+    Enum.each(Map.keys(state.subscribers), &send(&1, :pixir_sse_close))
+    {:reply, :ok, state}
   end
 
-  def handle_call({:subscribe, pid}, _from, state) when map_size(state.subscribers) < @max_subscribers do
-    ref = Process.monitor(pid)
-    subscriber = %{ref: ref, pending: false, queued: nil}
-    {:reply, {:ok, state.sequence}, put_in(state.subscribers[pid], subscriber)}
+  # The drain flag is set BEFORE close_all_subscribers is called and this
+  # GenServer handles messages serially, so any subscribe arriving after the
+  # close fan-out observes draining and is rejected — no subscriber can slip in
+  # unclosed during shutdown. A restarted drainer clears the flag in init/1,
+  # re-admitting subscriptions.
+  def handle_call({:subscribe, pid}, _from, state) do
+    if PixirMonitor.SseDrainer.draining?() do
+      {:reply, {:error, %{kind: "shutting_down", message: "Monitor is stopping"}}, state}
+    else
+      subscribe_reply(pid, state)
+    end
   end
-
-  def handle_call({:subscribe, _pid}, _from, state),
-    do: {:reply, {:error, %{kind: "subscriber_limit", message: "SSE subscriber limit reached", details: %{limit: @max_subscribers}}}, state}
 
   def handle_call({:publish, workspace, id}, _from, state) do
     sequence = state.sequence + 1
@@ -113,6 +121,19 @@ defmodule PixirMonitor.InvalidationHub do
 
   @impl true
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state), do: {:noreply, drop(pid, state)}
+
+  defp subscribe_reply(pid, %{subscribers: subscribers} = state) when is_map_key(subscribers, pid) do
+    {:reply, {:ok, state.sequence}, state}
+  end
+
+  defp subscribe_reply(pid, state) when map_size(state.subscribers) < @max_subscribers do
+    ref = Process.monitor(pid)
+    subscriber = %{ref: ref, pending: false, queued: nil}
+    {:reply, {:ok, state.sequence}, put_in(state.subscribers[pid], subscriber)}
+  end
+
+  defp subscribe_reply(_pid, state),
+    do: {:reply, {:error, %{kind: "subscriber_limit", message: "SSE subscriber limit reached", details: %{limit: @max_subscribers}}}, state}
 
   defp drop(pid, state) do
     case Map.pop(state.subscribers, pid) do

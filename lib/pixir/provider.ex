@@ -1592,11 +1592,28 @@ defmodule Pixir.Provider do
       Map.put(acc.provider_metadata, "open_responses", %{
         "known_event_counts" => acc.open_event_counts,
         "event_type_match" => acc.open_event_type_match,
-        "done" => acc.open_done
+        "done" => acc.open_done,
+        "termination" => open_termination(acc)
       })
 
     %{acc | provider_metadata: metadata}
   end
+
+  # The openresponses.org spec REQUIRES the literal [DONE] sentinel as the
+  # terminal frame, but real implementations (measured: Ollama 0.32.1) end the
+  # stream by closing after the typed terminal event, matching OpenAI's own
+  # Responses behavior. `done` stays strict evidence of the sentinel; this field
+  # names how the stream actually ended so the tolerance is confessed, never
+  # silent (HITL adjudication 2026-07-20, #208).
+  defp open_termination(%{open_done: true, terminal_event_type: type}) when is_binary(type),
+    do: "done_sentinel"
+
+  defp open_termination(%{open_done: true}), do: "done_sentinel_without_terminal"
+
+  defp open_termination(%{terminal_event_type: type}) when is_binary(type),
+    do: "eof_after_terminal"
+
+  defp open_termination(_acc), do: "eof_unterminated"
 
   defp apply_sse_block(block, acc) do
     payload =

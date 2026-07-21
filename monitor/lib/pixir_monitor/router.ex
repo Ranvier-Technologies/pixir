@@ -40,15 +40,15 @@ defmodule PixirMonitor.Router do
   end
 
   get "/api/workspaces/:key/runs" do
-    with_auth(conn, fn conn -> scoped_runs(conn, key) end)
+    with_api(conn, fn conn -> scoped_runs(conn, key) end)
   end
 
   get "/api/workspaces/:key/runs/:id" do
-    with_auth(conn, fn conn -> scoped_run(conn, key, id) end)
+    with_api(conn, fn conn -> scoped_run(conn, key, id) end)
   end
 
   get "/api/runs" do
-    with_auth(conn, fn conn ->
+    with_api(conn, fn conn ->
       case PixirMonitor.WorkspaceSet.mode() do
         {:ok, :workspace_set} ->
           set_error(conn, 404, "unscoped_route_unavailable", "Use a workspace-scoped Runs route")
@@ -63,7 +63,7 @@ defmodule PixirMonitor.Router do
   end
 
   get "/api/runs/:id" do
-    with_auth(conn, fn conn ->
+    with_api(conn, fn conn ->
       case PixirMonitor.WorkspaceSet.mode() do
         {:ok, :workspace_set} ->
           set_error(conn, 404, "unscoped_route_unavailable", "Use a workspace-scoped Run Detail route")
@@ -83,7 +83,7 @@ defmodule PixirMonitor.Router do
   end
 
   get "/api/events" do
-    with_auth(conn, &stream_events/1)
+    with_api(conn, &stream_events/1)
   end
 
   match _ do
@@ -168,6 +168,18 @@ defmodule PixirMonitor.Router do
       |> send_json(200, %{ok: true})
     else
       _ -> PixirMonitor.Security.reject(conn, 401, "invalid_launch", "Launch capability is invalid, expired, or already used")
+    end
+  end
+
+  # Deliberate AC3 carve-out: during the shutdown drain window (~50ms) loopback
+  # callers get 503 BEFORE auth runs — the Security host plug upstream still
+  # rejects off-host callers, and failing closed here is what keeps an open tab's
+  # stale display honest. Steady-state 401/403 pins are unaffected.
+  defp with_api(conn, callback) do
+    if PixirMonitor.SseDrainer.draining?() do
+      send_json(conn, 503, %{error: %{kind: "shutting_down", message: "Monitor is stopping"}})
+    else
+      with_auth(conn, callback)
     end
   end
 

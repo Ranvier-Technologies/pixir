@@ -234,6 +234,10 @@ defmodule Pixir.Conversation do
   @spec subscribe(session_id()) :: :ok | {:error, map()}
   def subscribe(session_id), do: Events.subscribe(session_id)
 
+  @doc "Symmetric teardown for subscribe/1; effect-only per the rule-5 exception."
+  @spec unsubscribe(session_id()) :: :ok
+  def unsubscribe(session_id), do: Events.unsubscribe(session_id)
+
   @doc "Interrupt the running Turn, if any (pass-through to `Session`)."
   @spec interrupt(session_id()) :: :ok | {:error, :no_turn}
   def interrupt(session_id), do: Session.interrupt(session_id)

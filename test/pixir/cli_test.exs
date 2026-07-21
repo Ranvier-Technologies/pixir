@@ -1025,8 +1025,11 @@ defmodule Pixir.CLITest do
     assert out =~
              "pixir delegate --spec <path|-> [--dry-run] [--json] [--contract-version 1] [--timeout-ms N]"
 
-    assert out =~ "strategy=\"subagents\""
-    assert out =~ "structured unsupported runtime result"
+    assert out =~ "strategy=\"subagents\" fanout"
+    assert out =~ "strategy=\"workflow\""
+    assert out =~ "dependency-wave execution"
+    assert out =~ "per-step checkpoint readiness"
+    assert out =~ "hold dependents"
     assert out =~ "--progress=stderr-jsonl"
     assert out =~ "--wait-horizon-ms"
     assert out =~ "status reads"

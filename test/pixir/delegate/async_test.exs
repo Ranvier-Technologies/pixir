@@ -162,13 +162,24 @@ defmodule Pixir.Delegate.AsyncTest do
   test "status, attach, and cancel normalize invalid Session handles without echo", %{ws: ws} do
     hostile = " valid "
     encoded_hostile = "dlg1_" <> Base.url_encode64("../../../outside;PWN", padding: false)
+    handles = [hostile, encoded_hostile]
+    commands = [&Async.status/2, &Async.attach/2, &Async.cancel/2]
 
-    for handle <- [hostile, encoded_hostile],
-        command <- [&Async.status/2, &Async.attach/2, &Async.cancel/2] do
-      assert {:error, %{"kind" => "invalid_args"} = error} = command.(handle, workspace: ws)
-      refute inspect(error) =~ hostile
-      refute inspect(error) =~ "PWN"
-    end
+    checked =
+      for handle <- handles, command <- commands do
+        assert {:error, %{"kind" => "invalid_args"} = error} = command.(handle, workspace: ws)
+        rendered = inspect(error)
+        # The rejection must not echo the offending handle verbatim, nor the
+        # traversal/injection payload it decodes to.
+        refute rendered =~ handle
+        refute rendered =~ "../../../outside"
+        refute rendered =~ "PWN"
+        {handle, command}
+      end
+
+    # Guard against a comprehension that silently degrades to zero iterations:
+    # every handle must be exercised against every command.
+    assert length(checked) == length(handles) * length(commands)
   end
 
   test "attach returns a bounded durable snapshot without Manager or host execution", %{

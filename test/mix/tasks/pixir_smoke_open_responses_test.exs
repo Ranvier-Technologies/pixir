@@ -166,6 +166,52 @@ defmodule Mix.Tasks.Pixir.Smoke.OpenResponsesTest do
     end
   end
 
+  test "eof_after_terminal without the sentinel succeeds and confesses the deviation" do
+    tolerate = fn base ->
+      base
+      |> put_in([:provider_metadata, "open_responses", "done"], false)
+      |> put_in([:provider_metadata, "open_responses", "termination"], "eof_after_terminal")
+    end
+
+    stream = fn _request, _opts ->
+      case Process.get(:open_responses_tolerated_call, 0) do
+        0 ->
+          Process.put(:open_responses_tolerated_call, 1)
+          {:ok, tolerate.(first_result())}
+
+        1 ->
+          Process.put(:open_responses_tolerated_call, 2)
+          {:ok, tolerate.(second_result())}
+      end
+    end
+
+    assert {:ok, evidence} =
+             Smoke.execute_protocol(stream, :resolved, %{model: "m", timeout_ms: 1})
+
+    assert length(evidence.calls) == 2
+    assert Enum.all?(evidence.calls, &(&1["termination"] == "eof_after_terminal"))
+    assert Enum.all?(evidence.calls, &(&1["deviations"] == ["missing_done_sentinel"]))
+    assert Enum.all?(evidence.calls, &(&1["done"] == false))
+  end
+
+  test "done false without a tolerated termination still cannot produce success" do
+    base =
+      first_result()
+      |> put_in([:provider_metadata, "open_responses", "done"], false)
+      |> put_in([:provider_metadata, "open_responses", "termination"], "eof_unterminated")
+
+    stream = fn _request, _opts -> {:ok, base} end
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :conformance_not_observed,
+                details: %{reason: :protocol_evidence_missing}
+              }
+            }, 1} =
+             Smoke.execute_protocol(stream, :resolved, %{model: "m", timeout_ms: 1})
+  end
+
   test "vendor-specific not_truncated reasons cannot satisfy either smoke call" do
     for invalid <- [
           %{first_result() | output_truncation: OutputTruncation.not_truncated("vendor:other")},

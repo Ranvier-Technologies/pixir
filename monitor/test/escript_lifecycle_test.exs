@@ -247,16 +247,11 @@ defmodule PixirMonitor.EscriptLifecycleTest do
        when is_integer(pid) do
     assert length(session_logs(workspace)) == 9
     assert Process.get({__MODULE__, :quiet_fingerprint}) == workspace_fingerprint(workspace)
-    # SIGTERM starts a graceful BEAM stop, but the tab's live SSE connection can
-    # hold it open far longer than this driver's bound (measured: >5s); escalate
-    # to SIGKILL the way an operator restart would.
+    # SIGTERM must drain the live SSE stream before Bandit stops, without an
+    # operator having to escalate to SIGKILL.
     {_, 0} = System.cmd("kill", ["-TERM", Integer.to_string(pid)])
 
-    unless process_exited?(pid, 100) do
-      _ = System.cmd("kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
-    end
-
-    assert process_exited?(pid, 200), "Monitor did not stop after SIGTERM then SIGKILL"
+    assert process_exited?(pid, 200), "Monitor did not stop within 5 seconds after SIGTERM"
   end
 
   defp verify_and_apply!(workspace, %{

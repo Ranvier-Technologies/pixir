@@ -40,6 +40,11 @@ defmodule Pixir.Workflows do
 
   @wildcard "**/*"
   @workflow_workspace_modes ~w(shared isolated virtual_overlay)
+  @workflow_shell_keys ~w(steps)
+  @workflow_step_keys ~w(
+    id task agent apply_from workspace_mode read_set virtual_commands limits write_set model
+    reasoning_effort attachments depends_on timeout_ms permission_mode sandbox_mode
+  )
   @default_poll_ms 50
   @default_timeout_ms 120_000
   @safe_id ~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
@@ -78,6 +83,14 @@ defmodule Pixir.Workflows do
 
   @workflow_statuses ~w(completed partial)
   @checkpoint_statuses ~w(checkpoint_ready partial failed held needs_orchestrator)
+
+  @doc false
+  @spec workflow_shell_keys() :: [String.t()]
+  def workflow_shell_keys, do: @workflow_shell_keys
+
+  @doc false
+  @spec workflow_step_keys() :: [String.t()]
+  def workflow_step_keys, do: @workflow_step_keys
 
   @doc "Named proof states used by dry-runs, smoke tasks, and completion audits."
   @spec proof_states() :: [String.t()]

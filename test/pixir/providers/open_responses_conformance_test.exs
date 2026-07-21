@@ -105,6 +105,8 @@ defmodule Pixir.Providers.OpenResponsesConformanceTest do
 
     assert manifest["probe"]["combined_sha256"] ==
              Mix.Tasks.Pixir.Smoke.OpenResponses.probe_digest()
+
+    assert manifest["probe"]["version"] == Mix.Tasks.Pixir.Smoke.OpenResponses.probe_version()
   end
 
   test "strict runtime validator accepts every pinned fixture event before activation" do

@@ -343,7 +343,10 @@
       const disclosure = el("div", "stale-disclosure");
       const heldObservedAt = route.view === "runs" ? held.listObservedAt : held.detailObservedAt;
       disclosure.append(untrustedText("strong", "Stale source snapshot · received " + scalar(heldObservedAt, "unknown") + " · refresh failure " + heldError.kind));
-      disclosure.append(text("p", "Held data is not current. Retry refetches only this authoritative source.", "provenance"));
+      disclosure.append(text("p", route.view === "runs" ? "Held data is not current. Retry refetches only this authoritative source." : "Held data is not current. Return to the runs list to retry this source.", "provenance"));
+      if (route.view === "runs") disclosure.append(key(button("Retry this source", function () {
+        refetchWorkspaceList(route.workspace, "source retry");
+      }, "source-retry"), "runs-source-retry:" + route.workspace));
       node.prepend(disclosure);
     }
     app.replaceChildren(node);
@@ -2075,6 +2078,8 @@
   window.addEventListener("pagehide", function () { history.replaceState({pixirView: captureView()}, "", location.href); });
 
   window.PixirMonitorUI = Object.freeze({parseRoute: parseRoute, routeHash: routeHash, clientStateKey: clientStateKey, visible: visible, classifyCommand: classifyCommand, escapedEvidence: escapedEvidence, validInvalidation: validInvalidation, limits: LIMITS, sortVocabulary: SORT_VOCABULARY, defaultSort: DEFAULT_SORT, runsComparator: runsComparator, temporalField: temporalField, durationLabel: durationLabel, attentionRenderAllCap: ATTENTION_RENDER_ALL_CAP, attentionRowBudget: attentionRowBudget});
+  // Pre-load failure UX belongs solely to the shell bootstrap (PixirMonitor.Bootstrap):
+  // this script loads only after the bootstrap promise fulfills, so rejection is unreachable here.
   window.__pixirBootstrap.then(function () {
     if (shellConfigError) {
       state.streamState = "down";
@@ -2085,5 +2090,11 @@
     if (!location.hash || location.hash === "#") history.replaceState(null, "", workspaceSetMode() ? "#/workspaces" : "#/runs");
     refreshSingleFlight("initial load");
     connect();
-  }).catch(function () { state.streamState = "down"; setStatus("Launch expired or already used. Relaunch required."); });
+  }).catch(function () {
+    // Only a synchronous throw in the continuation above can land here; bootstrap
+    // rejection cannot (see the ownership comment on the attachment). Report the
+    // failure honestly instead of attributing it to launch expiry.
+    state.streamState = "down";
+    setStatus("Monitor initialization failed. Reload the page, or run pixir-monitor serve again for a fresh session.");
+  });
 }());

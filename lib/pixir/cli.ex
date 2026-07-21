@@ -1304,7 +1304,9 @@ defmodule Pixir.CLI do
 
     case Conversation.start(start_opts) do
       {:ok, _id} = ok -> ok
-      {:error, %{error: %{kind: :not_found}} = err} -> print_error_return(err, 2)
+      # Pre-session failures flow upward so the caller's mode-aware printer runs:
+      # in --json mode the contract promises a structured envelope on stdout, which
+      # a human stderr line cannot honor. error_exit still maps :not_found to 2.
       {:error, _} = err -> err
     end
   end
@@ -1351,7 +1353,7 @@ defmodule Pixir.CLI do
 
     try do
       on_event = fn event ->
-        presentation = track_final_report(event, report)
+        presentation = track_final_report(event, report, json?)
         unless json?, do: render_tracked_event(event, presentation)
       end
 
@@ -1374,6 +1376,9 @@ defmodule Pixir.CLI do
       end
     after
       if sigint_trap, do: Sigint.remove(sigint_trap)
+      # Symmetric with the subscribe above: a second run_turn in the same process
+      # (embeds, in-process tests) must not double-deliver this turn's events.
+      Conversation.unsubscribe(session_id)
       Agent.stop(report)
     end
   end
@@ -1389,17 +1394,17 @@ defmodule Pixir.CLI do
 
   # Each provider call starts at a status "thinking", so the streamed accumulator
   # resets per call and the final assistant_message compares against its own deltas.
-  defp track_final_report(%{type: :status, data: %{"status" => "thinking"}}, report) do
+  defp track_final_report(%{type: :status, data: %{"status" => "thinking"}}, report, _json?) do
     Agent.update(report, &%{&1 | streamed: []})
     :render
   end
 
-  defp track_final_report(%{type: :text_delta, data: %{"chunk" => chunk}}, report) do
+  defp track_final_report(%{type: :text_delta, data: %{"chunk" => chunk}}, report, _json?) do
     Agent.update(report, fn state -> %{state | streamed: [chunk | state.streamed]} end)
     :render
   end
 
-  defp track_final_report(%{type: :provider_usage} = event, report) do
+  defp track_final_report(%{type: :provider_usage} = event, report, _json?) do
     projection = Pixir.Provider.OutputTruncationSummary.project(event)
     warning = Pixir.Provider.OutputTruncationSummary.warning(event)
 
@@ -1422,7 +1427,7 @@ defmodule Pixir.CLI do
     end)
   end
 
-  defp track_final_report(%{type: :assistant_message, data: data} = event, report) do
+  defp track_final_report(%{type: :assistant_message, data: data} = event, report, json?) do
     text = Map.get(data, "text", "")
 
     {streamed, presentation} =
@@ -1445,9 +1450,11 @@ defmodule Pixir.CLI do
     # delivered it only in the final message. Flush the unstreamed suffix before the
     # Renderer writes the closing newline; when the deltas mismatch the final text
     # (e.g. transport replay/duplication), the final message is authoritative — emit
-    # it in full on its own line rather than dropping the report.
+    # it in full on its own line rather than dropping the report. In --json mode the
+    # answer belongs solely in the envelope's output field: stdout carries exactly
+    # one machine-readable envelope, so the flush must not run.
     cond do
-      text == "" or text == streamed ->
+      json? or text == "" or text == streamed ->
         :ok
 
       String.starts_with?(text, streamed) ->
@@ -1460,7 +1467,7 @@ defmodule Pixir.CLI do
     presentation
   end
 
-  defp track_final_report(_event, _report), do: :render
+  defp track_final_report(_event, _report, _json?), do: :render
 
   defp track_cli_warning(state, session_id, warning) do
     key = {session_id, warning["provider_usage_event_id"]}
@@ -1946,11 +1953,6 @@ defmodule Pixir.CLI do
     error_exit(error)
   end
 
-  defp print_error_return(error, code) when is_map(error) do
-    print_error(error)
-    {:error, code}
-  end
-
   defp print_error_return(message, code) when is_binary(message) do
     print_error_msg(message)
     {:error, code}
@@ -2200,10 +2202,13 @@ defmodule Pixir.CLI do
     emits one final result envelope. --dry-run validates strategy/limits without
     provider, Subagent, Workflow, host command, or artifact execution.
 
-    The first runtime path supports strategy="subagents". strategy="workflow" remains
-    dry-run-valid but returns a structured unsupported runtime result without --dry-run.
-    Use --json for machine-readable stdout. attach --progress=stderr-jsonl emits bounded
-    progress frames to stderr while stdout remains one final JSON envelope; add
+    The attached runtime supports strategy="subagents" fanout and strategy="workflow"
+    dependency-wave execution. Workflow results expose per-step checkpoint readiness and
+    hold dependents when an upstream checkpoint is not ready. The resident start/service
+    path still supports subagents only and returns a structured unsupported result for
+    workflow specs. Use --json for
+    machine-readable stdout. attach --progress=stderr-jsonl emits bounded progress
+    frames to stderr while stdout remains one final JSON envelope; add
     --wait-horizon-ms N to follow a live owner for a bounded horizon. status reads
     durable Session Log evidence by Delegate id or parent Session id without network or
     host execution; attach remains snapshot-first and reports whether frames came from

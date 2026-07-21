@@ -44,6 +44,11 @@ defmodule Pixir.Delegate.Runner do
   @in_band_transport_error_kinds ~w(
     service_unavailable_error server_is_overloaded overloaded server_error
   )
+  @root_limit_keys ~w(child_timeout_ms delegate_timeout_ms timeout_ms wait_horizon_ms)
+
+  @doc false
+  @spec root_limit_keys() :: [String.t()]
+  def root_limit_keys, do: @root_limit_keys
 
   @doc "Run a validated Delegate spec through the attached runtime path."
   @spec run(map(), map(), map(), keyword()) :: {:ok, map()} | {:error, map()}
@@ -511,11 +516,16 @@ defmodule Pixir.Delegate.Runner do
   defp normalize_timeouts(request, spec) do
     default_timeout_ms = Subagents.default_limits().timeout_ms
 
+    root_limit_candidates =
+      Map.new(root_limit_keys(), fn key ->
+        {key, timeout_candidate(spec, ["limits", key])}
+      end)
+
     with {:ok, legacy_timeout_ms} <-
            normalize_timeout_candidate(
              [
                request_timeout_candidate(request),
-               timeout_candidate(spec, ["limits", "timeout_ms"]),
+               Map.fetch!(root_limit_candidates, "timeout_ms"),
                timeout_candidate(spec, ["timeout_ms"])
              ],
              default_timeout_ms,
@@ -523,14 +533,14 @@ defmodule Pixir.Delegate.Runner do
            ),
          {:ok, delegate_timeout_ms} <-
            normalize_timeout_candidate(
-             [timeout_candidate(spec, ["limits", "delegate_timeout_ms"])],
+             [Map.fetch!(root_limit_candidates, "delegate_timeout_ms")],
              legacy_timeout_ms,
              "limits.delegate_timeout_ms"
            ),
          {:ok, child_timeout_ms} <-
            normalize_timeout_candidate(
              [
-               timeout_candidate(spec, ["limits", "child_timeout_ms"]),
+               Map.fetch!(root_limit_candidates, "child_timeout_ms"),
                timeout_candidate(spec, ["subagents", "timeout_ms"])
              ],
              legacy_timeout_ms,
@@ -540,7 +550,7 @@ defmodule Pixir.Delegate.Runner do
            normalize_timeout_candidate(
              [
                request_wait_horizon_candidate(request),
-               timeout_candidate(spec, ["limits", "wait_horizon_ms"])
+               Map.fetch!(root_limit_candidates, "wait_horizon_ms")
              ],
              delegate_timeout_ms,
              "limits.wait_horizon_ms"
@@ -925,7 +935,10 @@ defmodule Pixir.Delegate.Runner do
       else
         case Map.get(spec, "workflow") do
           %{} = nested ->
-            Map.merge(Map.take(spec, ~w(id name max_concurrency timeout_ms workspace)), nested)
+            Map.merge(
+              Map.take(spec, ~w(id name max_concurrency timeout_ms workspace)),
+              Map.take(nested, Pixir.Workflows.workflow_shell_keys())
+            )
 
           _other ->
             %{}
