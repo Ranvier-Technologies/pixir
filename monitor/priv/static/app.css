@@ -85,6 +85,8 @@ button { cursor: pointer; }
 button:hover { border-color: var(--accent); }
 :focus-visible { outline: 3px solid #f0d96c; outline-offset: 3px; }
 .lede { color: var(--muted); max-width: 80ch; }
+.lede-with-copy { display: flex; align-items: center; flex-wrap: wrap; gap: .65rem; }
+.lede-with-copy .lede { margin: .25rem 0; }
 .projected-text, code, pre, td, dd, li { unicode-bidi: plaintext; overflow-wrap: anywhere; white-space: pre-wrap; }
 .sr-only { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; clip-path: inset(50%) !important; white-space: nowrap !important; border: 0 !important; }
 .inventory-notice { margin: 1rem 0; border: 2px solid var(--attention); border-radius: .6rem; background: rgba(244, 184, 96, .12); padding: 1rem; }
@@ -110,11 +112,20 @@ tbody tr:last-child td { border-bottom: 0; }
 .marker-completed::before, .marker-checkpoint_ready::before, .marker-ready::before, .marker-live::before, .marker-pass::before, .marker-workspace_applied::before { background: var(--good); }
 .marker-failed::before, .marker-stop::before, .marker-needs_orchestrator::before, .marker-indeterminate::before, .marker-partial::before { background: var(--danger); }
 .marker-running::before, .marker-current::before, .marker-mixed::before { background: var(--accent); }
-.marker-held::before, .marker-stale_handle::before, .marker-unknown::before, .marker-needs_review::before, .marker-not_applied::before { background: var(--attention); }
-.marker-unobserved::before, .marker-not_applicable::before { background: var(--muted); }
+.marker-held::before, .marker-stale_handle::before, .marker-unknown::before, .marker-needs_review::before, .marker-not_applied::before, .marker-observed::before, .marker-undetermined::before { background: var(--attention); }
+/* externally_owned is informational, not attention-weight: the owner is simply
+   another process and durable evidence confirms progress. It shares the muted
+   tone with the other honest "this observer cannot see it" states. */
+.marker-unobserved::before, .marker-not_applicable::before, .marker-externally_owned::before, .marker-none::before { background: var(--muted); }
+/* #447 post-terminal child activity: a reduced list-scope signal reading as a
+   count plus its parent-derived basis. It is deliberately styled like the
+   liveness basis note — an observation with visible provenance, never an action. */
+.post-terminal-basis { display: block; margin-top: .25rem; max-width: 18rem; color: var(--muted); font: .72rem/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.post-terminal { display: block; }
+.post-terminal-sessions { margin: .35rem 0 0; padding-left: 1.1rem; color: var(--muted); font: .74rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .liveness-basis { display: block; margin-top: .25rem; max-width: 18rem; color: var(--muted); font: .72rem/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .run-overview { display: grid; grid-template-columns: repeat(6, minmax(8rem, 1fr)); gap: .55rem; margin: 1rem 0; padding: .75rem; border: 1px solid var(--line); border-radius: .5rem; background: #0c151d; overflow-x: auto; }
-.truth-rail { display: grid; grid-template-columns: repeat(5, minmax(10rem, 1fr)); gap: .7rem; margin: 1.2rem 0 0; overflow-x: auto; }
+.truth-rail { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: .7rem; margin: 1.2rem 0 0; overflow-x: auto; }
 .truth-card { min-height: 8.7rem; border: 1px solid var(--line); border-radius: .55rem; padding: .8rem; background: linear-gradient(145deg, #14232e, #0d171f); }
 .truth-card .marker { margin-top: .75rem; }
 .provenance, .truth-extra { margin: .5rem 0 0; color: var(--muted); font: .76rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -163,6 +174,8 @@ summary { cursor: pointer; color: #a7dbe5; font-weight: 650; }
 .follow-snapshot-unavailable { border-left: 3px solid var(--attention); padding-left: 1rem; }
 .follow-identity-conflict { border-left: 3px solid var(--attention); padding-left: 1rem; }
 .follow-render-failure { border-left: 3px solid var(--attention); padding-left: 1rem; }
+.parent-resolution { margin-top: 1rem; border: 1px solid var(--line); border-radius: .6rem; background: rgba(16, 26, 35, .92); padding: 1rem; }
+.parent-resolution-candidates { display: grid; gap: .4rem; margin: .6rem 0 0; padding-left: 1.1rem; }
 .review-dialog { width: min(46rem, calc(100% - 2rem)); border: 1px solid #567084; border-radius: .6rem; color: #e6edf3; background: #111d26; padding: 1rem; }
 .review-dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .dialog-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: .6rem; margin-top: 1rem; }

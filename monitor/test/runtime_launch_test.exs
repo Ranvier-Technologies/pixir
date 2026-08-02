@@ -129,44 +129,9 @@ defmodule PixirMonitor.RuntimeLaunchTest do
     end
   end
 
-  describe "launch_browser/0 rescue boundary" do
-    @describetag :launch_browser_rescue
-
-    test "a launcher that raises with the capability URL never leaks it into diagnostics" do
-      unless match?({:unix, :darwin}, :os.type()) do
-        # The rescue path is only reachable past supported_platform/0.
-        assert true
-      else
-        previous_port = Application.get_env(:pixir_monitor, :active_port)
-        previous_launcher = Application.get_env(:pixir_monitor, :browser_launcher)
-
-        on_exit(fn ->
-          restore_env(:active_port, previous_port)
-          restore_env(:browser_launcher, previous_launcher)
-        end)
-
-        Application.put_env(:pixir_monitor, :active_port, 45_557, persistent: false)
-        # The launcher receives the real capability URL and raises with it in
-        # the message — exactly the shape that Exception.message/1 would leak.
-        Application.put_env(
-          :pixir_monitor,
-          :browser_launcher,
-          fn url -> raise "spawn failed for #{url}" end,
-          persistent: false
-        )
-
-        assert {:error, error} = PixirMonitor.Runtime.launch_browser()
-        assert error.kind == "browser_open_failed"
-        assert error.details.reason == ":launcher_raised"
-        refute inspect(error) =~ "launch="
-        refute inspect(error) =~ "127.0.0.1"
-        refute inspect(error) =~ "spawn failed"
-      end
-    end
-  end
-
-  defp restore_env(key, nil), do: Application.delete_env(:pixir_monitor, key, persistent: false)
-  defp restore_env(key, value), do: Application.put_env(:pixir_monitor, key, value, persistent: false)
+  # The launcher rescue boundary moved with the launch lifecycle itself: see
+  # PixirMonitor.LaunchSurfaceTest, "a launcher that raises with the capability
+  # URL never leaks it into diagnostics".
 
   # The reap pins are load-bearing: on a unix host without perl they must fail
   # loudly instead of passing vacuously.

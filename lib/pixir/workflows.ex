@@ -7,11 +7,24 @@ defmodule Pixir.Workflows do
   steps run the internal BEAM-native virtual workspace runner and return `virtual_diff`
   evidence without opening a child Session or mutating the parent workspace.
 
+  The module also exposes non-executing dependency-wave critical-path estimation for
+  Delegate admission, reusing the same normalization and wave planner as dry-run and
+  runtime scheduling.
+
   The top-level Workflow result has a narrow terminal contract: `"completed"` means
   every step produced a dependent-safe checkpoint, while `"partial"` means at least one
   step needs retry, synthesis, inspection, or orchestrator input. Step-level
   `checkpoint_status` values carry the detailed truth (`"held"`, `"failed"`,
   `"partial"`, `"needs_orchestrator"`, or `"checkpoint_ready"`).
+
+  Dependents unlock only from `"checkpoint_ready"`, with two explicit carve-outs: an
+  `apply` step consumes its `apply_from` producer at any status, and a step may name a
+  subset of its own `depends_on` in `allow_unverified_depends_on` to also admit a
+  dependency whose child completed successfully but derived `"partial"` — the
+  shell-less-writer-plus-audit shape. That opt-in is per-step and per-dependency, never
+  global and never a default, and a step admitted through it records
+  `verification.unverified_dependencies` and the
+  `"ran_against_unverified_dependencies"` known limitation in its own checkpoint.
 
   ## TODO(delegate-service-v1)
 
@@ -25,12 +38,14 @@ defmodule Pixir.Workflows do
   alias Pixir.{
     Agents,
     Event,
+    Permissions.WriteDenials,
     Permissions.WritePolicy,
     Session,
     SessionId,
     SessionResources,
     Skills,
     Subagents,
+    Subagents.WarmStart,
     Tool,
     VirtualDiffApply,
     VirtualOverlay,
@@ -43,10 +58,10 @@ defmodule Pixir.Workflows do
   @workflow_shell_keys ~w(steps)
   @workflow_step_keys ~w(
     id task agent apply_from workspace_mode read_set virtual_commands limits write_set model
-    reasoning_effort attachments depends_on timeout_ms permission_mode sandbox_mode
+    reasoning_effort attachments depends_on allow_unverified_depends_on timeout_ms
+    permission_mode sandbox_mode seed_session_id
   )
   @default_poll_ms 50
-  @default_timeout_ms 120_000
   @safe_id ~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
   # Virtual/apply runners use a short-lived linked Task.Supervisor per invocation.
   # That preserves task crash isolation while coupling the runner's lifetime to
@@ -163,6 +178,35 @@ defmodule Pixir.Workflows do
   defp keyword_put_if_present(opts, _key, []), do: opts
   defp keyword_put_if_present(opts, key, value), do: Keyword.put(opts, key, value)
 
+  @doc "Estimate the dependency-wave critical path without running a Workflow."
+  @spec critical_path(map(), keyword()) :: {:ok, map()} | {:error, map()}
+  def critical_path(spec, opts \\ [])
+
+  def critical_path(spec, opts) when is_map(spec) do
+    with {:ok, workflow} <- normalize(spec, opts),
+         {:ok, id_waves} <- plan_waves(workflow) do
+      index_by_id =
+        workflow.steps
+        |> Enum.with_index()
+        |> Map.new(fn {step, index} -> {step.id, index} end)
+
+      waves = Enum.map(id_waves, fn wave -> Enum.map(wave, &Map.fetch!(index_by_id, &1)) end)
+
+      with {:ok, estimate} <-
+             Pixir.Delegate.CriticalPath.estimate_workflow(
+               workflow.steps,
+               waves,
+               workflow.timeout_ms,
+               Subagents.default_limits().timeout_ms
+             ) do
+        {:ok, Map.put(estimate, :effective_timeout_ms, workflow.timeout_ms)}
+      end
+    end
+  end
+
+  def critical_path(_spec, _opts),
+    do: {:error, Tool.error(:invalid_args, "workflow spec must be an object", %{})}
+
   @doc "Run a Workflow by scheduling its steps through `Pixir.Subagents`."
   @spec run(String.t(), map(), keyword()) :: {:ok, map()} | {:error, map()}
   def run(parent_session_id, spec, opts \\ [])
@@ -256,7 +300,11 @@ defmodule Pixir.Workflows do
       poll_ms: non_negative_integer(Keyword.get(opts, :poll_ms, @default_poll_ms), "poll_ms"),
       timeout_ms:
         positive_integer(
-          field(spec, "timeout_ms", Keyword.get(opts, :timeout_ms, @default_timeout_ms)),
+          field(
+            spec,
+            "timeout_ms",
+            Keyword.get(opts, :timeout_ms, Subagents.default_limits().timeout_ms)
+          ),
           "timeout_ms"
         ),
       write_policy: Keyword.get(opts, :write_policy)
@@ -322,6 +370,8 @@ defmodule Pixir.Workflows do
                  normalize_optional_reasoning_effort(field(raw, "reasoning_effort"), id),
                {:ok, attachments} <-
                  normalize_optional_attachments(field(raw, "attachments"), id, workspace),
+               {:ok, seed_session_id} <-
+                 normalize_optional_seed(field(raw, "seed_session_id"), id, workspace),
                :ok <-
                  validate_knobs_apply(workspace_mode, model, reasoning_effort, attachments, id),
                {:ok, write_policy} <-
@@ -334,13 +384,16 @@ defmodule Pixir.Workflows do
                    agent_config,
                    id,
                    index
-                 ) do
+                 ),
+               {:ok, allow_unverified_depends_on} <-
+                 normalize_allow_unverified_depends_on(raw, id, index) do
             {:ok,
              %{
                id: id,
                task: String.trim(task),
                agent: agent_config.name,
                depends_on: normalize_id_list(field(raw, "depends_on", []), "depends_on", id),
+               allow_unverified_depends_on: allow_unverified_depends_on,
                posture: step_posture(workspace_mode, read_only?),
                permission_mode: step_permission_mode(workspace_mode, read_only?, opts),
                workspace_mode: workspace_mode,
@@ -353,6 +406,7 @@ defmodule Pixir.Workflows do
                model: model,
                reasoning_effort: reasoning_effort,
                attachments: attachments,
+               seed_session_id: seed_session_id,
                timeout_ms: maybe_positive_integer(field(raw, "timeout_ms"), "timeout_ms", id)
              }}
           end
@@ -363,6 +417,32 @@ defmodule Pixir.Workflows do
   defp normalize_step(_raw, index, _workspace, _agents_opts, _opts, _previous_steps),
     do: {:error, Tool.error(:invalid_args, "workflow step must be an object", %{index: index})}
 
+  # Warm-start seeding (#435): the seed reference is validated during normalization so
+  # an unusable seed rejects the whole workflow before any child Session is created.
+  defp normalize_optional_seed(nil, _id, _workspace), do: {:ok, nil}
+
+  defp normalize_optional_seed(seed_session_id, id, workspace) do
+    case WarmStart.validate(seed_session_id, workspace: workspace) do
+      {:ok, _lineage} ->
+        {:ok, seed_session_id}
+
+      {:error, %{error: %{kind: kind, message: message, details: details}}} ->
+        {:error, Tool.error(kind, message, Map.put(stringify_details(details), "step_id", id))}
+
+      {:error, error} ->
+        {:error,
+         Tool.error(:invalid_args, "workflow step seed_session_id is unusable", %{
+           "step_id" => id,
+           "reason" => inspect(error)
+         })}
+    end
+  end
+
+  defp stringify_details(details) when is_map(details),
+    do: Map.new(details, fn {key, value} -> {to_string(key), value} end)
+
+  defp stringify_details(_details), do: %{}
+
   defp normalize_apply_step(raw, index, id, opts, previous_steps) do
     with :ok <- validate_apply_from_bounded_write(opts, id, index),
          {:ok, apply_from} <- validate_apply_from_producer(raw, previous_steps, id, index),
@@ -370,13 +450,16 @@ defmodule Pixir.Workflows do
          :ok <- validate_apply_from_knobs(raw, id, index),
          {:ok, write_set} <- normalize_apply_write_set(raw, id, index),
          {:ok, write_policy} <-
-           step_write_policy(Keyword.get(opts, :write_policy), write_set, false) do
+           step_write_policy(Keyword.get(opts, :write_policy), write_set, false),
+         {:ok, allow_unverified_depends_on} <-
+           normalize_allow_unverified_depends_on(raw, id, index) do
       {:ok,
        %{
          id: id,
          task: String.trim(field(raw, "task", "apply virtual_diff from #{apply_from}") || ""),
          agent: nil,
          depends_on: normalize_id_list(field(raw, "depends_on", []), "depends_on", id),
+         allow_unverified_depends_on: allow_unverified_depends_on,
          posture: "apply",
          permission_mode: :auto,
          workspace_mode: "shared",
@@ -389,8 +472,45 @@ defmodule Pixir.Workflows do
          model: nil,
          reasoning_effort: nil,
          attachments: [],
+         # An apply step runs no child Turn, so it never warm-starts.
+         seed_session_id: nil,
          timeout_ms: maybe_positive_integer(field(raw, "timeout_ms"), "timeout_ms", id)
        }}
+    end
+  end
+
+  # `allow_unverified_depends_on` is the per-step, per-dependency opt-in that lets an
+  # audit-shaped step schedule against a dependency whose child completed but could not
+  # self-verify (issue #436). It never relaxes gating for dependencies it does not name,
+  # and it must be a subset of the step's own `depends_on`.
+  defp normalize_allow_unverified_depends_on(raw, id, index) do
+    declared = normalize_id_list(field(raw, "depends_on", []), "depends_on", id)
+
+    allowed =
+      field(raw, "allow_unverified_depends_on", [])
+      |> normalize_id_list("allow_unverified_depends_on", id)
+      |> Enum.uniq()
+
+    case Enum.reject(allowed, &(&1 in declared)) do
+      [] ->
+        {:ok, allowed}
+
+      unknown ->
+        {:error,
+         Tool.error(
+           :invalid_args,
+           "allow_unverified_depends_on must reference a declared dependency",
+           %{
+             "id" => id,
+             "index" => index,
+             "field" => "allow_unverified_depends_on",
+             "allow_unverified_depends_on" => allowed,
+             "depends_on" => declared,
+             "unknown" => unknown,
+             "location" => "/steps/#{index - 1}/allow_unverified_depends_on",
+             "next_actions" => ["list_the_dependency_in_depends_on_or_drop_the_opt_in"]
+           }
+         )}
     end
   end
 
@@ -450,8 +570,10 @@ defmodule Pixir.Workflows do
   end
 
   defp validate_apply_from_knobs(raw, id, index) do
+    # seed_session_id is rejected explicitly, never accepted and ignored: an apply
+    # step runs no child Turn, so there is nothing to warm-start (#435).
     rejected =
-      ~w(agent model reasoning_effort attachments virtual_commands read_set)
+      ~w(agent model reasoning_effort attachments virtual_commands read_set seed_session_id)
       |> Enum.filter(&has_field?(raw, &1))
 
     if rejected == [] do
@@ -1004,6 +1126,12 @@ defmodule Pixir.Workflows do
           {:completed, completed_step} ->
             waves = put_wave(acc.waves, wave, step.id)
 
+            # Engine-completed steps (virtual_overlay, apply) build their own bundles,
+            # so the unverified basis is stamped here against the same `completed` map
+            # admission used. Subagent steps carry it on the active record instead.
+            completed_step =
+              mark_unverified_basis(completed_step, step, acc.completed)
+
             acc = %{
               acc
               | completed: Map.put(acc.completed, step.id, completed_step),
@@ -1049,15 +1177,49 @@ defmodule Pixir.Workflows do
   defp deps_ready?(%{posture: "apply", apply_from: apply_from} = step, completed) do
     Enum.all?(step.depends_on, fn
       ^apply_from -> Map.has_key?(completed, apply_from)
-      dep -> get_in(completed, [dep, "checkpoint_status"]) == "checkpoint_ready"
+      dep -> dep_ready?(step, dep, completed)
     end)
   end
 
   defp deps_ready?(step, completed),
-    do:
-      Enum.all?(step.depends_on, fn dep ->
-        get_in(completed, [dep, "checkpoint_status"]) == "checkpoint_ready"
-      end)
+    do: Enum.all?(step.depends_on, &dep_ready?(step, &1, completed))
+
+  defp dep_ready?(step, dep, completed) do
+    case Map.get(completed, dep) do
+      nil -> false
+      record -> dep_record_ready?(step, dep, record)
+    end
+  end
+
+  defp dep_record_ready?(_step, _dep, %{"checkpoint_status" => "checkpoint_ready"}), do: true
+
+  # The narrow opt-in: only a child that reached a successful terminal completion AND
+  # derived `partial` is admissible. `failed`, `needs_orchestrator`, `held`, and any
+  # non-completed terminal status (timeouts, cancellations) stay inadmissible.
+  defp dep_record_ready?(step, dep, %{
+         "status" => "completed",
+         "checkpoint_status" => "partial"
+       }),
+       do: dep in unverified_opt_in(step)
+
+  defp dep_record_ready?(_step, _dep, _record), do: false
+
+  defp unverified_opt_in(step), do: Map.get(step, :allow_unverified_depends_on) || []
+
+  # The dependency ids that actually supplied an unverified basis for this step, in
+  # `depends_on` order. Empty when the step declared the opt-in but every dependency
+  # turned out to be checkpoint-ready.
+  defp unverified_dependency_basis(step, completed) do
+    opted_in = unverified_opt_in(step)
+
+    Enum.filter(step.depends_on, fn dep ->
+      dep in opted_in and
+        match?(
+          %{"status" => "completed", "checkpoint_status" => "partial"},
+          Map.get(completed, dep)
+        )
+    end)
+  end
 
   defp start_step(
          _parent_sid,
@@ -1173,13 +1335,15 @@ defmodule Pixir.Workflows do
       # Step knobs are the only source for these keys: inherited caller opts
       # must not reach children the dry-run plan showed as knobless. The
       # spawn_agent test seam never travels to the child either.
-      |> Keyword.drop([:model, :reasoning_effort, :attachments, :spawn_agent])
+      |> Keyword.drop([:model, :reasoning_effort, :attachments, :seed_session_id, :spawn_agent])
       |> Keyword.put(:workspace, workflow.workspace)
       |> Keyword.put(:permission_mode, step.permission_mode)
       |> Keyword.put(:write_policy, step.write_policy)
       |> keyword_put_if_present(:model, step.model)
       |> keyword_put_if_present(:reasoning_effort, step.reasoning_effort)
       |> keyword_put_if_present(:attachments, step.attachments)
+      # Runtime-owned lineage rides opts, never spawn args (#435).
+      |> keyword_put_if_present(:seed_session_id, Map.get(step, :seed_session_id))
       |> Keyword.put(
         :delegation_context,
         workflow_delegation_context(workflow, step, wave, completed)
@@ -1195,7 +1359,10 @@ defmodule Pixir.Workflows do
          agent: agent,
          wave: wave,
          started_at_ms: now_ms(),
-         workflow_timeout_ms: workflow.timeout_ms
+         workflow_timeout_ms: workflow.timeout_ms,
+         # Frozen at admission: which dependencies actually supplied an unverified
+         # basis for this step, so its own checkpoint can name them durably.
+         unverified_dependencies: unverified_dependency_basis(step, completed)
        }}
     end
   end
@@ -1367,6 +1534,7 @@ defmodule Pixir.Workflows do
       },
       "virtual_diff_apply" => result
     }
+    |> put_empty_write_denials(step)
     |> checkpoint_bundle_v2([artifact_ref(result)])
   end
 
@@ -1453,6 +1621,7 @@ defmodule Pixir.Workflows do
         "reason" => reason
       }
     }
+    |> put_empty_write_denials(step)
     |> checkpoint_bundle_v2([])
   end
 
@@ -1474,6 +1643,7 @@ defmodule Pixir.Workflows do
       },
       "virtual_diff" => artifact
     }
+    |> put_empty_write_denials(step)
     |> checkpoint_bundle_v2([artifact_ref(artifact)])
   end
 
@@ -1497,19 +1667,32 @@ defmodule Pixir.Workflows do
   end
 
   defp workflow_checkpoint_payload(bundle) do
+    payload = %{
+      "step_id" => bundle["step_id"],
+      "agent_id" => bundle["agent_id"],
+      "child_session_id" => bundle["child_session_id"],
+      "checkpoint_status" => bundle["status"],
+      "dependent_safe" => bundle["dependent_safe"],
+      "known_limitations" => bundle["known_limitations"] || [],
+      "verification_source" => get_in(bundle, ["verification", "source"])
+    }
+
     %{
       "schema_id" => "workflow_checkpoint.v1",
       "provenance" => "harness_projection",
       "validation" => %{"status" => "valid", "validated_at" => "runtime"},
-      "payload" => %{
-        "step_id" => bundle["step_id"],
-        "agent_id" => bundle["agent_id"],
-        "child_session_id" => bundle["child_session_id"],
-        "checkpoint_status" => bundle["status"],
-        "dependent_safe" => bundle["dependent_safe"],
-        "known_limitations" => bundle["known_limitations"] || [],
-        "verification_source" => get_in(bundle, ["verification", "source"])
-      }
+      "payload" =>
+        payload
+        |> maybe_put(
+          "unverified_dependencies",
+          non_empty(get_in(bundle, ["verification", "unverified_dependencies"]) || [])
+        )
+        # Projected, never decided here: whether a step owes a confession is a
+        # property of its policy, which the builders know and this projection
+        # does not. Every bounded-write builder puts the key structurally —
+        # empty when there was nothing to confess — so a missing key means the
+        # step had no write policy, not that a gated step went unreported.
+        |> maybe_put("write_denials", bundle["write_denials"])
     }
   end
 
@@ -1565,7 +1748,7 @@ defmodule Pixir.Workflows do
         {:ok, step_id} ->
           if Subagents.terminal?(agent["status"]) do
             record = Map.fetch!(acc.active, step_id)
-            completed_step = complete_record(record, agent)
+            completed_step = complete_record(record, agent, workflow.workspace)
 
             case record_checkpoint_decided(parent_sid, workflow, completed_step) do
               :ok ->
@@ -1588,7 +1771,7 @@ defmodule Pixir.Workflows do
     end)
   end
 
-  defp complete_record(record, agent) do
+  defp complete_record(record, agent, workspace) do
     checkpoint_status = checkpoint_status(record.step, agent)
 
     %{
@@ -1607,7 +1790,11 @@ defmodule Pixir.Workflows do
       "write_set" => record.step.write_set,
       "workspace" => agent["workspace"],
       "workspace_mode" => record.step.workspace_mode,
-      "checkpoint" => checkpoint_bundle(record, agent, checkpoint_status),
+      # Carried from the agent projection so the Delegate child envelope can report
+      # warm-start lineage for a workflow step, same as it does for a subagents child
+      # (#435). Unconditional: a cold step reports the absence of a seed.
+      "warm_start" => WarmStart.envelope_projection(agent["warm_start"]),
+      "checkpoint" => checkpoint_bundle(record, agent, checkpoint_status, workspace),
       "safe_next_actions" => step_safe_next_actions(checkpoint_status, agent["status"])
     }
     |> put_write_policy_metadata(record.step)
@@ -1684,7 +1871,7 @@ defmodule Pixir.Workflows do
   defp checkpoint_status(_step, %{"status" => "completed"}), do: "checkpoint_ready"
   defp checkpoint_status(_step, _agent), do: "failed"
 
-  defp checkpoint_bundle(record, agent, "checkpoint_ready") do
+  defp checkpoint_bundle(record, agent, "checkpoint_ready", workspace) do
     %{
       "step_id" => record.step.id,
       "agent_id" => record.agent_id,
@@ -1699,10 +1886,12 @@ defmodule Pixir.Workflows do
       }
     }
     |> put_timeout_verification(agent)
+    |> put_unverified_dependency_basis(record)
+    |> put_write_denials(record, agent, workspace)
     |> checkpoint_bundle_v2([])
   end
 
-  defp checkpoint_bundle(record, agent, checkpoint_status) do
+  defp checkpoint_bundle(record, agent, checkpoint_status, workspace) do
     %{
       "step_id" => record.step.id,
       "agent_id" => record.agent_id,
@@ -1717,8 +1906,82 @@ defmodule Pixir.Workflows do
       }
     }
     |> put_timeout_verification(agent)
+    |> put_unverified_dependency_basis(record)
+    |> put_write_denials(record, agent, workspace)
     |> checkpoint_bundle_v2([])
   end
+
+  # The mandatory bounded-write confession (#446). A step run under a write
+  # policy always carries it, present with a zero value when nothing was denied,
+  # so a completed step that recovered from a denial cannot read as a
+  # boundary-free run. Steps with no policy carry no confession to confess.
+  defp put_write_denials(bundle, record, agent, workspace) do
+    if bounded_write_step?(record) do
+      Map.put(bundle, "write_denials", step_write_denials(agent, workspace))
+    else
+      bundle
+    end
+  end
+
+  defp bounded_write_step?(%{step: %{write_policy: policy}}) when is_map(policy), do: true
+  defp bounded_write_step?(_record), do: false
+
+  # The confession for a checkpoint that never ran a subagent under the policy:
+  # a held step, a virtual-overlay step, an apply step. There is no child Log to
+  # fold, so the count is zero — but zero is a value the coordinator can read,
+  # and an absent key is not. Absence is a schema violation, so these builders
+  # put the empty confession structurally rather than conditionally on content.
+  defp put_empty_write_denials(bundle, step) do
+    if bounded_write_step?(%{step: step}) do
+      Map.put(bundle, "write_denials", WriteDenials.empty())
+    else
+      bundle
+    end
+  end
+
+  # The child's Log lives in the child's own workspace, which is the parent's
+  # only under `shared`; an isolated or virtual step gets its own directory.
+  defp step_write_denials(%{"child_session_id" => sid} = agent, workspace) when is_binary(sid) do
+    case agent["workspace"] || workspace do
+      child_workspace when is_binary(child_workspace) ->
+        WriteDenials.from_session(sid, child_workspace)
+
+      _other ->
+        WriteDenials.empty()
+    end
+  end
+
+  defp step_write_denials(_agent, _workspace), do: WriteDenials.empty()
+
+  # A step admitted through the opt-in must say so in its own claims: a consumer
+  # reading only this bundle can tell the conclusions rest on unverified upstream work.
+  defp put_unverified_dependency_basis(bundle, record) do
+    stamp_unverified_basis(bundle, Map.get(record, :unverified_dependencies) || [])
+  end
+
+  defp stamp_unverified_basis(bundle, []), do: bundle
+
+  defp stamp_unverified_basis(bundle, deps) do
+    bundle
+    |> put_in(["verification", "unverified_dependencies"], deps)
+    |> update_in(["known_limitations"], fn limitations ->
+      ((limitations || []) ++ ["ran_against_unverified_dependencies"]) |> Enum.uniq()
+    end)
+  end
+
+  defp mark_unverified_basis(%{"checkpoint" => checkpoint} = completed_step, step, completed) do
+    case unverified_dependency_basis(step, completed) do
+      [] ->
+        completed_step
+
+      deps ->
+        completed_step
+        |> Map.put("checkpoint", stamp_unverified_basis(checkpoint, deps))
+        |> refresh_step_checkpoint_projection()
+    end
+  end
+
+  defp mark_unverified_basis(completed_step, _step, _completed), do: completed_step
 
   defp held_record(step, reason) do
     %{
@@ -1749,6 +2012,7 @@ defmodule Pixir.Workflows do
           "known_limitations" => held_known_limitations(reason),
           "verification" => %{"source" => "workflow_scheduler"}
         }
+        |> put_empty_write_denials(step)
         |> checkpoint_bundle_v2([]),
       "safe_next_actions" => held_safe_next_actions(reason)
     }
@@ -1761,7 +2025,7 @@ defmodule Pixir.Workflows do
   defp held_safe_next_actions("workflow_timeout"), do: ["retry_workflow_with_larger_timeout"]
   defp held_safe_next_actions(_reason), do: ["rerun_after_dependencies_checkpoint_ready"]
 
-  defp timed_out_record(record, agent, reason) do
+  defp timed_out_record(record, agent, reason, workspace) do
     raw_agent = agent || record.agent
     raw_status = raw_agent["status"] || record.agent["status"] || "unknown"
 
@@ -1780,7 +2044,7 @@ defmodule Pixir.Workflows do
     }
 
     record
-    |> complete_record(agent)
+    |> complete_record(agent, workspace)
     |> Map.put("subagent_status", raw_status)
     |> put_in(["checkpoint", "verification", "subagent_status"], raw_status)
     |> put_in(["checkpoint", "verification", "workflow_timeout_action"], reason)
@@ -1810,12 +2074,21 @@ defmodule Pixir.Workflows do
   defp timeout_elapsed_ms(_agent, _record), do: nil
 
   defp timeout_active_record(parent_sid, workflow, record) do
-    case Subagents.close(parent_sid, record.agent_id, workspace: workflow.workspace) do
+    # The child Log's terminal cancellation event must be able to name its canceller
+    # (issue #444); the workflow close outcome is the one this path already records.
+    close_opts = [
+      workspace: workflow.workspace,
+      workflow_id: workflow.id,
+      workflow_step_id: record.step.id,
+      workflow_close_outcome: "closed_by_workflow_timeout"
+    ]
+
+    case Subagents.close(parent_sid, record.agent_id, close_opts) do
       {:ok, agent} ->
-        timed_out_record(record, agent, "closed_by_workflow_timeout")
+        timed_out_record(record, agent, "closed_by_workflow_timeout", workflow.workspace)
 
       {:error, _error} ->
-        timed_out_record(record, nil, "close_failed_after_workflow_timeout")
+        timed_out_record(record, nil, "close_failed_after_workflow_timeout", workflow.workspace)
     end
   end
 
@@ -2096,6 +2369,10 @@ defmodule Pixir.Workflows do
     }
     |> put_write_policy_metadata(step)
     |> maybe_put("apply_from", Map.get(step, :apply_from))
+    |> maybe_put(
+      "allow_unverified_depends_on",
+      non_empty(Map.get(step, :allow_unverified_depends_on) || [])
+    )
     |> maybe_put("virtual_commands", non_empty(step.virtual_commands))
   end
 

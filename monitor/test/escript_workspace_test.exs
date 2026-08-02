@@ -170,7 +170,15 @@ defmodule PixirMonitor.EscriptWorkspaceTest do
     try do
       readiness = await_json_file!(stderr_path)
       assert readiness["status"] == "ready"
-      refute_receive {^monitor, {:data, _stdout_before_handoff}}, 100
+      assert readiness["event"] == "launch_ready"
+
+      # Since issue #437 the launch handoff is auxiliary, so serving is announced
+      # BEFORE any reader attaches instead of after the handoff completes. The
+      # capability still crosses only the pipe: stdout must stay capability-free.
+      serving = await_stdout_json!(monitor)
+      assert %{"ok" => true, "status" => "serving"} = serving
+      assert serving["launch"]["launch_mode"] == "fifo"
+      refute inspect(serving) =~ "launch="
 
       reader =
         Task.async(fn ->
@@ -196,7 +204,6 @@ defmodule PixirMonitor.EscriptWorkspaceTest do
       assert detail["run"]["id"] == run_id
       expected_unit_id = "delegate:#{run_id}:subagent:subagent-one"
       assert [%{"logical_id" => ^expected_unit_id}] = detail["units"]
-      assert %{"ok" => true, "status" => "serving"} = await_stdout_json!(monitor)
     after
       close_port(monitor)
     end

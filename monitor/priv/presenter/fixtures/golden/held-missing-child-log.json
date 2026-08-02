@@ -154,6 +154,8 @@
         "status": "read_only",
         "observed_paths": [],
         "observed_semantics": "none",
+        "basis": "no_write_evidence",
+        "write_denials": [],
         "evidence_refs": [
           "e-envelope-held"
         ],
@@ -245,6 +247,8 @@
         "status": "read_only",
         "observed_paths": [],
         "observed_semantics": "none",
+        "basis": "no_write_evidence",
+        "write_denials": [],
         "evidence_refs": [
           "e-envelope-held"
         ],
@@ -299,6 +303,8 @@
     "status": "read_only",
     "observed_paths": [],
     "observed_semantics": "none",
+    "basis": "no_write_evidence",
+    "write_denials": [],
     "evidence_refs": [
       "e-envelope-held"
     ],
@@ -380,5 +386,15 @@
     "child_log_missing",
     "usage_incomplete_missing_child_log",
     "dependency_not_checkpoint_ready"
-  ]
+  ],
+  "post_terminal_child_activity": {
+    "state": "undetermined",
+    "basis": "child_evidence_unavailable",
+    "boundary_at": "2026-07-10T19:20:06Z",
+    "boundary_basis": "workflow_finished_event_ts",
+    "event_count": null,
+    "latest_event_at": null,
+    "child_session_ids": [],
+    "evidence_refs": []
+  }
 }

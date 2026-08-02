@@ -87,6 +87,29 @@ defmodule Pixir.SubagentsTest do
     end
   end
 
+  defmodule BlockingToolProvider do
+    def stream(%{history: history}, _opts) do
+      if Enum.any?(history, &(&1.type == :tool_result)) do
+        {:ok, %{text: "done", reasoning: "", function_calls: [], finish_reason: :stop}}
+      else
+        {:ok,
+         %{
+           text: "",
+           reasoning: "",
+           reasoning_items: [],
+           function_calls: [
+             %{
+               call_id: "blocking_sleep",
+               name: "bash",
+               args: %{"command" => "sleep 10"}
+             }
+           ],
+           finish_reason: :tool_calls
+         }}
+      end
+    end
+  end
+
   defmodule PartialThenErrorProvider do
     def stream(_request, opts) do
       on_delta = Keyword.get(opts, :on_delta, fn _ -> :ok end)
@@ -1920,6 +1943,259 @@ defmodule Pixir.SubagentsTest do
     assert id == queued["id"]
 
     assert {:ok, _cancelled_running} = Subagents.close(sid, running["id"], workspace: ws)
+
+    # A queued agent never opened a child Session, so there is no child Log at all.
+    refute is_binary(queued["child_session_id"])
+  end
+
+  test "cancelling a running subagent appends a terminal cancelled_by_parent event to the child log",
+       %{sid: sid, ws: ws} do
+    {:ok, agent} =
+      Subagents.spawn_agent(
+        sid,
+        %{"task" => "block", "timeout_ms" => 5_000},
+        workspace: ws,
+        provider: BlockingProvider,
+        permission_mode: :auto
+      )
+
+    child_sid = agent["child_session_id"]
+    on_exit(fn -> cleanup_session(child_sid) end)
+
+    wait_until_started(sid, ws, agent)
+
+    assert {:ok, cancelled} = Subagents.close(sid, agent["id"], workspace: ws)
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["reason"] == "cancelled_by_parent"
+
+    child_history = child_history!(cancelled)
+
+    assert [event] = child_cancellation_events(child_history)
+
+    # The child Log alone is sufficient evidence of a parent cancellation.
+    assert event.data["reason"] == "cancelled_by_parent"
+    assert event.data["lineage"] == "child"
+    assert event.data["subagent_id"] == agent["id"]
+    assert event.data["parent_session_id"] == sid
+
+    # Absent, not null-filled, when no workflow is above the cancellation.
+    refute Map.has_key?(event.data, "workflow_id")
+    refute Map.has_key?(event.data, "workflow_close_outcome")
+
+    # Terminal: it is the last canonical event in the child Log.
+    assert List.last(child_history).seq == event.seq
+
+    # No sibling spelling is invented anywhere on this path.
+    parent_reasons = cancellation_reasons(sid, ws, agent["id"])
+    assert parent_reasons != []
+    assert Enum.all?(parent_reasons, &(&1 == "cancelled_by_parent"))
+
+    refute Enum.any?(
+             child_history,
+             &(&1.data["reason"] in ["parent_cancelled", "cancelled_by_workflow"])
+           )
+  end
+
+  test "cancelling a subagent mid-tool-call orders the terminal event after orphan repair", %{
+    sid: sid,
+    ws: ws
+  } do
+    {:ok, agent} =
+      Subagents.spawn_agent(
+        sid,
+        %{"task" => "block in a tool", "timeout_ms" => 15_000},
+        workspace: ws,
+        provider: BlockingToolProvider,
+        permission_mode: :auto
+      )
+
+    child_sid = agent["child_session_id"]
+    on_exit(fn -> cleanup_session(child_sid) end)
+
+    wait_until(fn ->
+      case Log.fold(child_sid, workspace: agent["workspace"]) do
+        {:ok, history} -> Enum.any?(history, &(&1.type == :tool_call))
+        _ -> false
+      end
+    end)
+
+    assert {:ok, cancelled} = Subagents.close(sid, agent["id"], workspace: ws)
+    assert cancelled["reason"] == "cancelled_by_parent"
+
+    child_history = child_history!(cancelled)
+
+    assert [orphan] =
+             Enum.filter(child_history, fn event ->
+               event.type == :tool_result and
+                 get_in(event.data, ["error", "kind"]) == "orphan_tool_call"
+             end)
+
+    # The runtime picks the interrupt-path reason; both branches are legitimate.
+    assert get_in(orphan.data, ["error", "details", "reason"]) in [
+             "interrupt",
+             "interrupt_no_turn"
+           ]
+
+    assert [terminal] = child_cancellation_events(child_history)
+    assert orphan.seq < terminal.seq
+    assert List.last(child_history).seq == terminal.seq
+  end
+
+  test "cancelling a child that is alive but idle still writes the terminal child event", %{
+    sid: sid,
+    ws: ws
+  } do
+    {:ok, agent} =
+      Subagents.spawn_agent(
+        sid,
+        %{"task" => "block in a tool", "timeout_ms" => 15_000},
+        workspace: ws,
+        provider: BlockingToolProvider,
+        permission_mode: :auto
+      )
+
+    child_sid = agent["child_session_id"]
+    on_exit(fn -> cleanup_session(child_sid) end)
+
+    wait_until(fn ->
+      case Log.fold(child_sid, workspace: agent["workspace"]) do
+        {:ok, history} -> Enum.any?(history, &(&1.type == :tool_call))
+        _ -> false
+      end
+    end)
+
+    # Tear down only the child Turn task, leaving the child Session alive and idle:
+    # no :status event reaches the Manager, so the agent is still `running` and the
+    # cancel path takes the no-Turn interrupt branch.
+    assert Session.turn_running?(child_sid)
+    kill_child_turn!(child_sid)
+    wait_until(fn -> Session.turn_running?(child_sid) == false end)
+
+    assert {:ok, cancelled} = Subagents.close(sid, agent["id"], workspace: ws)
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["reason"] == "cancelled_by_parent"
+
+    child_history = child_history!(cancelled)
+    assert [terminal] = child_cancellation_events(child_history)
+    assert terminal.data["parent_session_id"] == sid
+    assert terminal.data["subagent_id"] == agent["id"]
+    assert List.last(child_history).seq == terminal.seq
+
+    assert [orphan] =
+             Enum.filter(child_history, fn event ->
+               event.type == :tool_result and
+                 get_in(event.data, ["error", "kind"]) == "orphan_tool_call"
+             end)
+
+    assert get_in(orphan.data, ["error", "details", "reason"]) in [
+             "interrupt",
+             "interrupt_no_turn"
+           ]
+  end
+
+  test "cancellation still succeeds when the child session is already gone", %{sid: sid, ws: ws} do
+    {:ok, agent} =
+      Subagents.spawn_agent(
+        sid,
+        %{"task" => "block", "timeout_ms" => 15_000},
+        workspace: ws,
+        provider: BlockingProvider,
+        permission_mode: :auto
+      )
+
+    child_sid = agent["child_session_id"]
+    wait_until_started(sid, ws, agent)
+
+    # The child races to termination before the interrupt lands: the Session is
+    # gone, no terminal :status event ever reached the Manager, and the agent is
+    # still `running` when close arrives.
+    assert {:ok, :stopped} = SessionSupervisor.stop_session(child_sid)
+    wait_until(fn -> Registry.lookup(Pixir.Sessions.Registry, child_sid) == [] end)
+
+    assert {:ok, cancelled} = Subagents.close(sid, agent["id"], workspace: ws)
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["reason"] == "cancelled_by_parent"
+    assert Process.alive?(Process.whereis(Pixir.Subagents.Manager))
+
+    # Parent-side evidence is unchanged and authoritative.
+    assert cancellation_reasons(sid, ws, agent["id"]) == ["cancelled_by_parent"]
+  end
+
+  test "cancelling a reattached subagent after a manager restart writes the child event", %{
+    sid: sid,
+    ws: ws
+  } do
+    {:ok, agent} =
+      Subagents.spawn_agent(
+        sid,
+        %{"task" => "block", "timeout_ms" => 15_000},
+        workspace: ws,
+        provider: BlockingProvider,
+        permission_mode: :auto
+      )
+
+    child_sid = agent["child_session_id"]
+    on_exit(fn -> cleanup_session(child_sid) end)
+
+    wait_until_started(sid, ws, agent)
+    restart_subagents_manager()
+
+    assert {:ok, [listed]} = Subagents.list(sid, workspace: ws)
+    assert listed["status"] == "running"
+
+    assert {:ok, cancelled} = Subagents.close(sid, agent["id"], workspace: ws)
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["reason"] == "cancelled_by_parent"
+
+    child_history = child_history!(cancelled)
+    assert [terminal] = child_cancellation_events(child_history)
+    assert terminal.data["parent_session_id"] == sid
+    assert terminal.data["subagent_id"] == agent["id"]
+  end
+
+  test "the child's own terminal cancellation event never reconstructs as a child of itself",
+       %{ws: ws} do
+    cold_sid = unique_session_id("child-terminal-cancellation")
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "cancelled_by_parent",
+          "scope" => "session",
+          "lineage" => "child",
+          "status" => "cancelled",
+          "reason" => "cancelled_by_parent",
+          "subagent_id" => "sub_self_444",
+          "parent_session_id" => "s_parent_444",
+          "child_session_id" => "s_child_444"
+        }
+      }
+    ])
+
+    assert {:ok, history} = Log.fold(cold_sid, workspace: ws)
+    assert Subagents.reconstruct(history) == %{}
+  end
+
+  test "a detached subagent refuses close and writes no child event", %{sid: sid, ws: ws} do
+    write_subagent_event!(sid, ws, %{
+      "event" => "started",
+      "subagent_id" => "sa_detached_444",
+      "child_session_id" => "s_detached_444",
+      "status" => "running",
+      "task" => "detached work"
+    })
+
+    assert {:error, %{error: %{kind: :detached}}} =
+             Subagents.close(sid, "sa_detached_444", workspace: ws)
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    refute Enum.any?(
+             history,
+             &(&1.type == :subagent_event and &1.data["subagent_id"] == "sa_detached_444" and
+                 &1.data["event"] == "cancelled")
+           )
   end
 
   test "max_depth rejects recursive fan-out beyond the configured cap", %{sid: sid, ws: ws} do
@@ -2014,6 +2290,161 @@ defmodule Pixir.SubagentsTest do
     assert {:ok, restricted} = Subagents.restrict_resume_posture(posture, :auto, nil)
     assert restricted.permission_mode == :read_only
     assert restricted.write_policy == nil
+  end
+
+  # #462: the cancellation-window markers Pixir writes itself are not mutation evidence.
+  # The layer-2 placeholder name is "unknown", on which `Permissions.mutating?/2` fails
+  # closed, so without the exemption a legacy Log healed by layer 2 could no longer be
+  # resumed at all — reason "missing" — over a call whose own paired result asserts it
+  # never ran. The layer-1 drain marker carries the call's REAL name (`bash` here) for the
+  # same reason: the Turn was killed before the Executor could run it.
+  test "legacy Log healed by #462's own markers still restores a read-only ceiling", %{ws: ws} do
+    cold_sid = unique_session_id("legacy-462-markers")
+
+    write_raw_history!(cold_sid, ws, [
+      %{"type" => "user_message", "data" => %{"text" => "legacy prompt"}},
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "call_synth",
+          "name" => "unknown",
+          "args" => %{},
+          "synthesized" => %{"reason" => "provider_dangling_tool_call"}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{
+          "call_id" => "call_synth",
+          "ok" => false,
+          "error" => %{"kind" => "orphan_tool_call", "message" => "did not run"}
+        }
+      },
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "call_drained",
+          "name" => "bash",
+          "args" => %{"command" => "rm -rf /"},
+          "drained" => %{"reason" => "interrupt"}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{
+          "call_id" => "call_drained",
+          "ok" => false,
+          "error" => %{"kind" => "orphan_tool_call", "message" => "did not run"}
+        }
+      }
+    ])
+
+    assert {:ok, posture} = Subagents.resume_posture(cold_sid, workspace: ws)
+    assert posture.permission_mode == :read_only
+    assert posture.lineage == :legacy_unknown
+  end
+
+  # #462 round 5: the marker alone must not buy the exemption. Every marker Pixir writes is
+  # paired with an `orphan_tool_call` result asserting the call did not run — that pairing
+  # is the actual claim, and it is what the exemption now checks. A Log carrying the marker
+  # next to a SUCCESS result is describing a call that ran, whatever the marker says: a
+  # forged or corrupted Log, or a future code path that reuses the marker key for something
+  # that does execute. Trusting the marker there would hide a real `rm -rf` behind a string
+  # any writer can put in the Log, and resume the Session write-capable over it.
+  test "a marked tool_call paired with a success result is still mutation evidence", %{ws: ws} do
+    cold_sid = unique_session_id("forged-drain-marker")
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "call_forged",
+          "name" => "bash",
+          "args" => %{"command" => "rm -rf x"},
+          "drained" => %{"reason" => "interrupt"}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{"call_id" => "call_forged", "ok" => true, "output" => "removed"}
+      }
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(cold_sid, workspace: ws)
+
+    assert details["reason"] == "missing"
+  end
+
+  # The same forging with the layer-2 marker, whose placeholder name `unknown` fails closed
+  # on `Permissions.mutating?/2` rather than being classified as a write: the exemption must
+  # not launder that either.
+  test "a synthesized tool_call paired with a success result is still mutation evidence", %{
+    ws: ws
+  } do
+    cold_sid = unique_session_id("forged-synth-marker")
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "call_forged_synth",
+          "name" => "unknown",
+          "args" => %{},
+          "synthesized" => %{"reason" => "provider_dangling_tool_call"}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{"call_id" => "call_forged_synth", "ok" => true, "output" => "ran"}
+      }
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(cold_sid, workspace: ws)
+
+    assert details["reason"] == "missing"
+  end
+
+  # A marked call with NO result at all is still exempt: that is the honest mid-drain shape
+  # (layer 1 appends the `tool_call`, the reconciliation that closes it can fail on the very
+  # next Log append), and there is no success anywhere claiming the call ran.
+  test "a marked tool_call with no result at all stays exempt", %{ws: ws} do
+    cold_sid = unique_session_id("unclosed-drain-marker")
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "call_unclosed",
+          "name" => "bash",
+          "args" => %{"command" => "rm -rf x"},
+          "drained" => %{"reason" => "interrupt"}
+        }
+      }
+    ])
+
+    assert {:ok, posture} = Subagents.resume_posture(cold_sid, workspace: ws)
+    assert posture.permission_mode == :read_only
+  end
+
+  # The exemption is scoped to Pixir's OWN markers, keyed on the marker itself. A real
+  # `tool_call` naming an unknown tool — a model hallucination the Executor persisted
+  # verbatim before failing — still fails closed on the catch-all, exactly as before.
+  test "an unmarked tool_call with an unknown name is still mutation evidence", %{ws: ws} do
+    cold_sid = unique_session_id("legacy-unknown-name")
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "tool_call",
+        "data" => %{"call_id" => "call_hallucinated", "name" => "unknown", "args" => %{}}
+      }
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(cold_sid, workspace: ws)
+
+    assert details["reason"] == "missing"
   end
 
   test "cold resume rejects a shared posture whose recorded workspace is absent", %{ws: ws} do
@@ -2566,6 +2997,40 @@ defmodule Pixir.SubagentsTest do
     end)
   end
 
+  # Kills only the child's Turn task, leaving the child Session process alive.
+  # No :status event is published, so the Subagents Manager keeps seeing `running`.
+  defp kill_child_turn!(session_id) do
+    assert [{session_pid, _}] = Registry.lookup(Pixir.Sessions.Registry, session_id)
+    assert %{turn: %{pid: turn_pid}} = :sys.get_state(session_pid)
+    Process.exit(turn_pid, :kill)
+  end
+
+  # A child Session's Log lives under the child's own (isolated) workspace.
+  defp child_history!(agent) do
+    assert {:ok, history} =
+             Log.fold(agent["child_session_id"], workspace: agent["workspace"])
+
+    history
+  end
+
+  defp child_cancellation_events(history) do
+    Enum.filter(
+      history,
+      &(&1.type == :subagent_event and &1.data["event"] == "cancelled_by_parent")
+    )
+  end
+
+  defp cancellation_reasons(sid, ws, subagent_id) do
+    {:ok, history} = Log.fold(sid, workspace: ws)
+
+    history
+    |> Enum.filter(
+      &(&1.type == :subagent_event and &1.data["subagent_id"] == subagent_id and
+          &1.data["event"] == "cancelled")
+    )
+    |> Enum.map(& &1.data["reason"])
+  end
+
   defp write_subagent_event!(sid, ws, data) do
     assert {:ok, _event} = Session.record(sid, Event.subagent_event(sid, data))
     assert {:ok, _history} = Log.fold(sid, workspace: ws)
@@ -2668,6 +3133,216 @@ defmodule Pixir.SubagentsTest do
 
       assert {:ok, restricted} = Subagents.restrict_resume_posture(posture, :auto, nil)
       assert restricted.write_policy == durable
+    end
+
+    test "allowlists that differ only in specificity keep their shared verify command" do
+      # Prefixes intersect by tokenwise coverage, not as exact strings: durable
+      # `mix` covers requested `mix format`, so the narrower `mix format`
+      # survives and still covers the command both sides already admitted.
+      durable =
+        policy_fixture(["app/**"],
+          bash: %{
+            "verify_prefixes" => ["mix"],
+            "verify" => ["mix format --check-formatted", "mix compile"]
+          }
+        )
+
+      requested =
+        policy_fixture(["app/**"],
+          bash: %{
+            "verify_prefixes" => ["mix format"],
+            "verify" => ["mix format --check-formatted"]
+          }
+        )
+
+      posture = posture_fixture(:auto, durable)
+
+      assert {:ok, restricted} = Subagents.restrict_resume_posture(posture, :auto, requested)
+
+      bash = restricted.write_policy["bash"]
+      assert bash != "disabled"
+      assert bash["verify"] == ["mix format --check-formatted"]
+
+      # The requested declaration is the narrower of the two, so it is what
+      # survives: never wider than what the requesting side asked for.
+      assert bash["verify_prefixes"] == ["mix format"]
+    end
+
+    test "a partial prefix overlap keeps every command both sides authorized" do
+      # Exact string intersection kept only `pnpm typecheck` here and dropped
+      # `mix` / `mix format` as unrelated, stranding the surviving
+      # `mix format --check-formatted` with no prefix covering it. Because
+      # `restrict_write_policy/2` re-normalizes the restricted map, resume then
+      # failed closed on a command both sides had already authorized.
+      durable =
+        policy_fixture(["app/**"],
+          bash: %{
+            "verify_prefixes" => ["mix", "pnpm typecheck"],
+            "verify" => ["mix format --check-formatted", "pnpm typecheck"]
+          }
+        )
+
+      requested =
+        policy_fixture(["app/**"],
+          bash: %{
+            "verify_prefixes" => ["mix format", "pnpm typecheck"],
+            "verify" => ["mix format --check-formatted", "pnpm typecheck"]
+          }
+        )
+
+      posture = posture_fixture(:auto, durable)
+
+      assert {:ok, restricted} = Subagents.restrict_resume_posture(posture, :auto, requested)
+
+      bash = restricted.write_policy["bash"]
+      assert bash["verify"] == ["mix format --check-formatted", "pnpm typecheck"]
+      assert bash["verify_prefixes"] == ["mix format", "pnpm typecheck"]
+
+      # Every surviving prefix is covered by the durable side, so no survivor
+      # admits more than durable already did.
+      assert Enum.all?(bash["verify_prefixes"], fn prefix ->
+               Enum.any?(["mix", "pnpm typecheck"], &String.starts_with?(prefix, &1))
+             end)
+    end
+
+    test "the surviving policy re-normalizes to itself" do
+      durable =
+        policy_fixture(["app/**"],
+          bash: %{
+            "verify_prefixes" => ["mix", "pnpm typecheck"],
+            "verify" => ["mix format --check-formatted", "pnpm typecheck"]
+          }
+        )
+
+      requested =
+        policy_fixture(["app/**"],
+          bash: %{
+            "verify_prefixes" => ["mix format", "pnpm typecheck"],
+            "verify" => ["mix format --check-formatted", "pnpm typecheck"]
+          }
+        )
+
+      posture = posture_fixture(:auto, durable)
+
+      assert {:ok, restricted} = Subagents.restrict_resume_posture(posture, :auto, requested)
+
+      # A restricted policy is durable evidence: re-admitting it must be a fixed
+      # point, not a second chance to fail closed. `normalize/1` takes the source
+      # fields, not the derived `hash`/`id`, so feed it the shape it accepts.
+      policy = restricted.write_policy
+
+      assert {:ok, renormalized} =
+               WritePolicy.normalize(%{
+                 "version" => policy["version"],
+                 "metadata" => policy["metadata"],
+                 "allow_writes" => policy["allow_writes"],
+                 "deny_writes" => policy["deny_writes"],
+                 "bash" => policy["bash"]
+               })
+
+      assert renormalized["bash"] == policy["bash"]
+      assert renormalized["hash"] == policy["hash"]
+
+      # Restricting the survivor against itself is also stable — the coverage
+      # relation is reflexive, so a second resume cannot erode the allowlist.
+      assert {:ok, twice} =
+               Subagents.restrict_resume_posture(posture_fixture(:auto, policy), :auto, policy)
+
+      assert twice.write_policy["bash"] == policy["bash"]
+    end
+
+    test "coverage never lets a requested prefix widen the durable allowlist" do
+      # `mix` is strictly wider than durable's `mix format`, so it cannot
+      # survive; only the durable declaration, which both sides cover, does.
+      durable =
+        policy_fixture(["app/**"],
+          bash: %{
+            "verify_prefixes" => ["mix format"],
+            "verify" => ["mix format --check-formatted"]
+          }
+        )
+
+      requested =
+        policy_fixture(["app/**"],
+          bash: %{
+            "verify_prefixes" => ["mix"],
+            "verify" => ["mix format --check-formatted", "mix compile"]
+          }
+        )
+
+      posture = posture_fixture(:auto, durable)
+
+      assert {:ok, restricted} = Subagents.restrict_resume_posture(posture, :auto, requested)
+
+      bash = restricted.write_policy["bash"]
+      assert bash["verify_prefixes"] == ["mix format"]
+      assert bash["verify"] == ["mix format --check-formatted"]
+      refute "mix compile" in bash["verify"]
+    end
+
+    test "a two-way coverage filter cannot overflow the declaration cap" do
+      # The filter keeps survivors from both sides, so it must not be able to
+      # build a list longer than the 8-prefix maximum the policy accepts. It
+      # cannot: a prefix survives from one side only, and a pair that covers
+      # each other is byte-equal and deduped, so the result is never longer
+      # than the longer input.
+      durable_prefixes = for i <- 1..8, do: "cmd#{i}"
+      requested_prefixes = for i <- 1..8, do: "cmd#{i} run"
+
+      durable =
+        policy_fixture(["app/**"],
+          bash: %{"verify_prefixes" => durable_prefixes, "verify" => ["cmd1 run --check"]}
+        )
+
+      requested =
+        policy_fixture(["app/**"],
+          bash: %{"verify_prefixes" => requested_prefixes, "verify" => ["cmd1 run --check"]}
+        )
+
+      posture = posture_fixture(:auto, durable)
+
+      assert {:ok, restricted} = Subagents.restrict_resume_posture(posture, :auto, requested)
+
+      bash = restricted.write_policy["bash"]
+      assert length(bash["verify_prefixes"]) == 8
+      assert bash["verify_prefixes"] == requested_prefixes
+      assert bash["verify"] == ["cmd1 run --check"]
+    end
+
+    test "prefix coverage is tokenwise, never a substring" do
+      # `mix` must not cover `mixer`: a shared command is what keeps the shell,
+      # and here the sides share none, so the restriction is a disabled shell.
+      durable =
+        policy_fixture(["app/**"],
+          bash: %{"verify_prefixes" => ["mix"], "verify" => ["mix compile"]}
+        )
+
+      requested =
+        policy_fixture(["app/**"],
+          bash: %{"verify_prefixes" => ["mixer"], "verify" => ["mixer build"]}
+        )
+
+      posture = posture_fixture(:auto, durable)
+
+      assert {:ok, restricted} = Subagents.restrict_resume_posture(posture, :auto, requested)
+      assert restricted.write_policy["bash"] == "disabled"
+    end
+
+    test "allowlists sharing no verify command still fail closed to a disabled shell" do
+      durable =
+        policy_fixture(["app/**"],
+          bash: %{"verify_prefixes" => ["mix"], "verify" => ["mix compile"]}
+        )
+
+      requested =
+        policy_fixture(["app/**"],
+          bash: %{"verify_prefixes" => ["pnpm typecheck"], "verify" => ["pnpm typecheck"]}
+        )
+
+      posture = posture_fixture(:auto, durable)
+
+      assert {:ok, restricted} = Subagents.restrict_resume_posture(posture, :auto, requested)
+      assert restricted.write_policy["bash"] == "disabled"
     end
   end
 

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://pixir.dev/schemas/pixir.presenter.workspace_set.v1.schema.json",
   "title": "Pixir Presenter Workspace Set v1",
-  "description": "Two-workspace Workspace Overview surfaces: bootstrap shell embed, scoped snapshot envelopes (list and detail), scoped error envelope, and set-mode SSE invalidation frame. Each envelope embeds the corresponding single-mode document verbatim: the pixir.monitor.runs v1 list document on the list route, the pixir.presenter.run.v1 document on the detail route. Frozen on #339; consumers #349 and #340.",
+  "description": "Bounded-N (2..8) Workspace Overview surfaces: bootstrap shell embed, scoped snapshot envelopes (list and detail), scoped error envelope, and set-mode SSE invalidation frame. Each envelope embeds the corresponding single-mode document verbatim: the pixir.monitor.runs v1 list document on the list route, the pixir.presenter.run.v1 document on the detail route. Frozen on #339; consumers #349 and #340; amended in place on #442, which widened the set cardinality from exactly 2 to 2..8 without touching any key set, route, or frame shape.",
   "oneOf": [
     { "$ref": "#/$defs/shell_config" },
     { "$ref": "#/$defs/scoped_list_snapshot" },
@@ -18,7 +18,7 @@
       "maxLength": 256
     },
     "shell_config": {
-      "description": "Embedded by the set-mode bootstrap shell (GET /) as HTML-attribute-escaped JSON in a data-workspace-set attribute on the shell's <main> element — no new inline script; the hashed bootstrap script and CSP are unchanged. The SPA reads and strictly validates it once at boot: present and valid = set mode; absent = single mode; present but malformed = explicit boot error, never a silent fallback. Single-workspace shells embed nothing and stay byte-identical to today. Keys are listed in declaration order, which is the stable section order everywhere.",
+      "description": "Embedded by the set-mode bootstrap shell (GET /) as HTML-attribute-escaped JSON in a data-workspace-set attribute on the shell's <main> element — no new inline script; the hashed bootstrap script and CSP are unchanged. The SPA reads and strictly validates it once at boot: present and valid = set mode; absent = single mode; present but malformed = explicit boot error, never a silent fallback. Single-workspace shells embed nothing and stay byte-identical to today. Keys are listed in declaration order, which is the stable section order everywhere. The set holds 2..8 unique keys (#442); an array of 1, of 9, or with duplicates is schema-invalid.",
       "type": "object",
       "additionalProperties": false,
       "required": ["mode", "workspaces"],
@@ -27,7 +27,7 @@
         "workspaces": {
           "type": "array",
           "minItems": 2,
-          "maxItems": 2,
+          "maxItems": 8,
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/workspace_key" }
         }

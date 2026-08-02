@@ -1447,7 +1447,7 @@ defmodule Pixir.CLITest do
                   "status" => "completed",
                   "kind" => "delegate_result",
                   "contract_version" => 1,
-                  "schema_version" => 5,
+                  "schema_version" => 9,
                   "schema" => "pixir.delegate.envelope.v1",
                   "command_ok" => true,
                   "work_complete" => true,
@@ -1595,7 +1595,14 @@ defmodule Pixir.CLITest do
 
         stdout =
           capture_io(spec, fn ->
-            assert {:error, 6} = CLI.route(["delegate", "--spec", "-", "--json"])
+            assert {:error, 6} =
+                     CLI.route([
+                       "delegate",
+                       "--spec",
+                       "-",
+                       "--allow-short-horizon",
+                       "--json"
+                     ])
           end)
 
         payload = Jason.decode!(stdout)
@@ -1664,7 +1671,7 @@ defmodule Pixir.CLITest do
 
           payload = Jason.decode!(stdout)
           assert payload["status"] == "completed"
-          assert payload["schema_version"] == 5
+          assert payload["schema_version"] == 9
           assert payload["command_ok"] == true
           assert payload["work_complete"] == true
           assert payload["outcome"] == "completed"
@@ -1842,7 +1849,7 @@ defmodule Pixir.CLITest do
                 "ok" => true,
                 "status" => "completed",
                 "kind" => "delegate_status",
-                "schema_version" => 5,
+                "schema_version" => 9,
                 "schema" => "pixir.delegate.envelope.v1",
                 "command_ok" => true,
                 "work_complete" => true,
@@ -1886,7 +1893,7 @@ defmodule Pixir.CLITest do
                "ok" => false,
                "status" => "rejected",
                "kind" => "not_found",
-               "schema_version" => 5,
+               "schema_version" => 9,
                "command_ok" => false,
                "work_complete" => false,
                "outcome" => "rejected",
@@ -1934,7 +1941,7 @@ defmodule Pixir.CLITest do
                 "ok" => true,
                 "status" => "running",
                 "kind" => "delegate_attach",
-                "schema_version" => 5,
+                "schema_version" => 9,
                 "schema" => "pixir.delegate.envelope.v1",
                 "command_ok" => true,
                 "work_complete" => false,
@@ -2487,7 +2494,14 @@ defmodule Pixir.CLITest do
           capture_io(:stderr, fn ->
             stdout =
               capture_io(spec, fn ->
-                assert {:error, 6} = CLI.route(["delegate", "--spec", "-", "--json"])
+                assert {:error, 6} =
+                         CLI.route([
+                           "delegate",
+                           "--spec",
+                           "-",
+                           "--allow-short-horizon",
+                           "--json"
+                         ])
               end)
 
             send(self(), {:delegate_stdout, stdout})
@@ -3230,7 +3244,9 @@ defmodule Pixir.CLITest do
     end)
   end
 
-  test "one-shot --json --write-policy emits terminal policy denial envelope" do
+  # The first denial is recoverable feedback (#446); exit 3 is reached on the
+  # SECOND denial of the Turn, with the envelope shape unchanged.
+  test "one-shot --json --write-policy emits terminal policy denial envelope on the second strike" do
     with_cli_provider(
       [
         tool_calls([
@@ -3238,6 +3254,13 @@ defmodule Pixir.CLITest do
             call_id: "c",
             name: "write",
             args: %{"path" => "blocked.txt", "content" => "no"}
+          }
+        ]),
+        tool_calls([
+          %{
+            call_id: "c2",
+            name: "write",
+            args: %{"path" => "blocked2.txt", "content" => "no"}
           }
         ]),
         stop("should not run")

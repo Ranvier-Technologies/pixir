@@ -82,7 +82,10 @@ references keep their own Session and sequence. `source.freshness` is:
 - `terminal` when the canonical run state is terminal;
 - `current` when mixed/live evidence is within the presenter's configured
   freshness window;
-- `stale` when a nonterminal durable state lacks current reachable liveness;
+- `current` when a nonterminal durable state is `externally_owned`, because the
+  durable Log itself is the evidence and it advanced;
+- `stale` when a nonterminal durable state lacks both current reachable
+  liveness and asserted durable activity;
 - `unknown` when timestamps or liveness are insufficient.
 
 The projection records timestamps but does not standardize a freshness window.
@@ -122,10 +125,53 @@ diagnostics do not upgrade or demote it. Typical examples:
   `stale_handle`/`owner_unavailable` until an operator resolves it;
 - durable nonterminal execution plus a reachable current Owner/Manager:
   liveness `live`;
-- durable nonterminal execution plus `snapshot_only`/stale Owner state:
-  liveness `stale_handle` and source freshness `stale`;
+- durable nonterminal execution plus `snapshot_only`/stale Owner state **and**
+  a caller-supplied assertion that durable evidence advanced: liveness
+  `externally_owned`, basis `durable_log_activity`, source freshness `current`;
+- durable nonterminal execution plus `snapshot_only`/stale Owner state without
+  that assertion: liveness `stale_handle` and source freshness `stale`;
 - explicit runtime lookup failure: liveness `owner_unavailable`;
 - insufficient evidence: liveness `unknown`.
+
+### Owner residency versus owner brokenness
+
+Not owning the Delegate and having a broken owner handle are different claims,
+and v1 keeps them apart.
+
+`snapshot_only` says only that the observing process is not the process that
+owns the Delegate. For a read-only Monitor observing somebody else's run that
+is the ordinary condition, not an anomaly. It becomes evidence of a problem
+only when nothing else confirms the run is progressing.
+
+The confirming signal is the optional builder input `activity_evidence`:
+
+```json
+{"durable_evidence": "advanced", "prior_as_of_seq": 41, "prior_last_durable_at": "…", "basis": "caller_observation_delta"}
+```
+
+`durable_evidence` is one of `advanced | unchanged | unknown`. It is a
+caller-supplied assertion that the durable parent Log advanced for this run
+identity since the caller's *own* prior observation, expressed from the durable
+sequence and durable timestamp the caller already carries. The polling caller
+that assembles builder inputs per observation tick is the only component
+permitted to hold that observation-to-observation state.
+
+The builder never derives the assertion. It remains a pure deterministic fold
+over one bounded input map: the same input map always yields the same
+projection, and no liveness, freshness, or attention outcome consults a clock,
+SSE state, or state retained between builds. An absent, null, unrecognized, or
+malformed `activity_evidence` is treated as "not asserted" — today's
+conservative behavior — and an unrecognized or malformed one additionally
+carries the `activity_evidence_unrecognized` limitation so a broken caller
+cannot silently buy a quieter projection.
+
+`externally_owned` keeps `liveness.reachable: false`. This observer genuinely
+cannot verify the process, and `basis: "durable_log_activity"` names the
+evidence actually relied on rather than claiming a delegate-owner observation
+the process never made. It emits no liveness attention reason and does not
+inflate `counts.attention_units`; owner non-residency alone never forces
+`source.freshness: "stale"` nor the `source_stale` limitation. Nothing here
+changes `execution.state`, which remains a durable/deterministic fold.
 
 Run execution vocabulary:
 
@@ -134,11 +180,166 @@ cancelled | detached | closed | held | unknown`
 
 Liveness vocabulary:
 
-`live | stale_handle | owner_unavailable | not_applicable | unknown`
+`live | externally_owned | stale_handle | owner_unavailable | not_applicable |
+unknown`
+
+Liveness basis vocabulary:
+
+`manager_diagnostics | delegate_owner | durable_log_activity | durable_snapshot
+| terminal_execution | none`
 
 `snapshot_only` is an Owner-service state, not presenter liveness. It means a
 durable snapshot exists without a resident Owner and is normalized using the
 rules above.
+
+List scope never consults owner diagnostics and therefore never reaches
+`externally_owned`. It folds liveness independently into `unobserved` (basis
+`parent_log_only`) for nonterminal rows and `not_applicable` for terminal rows.
+
+## Post-terminal child activity
+
+A parent run can go terminal while a child Session keeps working — most
+commonly when a Workflow step is cancelled by timeout and a coordinator then
+resumes the child Session directly. Every temporal and lifecycle fact in this
+contract is derived from the parent Log, so that work was previously
+unobservable: the run read `partial` and quiescent forever.
+
+`post_terminal_child_activity` is the dimension that reports it. It is
+**required** on every projection and is never omitted.
+
+```
+post_terminal_child_activity: {
+  state, basis, boundary_at, boundary_basis,
+  event_count, latest_event_at, child_session_ids, evidence_refs
+}
+```
+
+### It reports; it does not reclassify
+
+This dimension changes no other truth dimension, ever:
+
+- `execution.state`, `execution.terminal` and `execution.basis` remain exactly
+  what parent evidence says. A `partial` run stays `partial`. Post-terminal
+  child evidence never upgrades, demotes, or re-opens canonical execution.
+- `liveness` remains derived from owner diagnostics under the rules above. A
+  child Log is durable evidence of **past writes**, not of a reachable process,
+  so it can never produce `liveness.state == "live"` or
+  `liveness.reachable == true`.
+- The frozen `temporal` schema is not repurposed. `latest_at` keeps its
+  `max_parent_event_ts` basis and its existing completeness semantics, and the
+  pinned `recency_desc` order is unchanged. Any post-terminal child timestamp
+  is exposed only under `latest_event_at`, with its own basis.
+- Gate states, advisory verdicts, `counts`, and `attention` are unchanged.
+
+### The terminal boundary
+
+`boundary_at` is derived from **parent Log evidence only** — never from wall
+clock, browser time, SSE receipt, or the projector's own `projected_at` /
+`observed_at`. Two pinned basis names:
+
+- `workflow_finished_event_ts` — the last parent `workflow_event` whose
+  `data.kind` is `workflow_finished`.
+- `terminal_subagent_lifecycle_ts` — when no `workflow_finished` exists, the
+  max timestamp across parent `subagent_event` rows whose `data.status` is
+  itself terminal.
+
+Because the boundary and the count are both evidence-derived, projecting the
+same inputs twice at different wall-clock times produces byte-identical values
+for the whole dimension.
+
+### The four states
+
+| `state` | `basis` | Meaning |
+| --- | --- | --- |
+| `observed` | `child_events_after_parent_terminal_boundary` | Child evidence present; `event_count > 0` canonical child events are strictly after `boundary_at`. |
+| `none` | `child_events_after_parent_terminal_boundary` | Child evidence present (including an explicitly empty child-log list); `event_count == 0`. An **observed** zero. |
+| `undetermined` | `child_evidence_unavailable` or `terminal_boundary_unavailable` | Evidence is missing. `event_count` is `null`. |
+| `not_applicable` | `nonterminal_execution` | Execution is nonterminal, so no boundary exists to be after. |
+
+Observed zero and undetermined are distinct in the emitted document and must
+never be conflated: `none` carries `event_count: 0`, `undetermined` carries
+`event_count: null`. **Missing evidence never defaults to "nothing
+happened."**
+
+### Child-evidence precedence
+
+Resolution follows the same precedence the rest of the fold uses:
+`inputs.child_logs[session_id]` when that key holds a list (an explicit `[]` is
+present-and-empty), otherwise a **verified** `evidence_mirror` entry with role
+`child` for that session id. A child id named by parent evidence that resolves
+to neither — absent, `null`, unreadable, or only an unverified mirror entry —
+makes the whole dimension `undetermined`, and the run keeps its existing
+`child_log_missing` limitation.
+
+Child evidence resolved through a verified mirror is cited under the same
+`e-child-…` reference identity it would carry from `child_logs`, so a consumer
+that follows a reference cannot tell the two resolution paths apart.
+
+### Limitations and placement
+
+When `state == "observed"`, the run's **root** `limitations` array carries
+`post_terminal_child_activity_observed`, so operators and downstream consumers
+treat the run as narratively incomplete rather than finished. It is absent when
+the count is zero. The existing `child_log_missing` string keeps its current
+home in `source.limitations` and is not moved by this dimension.
+
+### List scope
+
+The `pixir.monitor.runs` row carries the reduced signal
+`post_terminal_child_activity: {state, basis, event_count, latest_event_at}`.
+The list consults child evidence only as far as that signal requires — the
+count and the latest timestamp, nothing else. Every existing list-scope honesty
+guarantee holds unchanged: a row still never claims `liveness.state == "live"`,
+`liveness.basis` stays `parent_log_only`, and `temporal.latest_at` keeps its
+`max_parent_event_ts` basis and its pre-existing value.
+
+### Usage and attribution
+
+Post-terminal child events are **counted and timestamped only**. They are not
+attributed to any logical unit, attempt, `childEventWindow`, or `usage` total.
+A session-level resume driven directly at the child Session produces no parent
+`subagent_event` and therefore no attempt; this dimension reports its existence
+without inventing an attempt to hold it.
+
+### Phase 2 (decided, not shipped)
+
+The eventual behavior — **not** implemented by this contract revision — is that
+a child Session continuing after its parent run went terminal projects as its
+own follow-up run carrying an explicit link back to the parent run id, so the
+work becomes a first-class row in the inventory instead of a footnote on a dead
+parent.
+
+The linkage identity Phase 2 will consume already exists and is pinned here.
+It is derivable deterministically from **the parent Log alone**:
+
+- parent `subagent_event` rows carry `data.child_session_id`;
+- where a Workflow owns the child, those rows also carry
+  `data.delegation_context.step_id`.
+
+Both directions of the linkage are reconstructed from that parent evidence. The
+list row's per-run `children` collection (child `session_id` plus its resolved
+`unit_id`) is the run's published child roster, and it remains sufficient to
+resolve a child Session id to its owning parent run without scanning any child
+Log.
+
+**Open dependency.** There is today **no durable child-Log record of the owning
+parent.** `Pixir.Subagents.DelegationContext` builds a map that is recorded on
+the *parent's* `subagent_event` data and is otherwise rendered only as
+model-visible developer-context prompt text on the child Turn. It is not a
+child-Log event. Phase 2 therefore cannot rely on child-side self-identification
+unless a future ADR introduces a durable child-side event; that is a separate
+decision, not an assumption this contract makes.
+
+Phase 2's blocking constraints, recorded so they are not rediscovered:
+
+1. The inventory list is a parent-only fold today; a child Session is not a
+   projectable run.
+2. Run identity is never minted from a child Session id, and this revision adds
+   no run rows: `inventory.projected_runs` and `inventory.non_parent_logs` for a
+   fixed workspace are unchanged by it.
+3. No durable child-side parent pointer exists (above).
+
+Phase 1 therefore deliberately **reports** rather than reclassifies.
 
 ## Logical units
 
@@ -275,7 +476,10 @@ is required. Reasons are emitted in this normative order:
    `advisory_gate_disagreement`, `advisory_unparseable`.
 4. Liveness: `nonterminal_stale_handle`,
    `nonterminal_owner_unavailable`, `nonterminal_liveness_unknown`,
-   `terminal_ambiguous_close`.
+   `terminal_ambiguous_close`. The liveness family has no reason for
+   `externally_owned`: a nonterminal run whose owner is another process and
+   whose durable evidence is advancing is healthy, so ordinary external
+   observation never inflates `counts.attention_units`.
 5. Mutation/artifacts: `mutation_partial`, `mutation_indeterminate`,
    `mutation_unknown`, `virtual_diff_unapplied`,
    `virtual_diff_apply_failed`, `virtual_diff_correlation_unknown`.
@@ -369,6 +573,64 @@ does not prove that no write occurred.
 
 Shared writer failure with incomplete evidence is `indeterminate` or `partial`,
 never `none`. A virtual diff with no apply evidence is `not_applied`.
+
+### Child-evidence fold
+
+When the terminal envelope supplies no `observed_applied_writes` for a unit, the
+projection derives applied write paths from that unit's child Log: a `tool_call`
+naming a write-class tool (`write`, `edit`, `apply_virtual_diff`) correlated by
+`call_id` to a `tool_result` with `ok: true`. A call with no correlated ok result
+contributes nothing.
+
+Derived paths are normalized to workspace-relative form and deduplicated in
+first-observation order. A target that is absolute, `~`-rooted, or escapes the
+workspace through `..` is not an observed path: the projection reports only what
+it can place inside the unit's lane.
+
+Child-derived evidence is a **lower bound**. It yields `observed_semantics:
+"at_least"` and at most `status: "partial"`. It never yields `exact` and never
+yields `workspace_applied`; an apply-engine checkpoint remains the only route to
+those. Envelope-supplied `observed_applied_writes` take precedence over derived
+paths, and a path present in both is counted once.
+
+### Write-policy denials
+
+`permission_decision` events with `gate: "write_policy"` and `decision: "deny"`
+are projected into `write_denials` at unit scope and folded to run scope. Each
+record carries the normalized (workspace-relative) path, the `matched_rule`, the
+deciding `policy_id` and `policy_hash`, the `tool`, and the child evidence refs
+that support it. Records are deduplicated by
+`(normalized_path or requested_path, matched_rule, policy_id, policy_hash)` and
+preserve first-observation order. The fallback to `requested_path` keeps two
+distinct out-of-lane targets distinct: both normalize to `null`, so the
+normalized path alone cannot tell them apart. At run scope the fold also keys on
+the denial's own `evidence_refs`, so denials from different units stay
+attributable to their unit even when they share a path and policy.
+
+A denial is not a mutation. An observed deny never moves `status` toward
+`partial` or `workspace_applied`.
+
+### Mutation basis
+
+`basis` names the evidence class the mutation record rests on. It is derived,
+never asserted by input:
+
+- `envelope_observed_writes` — the terminal envelope supplied the write set.
+- `child_log_derived` — write paths reconstructed from the child Log only.
+- `envelope_and_child_log` — the child Log contributed paths the envelope omitted.
+- `apply_checkpoint` — apply-engine checkpoint evidence.
+- `no_child_evidence_available` — the unit could have child write evidence but
+  none is readable (missing, explicitly empty, unavailable, or minimized).
+- `no_write_evidence` — child evidence was readable and showed no writes.
+
+The run-scope basis is a deterministic fold of unit bases: the strongest class
+any unit rests on wins, in the order listed above.
+
+Absence of child evidence is never read as absence of writes. When a unit's child
+Logs are missing, unavailable, or minimized, mutation records
+`mutation_evidence_incomplete` (and `child_log_missing` where that limitation
+applies), reports `basis: "no_child_evidence_available"`, and does not settle on
+`none`.
 
 A `virtual_overlay` unit itself mutates only its isolated overlay, so its unit
 mutation is `isolated_only`. Application state belongs to its `virtual_diff`
@@ -496,6 +758,7 @@ The v1 limitation registry is closed to:
 - `usage_fixture_minimized` (fixture-retention evidence only; never a runtime
   failure)
 - `virtual_diff_not_applied`
+- `post_terminal_child_activity_observed`
 
 Limitations are machine-readable ids. Presenters may supply localized copy,
 but must not soften their meaning. A new id requires a reviewed contract and

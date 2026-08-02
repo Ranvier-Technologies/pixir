@@ -95,7 +95,10 @@ jq . plan.json
 
 It needs no network and no auth. Treat its output as runtime teaching: fix
 structured errors, follow `next_actions`, and run the real delegation only
-once the planned shape matches your intent. This skill's job is not to
+once the planned shape matches your intent. Pass the same caller timeout to
+rehearsal and execution; `scripts/fanout.sh` enforces that parity, validates
+`plan.json`, and exits 2 before a real launch when the plan says
+`would_reject: true`. This skill's job is not to
 memorize Pixir's contract — it is to know when to ask Pixir to reveal the
 current one.
 
@@ -106,9 +109,79 @@ current one.
   silently queues the rest. It is also your backpressure lever — quota is
   shared across children.
 - **Size `--timeout-ms` for waves**: with tasks > max_threads, children run in
-  ceil(N / max_threads) waves; the timeout must cover all of them. Read-only
-  analysis children typically finish in a few minutes each — budget generously;
-  a timeout yields an honest partial envelope, not a crash.
+  ceil(N / max_threads) waves. Before any parent or child Session is created,
+  Pixir estimates `ceil(task_count / max_threads) * child_timeout_ms` and rejects
+  a real launch when that floor exceeds the effective wait horizon. Resolution
+  honors `limits.wait_horizon_ms`, then `delegate_timeout_ms`, then the explicit
+  `--timeout-ms` or 120s default cascade. The caller `--timeout-ms` changes the
+  delegate/wait horizon only: an omitted child budget stays at
+  `Subagents.default_limits().timeout_ms` (currently 120s). Specs can pin a child
+  budget with `limits.child_timeout_ms` or `subagents.timeout_ms`; the legacy
+  spec-level `limits.timeout_ms` / top-level `timeout_ms` remains a compatible child
+  default. Workflow estimates sum each dependency wave's largest effective step
+  budget; omitted steps use that same runtime default. The current
+  `estimated_critical_path_ms` and `wave_budgets_ms` cap every step budget by the
+  normalized workflow timeout. Workflow `suggested_timeout_ms` instead sums each
+  wave's largest uncapped declared/default budget: it is the least sufficient fixed
+  point after the cap moves, so it can exceed the current estimate only when that cap
+  binds and a one-shot relaunch at the suggestion is sufficient.
+  Workflow dry-runs also report the separately resolved `caller_horizon_ms`,
+  `wait_horizon_explicit`, `declared_workflow_timeout_ms`, and
+  `declared_workflow_timeout_explicit`. `wait_horizon_explicit` is true only when
+  request `--wait-horizon-ms` or spec `limits.wait_horizon_ms` supplied the horizon;
+  it is false when the horizon defaulted from the delegate timeout. The workflow
+  boolean records whether the normalized workflow spec contained `timeout_ms` before
+  default injection. `effective_timeout_ms` remains the minimum of the resolved values
+  and the runtime launch semantics are unchanged. All dry-runs report
+  `estimated_critical_path_ms`, `waves`, `suggested_timeout_ms`, and `would_reject`
+  without failing. When `would_reject` is true, rehearsal replaces run actions with the
+  same recovery `next_actions` as a real rejection. Recovery chooses the explicit wait
+  horizon knob when `wait_horizon_explicit` is true and the delegate timeout when it is
+  false. Workflow recovery compares both the caller horizon and the declared workflow
+  ceiling against `suggested_timeout_ms`. When
+  `declared_workflow_timeout_explicit` is true, the workflow timeout is an operator knob:
+  increase only the chosen caller knob when only the caller horizon is short, only the
+  workflow timeout when only it is short, and both when both are short. When that boolean
+  is false, the declared workflow timeout is the delegate-derived ceiling, not a workflow
+  field to widen. With an explicit wait horizon, increase only the wait when only the
+  caller is short, only the delegate timeout when only that ceiling is short, and both
+  the wait horizon and delegate timeout when both are short. With a delegate-derived wait
+  horizon, increase only the delegate timeout because it moves both derived values. This
+  avoids a wait-only recovery when the wait is already sufficient but the omitted
+  workflow timeout's delegate-derived ceiling still binds. This classification does not
+  infer the binding knob from whether the suggestion exceeds the capped estimate. Omitted
+  subagent child budgets stay stable, and workflow suggestions account for cap movement,
+  so that value is a fixed point. If a spec intentionally uses the legacy spec-level
+  timeout as its child default, first pin `limits.child_timeout_ms` explicitly, then
+  widen the caller horizon. The `--allow-short-horizon` flag is a break-glass escape
+  hatch that launches and records the same four stable override values as
+  `horizon_override`; the four binding-evidence fields remain admission/CLI detail
+  rather than additions to that override schema.
+  A workflow dry-run additionally emits `plan_warnings[]` when the spec explicitly
+  declares its own `timeout_ms` and at least one step explicitly declares a longer
+  `timeout_ms`. That entry has `kind: "step_budget_capped_by_workflow_timeout"` and
+  names, per offending step, its `step_index`, `step_id`, `json_pointer`, `path`,
+  `declared_step_timeout_ms`, the `declared_workflow_timeout_ms` that caps it, and the
+  `effective_step_timeout_ms` it will actually receive, so the rehearsal predicts the
+  runtime `closed_by_workflow_timeout` cancellation instead of leaving it implicit in the
+  gap between `estimated_critical_path_ms` and `suggested_timeout_ms`. Its
+  `next_actions` cover both directions:
+  `increase_workflow_timeout_to_cover_declared_step_timeouts`,
+  `reduce_workflow_step_timeouts`, and the runtime remedy the fold itself publishes,
+  `retry_workflow_with_larger_timeout`. The warning is advisory only and independent of
+  `would_reject`: it appears on accepted plans without changing `ok`, `status`, or the
+  exit code, and it appears alongside a horizon rejection's `summary` and `next_actions`
+  rather than replacing them. A plan carrying only this warning is still runnable. It
+  does not fire when the workflow timeout was defaulted rather than declared, when a
+  step omitted `timeout_ms` and fell back to the Subagent default, or when every
+  declared step budget fits the declared workflow timeout; `subagents` dry-runs never
+  carry it. Do not confuse `plan_warnings` with the runtime `warnings` list, which
+  carries Provider output-truncation evidence from real children.
+  Workflow dependency-wave maxima are a conservative batch admission estimate: a
+  work-conserving scheduler may realize less wall time by starting newly unblocked work
+  before the rest of a batch finishes. Admission deliberately still fails closed on the
+  conservative sum. The estimate excludes retries, jitter, and orchestration overhead,
+  so budget generously above it rather than treating it as a completion guarantee.
 - `role: "explorer"` is read-only; write-capable fan-out needs a spec-level
   mode and write policy — a dry run of your draft spec walks you through the
   exact fields.

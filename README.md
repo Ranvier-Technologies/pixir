@@ -240,6 +240,7 @@ Networked smoke tasks are manual and opt-in.
 ## Documentation
 
 - Quickstart: `docs/open-beta-quickstart.md`
+- Bounded write policy config: `docs/bounded-write-policy.md`
 - Release notes: `docs/release-notes/open-beta-developer-preview.md`
 - Changelog: `CHANGELOG.md`
 - Security policy: `SECURITY.md`

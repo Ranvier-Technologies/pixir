@@ -119,7 +119,7 @@ function loadSeam(appSource, workspaceSetConfig) {
   vm.createContext(sandbox);
   vm.runInContext(appSource, sandbox, {filename: "app.js"});
   const seam = sandbox.window.PixirMonitorUI;
-  if (!seam || typeof seam.parseRoute !== "function" || typeof seam.routeHash !== "function" || typeof seam.visible !== "function" || typeof seam.runsComparator !== "function") {
+  if (!seam || typeof seam.parseRoute !== "function" || typeof seam.routeHash !== "function" || typeof seam.visible !== "function" || typeof seam.runsComparator !== "function" || typeof seam.resolveParentObservedChild !== "function") {
     throw failure("seam_missing", "window.PixirMonitorUI did not expose the expected frozen members", "load_app");
   }
   return seam;
@@ -381,6 +381,74 @@ function checkComparator(seam) {
   return {rows: rows.length, order_checks: orderChecks, pairs, triples};
 }
 
+// ── Parent-observed child resolution (issue #438) ───────────────────────────
+//
+// resolveParentObservedChild(sessionId, rows) is the ONLY resolution primitive:
+// a pure, exact-equality scan over the parent-observed `children` already
+// carried by held authoritative list rows. It reads nothing else — no child
+// Log, no index, no network — so executing it here is the whole contract.
+
+function childRow(id, children) {
+  return {id, children};
+}
+
+function checkChildResolution(seam) {
+  const resolve = seam.resolveParentObservedChild;
+  if (typeof resolve !== "function") throw failure("child_resolution_missing", "The seam did not expose resolveParentObservedChild", "child_resolution");
+
+  const rows = [
+    childRow("parent-with-unit", [{session_id: "child-a", unit_id: "step:review"}, {session_id: "child-shared", unit_id: "step:one"}]),
+    childRow("parent-without-unit", [{session_id: "child-b", unit_id: null}]),
+    childRow("parent-second-observer", [{session_id: "child-shared", unit_id: "step:two"}]),
+    childRow("parent-no-children", []),
+    childRow("parent-malformed-children", "not-an-array"),
+    childRow("parent-nonstring-child", [{session_id: 42, unit_id: "step:x"}, {session_id: null, unit_id: "step:y"}])
+  ];
+
+  const cases = [
+    // Exact match carrying a unit: one candidate, unit preserved verbatim.
+    {name: "resolved_with_unit", id: "child-a", candidates: [{runId: "parent-with-unit", unitId: "step:review"}]},
+    // Exact match with no unit identified in parent evidence: unitId is null.
+    {name: "resolved_without_unit", id: "child-b", candidates: [{runId: "parent-without-unit", unitId: null}]},
+    // Ambiguity: BOTH observers are offered, in held-inventory order, none chosen.
+    {name: "ambiguous", id: "child-shared", candidates: [{runId: "parent-with-unit", unitId: "step:one"}, {runId: "parent-second-observer", unitId: "step:two"}]},
+    // Unknown id: no candidates at all — the dead end must stay unchanged.
+    {name: "unresolved", id: "child-missing", candidates: []},
+    // A parent's OWN run id is not a child observation of itself.
+    {name: "parent_id_is_not_a_child", id: "parent-with-unit", candidates: []},
+    // Prefix and case variants must NOT resolve: exact equality only.
+    {name: "prefix_rejected", id: "child-", candidates: []},
+    {name: "suffix_rejected", id: "child-a-extra", candidates: []},
+    {name: "case_rejected", id: "CHILD-A", candidates: []},
+    // Non-string / absent ids resolve nothing and must not throw.
+    {name: "empty_rejected", id: "", candidates: []},
+    {name: "null_rejected", id: null, candidates: []},
+    {name: "number_rejected", id: 42, candidates: []}
+  ];
+
+  for (const testCase of cases) {
+    const observed = resolve(testCase.id, rows);
+    if (!Array.isArray(observed)) throw failure("child_resolution_shape", "resolveParentObservedChild did not return an array", "child_resolution", {case: testCase.name});
+    const simplified = observed.map((candidate) => ({runId: candidate.runId, unitId: candidate.unitId ?? null}));
+    if (JSON.stringify(simplified) !== JSON.stringify(testCase.candidates)) {
+      throw failure("child_resolution_broken", `resolveParentObservedChild diverged for ${testCase.name}`, "child_resolution", {case: testCase.name, observed: simplified, expected: testCase.candidates});
+    }
+  }
+
+  // Absent / malformed inventory resolves nothing rather than fabricating.
+  for (const [index, inventory] of [null, undefined, "rows", {}, []].entries()) {
+    const observed = resolve("child-a", inventory);
+    if (!Array.isArray(observed) || observed.length !== 0) throw failure("child_resolution_fabricated", "resolveParentObservedChild resolved against an absent or malformed inventory", "child_resolution", {index});
+  }
+
+  // Purity: resolution must not mutate the inventory it reads.
+  const before = JSON.stringify(rows);
+  resolve("child-shared", rows);
+  if (JSON.stringify(rows) !== before) throw failure("child_resolution_mutated_inventory", "resolveParentObservedChild mutated the held inventory", "child_resolution");
+
+  return cases.length;
+}
+
 // ── Red proof: before trusting green, prove each family goes red against a
 // deliberately broken seam (the #362 red-proof idiom). Deleting an assertion
 // body can no longer keep the run green, because the tampered variant would
@@ -413,6 +481,14 @@ function checkRedProof(seam) {
     return (a, b) => -comparator(a, b);
   }});
   families += expectRed("comparator", invertedComparator, (tampered) => checkComparator(tampered));
+  // A resolver that answers on PREFIX instead of exact equality is precisely
+  // the speculative-match failure the brief forbids: it must go red here.
+  const fuzzyResolver = Object.freeze({...seam, resolveParentObservedChild: (sessionId, rows) => {
+    const needle = typeof sessionId === "string" ? sessionId : "";
+    if (!needle || !Array.isArray(rows)) return [];
+    return rows.flatMap((row) => (Array.isArray(row.children) ? row.children : []).filter((child) => typeof child.session_id === "string" && child.session_id.startsWith(needle)).map((child) => ({runId: row.id, unitId: child.unit_id ?? null, childSessionId: child.session_id})));
+  }});
+  families += expectRed("child_resolution", fuzzyResolver, (tampered) => checkChildResolution(tampered));
   return families;
 }
 
@@ -432,6 +508,7 @@ try {
   const roundtripSet = checkRoundTrip(set, "set", ["left", "right"]);
   const visibleCases = checkVisible(single);
   const comparator = checkComparator(single);
+  const childResolutionCases = checkChildResolution(single);
 
   output = {
     ok: true,
@@ -443,6 +520,7 @@ try {
     },
     visible_cases: visibleCases,
     comparator,
+    child_resolution_cases: childResolutionCases,
     red_proof_families: redProofFamilies
   };
 } catch (error) {

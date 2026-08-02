@@ -20,7 +20,8 @@
     "mutation",
     "safe_actions",
     "evidence",
-    "limitations"
+    "limitations",
+    "post_terminal_child_activity"
   ],
   "properties": {
     "schema": {"const": "pixir.presenter.run"},
@@ -56,7 +57,8 @@
       "type": "array",
       "items": {"type": "string", "minLength": 1},
       "uniqueItems": true
-    }
+    },
+    "post_terminal_child_activity": {"$ref": "#/$defs/postTerminalChildActivity"}
   },
   "$defs": {
     "nullableString": {
@@ -162,6 +164,7 @@
         "state": {
           "enum": [
             "live",
+            "externally_owned",
             "stale_handle",
             "owner_unavailable",
             "not_applicable",
@@ -173,6 +176,7 @@
           "enum": [
             "manager_diagnostics",
             "delegate_owner",
+            "durable_log_activity",
             "durable_snapshot",
             "terminal_execution",
             "none"
@@ -354,6 +358,50 @@
         "evidence_refs": {"$ref": "#/$defs/stringList"}
       }
     },
+    "postTerminalChildActivity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "basis",
+        "boundary_at",
+        "boundary_basis",
+        "event_count",
+        "latest_event_at",
+        "child_session_ids",
+        "evidence_refs"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "observed",
+            "none",
+            "undetermined",
+            "not_applicable"
+          ]
+        },
+        "basis": {
+          "enum": [
+            "child_events_after_parent_terminal_boundary",
+            "child_evidence_unavailable",
+            "terminal_boundary_unavailable",
+            "nonterminal_execution"
+          ]
+        },
+        "boundary_at": {"$ref": "#/$defs/nullableDateTime"},
+        "boundary_basis": {
+          "enum": [
+            "workflow_finished_event_ts",
+            "terminal_subagent_lifecycle_ts",
+            null
+          ]
+        },
+        "event_count": {"type": ["integer", "null"], "minimum": 0},
+        "latest_event_at": {"$ref": "#/$defs/nullableDateTime"},
+        "child_session_ids": {"$ref": "#/$defs/stringList"},
+        "evidence_refs": {"$ref": "#/$defs/stringList"}
+      }
+    },
     "artifact": {
       "type": "object",
       "additionalProperties": false,
@@ -430,10 +478,40 @@
         "limitations": {"$ref": "#/$defs/stringList"}
       }
     },
+    "writeDenial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "normalized_path",
+        "requested_path",
+        "matched_rule",
+        "policy_id",
+        "policy_hash",
+        "tool",
+        "evidence_refs"
+      ],
+      "properties": {
+        "normalized_path": {"$ref": "#/$defs/nullableString"},
+        "requested_path": {"$ref": "#/$defs/nullableString"},
+        "matched_rule": {"$ref": "#/$defs/nullableString"},
+        "policy_id": {"$ref": "#/$defs/nullableString"},
+        "policy_hash": {"$ref": "#/$defs/nullableString"},
+        "tool": {"$ref": "#/$defs/nullableString"},
+        "evidence_refs": {"$ref": "#/$defs/stringList"}
+      }
+    },
     "mutation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "observed_paths", "observed_semantics", "evidence_refs", "limitations"],
+      "required": [
+        "status",
+        "observed_paths",
+        "observed_semantics",
+        "basis",
+        "write_denials",
+        "evidence_refs",
+        "limitations"
+      ],
       "properties": {
         "status": {
           "enum": [
@@ -449,6 +527,20 @@
         },
         "observed_paths": {"$ref": "#/$defs/stringList"},
         "observed_semantics": {"enum": ["exact", "at_least", "none", "unknown"]},
+        "basis": {
+          "enum": [
+            "envelope_observed_writes",
+            "child_log_derived",
+            "envelope_and_child_log",
+            "apply_checkpoint",
+            "no_child_evidence_available",
+            "no_write_evidence"
+          ]
+        },
+        "write_denials": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/writeDenial"}
+        },
         "evidence_refs": {"$ref": "#/$defs/stringList"},
         "limitations": {"$ref": "#/$defs/stringList"}
       }

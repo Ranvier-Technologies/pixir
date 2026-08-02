@@ -14,9 +14,9 @@ defmodule Pixir.Tools.RunWorkflow do
   array (each step requires `id` and `task`), a Skill-backed `template_id` plus
   optional `template_args`, or separate `skill` and `template` fields. Optional
   workflow-level fields include: `id`, `name`, `max_concurrency`, and `timeout_ms`.
-  Each concrete step object may include `agent`, `depends_on`, `permission_mode`,
-  `workspace_mode`, `read_set`, `write_set`, `virtual_commands`, `limits`, and an
-  optional per-step `timeout_ms`.
+  Each concrete step object may include `agent`, `depends_on`,
+  `allow_unverified_depends_on`, `permission_mode`, `workspace_mode`, `read_set`,
+  `write_set`, `virtual_commands`, `limits`, and an optional per-step `timeout_ms`.
 
   Keep shape alternatives in descriptions and runtime validation rather than top-level
   JSON Schema composition keywords; the OpenAI Responses API rejects those at the tool
@@ -71,6 +71,12 @@ defmodule Pixir.Tools.RunWorkflow do
                   "type" => "array",
                   "items" => %{"type" => "string"},
                   "description" => "Step ids that must complete first"
+                },
+                "allow_unverified_depends_on" => %{
+                  "type" => "array",
+                  "items" => %{"type" => "string"},
+                  "description" =>
+                    "Narrow per-step opt-in: dependency ids (a subset of depends_on) whose child may have completed without self-verification. Such a dependency unblocks this step when its child completed and derived checkpoint_status partial; failed, needs_orchestrator, held, and non-completed children still gate strictly. Use it for an audit step that is itself the verification of a shell-less writer; the step's checkpoint then records that its conclusions rest on unverified upstream work."
                 },
                 "permission_mode" => %{
                   "type" => "string",

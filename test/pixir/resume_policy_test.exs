@@ -208,13 +208,12 @@ defmodule Pixir.ResumePolicyTest do
 
     try do
       File.cd!(workspace, fn ->
-        # A write-policy denial is deliberately terminal for its Turn. The first
-        # cold resume proves the restored policy denies the outside path; a second
-        # public resume proves the same restored policy still permits its allowlist.
-        assert {:error, 3} =
+        # A single write-policy denial is recoverable feedback (#446), so the cold
+        # resume survives it: the restored policy denies the outside path, the
+        # model adapts, and the same restored policy still permits its allowlist
+        # in the same Turn. Two denials in one Turn would still be terminal.
+        assert :ok =
                  CLI.route(["resume", child_sid, "attempt the outside write"], :auto)
-
-        assert :ok = CLI.route(["resume", child_sid, "continue inside policy"], :auto)
       end)
     after
       restore_cli_opts(previous_cli_opts)

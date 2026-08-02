@@ -1,6 +1,8 @@
 # Pixir Presenter Workspace Set v1
 
-Status: frozen (HITL approved 2026-07-14 on #339, epic #330)
+Status: frozen (HITL approved 2026-07-14 on #339, epic #330), amended in place
+on #442 (set cardinality widened from exactly 2 to a bounded 2..8 — see
+[Amendment: bounded-N set size](#amendment-bounded-n-set-size))
 Applies to: `pixir.presenter.workspace_set`, `schema_version: 1`
 JSON Schema: `schema/pixir.presenter.workspace_set.v1.schema.json`
 Embeds, verbatim and unmodified: the list document `pixir.monitor.runs` v1
@@ -11,8 +13,9 @@ Frozen inputs: resolutions of #361 and #365, inventory of #368 (verified against
 
 ## Purpose
 
-Workspace Overview projects exactly two explicitly configured local Pixir
-workspaces into one read-only overview. It is a separately versioned local
+Workspace Overview projects a bounded set of between 2 and 8 explicitly
+configured local Pixir workspaces into one read-only overview — one section per
+declared source, in declaration order. It is a separately versioned local
 contract: multi-root aggregation cannot honestly be built on the single-run
 `pixir.presenter.run.v1` contract and must not be advertised as available on it.
 
@@ -22,8 +25,9 @@ threat model; nothing in this contract may be presented as Fleet.
 
 ## Scope and exclusions
 
-- Exactly two explicit local workspaces. The set size is frozen at 2. No
-  discovery of any kind.
+- Between 2 and 8 explicit local workspaces (`2..8`, bounds inclusive). The
+  bound is real: a 9th declaration is a serve-time error, never a truncation
+  and never a silent drop of trailing declarations. No discovery of any kind.
 - Explicitly excluded: remote discovery, host identity, BEAM topology, AI chat.
 - Aggregates remain disposable read models. Per-source HTTP snapshots stay
   authoritative; run.v1 facts pass through per source; the set adds scope and
@@ -55,13 +59,14 @@ separate contract cases so neither drifts into the other:
   `=` is always a keyed declaration: split on the first `=`; the key is the
   prefix, the path is the remainder (the path may itself contain `=`). A value
   without `=` is a plain single-workspace path, exactly as today.
-- Workspace-set mode is entered by exactly two keyed declarations. All of the
+- Workspace-set mode is entered by 2 to 8 keyed declarations. All of the
   following are explicit serve-time errors, never silent reinterpretation.
   Each carries a stable machine-checkable kind token in its output (pinned by
   string contracts, fixture-enforceable):
   - exactly one keyed declaration (v1 has no labeled-single mode) —
     `workspace_declaration_single_keyed`,
-  - three or more declarations — `workspace_declaration_too_many`,
+  - more than 8 declarations — `workspace_declaration_too_many`, whose
+    `details.max_workspaces` and `next_actions` disclose the bound,
   - a mix of keyed and plain declarations — `workspace_declaration_mixed`,
   - a duplicate key — `workspace_declaration_duplicate_key`,
   - a key failing the safe-component rule —
@@ -78,7 +83,7 @@ In workspace-set mode the bootstrap shell (`GET /`) embeds a `shell_config`
 document (schema `$defs/shell_config`):
 
 ```json
-{ "mode": "workspace_set", "workspaces": ["<key>", "<key>"] }
+{ "mode": "workspace_set", "workspaces": ["<key>", "<key>", "…"] }
 ```
 
 - **Mechanism (pinned, CSP-safe):** the set-mode shell carries the
@@ -92,13 +97,14 @@ document (schema `$defs/shell_config`):
   present but malformed (bad JSON, wrong shape) renders an explicit boot
   error — never a silent fallback to single mode, which would be an
   inference.
-- `workspaces` lists the two declared keys in declaration order; declaration
+- `workspaces` lists the 2 to 8 declared keys in declaration order; declaration
   order is the stable section order everywhere (#365).
 - Keys are constants for the process lifetime; there is no index endpoint and
   nothing refetches them.
 - The single-workspace shell remains byte-identical to today and embeds
-  nothing. A `shell_config` with fewer or more than two keys, duplicate keys,
-  or an unknown `mode` is schema-invalid.
+  nothing. A `shell_config` with fewer than 2 or more than 8 keys, duplicate
+  keys, or an unknown `mode` is schema-invalid. The SPA boot validator agrees
+  with the schema at every one of those cardinalities.
 
 ## Routes
 
@@ -161,7 +167,11 @@ envelope:
     three projection-metadata keys production always enriches
     (`projected_runs`, `non_parent_logs`, `dropped_logs` — optional, since
     bare-rows providers synthesize only the quartet); the row shape remains
-    owned by the list producer.
+    owned by the list producer. Since #447 that row also carries the reduced
+    `post_terminal_child_activity` signal (`state`, `basis`, `event_count`,
+    `latest_event_at`); because the list document has no standalone JSON
+    Schema, that field is guarded by a test pinning the full row key set, not
+    by schema validation.
   - **detail** (`…/runs/:id`, schema `$defs/scoped_run_snapshot`): the
     `pixir.presenter.run.v1` document, pinned by `$ref` to the untouched
     run.v1 schema.
@@ -213,8 +223,9 @@ envelope:
   always encodes `details: {}` and must not be reused verbatim for these
   kinds). Single-workspace mode keeps its post-#371 `workspace_basename`
   shape untouched.
-- There is no set-level 503. The sibling source's routes, stream handling, and
-  rendering are unaffected by the failure (#361, #365 decision 5c).
+- There is no set-level 503. Every other declared source's routes, stream
+  handling, and rendering are unaffected by the failure (#361, #365 decision
+  5c), at any set size.
 - Unavailability is never rendered as zero, empty, or successful. A source
   with nothing held renders an explicit per-source error card: label + error
   kind, no path, retry at hand. "Source unreachable" and "run not found in a
@@ -223,8 +234,8 @@ envelope:
 
 ## Run-id collision rule
 
-Set-level run identity is `(workspace key, run id)`. Equal sids across the two
-roots are two unrelated runs: never merged, deduped, linked, or marked. No
+Set-level run identity is `(workspace key, run id)`. Equal sids across any two
+declared roots are unrelated runs: never merged, deduped, linked, or marked. No
 cross-workspace inference of any kind — the #364 no-invented-relationships
 doctrine extended to the set. The absence of any collision marker is
 deliberate and pinned by a fixture (a marker would itself be an invented
@@ -234,7 +245,7 @@ relationship).
 
 - Freshness is per source and independent: each source carries its own
   client-held observed-at; freshness is never pooled; a stale source never
-  masks the other (#361).
+  masks any other (#361).
 - The per-source observed-at is **client-held receipt state**: the SPA records
   when it received each source's snapshot. It is not a schema field and not a
   server fact.
@@ -280,18 +291,23 @@ enum.
 
 ## No set-level sums
 
-The overview is two source sections. Every count is per-source, observed-only,
-with its limitation beside it and its source's observed-at. No number
-aggregates across sources — a set total would pool freshness, and every
-degradation mode would need an inclusion rule. With the set frozen at 2, both
-addends are already in view (#365 decision 3).
+The overview is one section per declared source. Every count is per-source,
+observed-only, with its limitation beside it and its source's observed-at. No
+number aggregates across sources, at any set size. The reason is not that the
+addends are few enough to add up by eye: a set total would pool freshness
+across sources that are observed independently and fail independently, and
+every degradation mode (unavailable, stale, truncated, absent sessions
+directory) would need an inclusion rule that the sum itself could not confess
+(#365 decision 3, restated for bounded N on #442). Every addend stays visible
+in its own section with its own confessions beside it; that is the honest
+presentation at 2 sources and at 8.
 
 ## Attention and layout
 
 Each source section renders, in order: its source condition (error card /
 degradation banner) first, then its run-level attention region (the #364 order
 intact: families worst-first, members by `seq`), then its healthy region.
-Section order between the two sources is declaration order — stable, never
+Section order across the declared sources is declaration order — stable, never
 reshuffled by state; attention is signaled by the banner, not by layout
 movement. There is no interleaved set-level attention region: `seq` does not
 cross sources and timestamps are banned as an ordering axis, so an interleaved
@@ -307,7 +323,8 @@ execution surface; neither is re-litigated here.
 
 ## SSE invalidation
 
-- ONE shared stream at `GET /api/events` for both sources.
+- ONE shared stream at `GET /api/events` for all declared sources, carrying one
+  global monotonic sequence regardless of set size.
 - The set-mode frame (schema `$defs/invalidation_frame`) is a strict
   frame-shape change:
 
@@ -334,6 +351,11 @@ no hand-authored goldens. Positive scenarios:
 
 1. `ws-two-healthy` — both sources projecting; declaration order; per-source
    counts with `sessions_directory: "observed"`.
+1b. `ws-bounded-n` (#442) — a set of at least three sources exercised end to
+   end: declaration, shell embed in declaration order, scoped routes per key,
+   per-source SSE invalidation on the one shared sequence, and per-source
+   failure isolation. Pins the widened cardinality as regression, not as mere
+   permission.
 2. `ws-zero-observed` — one source with an observed sessions directory and 0
    Session Logs; a real zero, no attention condition.
 3. `ws-zero-absent` — one source with no `.pixir/sessions` directory;
@@ -361,8 +383,8 @@ Mandatory negative cases (#362 style):
    `snapshot` that fails the run.v1 schema; a `snapshot` that differs from
    the single-mode response beyond the normalized clock stamps (parity
    failure).
-3. **Shell drift** — `shell_config` with one or three keys, duplicate keys, or
-   unknown `mode`.
+3. **Shell drift** — `shell_config` with one key, with nine keys, with
+   duplicate keys, or with an unknown `mode`.
 4. **Route confession** — unscoped `/api/runs[/:id]` in set mode answers 404
    `unscoped_route_unavailable`; scoped routes in single mode fall to today's
    fallback; `invalid_workspace_key` and `workspace_not_found` behave as
@@ -393,12 +415,60 @@ mutation of v1:
   or the `shell_config` shape;
 - a change to the route grammar, the key charset or bound, or the serve-time
   declaration grammar;
-- a set size other than exactly 2;
+- a set size outside `2..8`, including an unbounded or discovery-driven set;
 - a separate display-name field;
 - any server timestamp in the envelope;
 - embedding any documents other than `pixir.monitor.runs` v1 (list) and
   `pixir.presenter.run.v1` (detail);
 - any cross-workspace inference, merging, or set-level aggregate.
+
+## Amendment: bounded-N set size
+
+**Landed as a v1 amendment, not a v2** (#442, 2026-08-01). The reasoning is
+recorded here so the decision is auditable rather than inferred.
+
+What the original freeze wrote down was a cap of two sources and an explicit
+rule that any different set size requires v2. The cap was pinned
+redundantly across the declaration grammar, `WorkspaceSet.configured/0`, the
+`shell_config` schema bounds, the SPA boot validator, and operator copy — which
+made it look intrinsic. It was not. Every consumer of the set is
+cardinality-agnostic and was so from the start:
+
+- the scoped routes `/api/workspaces/:key/runs[/:id]` address one key at a time;
+- the scoped envelope (`workspace` / `source.sessions_directory` / `snapshot`)
+  and the closed scoped-error kind enum are per-source documents;
+- the SSE frame names one `workspace` on one global monotonic sequence, and the
+  anomaly path already refetches *all declared* sources rather than a pair;
+- `LogWatcher` fingerprints and publishes per workspace over the configured
+  list;
+- the SPA iterates `shellConfig.workspaces` rather than addressing two fixed
+  slots.
+
+So the cap was a declaration-and-schema knob, not a contract invariant. Moving
+it changes no key set, no route grammar, no frame shape, no key charset or
+byte bound, and no embedded document. The only wire-visible movement is the
+`shell_config.workspaces` array bound, from `2..2` to `2..8` — a widening that
+accepts strictly more documents and rejects none that were previously valid, so
+every existing v1 consumer keeps validating. A v2 would have forked the schema,
+the SPA, and the fixture inventory to express a bound that no consumer reads as
+an invariant.
+
+The upper bound of 8 is a real bound, not advice. Nine declarations fail at
+serve time with `workspace_declaration_too_many`, carrying
+`details.max_workspaces` and a `next_actions` line that discloses the range;
+nothing is truncated, reordered, or dropped. The bound exists because the set
+must stay small enough that one section per source remains readable without
+density, collapsing, or pagination work, and because per-source projection
+bounds and the SSE subscriber bound were tuned for a small set. Raising it
+past 8, or removing it, still requires v2 under the Versioning rules above.
+
+Honesty properties are unchanged at the new cardinality: declaration order is
+still the stable section order, keys are still unique and safe-component-valid,
+there are still no set-level sums, no cross-workspace inference, no set-level
+503, and no discovery. Single-workspace mode is untouched: one plain path is
+still single mode, one keyed declaration is still
+`workspace_declaration_single_keyed`, and keyed and plain declarations still
+cannot be mixed.
 
 ## Design evidence
 
@@ -413,4 +483,4 @@ under the string contracts and browser gate pinned here.
 
 - #339 (this freeze), #361 and #365 (frozen resolutions), #368 (inventory),
   #364 (honesty rules), #362 (evidence style), #349 (implementation),
-  #340 (gate), ADR 0038 (monitor foundations).
+  #340 (gate), #442 (bounded-N amendment), ADR 0038 (monitor foundations).

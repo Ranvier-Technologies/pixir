@@ -14,6 +14,14 @@ defmodule PixirMonitor.Projection.Source do
   folds only those Logs before invoking the same Presenter projector used by
   fixtures. Workspace paths are server configuration and are never accepted from
   browser ids.
+
+  Detail fetch is also the polling caller for liveness purposes: it observes the
+  same run identity tick after tick, so it — not the pure builder — records the
+  durable coordinates of each observation in
+  `PixirMonitor.Projection.ActivityLedger` and hands the builder the resulting
+  `activity_evidence` assertion. That assertion is how a nonterminal run owned by
+  another process projects the informational `externally_owned` liveness state
+  instead of the attention-weight `stale_handle`.
   """
 
   @behaviour PixirMonitor.RunSource
@@ -95,7 +103,7 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
   pass through the same fail-closed parent-evidence validation.
   """
 
-  alias PixirMonitor.Projection.{Advisory, AttemptStatus, Gate, Temporal, UnitIdentity, WorkflowGraph}
+  alias PixirMonitor.Projection.{Advisory, AttemptStatus, Builder, Gate, Temporal, UnitIdentity, WorkflowGraph}
 
   require Logger
 
@@ -105,6 +113,7 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
   @default_max_events 20_000
   @subagent_lifecycle_events ~w(queued started input retrying finished failed timed_out cancelled detached closed)
   @terminal_subagent_statuses ~w(completed failed timed_out cancelled detached closed)
+  @post_terminal_basis "child_events_after_parent_terminal_boundary"
 
   @impl true
   @spec list_runs(keyword()) :: {:ok, map()} | {:error, map()}
@@ -117,7 +126,7 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
           case parent_history(id, workspace, opts) do
             {:ok, history} ->
               if run_parent?(history) do
-                case list_row(id, history) do
+                case list_row(id, history, workspace, opts) do
                   {:ok, row} -> {[row | rows], dropped, non_parent_logs}
                   {:error, error} -> {rows, [error | dropped], non_parent_logs}
                 end
@@ -184,6 +193,7 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
          {:ok, children, missing?} <- child_histories(parent, workspace, opts) do
       diagnostics = diagnostics(id, workspace)
       owner = owner_state(diagnostics)
+      parent_events = Enum.map(parent, &portable_event/1)
 
       {:ok,
        %{
@@ -192,11 +202,12 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
          "inputs" => %{
            "terminal_envelope" => nil,
            "delegate_snapshot" => nil,
-           "parent_log" => Enum.map(parent, &portable_event/1),
+           "parent_log" => parent_events,
            "parent_log_origin" => "workspace_log",
            "child_logs" => children,
            "runtime_diagnostics" => diagnostics,
            "owner_state" => owner,
+           "activity_evidence" => activity_evidence(id, parent_events),
            "evidence_mirror" => nil
          },
          "completeness" => %{
@@ -416,6 +427,18 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
     _, _ -> nil
   end
 
+  # This provider is the polling caller: it is the component that observes the
+  # same run identity tick after tick, so it — not the pure builder — is the
+  # component permitted to say whether durable evidence advanced. It hands the
+  # builder an assertion derived only from durable Log coordinates it already
+  # carries; no wall clock, no SSE state, no projection comparison.
+  defp activity_evidence(id, parent_events) do
+    seq = parent_events |> Enum.map(& &1["seq"]) |> Enum.filter(&is_integer/1) |> Enum.max(fn -> nil end)
+    at = parent_events |> Enum.map(& &1["ts"]) |> Enum.filter(&is_binary/1) |> Enum.max(fn -> nil end)
+
+    PixirMonitor.Projection.ActivityLedger.observe(id, seq, at)
+  end
+
   defp owner_state(nil), do: nil
 
   defp owner_state(diagnostics) do
@@ -423,7 +446,7 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
     %{"state" => if(reachable, do: "live_delegate_owner", else: "snapshot_only"), "reachable" => reachable}
   end
 
-  defp list_row(id, history) do
+  defp list_row(id, history, workspace, opts) do
     events = Enum.map(history, &portable_event/1)
     workflow = Enum.find(events, &(&1["type"] == "workflow_event" and get_in(&1, ["data", "kind"]) == "workflow_started"))
     finish = events |> Enum.filter(&(&1["type"] == "workflow_event" and get_in(&1, ["data", "kind"]) == "workflow_finished")) |> List.last()
@@ -503,7 +526,8 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
       "mutation" => %{"status" => "unknown", "observed_semantics" => "unknown"},
       "children" => list_children(subs, workflow_index),
       "latest_at" => latest_at,
-      "temporal" => Temporal.row_temporal(workflow, finish, subs, latest_at, all_terminal?)
+      "temporal" => Temporal.row_temporal(workflow, finish, subs, latest_at, all_terminal?),
+      "post_terminal_child_activity" => list_post_terminal_child_activity(events, terminal, workspace, opts)
     }
 
     with :ok <- safe_id(id),
@@ -511,6 +535,83 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
       {:ok, row}
     end
   end
+
+  # Reduced #447 Phase 1 signal for a list row.
+  #
+  # Every OTHER list dimension stays a strict parent-only fold. This one consults
+  # child Logs to exactly the depth the signal requires — the count of canonical
+  # child events after the parent's terminal boundary and the latest such
+  # timestamp — and nothing else: no child prose, no child usage, no child status.
+  # It can never make a row claim liveness: `liveness` is still derived from
+  # `list_liveness/1` with basis `parent_log_only`, and a child Log is durable
+  # evidence of past writes, never of a reachable process.
+  #
+  # The boundary comes from `Builder.terminal_boundary_from_events/1`, the SAME
+  # parent-only derivation the detail projection uses, so a row and its detail
+  # can never disagree about when the parent ended.
+  defp list_post_terminal_child_activity(events, terminal, workspace, opts) do
+    if terminal do
+      list_terminal_child_activity(events, Builder.terminal_boundary_from_events(events), workspace, opts)
+    else
+      %{"state" => "not_applicable", "basis" => "nonterminal_execution", "event_count" => nil, "latest_event_at" => nil}
+    end
+  end
+
+  defp list_terminal_child_activity(_events, {nil, _basis}, _workspace, _opts),
+    do: %{"state" => "undetermined", "basis" => "terminal_boundary_unavailable", "event_count" => nil, "latest_event_at" => nil}
+
+  defp list_terminal_child_activity(events, {boundary_at, _basis}, workspace, opts) do
+    ids =
+      events
+      |> Enum.filter(&(&1["type"] == "subagent_event"))
+      |> Enum.map(&get_in(&1, ["data", "child_session_id"]))
+      |> Enum.filter(&is_binary/1)
+      |> Enum.uniq()
+
+    Enum.reduce_while(ids, {[], false}, fn id, {timestamps, _unavailable} ->
+      case parent_history(id, workspace, opts) do
+        {:ok, child} ->
+          later =
+            child
+            |> Enum.map(& &1.ts)
+            |> Enum.filter(&(is_binary(&1) and after_boundary?(&1, boundary_at)))
+
+          {:cont, {timestamps ++ later, false}}
+
+        {:error, _reason} ->
+          {:halt, {[], true}}
+      end
+    end)
+    |> case do
+      {_timestamps, true} ->
+        %{"state" => "undetermined", "basis" => "child_evidence_unavailable", "event_count" => nil, "latest_event_at" => nil}
+
+      {[], false} ->
+        %{"state" => "none", "basis" => @post_terminal_basis, "event_count" => 0, "latest_event_at" => nil}
+
+      {timestamps, false} ->
+        %{
+          "state" => "observed",
+          "basis" => @post_terminal_basis,
+          "event_count" => length(timestamps),
+          "latest_event_at" => Temporal.max_instant(timestamps)
+        }
+    end
+  end
+
+  # Guarded exactly like the detail fold's twin: `DateTime.from_iso8601/1` has a
+  # binary guard and would raise `FunctionClauseError` on a non-binary boundary,
+  # aborting the whole `list_runs/1` request over one malformed Log row.
+  defp after_boundary?(ts, boundary_at) when is_binary(ts) and is_binary(boundary_at) do
+    with {:ok, event_at, _offset} <- DateTime.from_iso8601(ts),
+         {:ok, boundary, _boundary_offset} <- DateTime.from_iso8601(boundary_at) do
+      DateTime.compare(event_at, boundary) == :gt
+    else
+      _ -> false
+    end
+  end
+
+  defp after_boundary?(_ts, _boundary_at), do: false
 
   # List scope rereads the parent Log only: it never consults owner diagnostics,
   # clocks, SSE state, timestamps, or prose, so it can never claim "live". A

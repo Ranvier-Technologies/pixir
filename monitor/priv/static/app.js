@@ -41,9 +41,23 @@
   const COMPLETENESS_RANK = Object.freeze({complete: 0, incomplete: 1, unknown: 2, malformed: 3});
   const MARKER_TONES = new Set([
     "planned", "queued", "running", "completed", "partial", "failed", "timed_out", "cancelled", "detached", "closed", "held", "unknown",
-    "live", "stale_handle", "owner_unavailable", "unobserved", "not_applicable", "reconstructed", "mixed", "workflow", "subagents",
-    "needs_orchestrator", "checkpoint_ready", "ready", "stop", "needs_review", "pass", "invalid", "workspace_applied", "indeterminate", "not_applied", "current"
+    "live", "externally_owned", "stale_handle", "owner_unavailable", "unobserved", "not_applicable", "reconstructed", "mixed", "workflow", "subagents",
+    "needs_orchestrator", "checkpoint_ready", "ready", "stop", "needs_review", "pass", "invalid", "workspace_applied", "indeterminate", "not_applied", "current",
+    // #447 post-terminal child activity. "observed" reads as attention (the run
+    // is narratively incomplete), "undetermined" as attention (evidence is
+    // missing, and missing evidence is never a clean bill), "none" as muted.
+    "observed", "none", "undetermined"
   ]);
+  // Advisory display contract (#441). The bucket order is the frozen display
+  // severity ordering stop > needs_review > pass > unknown, with invalid counted
+  // separately and never given an invented verdict. The alias map renames only
+  // the human-readable label of the `unknown` bucket: a model advisory was
+  // present but its verdict was not classifiable, which is a different fact from
+  // "no advisory". Absence never reaches a bucket at all — the
+  // `advisory.present === true` guard in each count reader excludes it. Tone and
+  // severity keep reading the raw token, so this alias changes no classification.
+  const ADVISORY_BUCKET_ORDER = Object.freeze(["stop", "needs_review", "pass", "unknown", "invalid"]);
+  const ADVISORY_DISPLAY_ALIASES = Object.freeze({unknown: "unclassified verdict"});
   const app = document.getElementById("app");
   const status = document.getElementById("status");
   const shell = document.querySelector("body > main");
@@ -53,7 +67,7 @@
     try { value = JSON.parse(shell.getAttribute("data-workspace-set")); } catch (_error) { throw new Error("workspace set shell config is malformed"); }
     const exact = value && !Array.isArray(value) && Object.keys(value).sort().join(",") === "mode,workspaces";
     const keys = exact && Array.isArray(value.workspaces) ? value.workspaces : [];
-    const validKeys = keys.length === 2 && new Set(keys).size === 2 && keys.every(function (key) { return typeof key === "string" && key.length <= 256 && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(key); });
+    const validKeys = keys.length >= 2 && keys.length <= 8 && new Set(keys).size === keys.length && keys.every(function (key) { return typeof key === "string" && key.length <= 256 && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(key); });
     if (!exact || value.mode !== "workspace_set" || !validKeys) throw new Error("workspace set shell config has an invalid shape");
     return Object.freeze({mode: value.mode, workspaces: Object.freeze(keys.slice())});
   }
@@ -95,7 +109,19 @@
     restore: null,
     pendingAttemptScroll: null,
     detailConflict: false,
-    forceRefetch: false
+    forceRefetch: false,
+    // Parent-observed child resolution (#438). resolutionFor names the run id
+    // whose LAST authoritative response was a structured run_not_found; only
+    // that id may be offered a resolved parent. resolutionFailure is the failure
+    // to repaint after a one-shot inventory acquisition; resolutionInFlight
+    // bounds that acquisition to a single request. resolutionAttemptedFor names
+    // the id whose acquisition has ALREADY been attempted, which is what makes
+    // the bound terminal: a repaint over an inventory that came back empty or
+    // failed cannot re-enter acquisition for the same id.
+    resolutionFor: null,
+    resolutionFailure: null,
+    resolutionInFlight: null,
+    resolutionAttemptedFor: null
   };
   const SUPERSEDED = Symbol("superseded");
 
@@ -199,6 +225,14 @@
     return node;
   }
   function titleCase(value) { return scalar(value, "unknown").replaceAll("_", " "); }
+  /**
+   * Display label for one bucket of a distribution. Aliases rename the visible
+   * token only; the raw value still drives tone, severity, and ordering.
+   * @param {*} value Raw bucket token from the projection.
+   * @param {?Object} aliases Optional display-alias map keyed by raw token.
+   * @returns {string} Human-readable bucket label.
+   */
+  function distributionValueLabel(value, aliases) { return (aliases && aliases[value]) || titleCase(value); }
   function markerTone(value) { const tone = scalar(value, "unknown"); return MARKER_TONES.has(tone) ? tone : "unknown"; }
   function marker(value, dimension, basis) {
     return labeledMarker(titleCase(value), value, dimension, basis);
@@ -516,9 +550,177 @@
     if (livenessState === "not_applicable") return "Terminal per parent Log; liveness does not apply.";
     return null;
   }
+  /**
+   * Short label for the post-terminal child-activity dimension. A child Log is
+   * durable evidence of PAST writes, so this never reads as a liveness or
+   * reachability claim: it says work was recorded after the parent ended, and
+   * nothing about whether anything is running now.
+   * @param {Object} activity post_terminal_child_activity, list or detail form.
+   * @returns {string} Label text.
+   */
+  function postTerminalLabel(activity) {
+    const state = activity && activity.state;
+    if (state === "observed") return scalar(activity.event_count, "?") + " child events after the run ended";
+    if (state === "none") return "No child events after the run ended";
+    if (state === "undetermined") return "Undetermined (child evidence unavailable)";
+    if (state === "not_applicable") return "Not applicable (run is not terminal)";
+    return "Unknown";
+  }
+  /**
+   * Names the parent-only evidence the boundary and the count came from, so the
+   * reader can see this is not a wall-clock or SSE-derived claim.
+   * @param {Object} activity post_terminal_child_activity, list or detail form.
+   * @returns {string} Provenance note.
+   */
+  function postTerminalNote(activity) {
+    const state = activity && activity.state;
+    if (state === "undetermined") return "Child Log unavailable; absence of post-terminal activity is not asserted.";
+    if (state === "not_applicable") return "No terminal boundary exists yet, so no event can be after it.";
+    return "Boundary derived from parent Log evidence only; counted from child Log writes, not from any reachability observation.";
+  }
+  function postTerminalCell(activity) {
+    const cell = el("td", "post-terminal-cell");
+    const state = activity && activity.state;
+    const tone = scalar(state, "unknown");
+    const node = text("span", postTerminalLabel(activity), "post-terminal post-terminal-" + tone + " marker marker-" + tone);
+    node.dataset.postTerminalState = scalar(state, "unknown");
+    node.dataset.provenance = scalar(activity && activity.basis, "unknown");
+    cell.append(node);
+    if (activity && activity.latest_event_at) cell.append(untrustedText("span", scalar(activity.latest_event_at, "Unknown"), "absolute-ts"));
+    cell.append(text("span", postTerminalNote(activity), "post-terminal-basis"));
+    return cell;
+  }
   function listRows(payload) {
     if (payload && Array.isArray(payload.runs)) return payload.runs;
     return Array.isArray(payload) ? payload : [];
+  }
+  /**
+   * Resolves a Session id against the parent-observed `children` already carried
+   * by held authoritative list rows (issue #438). This is the ONLY resolution
+   * primitive: a pure, side-effect-free, EXACT-equality scan. It never reads a
+   * child Log, never builds or persists an index, and never touches the network.
+   * Every in-scope observer is returned in held-inventory order — ambiguity is
+   * surfaced, never resolved by silently picking one.
+   * @param {*} sessionId Requested Session id (only a non-empty string can match).
+   * @param {*} rows Held authoritative list rows for the routed scope.
+   * @returns {Array<{runId: string, unitId: (string|null), childSessionId: string}>}
+   */
+  function resolveParentObservedChild(sessionId, rows) {
+    if (typeof sessionId !== "string" || !sessionId) return [];
+    const candidates = [];
+    array(rows).forEach(function (row) {
+      const runId = scalar(row && row.id, "");
+      if (!runId) return;
+      array(row && row.children).forEach(function (child) {
+        if (!child || typeof child !== "object") return;
+        // Exact equality between two strings: no prefix, substring, or case
+        // folding, and a non-string session_id is rejected before comparison
+        // rather than coerced into something that could collide with a real id.
+        if (typeof child.session_id !== "string" || child.session_id !== sessionId) return;
+        const unitId = typeof child.unit_id === "string" && child.unit_id ? child.unit_id : null;
+        candidates.push({runId: runId, unitId: unitId, childSessionId: sessionId});
+      });
+    });
+    return candidates;
+  }
+  /**
+   * The authoritative list rows held for the ROUTED scope. In workspace-set mode
+   * only the routed workspace's snapshot is consulted, so a child observed in a
+   * sibling workspace can never resolve here.
+   * @param {Object} route Parsed route.
+   * @returns {Array<Object>}
+   */
+  function heldInventoryRows(route) {
+    if (workspaceSetMode()) { const scoped = workspaceSnapshots[route.workspace]; return scoped && scoped.list ? listRows(scoped.list.snapshot) : []; }
+    return listRows(state.list);
+  }
+  /**
+   * Acquires the scoped inventory through the ordinary authoritative list path
+   * when it is not currently held, then repaints the same dead end so resolution
+   * is attempted against real evidence. No mapping is ever fabricated: a failed
+   * or empty acquisition leaves the dead end exactly as it was, and the operator
+   * is never moved.
+   * @param {Object} route Parsed route whose runId hit run_not_found.
+   * @returns {void}
+   */
+  function acquireInventoryForResolution(route) {
+    // ONE acquisition per resolved-for id, terminally. The marker is recorded
+    // BEFORE the request is issued and is never cleared by the acquisition
+    // itself, so the repaint this acquisition triggers cannot re-enter here —
+    // not even when the acquired inventory came back empty or failed, which is
+    // exactly the "evidence unavailable" case. Only renderProjectionFailure
+    // moving resolutionFor to a DIFFERENT id clears it.
+    if (state.resolutionInFlight || state.resolutionAttemptedFor === route.runId) return;
+    state.resolutionAttemptedFor = route.runId;
+    // The ordinary authoritative list paths, reused verbatim: the workspace-set
+    // branch goes through refetchWorkspaceList (same per-source arbitration and
+    // snapshot bookkeeping as every other list acquisition), and single mode
+    // through the same /api/runs request the Runs view issues.
+    // Single mode commits under the navigation generation captured BEFORE the
+    // request, so a late acquisition can never overwrite a newer state.list —
+    // the workspace-set branch already arbitrates per source through
+    // sourceRequestGeneration, which is why it passes null there.
+    const acquisitionGeneration = state.generation;
+    const request = workspaceSetMode()
+      ? refetchWorkspaceList(route.workspace, null)
+      : fetchJSON("/api/runs", acquisitionGeneration).then(function (payload) {
+          if (payload === SUPERSEDED || acquisitionGeneration !== state.generation) return;
+          state.list = payload;
+        });
+    state.resolutionInFlight = request.catch(function () {}).finally(function () {
+      const current = parseRoute(location.hash);
+      const failure = state.resolutionFailure;
+      // Repaint only the dead end that asked for this inventory, and only while
+      // it is still the rendered view. Acquisition never navigates. The
+      // in-flight handle is released only AFTER the repaint has run, so the
+      // repaint observes an acquisition still in progress even if the attempt
+      // marker were ever weakened.
+      try {
+        if (failure && current.runId === route.runId && state.resolutionFor === route.runId && app.querySelector(".error-view")) renderProjectionFailureSafely(failure);
+      } finally { state.resolutionInFlight = null; }
+    });
+  }
+  /**
+   * Builds the resolved-parent affordance for a run_not_found dead end whose
+   * requested id is an exact parent-observed child in the held scoped inventory.
+   * Returns null whenever nothing resolves, so the unresolved dead end keeps its
+   * copy and action set byte-identical. It renders LINKS only: activating one is
+   * an explicit operator action, and nothing here navigates on its own.
+   * @param {Object} route Parsed route.
+   * @returns {HTMLElement|null}
+   */
+  function parentResolutionPanel(route) {
+    if (!route.runId || state.resolutionFor !== route.runId) return null;
+    const candidates = resolveParentObservedChild(route.runId, heldInventoryRows(route));
+    if (!candidates.length) return null;
+    const section = el("section", "parent-resolution");
+    section.setAttribute("role", "status");
+    section.append(heading(2, "Parent-observed child Session"));
+    const summary = candidates.length > 1 ? "This Session id is observed as a child by " + candidates.length + " parent runs in the held inventory. No parent was selected for you; choose one." : "This Session id is a parent-observed child of the run below.";
+    section.append(untrustedText("p", "The requested id " + route.runId + " is not a projectable run. " + summary, "empty-state"));
+    const list = el("ul", "parent-resolution-candidates");
+    candidates.forEach(function (candidate) {
+      const item = el("li");
+      const target = candidate.unitId ? routeHash({workspace: route.workspace, runId: candidate.runId, unitId: candidate.unitId, filters: route.filters, sort: route.sort, q: route.q}) : routeHash({workspace: route.workspace, runId: candidate.runId, filters: route.filters, sort: route.sort, q: route.q});
+      const label = "Open parent run " + candidate.runId + (candidate.unitId ? " → logical unit " + candidate.unitId : " (owning logical unit not identified in parent evidence)");
+      item.append(projectedLink(label, target, "parent-resolution-" + candidate.runId));
+      list.append(item);
+    });
+    section.append(list);
+    section.append(text("p", "Basis: parent-observed child evidence from parent Session Logs only. The child Session itself was not projected, fetched, or observed for liveness; no freshness is claimed for it.", "provenance"));
+    return section;
+  }
+  /**
+   * Appends the resolution outcome to a dead end's status line — and contributes
+   * nothing at all when nothing resolved, so the unresolved status line stays
+   * byte-identical to what it has always been.
+   * @param {Object} route Parsed route.
+   * @returns {string}
+   */
+  function resolutionStatusSuffix(route) {
+    if (!route.runId || state.resolutionFor !== route.runId) return "";
+    const candidates = resolveParentObservedChild(route.runId, heldInventoryRows(route));
+    return candidates.length ? " · owning parent run resolved from parent-observed child evidence" : "";
   }
   function filtersPanel(route) {
     const form = el("form", "filters");
@@ -593,7 +795,7 @@
     const recognized = new Set(order);
     order.forEach(function (name) {
       const count = Number(counts && counts[name]) || 0;
-      if (count > 0) wrap.append(labeledMarker(count + " " + ((aliases && aliases[name]) || titleCase(name)), name, dimension, basis));
+      if (count > 0) wrap.append(labeledMarker(count + " " + distributionValueLabel(name, aliases), name, dimension, basis));
     });
     const residual = Object.keys(counts && typeof counts === "object" ? counts : {}).reduce(function (total, name) {
       if (recognized.has(name)) return total;
@@ -628,7 +830,7 @@
     const table = el("table", "runs-table");
     const caption = text("caption", group + " runs"); caption.className = "sr-only"; table.append(caption);
     const head = el("thead"); const hr = el("tr");
-    ["Run", "Strategy", "Execution", "Liveness", "Gate", "Advisory", "Source", "Units", "Mutation", "Duration", "Latest"].forEach(function (name) { hr.append(text("th", name)); });
+    ["Run", "Strategy", "Execution", "Liveness", "Gate", "Advisory", "Source", "Units", "Mutation", "Duration", "Latest", "Child after end"].forEach(function (name) { hr.append(text("th", name)); });
     head.append(hr); table.append(head);
     const body = el("tbody");
     rows.forEach(function (row) {
@@ -659,7 +861,7 @@
       const gateMarkers = distributionMarkers(row.gate_counts, ["needs_orchestrator", "failed", "held", "partial", "unknown", "checkpoint_ready", "not_applicable"], {checkpoint_ready: "ready"}, "gate distribution", "parent_log_only");
       if (!gateMarkers.childNodes.length) gateCell.append(text("span", "—")); else gateCell.append(gateMarkers); tr.append(cellLabel(gateCell, "Gate"));
       const advisoryCell = el("td");
-      const advisoryMarkers = distributionMarkers(row.advisory_counts, ["stop", "needs_review", "pass", "unknown", "invalid"], null, "advisory distribution", "parent_log_only");
+      const advisoryMarkers = distributionMarkers(row.advisory_counts, ADVISORY_BUCKET_ORDER, ADVISORY_DISPLAY_ALIASES, "advisory distribution", "parent_log_only");
       if (!advisoryMarkers.childNodes.length) advisoryCell.append(text("span", "—")); else advisoryCell.append(advisoryMarkers); tr.append(cellLabel(advisoryCell, "Advisory"));
       const source = el("td"); source.append(marker(row.source && row.source.mode, "source")); tr.append(cellLabel(source, "Source"));
       tr.append(cellLabel(text("td", scalar(row.counts && row.counts.completed_units, "0") + "/" + scalar(row.counts && row.counts.planned_units, "?")), "Units"));
@@ -678,6 +880,7 @@
       if (relative) latestCell.append(text("span", relative, "relative-label"));
       if (latest.completeness === "malformed") latestCell.append(text("span", "Malformed timestamp", "relative-label duration-completeness-malformed"));
       tr.append(cellLabel(latestCell, "Latest"));
+      tr.append(cellLabel(postTerminalCell(row.post_terminal_child_activity), "Child after end"));
       body.append(tr);
     });
     table.append(body);
@@ -744,7 +947,7 @@
     const root = el("div", "view runs-view");
     root.append(heading(1, "Runs"));
     root.append(text("p", "Authoritative, recomputable projections. The monitor is read-only.", "lede"));
-    root.append(text("p", "List rows are reconstructed from the parent Log only and carry no activity observation. Opening a run may load additional evidence (owner diagnostics), so row and detail liveness can legitimately differ.", "lede provenance"));
+    root.append(text("p", "List rows are reconstructed from the parent Log only and carry no liveness observation; the sole exception is \"Child after end\", which counts child Log (or verified-mirror) writes after the parent's terminal boundary and still never asserts reachability. Opening a run may load additional evidence (owner diagnostics), so row and detail liveness can legitimately differ.", "lede provenance"));
     root.append(filtersPanel(route));
     root.append(searchPanel(route));
     const inventoryFacts = state.list && state.list.inventory;
@@ -788,6 +991,27 @@
     setStatus("Read-only · authoritative snapshots · " + all.length + " runs");
   }
 
+  function livenessState(run) { return run.liveness && run.liveness.state; }
+  function livenessBasis(run) { return run.liveness && run.liveness.basis; }
+  /**
+   * Detail-scope Liveness truth-card copy.
+   *
+   * Owner residency and owner brokenness are different claims. "externally_owned"
+   * means the Delegate owner is simply another process — the ordinary condition
+   * for read-only external observation — while the durable parent Log confirms
+   * the run is advancing. That is an epistemic position, not a fault, so the copy
+   * must not say the run is unreachable as if something were wrong. Reachability
+   * itself stays honestly false in the projection.
+   *
+   * @param {Object} run Projected run detail.
+   * @returns {string} Card copy for the projected liveness state.
+   */
+  function livenessCardNote(run) {
+    const state = livenessState(run);
+    if (state === "externally_owned") return "Owner is another process; activity confirmed from durable Log evidence.";
+    if (run.liveness && run.liveness.reachable === true) return "Reachable now";
+    return "Not currently reachable";
+  }
   function truthCard(label, dimension, value, basis, extra) {
     const card = el("section", "truth-card");
     card.dataset.truthDimension = dimension;
@@ -813,27 +1037,78 @@
   }
   function truthRail(run) {
     const rail = el("div", "truth-rail");
-    rail.setAttribute("aria-label", "Six independent truth dimensions");
+    rail.setAttribute("aria-label", "Seven independent truth dimensions");
     rail.append(truthCard("Execution", "execution", run.execution && run.execution.state, run.execution && run.execution.basis));
-    rail.append(truthCard("Liveness", "liveness", run.liveness && run.liveness.state, run.liveness && run.liveness.basis, run.liveness && run.liveness.reachable === true ? "Reachable now" : "Not currently reachable"));
+    rail.append(truthCard("Liveness", "liveness", livenessState(run), livenessBasis(run), livenessCardNote(run)));
     const gateCounts = stateCounts(run.units, function (unit) { return unit.gate && unit.gate.state; });
     const advisoryCounts = stateCounts(run.units, function (unit) { return unit.advisory && unit.advisory.present === true ? unit.advisory.verdict : null; }, function (unit) { return unit.advisory && unit.advisory.present === true && unit.advisory.parse_status === "invalid"; });
     rail.append(distributionCard("Dependency gate", "gate", gateCounts, ["needs_orchestrator", "failed", "held", "partial", "unknown", "checkpoint_ready", "not_applicable"], {checkpoint_ready: "ready"}, "unit checkpoint fold"));
-    rail.append(distributionCard("Model advisory", "advisory", advisoryCounts, ["stop", "needs_review", "pass", "unknown", "invalid"], null, "model declared", "Advisory does not control the runtime gate."));
+    rail.append(distributionCard("Model advisory", "advisory", advisoryCounts, ADVISORY_BUCKET_ORDER, ADVISORY_DISPLAY_ALIASES, "model declared", "Advisory does not control the runtime gate."));
     rail.append(truthCard("Source (run-scoped)", "source", run.source && run.source.mode, run.source && run.source.durable_origin, "Freshness: " + titleCase(run.source && run.source.freshness) + "; limitations: " + (array(run.source && run.source.limitations).map(titleCase).join(", ") || "none observed")));
     const attentionCounts = stateCounts(run.units, function (unit) { return unit.attention && unit.attention.required === true ? "yes" : "no"; });
     rail.append(distributionCard("Attention (parent-observed)", "attention", attentionCounts, ["yes", "no"], {yes: "required", no: "not required"}, "parent log"));
+    rail.append(postTerminalCard(run.post_terminal_child_activity));
     return rail;
+  }
+  /**
+   * Detail truth card for post-terminal child activity. It REPORTS: nothing
+   * here reclassifies execution, and it can never claim reachability. The card
+   * names its basis, the parent-derived boundary it was measured from, and the
+   * child Sessions whose Logs supplied the evidence.
+   * @param {Object} activity run.post_terminal_child_activity.
+   * @returns {Element} Truth card section.
+   */
+  function postTerminalCard(activity) {
+    const card = el("section", "truth-card");
+    card.dataset.truthDimension = "post_terminal_child_activity";
+    card.dataset.postTerminalState = scalar(activity && activity.state, "unknown");
+    card.append(heading(3, "Child activity after end"));
+    card.append(marker(scalar(activity && activity.state, "unknown"), "post-terminal", activity && activity.basis));
+    card.append(text("p", postTerminalLabel(activity), "truth-extra"));
+    if (activity && activity.latest_event_at) card.append(untrustedText("p", "Latest child event: " + activity.latest_event_at, "provenance"));
+    if (activity && activity.boundary_at) card.append(untrustedText("p", "Parent terminal boundary: " + activity.boundary_at + " (" + titleCase(activity.boundary_basis) + ")", "provenance"));
+    const sessions = array(activity && activity.child_session_ids);
+    if (sessions.length) {
+      const list = el("ul", "post-terminal-sessions");
+      sessions.slice(0, LIMITS.evidence).forEach(function (sessionId) { const item = el("li"); projected(item, "code", sessionId); list.append(item); });
+      card.append(text("p", "Child Logs that supplied the evidence:", "provenance"));
+      card.append(list);
+    }
+    card.append(text("p", postTerminalNote(activity), "provenance"));
+    card.append(text("p", "Reported, not reclassified: canonical execution and liveness are unchanged by this observation.", "provenance"));
+    return card;
   }
   function mutationPanel(mutation) {
     const section = el("section", "mutation-panel");
     section.append(heading(2, "Mutation observation"));
-    section.append(marker(mutation && mutation.status, "mutation", mutation && mutation.observed_semantics));
+    section.append(marker(mutation && mutation.status, "mutation", mutation && mutation.basis));
     section.append(text("p", "Observed semantics: " + titleCase(mutation && mutation.observed_semantics), "provenance"));
+    section.append(text("p", "Evidence basis: " + titleCase(mutation && mutation.basis), "provenance"));
     const paths = array(mutation && mutation.observed_paths);
     if (paths.length) { const list = el("ul"); paths.slice(0, LIMITS.evidence).forEach(function (path) { const item = el("li"); projected(item, "code", path); list.append(item); }); section.append(list); }
+    section.append(writeDenials(mutation));
     array(mutation && mutation.limitations).forEach(function (item) { section.append(untrustedText("p", titleCase(item), "limitation")); });
     return section;
+  }
+  // Denials are read-only observation: the operator sees which write was refused,
+  // by which rule, and under which policy, without opening the child Log.
+  function writeDenials(mutation) {
+    const denials = array(mutation && mutation.write_denials);
+    const region = el("div", "write-denials");
+    if (!denials.length) return region;
+    region.append(heading(3, "Write denials (" + denials.length + ")"));
+    const list = el("ul");
+    denials.slice(0, LIMITS.evidence).forEach(function (denial) {
+      const item = el("li", "write-denial");
+      projected(item, "code", denial.normalized_path || denial.requested_path);
+      item.append(untrustedText("span", " · " + titleCase(denial.matched_rule), "denial-rule"));
+      const policy = denial.policy_id ? denial.policy_id + (denial.policy_hash ? " · " + denial.policy_hash : "") : "unknown policy";
+      item.append(untrustedText("span", " · " + policy, "provenance"));
+      list.append(item);
+    });
+    region.append(list);
+    if (denials.length > LIMITS.evidence) region.append(text("p", "Showing " + LIMITS.evidence + " of " + denials.length + " observed denials.", "truncation"));
+    return region;
   }
   function unitSummary(run, unit, route, summaryFocusKey) {
     const article = el("article", "unit-card");
@@ -982,18 +1257,21 @@
     const observed = entity.members.filter(function (id) { return Boolean(lookup[id]); }).length;
     const limitations = semanticZoomLimitations(run, entity, lookup);
     summary.append(text("p", observed + " observed member" + (observed === 1 ? "" : "s") + (limitations.length ? " · limited: " + limitations.map(titleCase).join(", ") : ""), limitations.length ? "limitation" : "provenance"));
+    // Fourth slot is the optional display-alias map: the cluster row must call
+    // the advisory `unknown` bucket exactly what the truth rail and the Runs
+    // list call it, so the three surfaces never disagree about one bucket.
     const dimensions = [
-      ["Execution", "execution", function (unit) { return unit.execution && unit.execution.state; }],
-      ["Liveness", "liveness", function (unit) { return unit.liveness && unit.liveness.state; }],
-      ["Dependency gate", "gate", function (unit) { return unit.gate && unit.gate.state; }],
-      ["Model advisory", "advisory", function (unit) { return unit.advisory && unit.advisory.present === true ? (unit.advisory.parse_status === "invalid" ? "invalid" : unit.advisory.verdict) : null; }],
-      ["Attention", "attention", function (unit) { return unit.attention && unit.attention.required === true ? "yes" : "no"; }]
+      ["Execution", "execution", function (unit) { return unit.execution && unit.execution.state; }, null],
+      ["Liveness", "liveness", function (unit) { return unit.liveness && unit.liveness.state; }, null],
+      ["Dependency gate", "gate", function (unit) { return unit.gate && unit.gate.state; }, null],
+      ["Model advisory", "advisory", function (unit) { return unit.advisory && unit.advisory.present === true ? (unit.advisory.parse_status === "invalid" ? "invalid" : unit.advisory.verdict) : null; }, ADVISORY_DISPLAY_ALIASES],
+      ["Attention", "attention", function (unit) { return unit.attention && unit.attention.required === true ? "yes" : "no"; }, null]
     ];
     dimensions.forEach(function (dimension) {
       const row = el("p", "cluster-distribution"); row.dataset.truthDimension = dimension[1]; row.append(text("strong", dimension[0] + ": "));
       const counts = semanticZoomDistribution(entity.members, lookup, dimension[2]);
       const values = Object.keys(counts).sort();
-      row.append(text("span", values.length ? values.map(function (value) { return titleCase(value) + " " + counts[value]; }).join(" · ") : "0 observed"));
+      row.append(text("span", values.length ? values.map(function (value) { return distributionValueLabel(value, dimension[3]) + " " + counts[value]; }).join(" · ") : "0 observed"));
       summary.append(row);
     });
     return summary;
@@ -1337,8 +1615,13 @@
     }
     root.append(button("Refetch authoritative snapshot", function () { refreshSingleFlight(options.retryReason); }, "continuation"));
     root.append(link("Unfollow and return to Runs", semanticZoomRoute(route, {runId: null, unitId: null, attemptId: null, follow: false}), "return-runs"));
+    // The resolved-parent affordance is ADDITIVE: it is appended after the
+    // existing exits, and when nothing resolves it contributes no element and
+    // no status text, leaving this dead end byte-identical to before (#438).
+    const resolution = parentResolutionPanel(route);
+    if (resolution) root.append(resolution);
     replaceContent(root, options.announcement);
-    setStatus(options.status);
+    setStatus(options.status + resolutionStatusSuffix(route));
   }
   function renderFollowDegraded(route, message, failure) {
     renderFollowErrorView(route, {
@@ -1421,7 +1704,10 @@
     root.append(link("← Runs", semanticZoomRoute(route, {runId: null, unitId: null, attemptId: null, follow: false}), "back-runs"));
     const titleRow = el("div", "title-with-copy"); titleRow.append(projectedHeading(1, scalar(run.run.title, run.run.id))); titleRow.append(copyValueButton(run.run.id, "run id")); root.append(titleRow);
     root.append(followToggle(run, route));
-    root.append(untrustedText("p", titleCase(run.run.strategy) + " · " + titleCase(run.run.mode) + " · projection " + scalar(run.projection_id, "unknown"), "lede"));
+    const lede = el("div", "lede-with-copy");
+    lede.append(untrustedText("p", runSubtitleSegments(run).join(" · "), "lede"));
+    lede.append(copyValueButton(run.projection_id, "projection id"));
+    root.append(lede);
     root.append(truthRail(run)); root.append(mutationPanel(run.mutation));
     const overview = setDisclosureKey(el("details", "overview-disclosure"), "run-overview:" + run.run.id); overview.append(text("summary", "Run identifiers and counts")); overview.append(runOverview(run)); root.append(overview);
     if (run.run.strategy === "workflow") {
@@ -1435,9 +1721,48 @@
     setStatus("Read-only · " + titleCase(run.source && run.source.mode) + " projection · as of seq " + scalar(run.source && run.source.as_of_seq, "unknown"));
   }
 
+  /**
+   * Segments of the run detail subtitle (#441). Every segment names the fact it
+   * reports, and an unknown enum is dropped rather than rendered as the bare word
+   * `unknown` — the projected mode is frequently absent, and a bare token tells an
+   * operator nothing about which dimension is unknown. Filling `run.mode` upstream
+   * is a separate concern; this only refuses to render an empty slot. The
+   * `projection_id` is minted already carrying its `projection:` prefix, so it is
+   * pushed verbatim with no second human-facing `projection` word: the id an
+   * operator cites when reporting a projection bug must match the snapshot field
+   * exactly. An absent id is dropped for the same reason an unknown enum is: a
+   * literal `unknown` in the id slot is the bare token this subtitle exists to
+   * eliminate, and the copy control already announces the value as unavailable.
+   * Joining a filtered array is what keeps dropped slots from leaving a
+   * doubled, leading, or trailing separator.
+   * @param {Object} run Run projection snapshot.
+   * @returns {Array<string>} Ordered, non-empty subtitle segments.
+   */
+  function runSubtitleSegments(run) {
+    const segments = [];
+    const strategy = run.run && run.run.strategy;
+    const mode = run.run && run.run.mode;
+    if (strategy && strategy !== "unknown") segments.push(titleCase(strategy));
+    if (mode && mode !== "unknown") segments.push("Workspace mode " + titleCase(mode));
+    if (run.projection_id) segments.push(String(run.projection_id));
+    return segments;
+  }
+  /**
+   * Collapsed-summary label for `usage.complete` (#441). The claim is scoped to
+   * the usage evidence: beside a running run the bare word "Complete" read as a
+   * statement that the run had finished. `usage.complete` is a builder fact about
+   * evidence completeness with no relation to `execution.state`, so the label
+   * names its subject. Both polarities stay visible while the panel is collapsed
+   * because partial usage evidence is load-bearing provenance.
+   * @param {?Object} usage Projection usage object.
+   * @returns {string} Scoped completeness label.
+   */
+  function usageCompletenessLabel(usage) {
+    return usage && usage.complete === true ? "Evidence complete" : "Evidence incomplete";
+  }
   function usagePanel(usage, disclosureKey) {
     const section = setDisclosureKey(el("details", "usage-panel"), disclosureKey);
-    section.append(text("summary", "Evidence-derived usage · " + scalar(usage && usage.calls, 0) + " calls · " + (usage && usage.complete ? "Complete" : "Incomplete")));
+    section.append(text("summary", "Evidence-derived usage · " + scalar(usage && usage.calls, 0) + " calls · " + usageCompletenessLabel(usage)));
     section.append(text("p", scalar(usage && usage.calls, 0) + " durable provider call(s) · " + (usage && usage.complete ? "complete at observed boundary" : "incomplete") + " · source " + titleCase(usage && usage.source), "provenance"));
     const groups = array(usage && usage.groups);
     if (!groups.length) section.append(empty("No attributable provider usage groups."));
@@ -1627,7 +1952,7 @@
   function renderWorkspaceOverview() {
     const root = el("div", "view workspace-overview");
     root.append(heading(1, "Workspace Overview"));
-    root.append(text("p", "Two explicitly configured local sources. Counts are observed per source; no set-level total is calculated.", "lede"));
+    root.append(text("p", "Explicitly configured local sources, in declaration order. Counts are observed per source; no set-level total is calculated.", "lede"));
     shellConfig.workspaces.forEach(function (workspace) {
       const held = workspaceSnapshots[workspace] || {};
       const section = el("section", "workspace-source");
@@ -1711,11 +2036,11 @@
       section.append(rest);
       root.append(section);
     });
-    replaceContent(root, "Workspace Overview updated. Two source sections remain in declaration order.");
+    replaceContent(root, "Workspace Overview updated. " + shellConfig.workspaces.length + " source sections remain in declaration order.");
     setStatus("Read-only Workspace Overview · per-source authority and freshness");
   }
 
-  function renderUnavailable(message, failure) { const root = el("div", "view error-view"); if (failure) applyFailureDiagnostic(root, failure); root.append(heading(1, "Projection unavailable")); root.append(text("p", message, "empty-state")); root.append(link(workspaceSetMode() ? "Return to Workspace Overview" : "Return to Runs", workspaceSetMode() ? "#/workspaces" : "#/runs", "return-runs")); replaceContent(root, message); setStatus(failure ? projectionFailureStatus(failure) : "Requested projection unavailable; return to Runs or relaunch."); }
+  function renderUnavailable(message, failure) { const route = parseRoute(location.hash); const root = el("div", "view error-view"); if (failure) applyFailureDiagnostic(root, failure); root.append(heading(1, "Projection unavailable")); root.append(text("p", message, "empty-state")); root.append(link(workspaceSetMode() ? "Return to Workspace Overview" : "Return to Runs", workspaceSetMode() ? "#/workspaces" : "#/runs", "return-runs")); const unavailableResolution = parentResolutionPanel(route); if (unavailableResolution) root.append(unavailableResolution); replaceContent(root, message); setStatus((failure ? projectionFailureStatus(failure) : "Requested projection unavailable; return to Runs or relaunch.") + resolutionStatusSuffix(route)); }
   function renderCurrent() { const route = parseRoute(location.hash); if (route.view === "workspaces") renderWorkspaceOverview(); else if (route.view === "runs") renderRuns(); else if (route.view === "unit") renderUnit(); else if (route.view === "invalid") renderUnavailable("The requested route is invalid or could not be decoded."); else renderDetail(); }
   function renderProjectionFailure(error) {
     const route = parseRoute(location.hash);
@@ -1729,6 +2054,17 @@
       state.detailConflict = false;
     }
     if (identityLoss) state.detailId = null;
+    // Only a structured run_not_found for the ROUTED id licenses offering a
+    // resolved parent; every other failure clears the licence so no other state
+    // can inherit the affordance (#438).
+    const nextResolutionFor = identityLoss ? route.runId : null;
+    // The one-shot acquisition budget belongs to the resolved-for id. Moving to
+    // a different id (or off the affordance entirely) returns the budget; a
+    // repaint of the SAME dead end does not, which is what bounds the cycle.
+    if (state.resolutionAttemptedFor !== null && state.resolutionAttemptedFor !== nextResolutionFor) state.resolutionAttemptedFor = null;
+    state.resolutionFor = nextResolutionFor;
+    state.resolutionFailure = identityLoss ? failure : null;
+    if (identityLoss && !heldInventoryRows(route).length) acquireInventoryForResolution(route);
     if (identityLoss && route.follow === true) renderFollowDegraded(route, "The followed run is not projected in the authoritative snapshot.", failure);
     else if (identityConflict && failure.phase === "render") {
       try { renderFollowIdentityConflict(route, "The authoritative snapshot returned a different run identity than the one being followed.", failure); }
@@ -1781,7 +2117,7 @@
       if (!exactObjectKeys(inventory, inventoryRequired, inventoryAllowed) || !Number.isSafeInteger(inventory.total) || inventory.total < 0 || !Number.isSafeInteger(inventory.selected) || inventory.selected < 0 || typeof inventory.truncated !== "boolean" || !Array.isArray(inventory.limitations) || !inventory.limitations.every(function (item) { return item && typeof item === "object" && !Array.isArray(item); })) return false;
       return ["dropped_logs", "non_parent_logs", "projected_runs"].every(function (name) { return inventory[name] === undefined || Number.isSafeInteger(inventory[name]) && inventory[name] >= 0; });
     }
-    const detailKeys = ["counts", "evidence", "execution", "graph", "limitations", "liveness", "mutation", "projected_at", "projection_id", "run", "safe_actions", "schema", "schema_version", "source", "units", "usage"];
+    const detailKeys = ["counts", "evidence", "execution", "graph", "limitations", "liveness", "mutation", "post_terminal_child_activity", "projected_at", "projection_id", "run", "safe_actions", "schema", "schema_version", "source", "units", "usage"];
     if (!exactObjectKeys(snapshot, detailKeys, detailKeys) || snapshot.schema !== "pixir.presenter.run" || snapshot.schema_version !== 1) return false;
     return typeof snapshot.projection_id === "string" && snapshot.projection_id.length > 0 && typeof snapshot.projected_at === "string" && snapshot.run && typeof snapshot.run === "object" && !Array.isArray(snapshot.run) && typeof snapshot.run.id === "string" && snapshot.run.id.length > 0 && Array.isArray(snapshot.units) && Array.isArray(snapshot.safe_actions) && Array.isArray(snapshot.evidence) && Array.isArray(snapshot.limitations);
   }
@@ -2077,7 +2413,7 @@
   });
   window.addEventListener("pagehide", function () { history.replaceState({pixirView: captureView()}, "", location.href); });
 
-  window.PixirMonitorUI = Object.freeze({parseRoute: parseRoute, routeHash: routeHash, clientStateKey: clientStateKey, visible: visible, classifyCommand: classifyCommand, escapedEvidence: escapedEvidence, validInvalidation: validInvalidation, limits: LIMITS, sortVocabulary: SORT_VOCABULARY, defaultSort: DEFAULT_SORT, runsComparator: runsComparator, temporalField: temporalField, durationLabel: durationLabel, attentionRenderAllCap: ATTENTION_RENDER_ALL_CAP, attentionRowBudget: attentionRowBudget});
+  window.PixirMonitorUI = Object.freeze({parseRoute: parseRoute, routeHash: routeHash, clientStateKey: clientStateKey, visible: visible, classifyCommand: classifyCommand, escapedEvidence: escapedEvidence, validInvalidation: validInvalidation, limits: LIMITS, sortVocabulary: SORT_VOCABULARY, defaultSort: DEFAULT_SORT, runsComparator: runsComparator, temporalField: temporalField, durationLabel: durationLabel, attentionRenderAllCap: ATTENTION_RENDER_ALL_CAP, attentionRowBudget: attentionRowBudget, resolveParentObservedChild: resolveParentObservedChild});
   // Pre-load failure UX belongs solely to the shell bootstrap (PixirMonitor.Bootstrap):
   // this script loads only after the bootstrap promise fulfills, so rejection is unreachable here.
   window.__pixirBootstrap.then(function () {

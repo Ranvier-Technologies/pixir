@@ -164,7 +164,7 @@ const PRELOAD_SCRIPT = `(() => {
     control.retryToken = null;
     const options = {...(init || {})};
     const headers = new Headers(options.headers || {});
-    headers.set("x-pixir-harness-retry", token);
+    headers.set("x-pixir-test-retry", token);
     options.headers = headers;
     return nativeFetch(input, options);
   };
@@ -361,7 +361,7 @@ async function run(options) {
         const match = path.match(/^\/api\/workspaces\/(left|right)\/runs(?:\/|$)/);
         if (match) {
           const headers = message.params.request.headers || {};
-          const retryHeader = Object.entries(headers).find(([name]) => name.toLowerCase() === "x-pixir-harness-retry");
+          const retryHeader = Object.entries(headers).find(([name]) => name.toLowerCase() === "x-pixir-test-retry");
           network.records.push({workspace: match[1], path, timestamp: message.params.timestamp, retryToken: retryHeader ? String(retryHeader[1]) : null});
         }
       } catch (_error) {}

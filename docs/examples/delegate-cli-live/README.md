@@ -30,7 +30,7 @@ command path first, then parse stdout JSON.
 | `pixir delegate --spec ... --dry-run --json` | `2` | Invalid args/spec, unreadable stdin/spec, unsupported mode, or unknown role. | Inspect `kind`, `details`, `field` / `json_pointer`, and `next_actions`; fix the spec before runtime. |
 | `pixir delegate --spec ... --dry-run --json` | `3` | Bounded write policy rejected the planned write scope. | Narrow the child `write_set` or explicitly expand `write_policy.allow_writes`. |
 | attached `pixir delegate --spec ... --json` | `0` | Delegate work reached a clean success state; expect `ok: true` and `status: "completed"`. | Consume `children`, diagnostics commands, artifacts, and summaries as evidence pointers. |
-| attached `pixir delegate --spec ... --json` | `3` | Permission, workspace, read-confinement, disabled-shell, or bounded-write policy denial. | Distinguish `kind: "outside_workspace"`, `kind: "write_policy_denied"`, `kind: "permission_denied"`, and `kind: "bash_disabled"` before retrying. |
+| attached `pixir delegate --spec ... --json` | `3` | Permission, workspace, read-confinement, disabled-shell, or bounded-write policy denial. | Distinguish `kind: "outside_workspace"`, `kind: "write_policy_denied"` (read its `matched_rule`), `kind: "permission_denied"`, and `kind: "bash_disabled"` before retrying. |
 | attached `pixir delegate --spec ... --json` | `4` | Provider/auth/network class failure. | Inspect `kind`, provider diagnostics, and retry or re-auth guidance. |
 | attached `pixir delegate --spec ... --json` | `5` | Runner-level failure before delegated work reached a terminal state: backpressure, unavailable manager, or daemon requirement. | Inspect the error `kind` and details; retry with adjusted budgets or daemon setup. |
 | attached `pixir delegate --spec ... --json` | `6` | Domain work reached an incomplete terminal state such as `partial`, `timed_out`, `failed`, or `cancelled` — attached child timeouts normalize to `status: "timed_out"` and exit here, not `5`. | Parse the envelope; inspect `children[*].status`, workflow buckets, `write_destination`, and diagnostics before deciding whether the result is usable. Non-completed subagent-strategy children carry ready-made `resume_command` / `diagnose_command` (recover per child, never re-run the whole spec); workflow-strategy steps carry buckets and evidence instead, so recover those via diagnostics and the step logs. |
@@ -99,11 +99,16 @@ Illustrative non-golden partial bounded-write envelope:
 
 Do not collapse read/scope denials and write allowlist denials:
 
-- `kind: "outside_workspace"` with `matched_rule: "outside_workspace"` means a
-  read/scope escape, such as a shell-shaped path token resolving outside the
-  workspace. This is a tripwire, not a full POSIX sandbox.
-- `kind: "write_policy_denied"` means the requested write exceeded the bounded write
-  policy.
+- `kind: "outside_workspace"` means a read/scope escape outside any bounded write
+  policy — a path argument resolving outside the workspace on an ordinary run.
+  This is a tripwire, not a full POSIX sandbox.
+- `kind: "write_policy_denied"` means the request exceeded the bounded write
+  policy. Read `matched_rule` for which rule refused it: `no_allow_match`,
+  `deny_match`, a protected path, `child_policy_override_unsupported`, or
+  `outside_workspace` for a shell-shaped path token resolving outside the
+  workspace. Under a bounded write policy that last case is a boundary probe, so
+  it carries the `write_policy_denied` kind, counts toward the two-strike limit,
+  and appears in `write_denials` — do not treat it as a mere read escape.
 - `kind: "permission_denied"` means the permission mode (ADR 0006) rejected the
   request, independent of any bounded write policy.
 - `kind: "bash_disabled"` means the shell tool itself is disabled by the bounded
@@ -113,14 +118,14 @@ Do not collapse read/scope denials and write allowlist denials:
   `use_edit_or_write_within_allowed_globs`). Do not respond by widening write
   globs; they are unrelated.
 
-Illustrative non-golden `outside_workspace` denial:
+Illustrative non-golden outside-workspace denial under a bounded write policy:
 
 ```json
 {
   "ok": false,
   "status": "rejected",
   "exit_code": 3,
-  "kind": "outside_workspace",
+  "kind": "write_policy_denied",
   "message": "bash command references a path outside the workspace",
   "details": {
     "tool": "bash",

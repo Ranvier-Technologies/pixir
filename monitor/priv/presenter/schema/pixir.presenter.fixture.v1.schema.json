@@ -69,6 +69,12 @@
         "parent_log_origin": {
           "enum": ["fixture", "workspace_log", null]
         },
+        "activity_evidence": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/activityEvidence"}
+          ]
+        },
         "child_logs": {
           "type": "object",
           "additionalProperties": {
@@ -214,6 +220,17 @@
         "runtime_gaps": {"type": "array"}
       },
       "additionalProperties": true
+    },
+    "activityEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["durable_evidence"],
+      "properties": {
+        "durable_evidence": {"enum": ["advanced", "unchanged", "unknown"]},
+        "prior_as_of_seq": {"type": ["integer", "null"], "minimum": 0},
+        "prior_last_durable_at": {"type": ["string", "null"], "format": "date-time"},
+        "basis": {"enum": ["caller_observation_delta"]}
+      }
     },
     "ownerState": {
       "type": "object",

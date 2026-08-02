@@ -21,7 +21,8 @@
       "attention reasons",
       "volatile versus durable materialization",
       "child event windows",
-      "virtual diff application correlation"
+      "virtual diff application correlation",
+      "write policy denials"
     ]
   },
   "scenarios": [
@@ -121,8 +122,21 @@
       "source_refs": ["Delegate Owner snapshot-only and stale-handle contracts"],
       "proves": [
         "durable running state remains running",
-        "snapshot-only Owner state normalizes to stale_handle",
+        "snapshot-only Owner state without asserted durable activity normalizes to stale_handle",
         "source freshness stale requires attention"
+      ]
+    },
+    {
+      "id": "externally-owned-running-advancing",
+      "class": "synthetic_from_runtime_contract",
+      "source_refs": [
+        "Delegate Owner snapshot-only contract",
+        "caller-supplied activity_evidence contract"
+      ],
+      "proves": [
+        "snapshot-only Owner state with asserted durable activity projects externally_owned",
+        "external observation claims no reachability and names basis durable_log_activity",
+        "ordinary external observation emits no liveness attention reason and no source_stale"
       ]
     },
     {
@@ -143,6 +157,35 @@
         "invalid JSON cannot change runtime gate",
         "bounded raw excerpt remains advisory",
         "model_advisory_unparseable requires attention"
+      ]
+    },
+    {
+      "id": "child-write-and-policy-deny",
+      "class": "real_minimized",
+      "source_refs": [
+        "<private-repo>/.pixir/sessions/<parent-child-write-deny>.ndjson",
+        "<private-repo>/.pixir/sessions/<child-writer>.ndjson"
+      ],
+      "proves": [
+        "child-log-derived applied writes without envelope observed_applied_writes",
+        "write-policy no_allow_match denial carries its policy identity",
+        "mutation basis names the evidence class it rests on",
+        "an observed denial alone is not a mutation"
+      ]
+    },
+    {
+      "id": "post-terminal-child-resume",
+      "class": "synthetic_from_workflow_contract",
+      "source_refs": [
+        "Workflow timeout-cancellation contract",
+        "Session-level resume contract"
+      ],
+      "proves": [
+        "child events strictly after the parent terminal boundary are counted and timestamped",
+        "post-terminal child activity never moves canonical execution off partial",
+        "post-terminal child activity never yields a live or reachable liveness claim",
+        "the terminal boundary is derived from parent Log evidence alone",
+        "observed post-terminal activity carries its own root limitation"
       ]
     }
   ]

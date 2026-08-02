@@ -18,8 +18,11 @@ defmodule Pixir.Permissions.WritePolicy do
   @safe_bash_commands ~w(ls cat pwd echo grep rg ripgrep head tail wc which whoami date true
                          tree stat file dirname basename realpath sort uniq diff)
   @shell_metachars ["\n", "\r", "&&", "||", ";", "|", "&", ">", "<", "`", "$(", ">>"]
-  @accepted_verify_prefixes [["mix", "format"], ["mix", "compile"]]
+  @default_verify_prefixes [["mix", "format"], ["mix", "compile"]]
   @max_verify_commands 8
+  @max_verify_prefixes 8
+  @max_verify_prefix_tokens 2
+  @bash_keys ["verify", "verify_prefixes"]
 
   @doc "Load and normalize a bounded write policy JSON file."
   @spec from_file(String.t(), String.t()) :: {:ok, map()} | {:error, map()}
@@ -133,8 +136,12 @@ defmodule Pixir.Permissions.WritePolicy do
   def authorize_tool(policy, tool, args, workspace) when tool in ["write", "edit"] do
     path = Map.get(args, "path")
 
-    with {:ok, rel} <- canonical_relative(workspace, path) do
-      authorize_write_target(policy, tool, path, rel)
+    case canonical_relative(workspace, path) do
+      {:ok, rel} ->
+        authorize_write_target(policy, tool, path, rel)
+
+      {:error, error} ->
+        {:error, stamp_policy_identity(error, policy, tool)}
     end
   end
 
@@ -161,7 +168,13 @@ defmodule Pixir.Permissions.WritePolicy do
     if Map.has_key?(args, "write_policy") do
       {:deny,
        denial(policy, "spawn_agent", "child_policy_override_unsupported", %{
-         "matched_rule" => "child_policy_override_unsupported"
+         "matched_rule" => "child_policy_override_unsupported",
+         # This denial has no path and no command: the worker tried to hand a
+         # child a different policy, not to write somewhere. The confession
+         # still has to name what was aimed at, so the tool itself is the
+         # target — an entry with no target key is one the coordinator cannot
+         # reconcile at all.
+         "normalized_path" => "spawn_agent"
        })}
     else
       :allow
@@ -176,7 +189,11 @@ defmodule Pixir.Permissions.WritePolicy do
     if Permissions.mutating?(tool, args) do
       {:deny,
        denial(policy, tool, "unsupported_mutating_tool", %{
-         "matched_rule" => "unsupported_mutating_tool"
+         "matched_rule" => "unsupported_mutating_tool",
+         # Same reasoning as the child-policy override: an unknown mutating tool
+         # is refused for being unknown, so its arguments carry no target the
+         # policy understands. The tool name is the aim.
+         "normalized_path" => tool
        })}
     else
       :allow
@@ -227,13 +244,14 @@ defmodule Pixir.Permissions.WritePolicy do
     root = Path.expand(workspace)
 
     with {:ok, abs} <- confine_policy_path(root, path),
-         :ok <- reject_symlink_components(root, abs) do
+         :ok <- reject_symlink_components(root, abs, path) do
       rel = Path.relative_to(abs, root)
 
       if rel == "." do
         {:error,
          Tool.error(:write_policy_denied, "write denied by bounded write policy", %{
            "matched_rule" => "workspace_root_not_writable",
+           "requested_path" => path,
            "normalized_path" => rel,
            "next_actions" => ["request_policy_expansion", "write_within_allowed_globs"]
          })}
@@ -291,6 +309,34 @@ defmodule Pixir.Permissions.WritePolicy do
     )
   end
 
+  # Confinement and root denials are raised by `canonical_relative/2`, which is a
+  # generic path helper with no policy in hand: it can name the rule that refused
+  # the path but not the policy that was active. Every `write_policy_denied` is a
+  # policy denial — it strikes in Turn and is confessed in `write_denials`, where
+  # the coordinator reconciles each entry against the policy identity — so the
+  # identity is merged back here, at the one boundary that has both. Existing
+  # keys win: a denial that already named its policy is never rewritten.
+  #
+  # Only the policy kind is stamped. An `:invalid_args` error (a non-string or
+  # empty path) is a malformed call, not a boundary probe, and stays untouched.
+  defp stamp_policy_identity(
+         %{error: %{kind: :write_policy_denied, details: details}} = error,
+         policy,
+         tool
+       )
+       when is_map(details) do
+    identity = %{
+      "tool" => tool,
+      "policy_id" => policy["id"],
+      "policy_hash" => policy["hash"],
+      "policy_version" => policy["version"]
+    }
+
+    put_in(error, [:error, :details], Map.merge(identity, details))
+  end
+
+  defp stamp_policy_identity(error, _policy, _tool), do: error
+
   # The shell being disabled is a property of the bounded-write mode, not a write
   # allowlist violation: the denial must not read as "write denied" when the command
   # was a read (#218). Distinct kind, honest message, shell-free next_actions.
@@ -313,15 +359,26 @@ defmodule Pixir.Permissions.WritePolicy do
     )
   end
 
+  # A bash command reaching outside the workspace under a bounded write policy is
+  # a boundary probe, so it raises the `write_policy_denied` kind: it strikes in
+  # Turn, is turn-fatal on the second strike, and is confessed in `write_denials`
+  # like any other write denial (#446). `matched_rule` stays `outside_workspace`,
+  # so the specific rule that refused the command is never lost — only the kind
+  # is unified, which is what the strike counter and the confession key on.
+  #
+  # This is the *policy-gated* path only. The plain workspace-confinement error
+  # raised by `Pixir.Tools.Workspace` and friends outside any bounded-write run
+  # keeps the `:outside_workspace` kind, which is not a policy denial at all.
   defp outside_workspace_denial(policy, command, token) do
     Tool.error(
-      :outside_workspace,
+      :write_policy_denied,
       "bash command references a path outside the workspace",
       %{
         "tool" => "bash",
         "requested_command" => command,
         "token" => token,
         "matched_rule" => "outside_workspace",
+        "rule" => "outside_workspace",
         "policy_id" => policy["id"],
         "policy_hash" => policy["hash"],
         "policy_version" => policy["version"],
@@ -344,8 +401,18 @@ defmodule Pixir.Permissions.WritePolicy do
 
     with :ok <- reject_unknown_bash_keys(bash),
          :ok <- require_bash_verify_key(bash),
-         {:ok, verify} <- normalize_verify_commands(Map.get(bash, "verify")) do
-      {:ok, %{"verify" => verify}}
+         {:ok, declared} <- normalize_verify_prefixes(Map.get(bash, "verify_prefixes")),
+         {:ok, verify} <- normalize_verify_commands(Map.get(bash, "verify"), declared) do
+      # The allowlist key is only materialized when the operator declared one.
+      # Omitting it for default policies keeps `bash` — and therefore the durable
+      # policy hash — byte-identical to what pre-allowlist Pixir produced (#445).
+      normalized =
+        case declared do
+          nil -> %{"verify" => verify}
+          prefixes -> %{"verify_prefixes" => join_prefixes(prefixes), "verify" => verify}
+        end
+
+      {:ok, normalized}
     end
   end
 
@@ -356,13 +423,13 @@ defmodule Pixir.Permissions.WritePolicy do
        "write_policy bash must be disabled or a verify command map",
        %{
          "observed" => other,
-         "accepted_values" => ["disabled", %{"verify" => accepted_verify_prefixes()}]
+         "accepted_values" => ["disabled", %{"verify" => default_verify_prefixes()}]
        }
      )}
   end
 
   defp reject_unknown_bash_keys(bash) do
-    case Map.keys(bash) -- ["verify"] do
+    case Map.keys(bash) -- @bash_keys do
       [] ->
         :ok
 
@@ -370,7 +437,7 @@ defmodule Pixir.Permissions.WritePolicy do
         {:error,
          Tool.error(:invalid_args, "write_policy bash verify map has unsupported keys", %{
            "observed" => unknown,
-           "accepted_keys" => ["verify"]
+           "accepted_keys" => @bash_keys
          })}
     end
   end
@@ -381,11 +448,97 @@ defmodule Pixir.Permissions.WritePolicy do
     {:error,
      Tool.error(:invalid_args, "write_policy bash map requires verify", %{
        "missing" => ["verify"],
-       "accepted_keys" => ["verify"]
+       "accepted_keys" => @bash_keys
      })}
   end
 
-  defp normalize_verify_commands(commands) when is_list(commands) do
+  # An absent declaration means "use the built-in Elixir default", which is not
+  # the same as an operator declaring an empty allowlist — that is malformed and
+  # fails closed rather than silently disabling every verify command.
+  defp normalize_verify_prefixes(nil), do: {:ok, nil}
+
+  defp normalize_verify_prefixes(prefixes) when is_list(prefixes) and prefixes != [] do
+    if length(prefixes) > @max_verify_prefixes do
+      {:error,
+       Tool.error(:invalid_args, "write_policy bash verify_prefixes list is too large", %{
+         "observed_count" => length(prefixes),
+         "accepted_max" => @max_verify_prefixes
+       })}
+    else
+      prefixes
+      |> Enum.reduce_while({:ok, []}, fn prefix, {:ok, acc} ->
+        case normalize_verify_prefix(prefix) do
+          {:ok, tokens} -> {:cont, {:ok, [tokens | acc]}}
+          {:error, _} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, tokens} -> {:ok, Enum.reverse(tokens)}
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  defp normalize_verify_prefixes(other) do
+    {:error,
+     Tool.error(:invalid_args, "write_policy bash verify_prefixes must be a non-empty list", %{
+       "observed" => other,
+       "accepted_type" => "list"
+     })}
+  end
+
+  defp normalize_verify_prefix(prefix) when is_binary(prefix) do
+    trimmed = String.trim(prefix)
+    tokens = String.split(trimmed, ~r/\s+/, trim: true)
+
+    cond do
+      trimmed == "" ->
+        {:error, invalid_verify_prefix(trimmed, "verify_prefixes entries must be non-empty")}
+
+      metachar = Enum.find(@shell_metachars, &String.contains?(trimmed, &1)) ->
+        {:error,
+         Tool.error(
+           :invalid_args,
+           "write_policy bash verify_prefixes may not contain shell metacharacters",
+           %{
+             "observed" => trimmed,
+             "metachar" => metachar,
+             "accepted_max_tokens" => @max_verify_prefix_tokens
+           }
+         )}
+
+      Enum.any?(tokens, &parent_directory_token?/1) ->
+        {:error,
+         invalid_verify_prefix(
+           trimmed,
+           "verify_prefixes entries may not contain parent-directory tokens"
+         )}
+
+      length(tokens) > @max_verify_prefix_tokens ->
+        {:error,
+         invalid_verify_prefix(
+           trimmed,
+           "verify_prefixes entries may name at most #{@max_verify_prefix_tokens} tokens"
+         )}
+
+      true ->
+        {:ok, tokens}
+    end
+  end
+
+  defp normalize_verify_prefix(other),
+    do: {:error, invalid_verify_prefix(other, "verify_prefixes entries must be strings")}
+
+  defp invalid_verify_prefix(observed, reason) do
+    Tool.error(:invalid_args, "write_policy bash verify_prefixes entry is unsupported", %{
+      "observed" => observed,
+      "reason" => reason,
+      "accepted_max_tokens" => @max_verify_prefix_tokens,
+      "next_actions" => ["declare_a_literal_command_prefix", "remove_verify_prefixes"]
+    })
+  end
+
+  defp normalize_verify_commands(commands, declared) when is_list(commands) do
     if length(commands) > @max_verify_commands do
       {:error,
        Tool.error(:invalid_args, "write_policy bash verify command list is too large", %{
@@ -395,7 +548,7 @@ defmodule Pixir.Permissions.WritePolicy do
     else
       commands
       |> Enum.reduce_while({:ok, []}, fn command, {:ok, acc} ->
-        case normalize_verify_command(command) do
+        case normalize_verify_command(command, declared) do
           {:ok, normalized} -> {:cont, {:ok, [normalized | acc]}}
           {:error, _} = error -> {:halt, error}
         end
@@ -407,7 +560,7 @@ defmodule Pixir.Permissions.WritePolicy do
     end
   end
 
-  defp normalize_verify_commands(other) do
+  defp normalize_verify_commands(other, _declared) do
     {:error,
      Tool.error(:invalid_args, "write_policy bash verify must be a list", %{
        "observed" => other,
@@ -415,8 +568,9 @@ defmodule Pixir.Permissions.WritePolicy do
      })}
   end
 
-  defp normalize_verify_command(command) when is_binary(command) do
+  defp normalize_verify_command(command, declared) when is_binary(command) do
     command = String.trim(command)
+    accepted = effective_verify_prefixes(declared)
 
     cond do
       command == "" ->
@@ -426,7 +580,7 @@ defmodule Pixir.Permissions.WritePolicy do
            "write_policy bash verify entries must be non-empty strings",
            %{
              "observed" => command,
-             "accepted_prefixes" => accepted_verify_prefixes()
+             "accepted_prefixes" => join_prefixes(accepted)
            }
          )}
 
@@ -438,7 +592,7 @@ defmodule Pixir.Permissions.WritePolicy do
            %{
              "observed" => command,
              "metachar" => metachar,
-             "accepted_prefixes" => accepted_verify_prefixes()
+             "accepted_prefixes" => join_prefixes(accepted)
            }
          )}
 
@@ -451,23 +605,26 @@ defmodule Pixir.Permissions.WritePolicy do
            "write_policy bash verify entries may not contain parent-directory tokens",
            %{
              "observed" => command,
-             "accepted_prefixes" => accepted_verify_prefixes()
+             "accepted_prefixes" => join_prefixes(accepted)
            }
          )}
 
-      verify_prefix(command) == ["mix", "test"] ->
+      # `mix test` stays rejected only under the built-in default: an operator who
+      # declared their own allowlist never inherits the Elixir prefixes, so this
+      # arm cannot fire for them (#445 keeps the division of labor unchanged).
+      is_nil(declared) and verify_prefix(command) == ["mix", "test"] ->
         {:error,
          Tool.error(
            :invalid_args,
            "verify test commands are not accepted yet (v1 allows format/compile only)",
            %{
              "observed" => command,
-             "accepted_prefixes" => accepted_verify_prefixes(),
+             "accepted_prefixes" => join_prefixes(accepted),
              "next_action" => "keep_test_execution_with_the_orchestrator"
            }
          )}
 
-      verify_prefix(command) in @accepted_verify_prefixes ->
+      command_matches_prefix?(command, accepted) ->
         {:ok, command}
 
       true ->
@@ -477,27 +634,40 @@ defmodule Pixir.Permissions.WritePolicy do
            "write_policy bash verify entries must start with an accepted command prefix",
            %{
              "observed" => command,
-             "accepted_prefixes" => accepted_verify_prefixes()
+             "accepted_prefixes" => join_prefixes(accepted)
            }
          )}
     end
   end
 
-  defp normalize_verify_command(other) do
+  defp normalize_verify_command(other, declared) do
     {:error,
      Tool.error(
        :invalid_args,
        "write_policy bash verify entries must be non-empty strings",
        %{
          "observed" => other,
-         "accepted_prefixes" => accepted_verify_prefixes()
+         "accepted_prefixes" => declared |> effective_verify_prefixes() |> join_prefixes()
        }
      )}
   end
 
   defp verify_prefix(command), do: command |> String.split(~r/\s+/, trim: true) |> Enum.take(2)
 
-  defp accepted_verify_prefixes, do: Enum.map(@accepted_verify_prefixes, &Enum.join(&1, " "))
+  # A declared prefix matches by token, not by substring: `pnpm typecheck` never
+  # admits `pnpm typechecker`, and a one-token `cargo` prefix admits `cargo check`
+  # but not `cargonaut check`.
+  defp command_matches_prefix?(command, accepted) do
+    tokens = String.split(command, ~r/\s+/, trim: true)
+    Enum.any?(accepted, &(Enum.take(tokens, length(&1)) == &1))
+  end
+
+  defp effective_verify_prefixes(nil), do: @default_verify_prefixes
+  defp effective_verify_prefixes(declared) when is_list(declared), do: declared
+
+  defp join_prefixes(prefixes), do: Enum.map(prefixes, &Enum.join(&1, " "))
+
+  defp default_verify_prefixes, do: join_prefixes(@default_verify_prefixes)
 
   defp declared_verify_command?(policy, command) do
     String.trim(command) in verify_commands(policy)
@@ -950,7 +1120,12 @@ defmodule Pixir.Permissions.WritePolicy do
     end
   end
 
-  defp reject_symlink_components(root, abs) do
+  # The walk stops at the first component it cannot accept, but the component is
+  # not what the worker aimed at: a write to `link/deep/out.txt` refused at
+  # `link` must confess the whole requested path, or the coordinator sees a
+  # target that no call ever named. `requested_path` carries the aim; the
+  # component that actually failed keeps its own key so neither fact is lost.
+  defp reject_symlink_components(root, abs, requested_path) do
     rel = Path.relative_to(abs, root)
 
     if rel == "." do
@@ -967,6 +1142,8 @@ defmodule Pixir.Permissions.WritePolicy do
              {:error,
               Tool.error(:write_policy_denied, "write denied by bounded write policy", %{
                 "matched_rule" => "symlink_path_component",
+                "requested_path" => requested_path,
+                "symlink_component" => Path.relative_to(next, root),
                 "normalized_path" => Path.relative_to(next, root),
                 "next_actions" => ["write_to_real_workspace_paths", "request_policy_expansion"]
               })}}
@@ -982,6 +1159,8 @@ defmodule Pixir.Permissions.WritePolicy do
              {:error,
               Tool.error(:write_policy_denied, "write denied by bounded write policy", %{
                 "matched_rule" => "path_not_inspectable",
+                "requested_path" => requested_path,
+                "uninspectable_component" => Path.relative_to(next, root),
                 "normalized_path" => Path.relative_to(next, root),
                 "reason" => inspect(reason),
                 "next_actions" => ["check_workspace_path", "retry_after_fixing_path"]

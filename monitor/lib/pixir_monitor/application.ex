@@ -1,6 +1,7 @@
 defmodule PixirMonitor.Application do
   @moduledoc """
-  Owns only disposable monitor security, metadata invalidation, HTTP, and port state.
+  Owns only disposable monitor security, metadata invalidation, observation
+  deltas, HTTP, and port state.
 
   Canonical Pixir run state is deliberately absent from this supervision tree; every
   child holds recomputable or disposable state. Children restart `rest_for_one`, so
@@ -18,6 +19,7 @@ defmodule PixirMonitor.Application do
     children = [
       PixirMonitor.Vault,
       PixirMonitor.InvalidationHub,
+      PixirMonitor.Projection.ActivityLedger,
       PixirMonitor.LogWatcher,
       PixirMonitor.Endpoint,
       PixirMonitor.PortRegistry,

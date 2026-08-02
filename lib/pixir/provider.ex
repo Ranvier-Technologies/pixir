@@ -13,7 +13,17 @@ defmodule Pixir.Provider do
       these into ephemeral Events — keeping this module free of bus/Session deps);
     * the assembled result `%{text, reasoning, function_calls, finish_reason}` is
       returned for the Turn loop to persist (the final `assistant_message`) and to
-      decide whether to run tools.
+      decide whether to run tools;
+    * each function call is additionally announced to the `:on_committed_call` callback
+      the moment its output item completes on the wire, mid-stream (#462). The returned
+      result is too late for cancellation: an interrupt kills the Turn Task while the
+      stream is still open, so a call committed provider-side would never be persisted
+      and the next request would omit its output. The callback is the Turn's chance to
+      hand the call to a process that outlives the kill. It returns `:ok`, or
+      `{:error, structured}` to fail the stream with that error — a structured return is
+      how a bookkeeping fault stays NON-retryable, since an exit raised out of the callback
+      would be caught by `Pixir.Provider.StreamIdle` and reported as a retryable
+      `:network` blip.
 
   Errors are structured (ADR 0005). Tests may still inject `:transport` directly; the
   production path uses `Pixir.Provider.TransportPolicy` (`:auto | :websocket |
@@ -47,6 +57,10 @@ defmodule Pixir.Provider do
 
   @default_model "gpt-5.5"
   @default_max_retries 2
+  # Tool a replayed `function_call` is renamed to when its recorded name is not one Pixir
+  # sends (see `wire_tool_name/2`). `read` is in every request's tools array — the
+  # catalogue is sent whole, unfiltered by role or mode.
+  @wire_placeholder_tool "read"
   @config_ingress_keys [:config_path, :raw_config, :request_snapshot_loader]
 
   # The built-in model catalog (ADR 0009 / epic A.5). The same OpenAI/Codex
@@ -132,6 +146,15 @@ defmodule Pixir.Provider do
   @doc "Whether this Provider accepts an explicit Responses backend selection."
   def responses_backend_compatible?, do: true
 
+  @doc """
+  Whether a structured Provider error is one `stream/2` would retry.
+
+  Exposed so callers and tests can read the retry classification from its single source
+  instead of restating it — a restated rule keeps passing after the rule itself moves.
+  """
+  @spec retryable_error?(map()) :: boolean()
+  def retryable_error?(error) when is_map(error), do: retryable?(error)
+
   defp attempt(request, opts, n, max, sleep) do
     case do_stream(request, opts) do
       {:ok, result} ->
@@ -160,6 +183,7 @@ defmodule Pixir.Provider do
 
   defp do_stream(request, opts) do
     on_delta = Keyword.get(opts, :on_delta, fn _ -> :ok end)
+    on_committed_call = Keyword.get(opts, :on_committed_call, fn _ -> :ok end)
     resolved = Keyword.fetch!(opts, :resolved_provider_request)
     routing = Keyword.fetch!(opts, :responses_routing)
     request_url = ResponsesRouting.http_url(routing)
@@ -208,7 +232,13 @@ defmodule Pixir.Provider do
         },
         usage: nil,
         usage_summary: usage_summary(nil),
-        on_delta: on_delta
+        on_delta: on_delta,
+        # #462 layer 1: invoked the instant a `function_call` output item completes on the
+        # wire, from inside the streaming process — NOT after `stream/2` returns. That is
+        # the kill window: `Session.interrupt/1` brutally kills the Turn Task (and with it
+        # this stream), so a call the Provider already committed is lost unless it has been
+        # handed to a process that survives the kill before the stream ends.
+        on_committed_call: on_committed_call
       }
 
       case run(request, opts, http_request, init) do
@@ -1192,7 +1222,7 @@ defmodule Pixir.Provider do
          %{
            "type" => "function_call",
            "call_id" => id,
-           "name" => name,
+           "name" => wire_tool_name(name, data),
            "arguments" => Jason.encode!(data["args"] || %{})
          }
        ]
@@ -1215,6 +1245,34 @@ defmodule Pixir.Provider do
   end
 
   defp to_input_item(_other, _model, _opts), do: []
+
+  # #462 layer 2 records its synthesized recovery call under the honest placeholder name
+  # `"unknown"` — Pixir never saw the real name, and writing a real tool into the Log for
+  # a call it never made would be a lie. But the Responses API validates an input
+  # `function_call` against the tools array of that same request, and `"unknown"` is in no
+  # tools array, so the healed request would risk being rejected for a second reason. A
+  # `function_call_output` alone does not work either: `fold_input/3` drops a `tool_result`
+  # with no matching pending call, so the retry would resend the byte-identical rejected
+  # request. Rendering it as a tool Pixir always sends keeps the wire valid while the Log
+  # keeps the truth; the paired output is an `orphan_tool_call` error, so no tool is ever
+  # claimed to have run.
+  #
+  # Scoped deliberately to the synthesized event — keyed on the `"synthesized"` marker
+  # layer 2 writes, NOT on registry membership. A `tool_call` whose recorded name is
+  # merely unregistered is a different animal: `Tools.Executor.run/2` persists a
+  # model-hallucinated name verbatim before failing with `:unknown_tool`, and rewriting
+  # that to `read` would replay a call the model never made, carrying arguments `read`
+  # does not accept. Replay fidelity for real history wins; only Pixir's own synthetic
+  # event is renamed.
+  defp wire_tool_name(name, %{"synthesized" => %{}}), do: registered_or_placeholder(name)
+  defp wire_tool_name(name, _data), do: name
+
+  defp registered_or_placeholder(name) do
+    case Pixir.Tools.Registry.fetch(name) do
+      {:ok, _module} -> name
+      {:error, _unknown_tool} -> @wire_placeholder_tool
+    end
+  end
 
   defp current_user_content(session_id, text, resources, opts) do
     workspace = Keyword.get(opts, :workspace, File.cwd!())
@@ -1511,6 +1569,13 @@ defmodule Pixir.Provider do
 
   defp apply_open_event(acc, event), do: apply_event({:ok, event}, acc)
 
+  # #462: this classifier deliberately does NOT detect the dangling-call rejection, so
+  # layer-2 recovery does not fire on an Open Responses backend. Detection requires
+  # reading the offending call id out of the remote message, and this path exists
+  # precisely to keep that message out of Pixir's hands — it records
+  # `remote_message_bytes` rather than the message. The privacy posture wins; a poisoned
+  # Open Responses Session is healed by layer 1 (transport-independent) or by the
+  # existing orphan reconciliation, not here.
   defp put_open_in_band_error(%{stream_error: nil, status: status} = acc, event_type, error) do
     type = safe_error_field(error, "type")
     code = safe_error_field(error, "code")
@@ -1661,8 +1726,18 @@ defmodule Pixir.Provider do
          acc
        ) do
     case ToolCall.from_json(item["call_id"], item["name"], item["arguments"]) do
-      {:ok, call} -> %{acc | output_items: [{:function_call, call} | acc.output_items]}
-      {:error, error} -> %{acc | stream_error: acc.stream_error || error}
+      {:ok, call} ->
+        # #462 layer 1: the call is committed on the wire as of THIS event. Declare it now,
+        # synchronously, before another chunk is read — everything after this point (the
+        # rest of the stream, `finalize/1`, the Turn loop, the Executor) happens in
+        # processes an interrupt can kill. `on_committed_call` hands it to the Session,
+        # which survives.
+        acc
+        |> put_committed_call_error(acc.on_committed_call.(call))
+        |> Map.update!(:output_items, &[{:function_call, call} | &1])
+
+      {:error, error} ->
+        %{acc | stream_error: acc.stream_error || error}
     end
   end
 
@@ -1739,31 +1814,43 @@ defmodule Pixir.Provider do
     # stream or the WebSocket transport) carry overflow rejections too. Unlike
     # HTTP classification, this path has no status guard, so message-only matches
     # are accepted only for provider/context-shaped error families.
+    dangling_call_id = dangling_tool_call_id(error)
+
     kind =
-      if stream_context_overflow?(type, code, error["message"]) do
-        :context_overflow
-      else
-        :provider_http_error
+      cond do
+        stream_context_overflow?(type, code, error["message"]) -> :context_overflow
+        is_binary(dangling_call_id) -> :dangling_tool_call
+        true -> :provider_http_error
       end
 
-    %{
-      acc
-      | stream_error:
-          err(
-            kind,
-            message,
-            maybe_retryable_stream_error_details(kind, type, code, %{
-              status: status,
-              event_type: event_type,
-              code: error["code"],
-              type: error["type"],
-              param: error["param"]
-            })
-          )
-    }
+    details =
+      maybe_retryable_stream_error_details(kind, type, code, %{
+        status: status,
+        event_type: event_type,
+        code: error["code"],
+        type: error["type"],
+        param: error["param"]
+      })
+
+    details = maybe_put_dangling_call_id(details, kind, dangling_call_id)
+
+    %{acc | stream_error: err(kind, message, details)}
   end
 
   defp put_stream_error(acc, _event_type, _error), do: acc
+
+  # #462 round 5: the declare callback may report a STRUCTURED failure it cannot handle
+  # itself. Before, its only way to say so was to `exit` — and the declare runs inside
+  # `StreamIdle.run_stream/3`, whose `catch` maps ANY exit to a retryable `:network` error.
+  # A bookkeeping fault was therefore laundered into a transport blip and re-entered
+  # `attempt/5`'s retry path, where the retried stream re-commits the same calls. Returning
+  # the error instead routes it through the ordinary stream-error path, where `retryable?/1`
+  # does not match it and the stream ends without a re-stream. No `retryable: true` is ever
+  # attached here, and the first error wins, as everywhere else on this path.
+  defp put_committed_call_error(acc, {:error, %{error: %{}} = error}),
+    do: %{acc | stream_error: acc.stream_error || error}
+
+  defp put_committed_call_error(acc, _ok), do: acc
 
   defp maybe_retryable_stream_error_details(:provider_http_error, type, code, details) do
     if transient_stream_error?(type, code) do
@@ -1774,6 +1861,77 @@ defmodule Pixir.Provider do
   end
 
   defp maybe_retryable_stream_error_details(_kind, _type, _code, details), do: details
+
+  defp maybe_put_dangling_call_id(details, :dangling_tool_call, call_id)
+       when is_binary(call_id),
+       do: Map.put(details, :call_id, call_id)
+
+  defp maybe_put_dangling_call_id(details, _kind, _call_id), do: details
+
+  # #462: the Responses API rejects an input whose `function_call` has no matching
+  # `function_call_output`. The rejection is structurally identified — an
+  # `invalid_request_error` (or `bad_request`) whose `param` is `input` — and only then
+  # is the offending call id read out of the message. Prose alone never classifies:
+  # without the structural gate this returns nil and the error stays a plain
+  # `:provider_http_error`.
+  defp dangling_tool_call_id(%{"param" => "input"} = error) do
+    if dangling_tool_call_family?(error["type"], error["code"]) do
+      extract_dangling_call_id(error["message"])
+    end
+  end
+
+  defp dangling_tool_call_id(_error), do: nil
+
+  defp dangling_tool_call_family?(type, code) do
+    type in ["invalid_request_error", "bad_request"] or
+      code in ["invalid_request_error", "bad_request"]
+  end
+
+  # ONE alphabet, read from `Pixir.Provider.ToolCall` rather than restated (#462 round 5).
+  # The previous private copy was narrower than the validator's at the edges — it required
+  # the first and last characters to be non-`.`, so a legal id that BEGINS with `.`, one
+  # that is a single `.`, and one that ENDS with `.` were captured truncated or missed
+  # entirely. Truncated is the dangerous half: it heals an id the Provider never named
+  # while the real rejection stands, which is worse than not classifying at all.
+  @dangling_call_re Regex.compile!(
+                      "No tool output found for function call ([" <>
+                        ToolCall.identity_alphabet() <> "]+)"
+                    )
+
+  # One genuine ambiguity remains and cannot be regexed away: a message ending
+  # "…function call call_abc." is identical whether the id is `call_abc` and the `.` closes
+  # the sentence, or the id is `call_abc.` — both are legal identities. The sentence reading
+  # is the one the API actually produces, so a trailing `.` is dropped, and only when the
+  # capture runs to the end of the message or to whitespace. A `.` followed by more id
+  # characters is inside the id and is kept, which is what `call.foo:bar` needs. Stripping
+  # can never empty the capture: a lone `.` at the end of the message would strip to "",
+  # which is not a valid identity and so returns nil rather than a bogus id.
+  defp extract_dangling_call_id(message) when is_binary(message) do
+    case Regex.run(@dangling_call_re, message, return: :index) do
+      [_full, {start, length}] ->
+        message
+        |> binary_part(start, length)
+        |> strip_sentence_period(sentence_ends_at?(message, start + length))
+
+      _no_match ->
+        nil
+    end
+  end
+
+  defp extract_dangling_call_id(_message), do: nil
+
+  defp sentence_ends_at?(message, offset) when byte_size(message) == offset, do: true
+
+  defp sentence_ends_at?(message, offset),
+    do: binary_part(message, offset, 1) in [" ", "\t", "\n", "\r"]
+
+  # Exactly ONE trailing `.` is dropped, never a run of them: `call_a..` is a legal
+  # identity whose sentence period is the last dot only.
+  defp strip_sentence_period(".", true), do: nil
+
+  defp strip_sentence_period(call_id, true), do: String.replace_suffix(call_id, ".", "")
+
+  defp strip_sentence_period(call_id, false), do: call_id
 
   # #278: mirror the Anthropic in-band classifier precedent by stamping retryable
   # once at the stream-error source; retry layers only read this classification.
@@ -2260,6 +2418,17 @@ defmodule Pixir.Provider do
       status == 400 and is_binary(message) and
           message =~ ~r/model.*(not supported|not available|does not exist)/i ->
         err(:model_not_supported, message, %{status: status})
+
+      # #462: the same dangling-call rejection can also arrive with a real 4xx status
+      # rather than in-band over 200. Same structural gate, same recovery downstream.
+      status == 400 and is_binary(dangling_tool_call_id(error)) ->
+        err(:dangling_tool_call, message, %{
+          status: status,
+          type: error["type"],
+          code: error["code"],
+          param: error["param"],
+          call_id: dangling_tool_call_id(error)
+        })
 
       true ->
         err(:provider_http_error, message || "Responses API returned an error", %{

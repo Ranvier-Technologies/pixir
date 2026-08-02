@@ -87,10 +87,40 @@ are Workflow outcomes, not protocol failures. They should be returned as structu
 Workflow data so parent agents and presenters cannot mistake partial work for success or
 lose useful evidence.
 
+### Amendment (2026-07-31, issue #436): the unverified-dependency opt-in
+
+Downstream steps unlock only from `checkpoint_ready` by default, and that default is
+unchanged. One narrow, explicit, per-step exception exists: a step may list a subset of
+its own `depends_on` in `allow_unverified_depends_on`, and each named dependency then
+also unblocks the step when that dependency's child reached a **successful terminal
+completion** whose derived `checkpoint_status` is **`partial`**. Every other outcome —
+`failed`, `needs_orchestrator`, `held`, and any child that timed out or did not terminate
+successfully — remains inadmissible, and a dependency the flag does not name still gates
+strictly.
+
+This does not add a `checkpoint_status` value, does not change how `checkpoint_status` is
+derived from a child's terminal summary, and does not relax gating anywhere the flag is
+absent. It exists because a bounded writer with no shell cannot run verification
+commands, so its honest terminal shape is a completed child that marks itself `partial` —
+indistinguishable at runtime from a child that genuinely did not finish. The flag is
+therefore an operator assertion about the lane, not runtime-proven evidence, and the
+runtime records it as such: the opted-in step's Checkpoint Bundle carries
+`verification.unverified_dependencies` plus the `ran_against_unverified_dependencies`
+known limitation, mirrored into its `workflow_checkpoint.v1` payload as
+`unverified_dependencies`, so a reader of the bundle alone can tell the step's
+conclusions rest on unverified upstream work. The upstream dependency's own
+`checkpoint_status`, `dependent_safe` flag, `known_limitations`, and rollup contribution
+are untouched.
+
+See the workflow contract design note for when to reach for this shape at all: for
+implementation lanes the canonical shape remains a single-step workflow verified by the
+parent.
+
 ## Consequences
 
 - Downstream steps should unlock only from `checkpoint_ready`, not merely from raw
-  Subagent `completed`.
+  Subagent `completed`, except through the explicit per-step opt-in described in the
+  amendment above.
 - A Workflow can fail honestly without erasing completed child work.
 - ACP/T3 and terminal presenters can show partial outcomes without misleading success
   prose.

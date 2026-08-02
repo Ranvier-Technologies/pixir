@@ -41,3 +41,24 @@ v0.1's single Provider is the **OpenAI Responses API**, reached via two
   from the JWT and sent as a header.
 - **Deferring `req_llm`** means multi-provider breadth comes later; re-adding it is
   additive (a second dialect behind the same Provider seam).
+
+## Amendment (2026-07-21): the deferral of non-OpenAI backends is lifted
+
+The "all other providers (Anthropic, local models) are deferred" clause no longer
+describes the shipped runtime:
+
+- **Anthropic** shipped as a second Provider behind the same seam (ADR 0037,
+  v0.1.8 era).
+- **Open Responses endpoints** shipped as the `open_responses` provider mode
+  (v0.1.11): operator-configured `base_url` routed to `/v1/responses`, auth
+  policies `bearer_env` and `none`, OpenAI-only request extensions gated off,
+  and SSE-first transport for non-OpenAI backends. Live compatibility was
+  verified in the v0.1.12 cycle against a local open-source server via
+  `mix pixir.smoke.open_responses`, at the honest claim level
+  `endpoint_compatibility_observed`, with protocol deviations confessed in the
+  evidence (`termination` field) rather than papered over.
+
+Credentials remain as decided here for the OpenAI path; the `open_responses`
+mode requires no OpenAI account. This amendment records the lifted deferral so
+public copy can stand on a documented decision; the original decision text
+above is preserved as written.

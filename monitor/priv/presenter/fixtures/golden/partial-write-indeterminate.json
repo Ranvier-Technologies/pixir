@@ -138,6 +138,8 @@
           "lib/pixir/example.ex"
         ],
         "observed_semantics": "at_least",
+        "basis": "envelope_observed_writes",
+        "write_denials": [],
         "evidence_refs": [
           "e-envelope-partial",
           "e-child-1",
@@ -216,6 +218,8 @@
       "lib/pixir/example.ex"
     ],
     "observed_semantics": "at_least",
+    "basis": "envelope_observed_writes",
+    "write_denials": [],
     "evidence_refs": [
       "e-envelope-partial",
       "e-child-1",
@@ -303,5 +307,15 @@
   ],
   "limitations": [
     "partial_repo_mutation"
-  ]
+  ],
+  "post_terminal_child_activity": {
+    "state": "none",
+    "basis": "child_events_after_parent_terminal_boundary",
+    "boundary_at": "2026-07-10T19:40:04Z",
+    "boundary_basis": "terminal_subagent_lifecycle_ts",
+    "event_count": 0,
+    "latest_event_at": null,
+    "child_session_ids": [],
+    "evidence_refs": []
+  }
 }

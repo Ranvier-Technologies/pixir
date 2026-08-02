@@ -34,7 +34,12 @@ defmodule Pixir.ACP.Server do
   `_meta`; sticky model and reasoning-effort selection are exposed through
   `configOptions`; the legacy model catalog + auth status ride on `initialize._meta.pixir`.
   Other methods get `-32601`. JSON-RPC errors are reserved for protocol faults; a
-  failed Turn is reported as content with `stopReason:"end_turn"` (ADR 0009 §5).
+  failed Turn is reported as content with `stopReason:"end_turn"` (ADR 0009 §5), and
+  the prompt result additionally carries `_meta.pixir.turn_failure` (bounded facts:
+  `terminal_status`, `error_kind`) exactly when a `turn_failed` event was observed
+  during the prompt, so clients can distinguish failure from completion without
+  parsing chat text (#465, ADR 0009 §5 amendment). The signal is evidence-based: a
+  refused `session/prompt` (`:busy`) or a silent stall claims nothing.
   Permission posture follows the session mode (`plan` → read-only) and
   `_meta.permission_mode "ask"` (→ interactive approval via the ACP asker).
 
@@ -1449,7 +1454,7 @@ defmodule Pixir.ACP.Server do
 
     case Conversation.send(pixir_sid, prompt_text, turn_opts) do
       {:ok, _ref} ->
-        {outcome, saw_text?, last_text} =
+        {outcome, saw_text?, last_text, failure} =
           consume(server, acp_sid, pixir_sid, prompt_idle_timeout_ms, false, nil)
 
         fallback_text =
@@ -1461,10 +1466,10 @@ defmodule Pixir.ACP.Server do
         maybe_fallback(server, acp_sid, saw_text?, fallback_text)
         # The Server resolves the request id and the cancel flag at this point, so a
         # cancel that raced a terminal status still wins (ADR 0009 §5 cancel race).
-        finish_prompt(server, pixir_sid, outcome, prompt_resolve_hook)
+        finish_prompt(server, pixir_sid, outcome, failure, prompt_resolve_hook)
 
       {:error, :busy} ->
-        finish_prompt(server, pixir_sid, :error, prompt_resolve_hook)
+        finish_prompt(server, pixir_sid, :error, nil, prompt_resolve_hook)
     end
   end
 
@@ -1498,39 +1503,84 @@ defmodule Pixir.ACP.Server do
     end
   end
 
-  defp finish_prompt(server, pixir_sid, outcome, prompt_resolve_hook) do
+  defp finish_prompt(server, pixir_sid, outcome, failure, prompt_resolve_hook) do
     prompt_resolve_hook.(outcome)
-    :ok = GenServer.call(server, {:resolve_prompt, pixir_sid, outcome})
+    :ok = GenServer.call(server, {:resolve_prompt, pixir_sid, outcome, failure})
   end
 
   # Mirror of Conversation's terminal detection (conversation.ex:113-130), extended to
-  # track text-streamed + last assistant text for the no-deltas fallback (ADR 0009 §4).
-  defp consume(server, acp_sid, pixir_sid, timeout, saw_text?, last_text) do
+  # track text-streamed + last assistant text for the no-deltas fallback (ADR 0009 §4)
+  # and the bounded turn-failure facts for the prompt result's `_meta` (#465).
+  defp consume(server, acp_sid, pixir_sid, timeout, saw_text?, last_text, failure \\ nil) do
     receive do
       {:pixir_event, event} ->
         Pixir.ACP.Server.emit_event(server, acp_sid, event)
 
         saw_text? = saw_text? or event.type == :text_delta
         last_text = stash_assistant(event, last_text)
+        failure = stash_turn_failure(event, failure)
 
         case terminal(event) do
-          nil -> consume(server, acp_sid, pixir_sid, timeout, saw_text?, last_text)
-          outcome -> {outcome, saw_text?, last_text}
+          nil -> consume(server, acp_sid, pixir_sid, timeout, saw_text?, last_text, failure)
+          outcome -> {outcome, saw_text?, last_text, failure}
         end
     after
       timeout ->
         if turn_running?(pixir_sid) do
-          consume(server, acp_sid, pixir_sid, timeout, saw_text?, last_text)
+          consume(server, acp_sid, pixir_sid, timeout, saw_text?, last_text, failure)
         else
-          {:timeout, saw_text?, last_text}
+          {:timeout, saw_text?, last_text, failure}
         end
     end
+  end
+
+  # #465: keep only the bounded classification facts — never the raw error message or
+  # details, which already reach the user as chat content and may embed provider prose.
+  defp stash_turn_failure(%{type: :turn_failed, data: data}, _failure) when is_map(data),
+    do: turn_failure_facts(data)
+
+  defp stash_turn_failure(_event, failure), do: failure
+
+  @doc false
+  # Bounded and type-guarded: a field only ships when the producer recorded a binary
+  # (Event.turn_failed/2 accepts any map, so a sloppy future producer must not be able
+  # to push a nested term or a JSON null onto the ACP wire through this channel). An
+  # empty map is still meaningful: the turn_failed event itself WAS observed.
+  def turn_failure_facts(data) when is_map(data) do
+    for key <- ["terminal_status", "error_kind"],
+        value = data[key],
+        is_binary(value),
+        into: %{},
+        do: {key, value}
   end
 
   defp turn_running?(pixir_sid) do
     Pixir.Session.turn_running?(pixir_sid)
   catch
     :exit, _reason -> false
+  end
+
+  # #465: the chat rendering of a failed Turn stays exactly as ADR 0009 §5 decided
+  # (content + `stopReason:"end_turn"`, because a JSON-RPC error surfaces in clients
+  # as a provider-failure view and any other stopReason reads as completion). What was
+  # missing is a MACHINE-readable channel: the prompt RESULT carries
+  # `_meta.pixir.turn_failure` exactly when a `turn_failed` event was OBSERVED during
+  # this prompt — the contract is evidence-based, never inferred from the terminal
+  # shape (Grok round 1: inferring from `outcome == :error` falsely marked a
+  # `Conversation.send` `:busy` refusal, where no Turn ran at all, as a failed Turn).
+  # Fields stay bounded (`terminal_status`, `error_kind`). A cancel that raced a
+  # failure keeps `stopReason:"cancelled"` AND carries the facts; the same holds for
+  # a prompt-idle `:timeout` whose Turn recorded `turn_failed` and then died without
+  # a terminal status.
+  @doc false
+  def prompt_result(stop_reason, failure) do
+    base = %{"stopReason" => stop_reason}
+
+    if is_map(failure) do
+      Map.put(base, "_meta", %{"pixir" => %{"turn_failure" => failure}})
+    else
+      base
+    end
   end
 
   defp stash_assistant(%{type: :assistant_message, data: %{"text" => text}}, _last), do: text
@@ -1544,14 +1594,14 @@ defmodule Pixir.ACP.Server do
   # Read the request id + cancel flag at resolve time so a cancel that raced a terminal
   # status still wins.
   @impl true
-  def handle_call({:resolve_prompt, pixir_sid, outcome}, _from, state) do
+  def handle_call({:resolve_prompt, pixir_sid, outcome, failure}, _from, state) do
     id = get_in(state.prompts, [pixir_sid, :id])
     cancel? = get_in(state.prompts, [pixir_sid, :cancel?]) || false
     stop_reason = Translate.stop_reason(outcome, cancel?)
 
     acp_sid = acp_sid_for_pixir(state, pixir_sid)
     maybe_write_acp_warning_summary(state.out, acp_sid, Map.get(state.prompts, pixir_sid, %{}))
-    write(state.out, Protocol.result(id, %{"stopReason" => stop_reason}))
+    write(state.out, Protocol.result(id, prompt_result(stop_reason, failure)))
     {:reply, :ok, %{state | prompts: Map.delete(state.prompts, pixir_sid)}}
   end
 

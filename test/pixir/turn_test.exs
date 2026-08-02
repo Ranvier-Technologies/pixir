@@ -4,7 +4,8 @@ defmodule Pixir.TurnTest do
   import ExUnit.CaptureLog
 
   alias Pixir.{Compaction, Event, Events, Log, Session, SessionSupervisor, Turn}
-  alias Pixir.Permissions.WritePolicy
+  alias Pixir.Permissions.{WriteDenials, WritePolicy}
+  alias Pixir.Test.WorkspaceFixtures
 
   # A provider stub that pops scripted results from an Agent and streams text deltas.
   defmodule StubProvider do
@@ -544,11 +545,37 @@ defmodule Pixir.TurnTest do
     assert result.data["output"] == "hello from file"
   end
 
-  test "write_policy_denied is terminal and does not route back to provider", %{
-    ctx: ctx,
-    sid: sid,
-    ws: ws
-  } do
+  defp avd_artifact(changes) do
+    %{
+      "kind" => "virtual_diff",
+      "version" => 1,
+      "workspace_strategy" => "virtual_overlay",
+      "workspace_fidelity" => "virtual_shell_no_host_binaries",
+      "parent_workspace" => %{"mutation" => "none"},
+      "import" => %{"read_set" => [], "file_count" => 0, "byte_count" => 0, "truncated" => false},
+      "commands" => [],
+      "summary" => %{},
+      "changes" => changes,
+      "limits" => %{},
+      "caveats" => [],
+      "apply" => %{"status" => "not_applied", "requires_explicit_apply" => true}
+    }
+  end
+
+  defp avd_add_change(path, content) do
+    %{
+      "path" => path,
+      "operation" => "add",
+      "after" => %{
+        "sha256" => :crypto.hash(:sha256, content) |> Base.encode16(case: :lower),
+        "byte_count" => byte_size(content),
+        "content" => content
+      },
+      "diff" => %{"format" => "unified", "text" => "+#{content}", "truncated" => false}
+    }
+  end
+
+  defp strike_policy do
     {:ok, policy} =
       WritePolicy.normalize(%{
         "version" => 1,
@@ -556,31 +583,429 @@ defmodule Pixir.TurnTest do
         "allow_writes" => ["allowed/**"]
       })
 
+    policy
+  end
+
+  test "first write_policy denial is recoverable: the Turn continues and completes", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
     script = [
       tool_calls([
         %{call_id: "c1", name: "write", args: %{"path" => "blocked.txt", "content" => "no"}}
+      ]),
+      tool_calls([
+        %{call_id: "c2", name: "write", args: %{"path" => "allowed/ok.txt", "content" => "yes"}}
+      ]),
+      stop("wrote inside the allowlist")
+    ]
+
+    assert {:ok, "wrote inside the allowlist"} =
+             run_with(ctx, "write outside then inside", script, write_policy: strike_policy())
+
+    refute File.exists?(Path.join(ws, "blocked.txt"))
+    assert File.read!(Path.join(ws, "allowed/ok.txt")) == "yes"
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    assert [deny] =
+             Enum.filter(
+               history,
+               &(&1.type == :permission_decision and &1.data["decision"] == "deny")
+             )
+
+    assert deny.data["gate"] == "write_policy"
+
+    # The allowed write really ran after the denial.
+    allowed_call = Enum.find(history, &(&1.type == :tool_call and &1.data["call_id"] == "c2"))
+    allowed_result = Enum.find(history, &(&1.type == :tool_result and &1.data["call_id"] == "c2"))
+    assert allowed_call.data["name"] == "write"
+    assert allowed_result.data["ok"] == true
+
+    refute Enum.any?(history, &(&1.type == :turn_failed))
+    assert List.last(history).type == :assistant_message
+    # The Turn reached a second provider round-trip and a third for the answer.
+    assert Enum.count(history, &(&1.type == :provider_usage)) == 3
+  end
+
+  test "the round-trip after a recoverable denial delivers the structured denial to the provider",
+       %{ctx: ctx, ws: ws} do
+    script = [
+      tool_calls([
+        %{call_id: "c1", name: "write", args: %{"path" => "blocked.txt", "content" => "no"}}
+      ]),
+      stop("understood")
+    ]
+
+    {:ok, agent} = Agent.start_link(fn -> script end)
+
+    assert {:ok, "understood"} =
+             Turn.run(ctx, "write outside policy",
+               provider: ScriptedRequestCaptureProvider,
+               provider_opts: [agent: agent, test_pid: self()],
+               write_policy: strike_policy()
+             )
+
+    refute File.exists?(Path.join(ws, "blocked.txt"))
+
+    assert_receive {:scripted_provider_request, _first_request}
+    assert_receive {:scripted_provider_request, second_request}
+    assert {:ok, body} = Pixir.Provider.request_body_preview(second_request)
+
+    denial_output =
+      Enum.find(body["input"], fn item ->
+        item["type"] == "function_call_output" and item["call_id"] == "c1"
+      end)
+
+    assert denial_output, "the denied call must be folded into a function_call_output"
+
+    payload = Jason.decode!(denial_output["output"])
+    assert payload["ok"] == false
+    assert payload["error"]["kind"] == "write_policy_denied"
+
+    details = payload["error"]["details"]
+    assert details["tool"] == "write"
+    assert details["normalized_path"]
+    assert details["matched_rule"] || details["rule"]
+    assert details["policy_id"]
+    assert details["policy_hash"]
+    assert details["policy_version"]
+    assert is_list(details["next_actions"]) and details["next_actions"] != []
+  end
+
+  test "the second write_policy denial in a Turn is turn-fatal", %{ctx: ctx, sid: sid, ws: ws} do
+    script = [
+      tool_calls([
+        %{call_id: "c1", name: "write", args: %{"path" => "blocked.txt", "content" => "no"}}
+      ]),
+      tool_calls([
+        %{call_id: "c2", name: "write", args: %{"path" => "blocked2.txt", "content" => "no"}}
       ]),
       stop("should not be called")
     ]
 
     assert {:error, %{error: %{kind: :write_policy_denied}}} =
-             run_with(ctx, "write outside policy", script, write_policy: policy)
+             run_with(ctx, "keep pushing the boundary", script, write_policy: strike_policy())
 
     refute File.exists?(Path.join(ws, "blocked.txt"))
+    refute File.exists?(Path.join(ws, "blocked2.txt"))
+
     assert {:ok, history} = Log.fold(sid, workspace: ws)
 
-    assert Enum.map(history, & &1.type) == [
-             :user_message,
-             :provider_usage,
-             :tool_call,
-             :permission_decision,
-             :tool_result,
-             :turn_failed
-           ]
+    denials =
+      Enum.filter(
+        history,
+        &(&1.type == :permission_decision and &1.data["decision"] == "deny")
+      )
 
-    assert List.last(history).data["terminal_status"] == "tool_error"
-    assert List.last(history).data["error_kind"] == "write_policy_denied"
-    assert Enum.count(history, &(&1.type == :provider_usage)) == 1
+    assert length(denials) == 2
+    assert Enum.all?(denials, &(&1.data["gate"] == "write_policy"))
+
+    failure = List.last(history)
+    assert failure.type == :turn_failed
+    assert failure.data["terminal_status"] == "tool_error"
+    assert failure.data["error_kind"] == "write_policy_denied"
+  end
+
+  test "three denied writes in a single batch halt after the second", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    script = [
+      tool_calls([
+        %{call_id: "c1", name: "write", args: %{"path" => "blocked1.txt", "content" => "no"}},
+        %{call_id: "c2", name: "write", args: %{"path" => "blocked2.txt", "content" => "no"}},
+        %{call_id: "c3", name: "write", args: %{"path" => "blocked3.txt", "content" => "no"}}
+      ]),
+      stop("should not be called")
+    ]
+
+    assert {:error, %{error: %{kind: :write_policy_denied}}} =
+             run_with(ctx, "three boundary probes at once", script, write_policy: strike_policy())
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    denials =
+      Enum.filter(
+        history,
+        &(&1.type == :permission_decision and &1.data["decision"] == "deny")
+      )
+
+    assert length(denials) == 2
+
+    # The third call of the same batch never runs: the Turn halts mid-batch on
+    # the second strike rather than draining the response.
+    assert Enum.map(Enum.filter(history, &(&1.type == :tool_call)), & &1.data["call_id"]) ==
+             ["c1", "c2"]
+
+    refute File.exists?(Path.join(ws, "blocked3.txt"))
+
+    failure = List.last(history)
+    assert failure.type == :turn_failed
+    assert failure.data["error_kind"] == "write_policy_denied"
+  end
+
+  test "an outside-workspace bash token strikes and fatals like any write denial", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    fixture = WorkspaceFixtures.outside_workspace_fixture(ws)
+    on_exit(fn -> File.rm_rf!(fixture.outside) end)
+
+    script = [
+      tool_calls([
+        %{
+          call_id: "c1",
+          name: "bash",
+          args: %{"command" => "cat #{fixture.outside_file}"}
+        }
+      ]),
+      tool_calls([
+        %{
+          call_id: "c2",
+          name: "bash",
+          args: %{"command" => "cat #{fixture.outside_file}"}
+        }
+      ]),
+      stop("should not be called")
+    ]
+
+    assert {:error, %{error: %{kind: :write_policy_denied}}} =
+             run_with(ctx, "probe outside the workspace twice", script,
+               write_policy: strike_policy()
+             )
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    denials =
+      Enum.filter(
+        history,
+        &(&1.type == :permission_decision and &1.data["decision"] == "deny")
+      )
+
+    assert length(denials) == 2
+    assert Enum.all?(denials, &(&1.data["matched_rule"] == "outside_workspace"))
+
+    failure = List.last(history)
+    assert failure.type == :turn_failed
+    assert failure.data["error_kind"] == "write_policy_denied"
+
+    # The confession classifies exactly what the strike counter classified.
+    confession = WriteDenials.from_history(history)
+    assert confession["count"] == 2
+    assert Enum.map(confession["denials"], & &1["disposition"]) == ["recovered", "fatal"]
+
+    assert Enum.all?(
+             confession["denials"],
+             &(&1["normalized_path"] == "cat #{fixture.outside_file}")
+           )
+  end
+
+  test "a denied write in a batch leaves the other calls of that batch executed", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    File.write!(Path.join(ws, "a.txt"), "hello from file")
+
+    script = [
+      tool_calls([
+        %{call_id: "c1", name: "write", args: %{"path" => "blocked.txt", "content" => "no"}},
+        %{call_id: "c2", name: "read", args: %{"path" => "a.txt"}}
+      ]),
+      stop("read it anyway")
+    ]
+
+    assert {:ok, "read it anyway"} =
+             run_with(ctx, "batch with a denial", script, write_policy: strike_policy())
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    assert Enum.map(Enum.filter(history, &(&1.type == :tool_call)), & &1.data["call_id"]) ==
+             ["c1", "c2"]
+
+    read_result = Enum.find(history, &(&1.type == :tool_result and &1.data["call_id"] == "c2"))
+    assert read_result.data["output"] == "hello from file"
+    refute Enum.any?(history, &(&1.type == :turn_failed))
+  end
+
+  test "a denied write in the output-item walk leaves later items processed", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    File.write!(Path.join(ws, "a.txt"), "hello from file")
+
+    after_denial = %{"type" => "reasoning", "id" => "rs_after", "encrypted_content" => "ENC"}
+
+    denied_call = %{
+      call_id: "c1",
+      name: "write",
+      args: %{"path" => "blocked.txt", "content" => "no"}
+    }
+
+    later_call = %{call_id: "c2", name: "read", args: %{"path" => "a.txt"}}
+
+    script = [
+      tool_calls_with_output_items(
+        [denied_call, later_call],
+        [after_denial],
+        [{:function_call, denied_call}, {:reasoning, after_denial}, {:function_call, later_call}]
+      ),
+      stop("kept going")
+    ]
+
+    assert {:ok, "kept going"} =
+             run_with(ctx, "output-item walk with a denial", script,
+               write_policy: strike_policy()
+             )
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    assert Enum.map(Enum.filter(history, &(&1.type == :tool_call)), & &1.data["call_id"]) ==
+             ["c1", "c2"]
+
+    assert Enum.any?(history, &(&1.type == :reasoning and &1.data["item"] == after_denial))
+    refute Enum.any?(history, &(&1.type == :turn_failed))
+  end
+
+  test "workspace-root and apply_virtual_diff denials count on the same strike counter", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    script = [
+      tool_calls([
+        %{call_id: "c1", name: "write", args: %{"path" => ".", "content" => "no"}}
+      ]),
+      tool_calls([
+        %{
+          call_id: "c2",
+          name: "apply_virtual_diff",
+          args: %{
+            "artifact" => avd_artifact([avd_add_change("blocked.txt", "no\n")]),
+            "dry_run" => false
+          }
+        }
+      ]),
+      stop("should not be called")
+    ]
+
+    assert {:error, %{error: %{kind: :write_policy_denied}}} =
+             run_with(ctx, "root then virtual diff", script, write_policy: strike_policy())
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    denials =
+      Enum.filter(
+        history,
+        &(&1.type == :permission_decision and &1.data["decision"] == "deny")
+      )
+
+    assert length(denials) == 2
+    assert Enum.all?(denials, &(&1.data["gate"] == "write_policy"))
+    assert List.last(history).type == :turn_failed
+  end
+
+  test "the strike counter resets between Turns", %{ctx: ctx, sid: sid, ws: ws} do
+    policy = strike_policy()
+
+    script_a = [
+      tool_calls([
+        %{call_id: "a1", name: "write", args: %{"path" => "blocked.txt", "content" => "no"}}
+      ]),
+      stop("turn a done")
+    ]
+
+    script_b = [
+      tool_calls([
+        %{call_id: "b1", name: "write", args: %{"path" => "blocked2.txt", "content" => "no"}}
+      ]),
+      stop("turn b done")
+    ]
+
+    assert {:ok, "turn a done"} = run_with(ctx, "turn a", script_a, write_policy: policy)
+    assert {:ok, "turn b done"} = run_with(ctx, "turn b", script_b, write_policy: policy)
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    assert Enum.count(
+             history,
+             &(&1.type == :permission_decision and &1.data["decision"] == "deny")
+           ) == 2
+
+    refute Enum.any?(history, &(&1.type == :turn_failed))
+  end
+
+  test "a resumed Turn starts at zero strikes even with prior denials in the Log", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    policy = strike_policy()
+
+    first = [
+      tool_calls([
+        %{call_id: "a1", name: "write", args: %{"path" => "blocked.txt", "content" => "no"}}
+      ]),
+      stop("first done")
+    ]
+
+    assert {:ok, "first done"} = run_with(ctx, "first", first, write_policy: policy)
+
+    # A "resumed" Turn is a fresh Turn.run over a Log that already carries a denial.
+    resumed = [
+      tool_calls([
+        %{call_id: "b1", name: "write", args: %{"path" => "blocked2.txt", "content" => "no"}}
+      ]),
+      stop("resumed done")
+    ]
+
+    assert {:ok, "resumed done"} = run_with(ctx, "resumed", resumed, write_policy: policy)
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    assert Enum.count(
+             history,
+             &(&1.type == :permission_decision and &1.data["decision"] == "deny")
+           ) == 2
+
+    refute Enum.any?(history, &(&1.type == :turn_failed))
+  end
+
+  test "a strike-1 denial still records a full permission_decision Event", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    script = [
+      tool_calls([
+        %{call_id: "c1", name: "write", args: %{"path" => "blocked.txt", "content" => "no"}}
+      ]),
+      stop("noted")
+    ]
+
+    assert {:ok, "noted"} = run_with(ctx, "one denial", script, write_policy: strike_policy())
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+    refute Enum.any?(history, &(&1.type == :turn_failed))
+
+    assert [deny] =
+             Enum.filter(
+               history,
+               &(&1.type == :permission_decision and &1.data["decision"] == "deny")
+             )
+
+    details = deny.data
+    assert details["gate"] == "write_policy"
+    assert details["policy_id"]
+    assert details["policy_hash"]
+    assert details["policy_version"]
+    assert details["matched_rule"] || details["rule"]
+    assert details["tool"] == "write"
   end
 
   test "bash_disabled is not terminal: the model adapts after the denial", %{
@@ -616,6 +1041,53 @@ defmodule Pixir.TurnTest do
     assert "use_native_read_tools" in result.data["error"]["details"]["next_actions"]
     refute Enum.any?(history, &(&1.type == :turn_failed))
     assert List.last(history).type == :assistant_message
+
+    # The denial is gated and logged under the write_policy gate...
+    assert [deny] =
+             Enum.filter(
+               history,
+               &(&1.type == :permission_decision and &1.data["decision"] == "deny")
+             )
+
+    assert deny.data["gate"] == "write_policy"
+    assert deny.data["matched_rule"] == "bash_disabled"
+
+    # ...but it is not a boundary probe, so the mandatory confession stays empty.
+    # A non-empty confession tells the coordinator to check whether the worker's
+    # scope was drawn correctly; a worker that merely tried to shell out must not
+    # manufacture that signal.
+    assert WriteDenials.from_history(history) == WriteDenials.empty()
+    assert WriteDenials.from_session(sid, ws) == %{"count" => 0, "denials" => []}
+  end
+
+  test "a shell command that is neither safe nor declared confesses no denial", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    script = [
+      tool_calls([
+        %{call_id: "c1", name: "bash", args: %{"command" => "npm run build --silent"}}
+      ]),
+      tool_calls([
+        %{call_id: "c2", name: "write", args: %{"path" => "allowed/ok.txt", "content" => "yes"}}
+      ]),
+      stop("built nothing, wrote inside")
+    ]
+
+    assert {:ok, "built nothing, wrote inside"} =
+             run_with(ctx, "build then write", script, write_policy: strike_policy())
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    assert [result] = Enum.filter(history, &(&1.type == :tool_result and &1.data["error"]))
+    assert result.data["error"]["kind"] == "bash_disabled"
+
+    # It did not strike: the later write inside the allowlist still ran.
+    assert File.read!(Path.join(ws, "allowed/ok.txt")) == "yes"
+    refute Enum.any?(history, &(&1.type == :turn_failed))
+
+    assert WriteDenials.from_session(sid, ws) == %{"count" => 0, "denials" => []}
   end
 
   test "records explicit dollar skill activation before the user message", %{
@@ -866,20 +1338,22 @@ defmodule Pixir.TurnTest do
     assert Enum.count(history, &(&1.type == :tool_result)) == 1
   end
 
-  test "terminal tool error stops ordered output_items before later reasoning is recorded", %{
+  test "the fatal strike stops ordered output_items before later reasoning is recorded", %{
     ctx: ctx,
     sid: sid,
     ws: ws
   } do
-    {:ok, policy} =
-      WritePolicy.normalize(%{
-        "version" => 1,
-        "metadata" => %{"id" => "turn-test"},
-        "allow_writes" => ["allowed/**"]
-      })
+    policy = strike_policy()
 
     after_error = %{"type" => "reasoning", "id" => "rs_after", "encrypted_content" => "ENC"}
 
+    first_denied = %{
+      call_id: "c0",
+      name: "write",
+      args: %{"path" => "blocked0.txt", "content" => "no"}
+    }
+
+    # Strike 2: this one halts the walk, so the reasoning item after it is never recorded.
     failing_call = %{
       call_id: "c1",
       name: "write",
@@ -889,6 +1363,7 @@ defmodule Pixir.TurnTest do
     later_call = %{call_id: "c2", name: "read", args: %{"path" => "a.txt"}}
 
     script = [
+      tool_calls([first_denied]),
       tool_calls_with_output_items(
         [failing_call, later_call],
         [after_error],
@@ -906,6 +1381,7 @@ defmodule Pixir.TurnTest do
     refute Enum.any?(history, &(&1.type == :reasoning and &1.data["item"] == after_error))
 
     assert Enum.map(Enum.filter(history, &(&1.type == :tool_call)), & &1.data["call_id"]) == [
+             "c0",
              "c1"
            ]
 

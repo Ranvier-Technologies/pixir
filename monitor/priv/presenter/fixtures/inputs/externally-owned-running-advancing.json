@@ -1,0 +1,23 @@
+{
+  "fixture_schema": "pixir.presenter.fixture",
+  "fixture_version": 1,
+  "scenario": "externally-owned-running-advancing",
+  "source_class": "synthetic_from_runtime_contract",
+  "observed_at": "2026-07-31T09:15:30Z",
+  "inputs": {
+    "terminal_envelope": null,
+    "delegate_snapshot": {"kind": "delegate_status", "delegate_id": "dlg-external", "parent_session_id": "parent-external", "strategy": "subagents", "mode": "read_only", "status": "running", "children": [{"subagent_id": "sub-external-a", "child_session_id": "child-external-a", "agent": "explorer", "status": "running"}, {"subagent_id": "sub-external-b", "child_session_id": "child-external-b", "agent": "explorer", "status": "running"}]},
+    "parent_log": [
+      {"seq": 0, "ts": "2026-07-31T09:15:00Z", "type": "subagent_event", "data": {"event": "started", "subagent_id": "sub-external-a", "child_session_id": "child-external-a", "agent": "explorer", "status": "running"}},
+      {"seq": 1, "ts": "2026-07-31T09:15:20Z", "type": "subagent_event", "data": {"event": "started", "subagent_id": "sub-external-b", "child_session_id": "child-external-b", "agent": "explorer", "status": "running"}}
+    ],
+    "parent_log_origin": "fixture",
+    "child_logs": {"child-external-a": [], "child-external-b": []},
+    "runtime_diagnostics": null,
+    "owner_state": {"state": "snapshot_only", "reachable": false},
+    "activity_evidence": {"durable_evidence": "advanced", "prior_as_of_seq": 0, "prior_last_durable_at": "2026-07-31T09:15:00Z", "basis": "caller_observation_delta"},
+    "evidence_mirror": null
+  },
+  "completeness": {"delegate_snapshot": "complete_snapshot", "parent_log": "complete_through_observed_at", "child_logs": "complete_through_observed_at"},
+  "sanitization": {"absolute_paths_removed": true, "identifiers_replaced": true, "model_content_minimized": true, "secrets_removed": true}
+}

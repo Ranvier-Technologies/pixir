@@ -272,7 +272,17 @@ defmodule PixirMonitor.FifoHandoff do
     close_port(port)
   end
 
-  defp close_writer(writer) do
+  @doc """
+  Reaps an armed writer's OS processes.
+
+  `PixirMonitor.LaunchSurface` calls this on shutdown. Closing the Port alone is
+  not enough: the writer blocks in `sysopen` on the FIFO BEFORE it ever reads
+  stdin, so it never observes the EOF that port closure produces and would
+  outlive the surface, holding a pipe nobody will read until its own 65-second
+  watchdog reaps it. Killing the OS pids makes that bound immediate.
+  """
+  @spec close_writer(writer()) :: :ok
+  def close_writer(writer) do
     kill_pid(writer.kill, writer.watchdog_pid)
     kill_pid(writer.kill, writer.os_pid)
     close_port(writer.port)

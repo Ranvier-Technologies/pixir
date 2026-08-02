@@ -40,6 +40,11 @@ import BaseLayout from "../layouts/BaseLayout.astro";
               <h3>Presenters are replaceable</h3>
               <p>Zed, T3Code, CLI, and other ACP clients can request work while Pixir owns the runtime.</p>
             </article>
+            <article class="proof">
+              <code>open_responses</code>
+              <h3>Bring your own endpoint</h3>
+              <p>The provider layer speaks the Open Responses contract: point it at a hosted or local endpoint, no OpenAI account required.</p>
+            </article>
           </div>
         </div>
       </section>
@@ -95,7 +100,8 @@ import BaseLayout from "../layouts/BaseLayout.astro";
           <p class="section-lead">
             Pixir's first public surface is intentionally narrow: CLI and ACP. The
             primitives are built around diagnostics, continuation, supervision, and
-            local evidence.
+            local evidence. The machine surface is a checked-in contract with pinned
+            stable fields: <a href="https://github.com/Ranvier-Technologies/pixir/blob/main/docs/cli-contract.md">docs/cli-contract.md</a>.
           </p>
 
           <div class="command-grid">

@@ -1996,8 +1996,62 @@ defmodule Pixir.ACP.ServerTest do
       end)
 
     assert get_in(chunk, ["params", "update", "content", "text"]) == "boom"
-    # …and the turn resolves end_turn (a failed turn is content, not a protocol error).
-    assert Enum.find(lines, &(&1["id"] == 3))["result"]["stopReason"] == "end_turn"
+    # …and the turn resolves end_turn (a failed turn is content, not a protocol error)…
+    result = Enum.find(lines, &(&1["id"] == 3))["result"]
+    assert result["stopReason"] == "end_turn"
+
+    # …AND the result carries the machine-readable failure facts (#465, ADR 0009 §5
+    # amendment): presence of the key is the signal a client gates on, and the fields
+    # stay bounded — the error MESSAGE travels only as chat content, never here.
+    assert %{"terminal_status" => "provider_error", "error_kind" => "provider_http_error"} =
+             get_in(result, ["_meta", "pixir", "turn_failure"])
+
+    refute inspect(result["_meta"]) =~ "boom"
+  end
+
+  test "a clean turn's result carries no turn_failure meta (#465)", %{out: out, ws: ws} do
+    server = start_server(out, provider: NoDeltaProvider)
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    [new_resp] = await_lines(out, 1)
+    sid = new_resp["result"]["sessionId"]
+
+    Server.feed(
+      server,
+      request(3, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "hi"}]
+      })
+    )
+
+    result = await_id(out, 3)["result"]
+    assert result["stopReason"] == "end_turn"
+    refute Map.has_key?(result, "_meta")
+  end
+
+  describe "the #465 evidence-based contract (Grok round 1)" do
+    test "no _meta without observed turn_failed evidence: a refused or stalled prompt claims nothing" do
+      assert Server.prompt_result("end_turn", nil) == %{"stopReason" => "end_turn"}
+    end
+
+    test "observed facts ride under any stopReason, including a cancel that raced the failure" do
+      facts = %{"terminal_status" => "provider_error", "error_kind" => "provider_http_error"}
+
+      assert Server.prompt_result("cancelled", facts) == %{
+               "stopReason" => "cancelled",
+               "_meta" => %{"pixir" => %{"turn_failure" => facts}}
+             }
+    end
+
+    test "facts are type-guarded: non-binary fields drop, evidence presence survives as {}" do
+      assert Server.turn_failure_facts(%{
+               "terminal_status" => %{"nested" => "term"},
+               "error_kind" => nil
+             }) == %{}
+
+      assert Server.turn_failure_facts(%{"terminal_status" => "tool_error"}) ==
+               %{"terminal_status" => "tool_error"}
+    end
   end
 
   test "a cancelled prompt does not fall back to a previous assistant message", %{

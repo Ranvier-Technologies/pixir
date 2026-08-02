@@ -295,6 +295,283 @@ defmodule Pixir.ProviderTest do
              )
   end
 
+  # #462: the dangling-call rejection arrives in-band over HTTP 200 (WebSocket or SSE).
+  # It gets its own kind so the Turn can heal it once; classification is structural
+  # (`invalid_request_error` on `param: "input"`), and only then is the id read out of
+  # the message. Prose alone must never classify.
+  test "in-band dangling tool call rejection is classified with the named call id", %{
+    auth: auth
+  } do
+    chunks = [
+      sse(%{
+        type: "error",
+        error: %{
+          type: "invalid_request_error",
+          code: nil,
+          param: "input",
+          message: "No tool output found for function call call_uTp5vkqm7AYu50YRCLPKhOAM."
+        }
+      })
+    ]
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :dangling_tool_call,
+                message: "No tool output found for function call call_uTp5vkqm7AYu50YRCLPKhOAM.",
+                details: %{
+                  status: 200,
+                  event_type: "error",
+                  type: "invalid_request_error",
+                  param: "input",
+                  call_id: "call_uTp5vkqm7AYu50YRCLPKhOAM"
+                }
+              }
+            }} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned(chunks),
+               max_retries: 0
+             )
+  end
+
+  test "the dangling-call message alone does not classify without the structural markers",
+       %{auth: auth} do
+    chunks = [
+      sse(%{
+        type: "error",
+        error: %{
+          type: "server_error",
+          code: "server_error",
+          param: nil,
+          message: "No tool output found for function call call_ghost."
+        }
+      })
+    ]
+
+    assert {:error, %{error: %{kind: :provider_http_error} = error}} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned(chunks),
+               max_retries: 0
+             )
+
+    refute Map.has_key?(error.details, :call_id)
+  end
+
+  test "an unrelated invalid_request_error on input is not a dangling tool call", %{auth: auth} do
+    chunks = [
+      sse(%{
+        type: "error",
+        error: %{
+          type: "invalid_request_error",
+          code: nil,
+          param: "input",
+          message: "Invalid value for 'input': expected an array."
+        }
+      })
+    ]
+
+    assert {:error, %{error: %{kind: :provider_http_error}}} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned(chunks),
+               max_retries: 0
+             )
+  end
+
+  test "a dangling tool call rejection is never retried at the provider layer", %{auth: auth} do
+    dangling =
+      sse(%{
+        type: "error",
+        error: %{
+          type: "invalid_request_error",
+          code: nil,
+          param: "input",
+          message: "No tool output found for function call call_ghost."
+        }
+      })
+
+    assert {:error, %{error: %{kind: :dangling_tool_call}}} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned([dangling]),
+               max_retries: 2,
+               sleep: fn _ -> :ok end
+             )
+
+    assert_received {:request, _first}
+    refute_received {:request, _retry}
+  end
+
+  # #462 round 3: the same rejection can arrive with a REAL 4xx status rather than in-band
+  # over 200. That branch of `do_classify_http_error/2` builds a different details map
+  # (`status: 400` plus `param`) and sits AFTER the `model_not_supported` clause, so
+  # nothing about it was pinned.
+  test "a 400 dangling tool call rejection is classified with the named call id", %{auth: auth} do
+    body =
+      ~s({"error":{"type":"invalid_request_error","param":"input","message":"No tool output found for function call call_http400."}})
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :dangling_tool_call,
+                details: %{status: 400, param: "input", call_id: "call_http400"}
+              }
+            }} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned([body], 400),
+               max_retries: 0
+             )
+  end
+
+  test "a 400 without the structural param gate stays a generic provider error", %{auth: auth} do
+    body =
+      ~s({"error":{"type":"invalid_request_error","message":"No tool output found for function call call_ghost."}})
+
+    assert {:error, %{error: %{kind: :provider_http_error}}} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned([body], 400),
+               max_retries: 0
+             )
+  end
+
+  # The `model_not_supported` clause is earlier in the same `cond`. A 400 whose message
+  # matches both patterns must still take the earlier branch — the ordering is behaviour,
+  # not an accident.
+  test "a 400 naming both a bad model and a dangling call classifies as model_not_supported",
+       %{auth: auth} do
+    body =
+      ~s({"error":{"type":"invalid_request_error","param":"input","message":"The model gpt-x does not exist. No tool output found for function call call_both."}})
+
+    assert {:error, %{error: %{kind: :model_not_supported}}} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned([body], 400),
+               max_retries: 0
+             )
+  end
+
+  # #462 round 3: the id alphabet must match `Pixir.Provider.ToolCall`'s identity
+  # alphabet, which allows `.` and `:`. A narrower extractor truncated `call.foo:bar` at
+  # the first `.`, healed an id the Provider never named, and left the real rejection
+  # standing. The sentence's own trailing `.` is still not part of the id.
+  test "a dangling call id carrying dots and colons is extracted whole", %{auth: auth} do
+    chunks = [
+      sse(%{
+        type: "error",
+        error: %{
+          type: "invalid_request_error",
+          code: nil,
+          param: "input",
+          message: "No tool output found for function call call.foo:bar."
+        }
+      })
+    ]
+
+    assert {:error, %{error: %{kind: :dangling_tool_call, details: %{call_id: "call.foo:bar"}}}} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned(chunks),
+               max_retries: 0
+             )
+  end
+
+  # #462 round 5: the extractor's alphabet is now READ from `Pixir.Provider.ToolCall`
+  # instead of restated, so the identity edge classes the validator accepts are the ones
+  # the extractor captures. The private copy was narrower at both ends — it required the
+  # first and last characters to be non-`.` — so an id beginning with `.` was captured
+  # truncated (healing an id the Provider never named while the real rejection stood) and
+  # an id that is a single `.` was missed. Each case below is a legal identity under
+  # `ToolCall`'s own validator, which is asserted here rather than assumed.
+  for {label, call_id} <- [
+        {"a leading dot", ".call_lead"},
+        {"only dots", "..."},
+        {"a leading colon", ":call_colon"},
+        {"a leading hyphen", "-call_hyphen"},
+        {"a single character", "c"},
+        {"a single separator", "-"},
+        {"interior separators", "call.foo:bar-baz"}
+      ] do
+    test "a dangling call id with #{label} is extracted whole", %{auth: auth} do
+      call_id = unquote(call_id)
+
+      assert {:ok, _} = Pixir.Provider.ToolCall.from_json(call_id, "bash", ~s({})),
+             "precondition: #{call_id} must be a legal tool-call identity"
+
+      chunks = [
+        sse(%{
+          type: "error",
+          error: %{
+            type: "invalid_request_error",
+            code: nil,
+            param: "input",
+            message: "No tool output found for function call #{call_id}."
+          }
+        })
+      ]
+
+      assert {:error, %{error: %{kind: :dangling_tool_call, details: details}}} =
+               Provider.stream(%{history: []},
+                 auth: auth,
+                 transport: canned(chunks),
+                 max_retries: 0
+               )
+
+      assert details.call_id == call_id
+    end
+  end
+
+  # The one ambiguity the alphabet cannot resolve: a trailing `.` at the end of the
+  # sentence. `call_x.` and `call_x` + sentence period are the same bytes, and the sentence
+  # reading is the one the API produces, so the id is read as `call_x`. Pinned so the
+  # tradeoff is a decision on record, not an accident of the regex.
+  test "a sentence-final period is not read as part of the id", %{auth: auth} do
+    chunks = [
+      sse(%{
+        type: "error",
+        error: %{
+          type: "invalid_request_error",
+          code: nil,
+          param: "input",
+          message: "No tool output found for function call call_trailing."
+        }
+      })
+    ]
+
+    assert {:error, %{error: %{kind: :dangling_tool_call, details: %{call_id: "call_trailing"}}}} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned(chunks),
+               max_retries: 0
+             )
+  end
+
+  # A `.` immediately followed by more id characters is INSIDE the id, not a sentence end:
+  # the strip only fires at end-of-message or before whitespace.
+  test "a period followed by more of the message does not truncate the id", %{auth: auth} do
+    chunks = [
+      sse(%{
+        type: "error",
+        error: %{
+          type: "invalid_request_error",
+          code: nil,
+          param: "input",
+          message: "No tool output found for function call call_mid.part please retry"
+        }
+      })
+    ]
+
+    assert {:error, %{error: %{kind: :dangling_tool_call, details: %{call_id: "call_mid.part"}}}} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned(chunks),
+               max_retries: 0
+             )
+  end
+
   test "retryable in-band transient stream error retries and succeeds", %{auth: auth} do
     overloaded =
       sse(%{

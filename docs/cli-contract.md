@@ -143,6 +143,7 @@ Fields that only exist after a child starts are conditional as noted.
 | --- | --- | --- | --- |
 | `ok` | boolean | High-level result indication. | Do not collapse it with `work_complete`. |
 | `status` | string | Delegate command/work status. | |
+| `schema_version` | integer | Additive revision counter of the Delegate envelope contract. | Consumers gate with `>=`; the current value is `9`, meaning nine additive, backward-compatible revisions within the current envelope family. |
 | `work_complete` | boolean | Whether delegated work reached clean terminal success. | |
 | `children` | array | Child result projections. | Present for Subagent result shapes. Array order is not a task identity. |
 | `children[].index` | integer | Zero-based source `tasks[]` position. | Join by this value, not array position. |
@@ -153,6 +154,37 @@ Fields that only exist after a child starts are conditional as noted.
 | `children[].summary` | string | Bounded child summary. | Evidence pointer, not proof by itself. |
 | `children[].retry_history` | array | Bounded history of automatic retry attempts. | Present when the runtime retried the child. |
 | `children[].resume_command` | string | Ready-to-run child-specific recovery command. | Present for non-completed recoverable children; recover the child, not the whole spec. |
+| `children[].warm_start` | object | Warm-start lineage for this child. | Always present. A cold child reports the absence of a seed rather than omitting the key. |
+| `children[].warm_start.warm_started` | boolean | Whether this child opened on a seeded prefix. | `false` for a cold child. |
+| `children[].warm_start.seed_session_id` | string or null | The prior Session this child was warm-started from. | `null` for a cold child. |
+| `children[].warm_start.fork_root_session_id` | string or null | Inherited fork-tree root driving the Provider cache family. | `null` for a cold child. |
+| `children[].warm_start.replay_event_count` | integer or null | Replayed Event count in the seeded prefix. | `null` for a cold child. |
+| `children[].warm_start.strategy` | string or null | Replay strategy that produced the seeded prefix. | `null` for a cold child. |
+| `children[].warm_start.boundary_marker_kind` | string or null | Kind of the runtime-authored lineage boundary marker terminating the replayed prefix. | `null` for a cold child. |
+| `write_denials` | object | Mandatory bounded-write denial confession: `count` plus a `denials` array. | Always present on a **terminal** `bounded_write` envelope, including when nothing was denied (`count: 0`) and when the run produced no children at all. Absence is a schema violation, not silence. Counts write denials only: a `bash_disabled` denial is not a boundary probe and is excluded. When a Log exists but could not be read, the shape changes instead of lying: `count` is **absent** and `status: "unavailable"` plus an `error` string take its place, at the child level and — contagiously — on the aggregate. A Session that never wrote a Log is not this case and folds to `count: 0`. |
+| `write_denials.denials[]` | object | One denial: `tool`, `normalized_path` (the AIM of the denied call: the requested path, else the normalized path, else the denied command, else the tool name for the two targetless kinds; symlink/uninspectable confinement denials additionally carry the failing component in `symlink_component` / `uninspectable_component`), `matched_rule`, the policy identity, and `disposition`. | `disposition` is `recovered`, `fatal`, or `unresolved`. A completed run with a non-empty confession is a signal to check the worker's scope, not a defect. `unresolved` means the denial's **own** Turn never reached a terminal event in the Log — a Turn ends at its terminal event or at the `user_message` opening the next Turn, so an interrupted Turn's denial stays `unresolved` and is never closed by a later Turn's `assistant_message`. Read the child's Log rather than assuming it recovered. |
+| `children[].write_denials` | object | The same confession scoped to one child or workflow step. | Same always-present rule under `bounded_write`. |
+
+Every additive envelope change appends exactly one registry entry and raises the revision
+by one. Each revision gets its own CHANGELOG line naming its feature. The
+`pixir.delegate.envelope.v1` family name remains reserved for breaking shape changes.
+
+The confession is a property of **terminal** envelopes: the delegate result and
+the workflow result, and the child or step entries inside them. It is
+deliberately **out of scope** for surfaces that report a run which has not
+finished producing denials, and those surfaces omit the key rather than shipping
+a misleadingly empty one:
+
+- **Dry-run planning** (`--dry-run`) — nothing executed, so there is nothing to
+  confess.
+- **`delegate --detach` start acknowledgements** — the children have only just
+  been spawned.
+- **`delegate status` / `delegate attach` snapshots** — a liveness view of a run
+  still in flight. Read the terminal envelope, or fold the child Logs, for the
+  confession.
+
+Non-`bounded_write` runs have no write policy and therefore no confession; the
+key is absent for them on every surface.
 
 ### Delegate spec-surface admission
 
@@ -178,6 +210,22 @@ surfaces:
   unknown nested keys are rejected at `/workflow/<key>`. Root `steps` and
   `workflow.steps` cannot both be present: co-presence is rejected at
   `/workflow/steps` as mutually exclusive, regardless of the root value.
+- A `tasks[]` object entry accepts `task`, `attachments`, and `seed_session_id`.
+  A Workflow step accepts `seed_session_id` too. `seed_session_id` warm-starts that one
+  child from a named prior Session in the same workspace: the child's Log opens with a
+  seq-0 lineage Event, the seed's complete replayable conversational prefix, and a
+  runtime-authored boundary marker, and the child joins the seed's Provider cache
+  family. Omitting the key keeps today's cold-child behavior exactly. A seed that does
+  not exist, has no replayable prefix, or lives outside the delegate workspace is
+  rejected at `/tasks/<index>/seed_session_id` (or `/steps/<index>/seed_session_id`)
+  before any child Session is created. `apply_from` Workflow steps reject
+  `seed_session_id` explicitly: they spawn no child to warm-start.
+
+  Seeding grants context, never scope. The replayed prefix carries the seed's own
+  `subagent_event` posture records and `permission_decision` Events verbatim, as inert
+  historical transcript. The warm-started child's permission mode, write policy, write
+  set, read set, workspace mode, and task text are resolved from the NEW request only,
+  exactly as for a cold child.
 
 **Recorded decision (2026-07-20):** `template_args` is free-form by design. Template
 authors choose arbitrary substitution values, so validating its contents against
@@ -198,7 +246,7 @@ JSON envelope.
 | `1` | General Turn/runtime error. |
 | `2` | Invalid arguments or a requested Session was not found at session start. |
 | `1` | Also: resuming an id whose Log is missing fails during posture restoration (`resume_policy_unavailable`) before session start, so it exits `1`, not `2`. |
-| `3` | Permission, bounded-write, workspace, or disabled-shell denial. |
+| `3` | Permission, bounded-write, workspace, or disabled-shell denial. A bounded-write denial reaches this code only on the **second** denial of a Turn: the first is recoverable feedback the model may act on, so a run that recovered exits `0`. One-shot and resume envelopes carry no `write_denials` field — a `0` here does not by itself prove the Turn never probed its boundary. The Log is the record: read the `permission_decision` Events with `gate: "write_policy"`, or fold them with `Pixir.Permissions.WriteDenials.from_session/2`. The `write_denials` confession is attached on the delegate and workflow surfaces, which run workers on a coordinator's behalf. See [the bounded write policy](bounded-write-policy.md). |
 | `5` | Session writer lease is active, stale, ambiguous, or lost. |
 | `6` | Turn ended without a non-empty final assistant message. |
 | `124` | Presenter idle timeout; inspect the fail-closed `recovery` object before resuming. |

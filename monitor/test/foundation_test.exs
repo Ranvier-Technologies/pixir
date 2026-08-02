@@ -275,14 +275,23 @@ defmodule PixirMonitor.FoundationTest do
     assert source =~ ~S|deadline = System.monotonic_time(:millisecond) + timeout_ms|
     assert source =~ ~S|if remaining_ms(deadline) == 0 do|
     assert source =~ ":launcher_pid_unavailable"
-    assert source =~ ":launcher_contract_violation"
     assert source =~ "_discarded_output"
     refute source =~ "mkfifo"
     refute source =~ "launch.fifo"
     refute source =~ "Task.async"
     refute source =~ ~S|args: [url]|
     refute source =~ ~S|"#{url}"|
-    assert source =~ "unsupported_platform"
+
+    # The launch LIFECYCLE — platform gating and the launcher-contract boundary —
+    # moved to PixirMonitor.LaunchSurface with issue #437, so that a launch
+    # failure degrades instead of ending serving. The pins move with it.
+    surface = File.read!(Path.expand("../lib/pixir_monitor/launch_surface.ex", __DIR__))
+    assert surface =~ ":launcher_contract_violation"
+    assert surface =~ ":launcher_raised"
+    assert surface =~ "unsupported_platform"
+    # No emitted frame may be built from a launcher-derived term.
+    refute surface =~ ~S|inspect(url)|
+    refute surface =~ ~S|"#{url}"|
   end
 
   test "SSE rotation is long and bounded rather than a five-second refold loop" do

@@ -277,6 +277,7 @@ defmodule Pixir.Delegate.DaemonServer do
       output_dir: nil,
       progress: nil,
       quiet?: false,
+      allow_short_horizon?: Map.get(request, "allow_short_horizon?", false),
       spec_source: Map.get(request, "spec_source"),
       timeout_ms: Map.get(request, "timeout_ms"),
       contract_version: Map.get(request, "contract_version", 1)

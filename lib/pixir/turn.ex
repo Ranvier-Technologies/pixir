@@ -50,11 +50,54 @@ defmodule Pixir.Turn do
   @presenter_context_max_items 12
   @presenter_context_max_text 1_200
   @overflow_recovery_tail_attempts [40, 20, 10, 5]
+  # Bounded-write denials are recoverable feedback until this many strikes land in
+  # one Turn; the Nth is turn-fatal. Fixed by owner decision (#446): not a flag,
+  # not a policy key, not an env var.
+  @write_policy_strike_limit 2
+  # Placeholder tool name for a call that only ever existed Provider-side (#462 layer 2):
+  # Pixir never saw its name, and inventing a real tool name would be a lie in the Log.
+  @dangling_call_tool_name "unknown"
+  # Total dangling-call recoveries one Turn may perform across ALL ids (#462 layer 2).
+  # The per-id bound alone is not a bound: the Responses validator reports one missing
+  # `function_call_output` at a time, so a Log missing N calls yields N distinct ids and
+  # an unbounded loop that appends two durable events per round. ADR 0036 requires the
+  # attempt count itself to be bounded; this is that count.
+  #
+  # Sized off the issue's own reproduction, which instructs SEVEN sequential bash calls:
+  # a Log poisoned by a pre-#462 binary can therefore be missing seven outputs, and a
+  # budget below that would surface the provider error on a Session layer 2 could have
+  # healed. Eight covers that recipe with a call to spare. This bounds recovery of an
+  # ALREADY-poisoned Log; going forward layer 1 persists each call the instant it is
+  # committed on the wire, so a fresh cancellation leaves nothing for this budget to
+  # spend.
+  @dangling_call_recovery_budget 8
+  # Session-LIFETIME ceiling on dangling-call recoveries (#462 round 3). The budget above
+  # is per-Turn, so a provider naming a fresh id every Turn resets it and could append two
+  # durable events per recovery for the life of the Session. This ceiling is read off the
+  # Log itself (the count of synthesized markers already there), so it needs no state and
+  # survives a restart. Sized four Turns' worth of the per-Turn budget: comfortably above
+  # any real poisoning — the issue's own recipe is seven calls in ONE Turn — while still a
+  # hard stop on an endless loop.
+  @dangling_call_session_budget 32
+
+  @doc false
+  @spec dangling_call_recovery_budget() :: pos_integer()
+  def dangling_call_recovery_budget, do: @dangling_call_recovery_budget
+
+  @doc false
+  @spec dangling_call_session_budget() :: pos_integer()
+  def dangling_call_session_budget, do: @dangling_call_session_budget
 
   @type ctx :: %{
           :session_id => String.t(),
           :workspace => String.t(),
           :role => atom(),
+          # Turn IDENTITY (#462 round 3). `Session.start_turn/2` always stamps it, and the
+          # declare path reads it to tag every committed-call declaration, so a killed
+          # Turn's surviving stream runner can never be mistaken for its successor. It is
+          # required: a ctx built without it declares under a nil generation and its
+          # declarations are drained as stale.
+          :turn_generation => pos_integer(),
           # Fork family (ADR 0020): a fork passes its fork-tree ROOT session id so the
           # whole tree shares one prompt-cache family. No producer sets this yet (fork
           # UX is post-v0.1); whoever builds it must thread the key through
@@ -158,6 +201,17 @@ defmodule Pixir.Turn do
         # :context_overflow failures in the same Turn consume the next smaller tail
         # instead of giving up after the first recorded checkpoint.
         overflow_recovery_tail_attempts: @overflow_recovery_tail_attempts,
+        # Turn-scoped bounded-write strike counter (#446). It starts at zero for
+        # every Turn — including a resumed Turn over a Log that already carries
+        # prior `permission_decision` denials — so history is never recounted, and
+        # it is never shared with sibling child Sessions.
+        write_policy_strikes: 0,
+        # #462 layer 2: call ids for which this Turn has already injected a synthesized
+        # cancelled tool output. One recovery per dangling id, per Turn; a second
+        # rejection naming the same id surfaces the provider error unchanged.
+        dangling_call_recoveries: MapSet.new(),
+        # Remaining total recoveries across all ids (see @dangling_call_recovery_budget).
+        dangling_call_recovery_budget: @dangling_call_recovery_budget,
         # The interaction mode (`:build` | `:plan`, default `:build`). In `:plan`
         # the Turn instructs the model to plan (not act) and the permission posture
         # is forced to `:read_only`, so mutating tools are denied (plan-and-wait,
@@ -205,7 +259,7 @@ defmodule Pixir.Turn do
       "details" => error_details(error)
     }
 
-    {:ok, _} = Session.record(sid, Event.turn_failed(sid, failure_data))
+    record_turn_failure(sid, failure_data)
     Session.emit(sid, Event.text_delta(sid, human_error(error)))
     Session.emit(sid, Event.status(sid, "error"))
     {:error, error}
@@ -470,6 +524,7 @@ defmodule Pixir.Turn do
       provider_opts =
         state.provider_opts
         |> Keyword.put(:on_delta, delta_handler(sid, delta_acc))
+        |> Keyword.put(:on_committed_call, committed_call_handler(sid, ctx[:turn_generation]))
         |> Keyword.put_new(:session_id, sid)
 
       case state.provider.stream(request, provider_opts) do
@@ -514,8 +569,142 @@ defmodule Pixir.Turn do
             loop(ctx, iteration, new_state)
 
           :no_recovery ->
-            finish_provider_error(ctx.session_id, error, partial_text)
+            case recover_from_dangling_call(ctx, state, error, history) do
+              {:recovered, new_state} ->
+                # History is re-folded at the top of the loop; the synthesized output is
+                # already a durable tool_call/tool_result pair in the Log by then.
+                loop(ctx, iteration, new_state)
+
+              :no_recovery ->
+                finish_provider_error(ctx.session_id, error, partial_text)
+            end
         end
+    end
+  end
+
+  # #462 layer 2: the Responses API rejects a request whose input contains a function
+  # call with no matching output ("No tool output found for function call <id>"). That
+  # happens when the Provider committed a call this Session never persisted — a hard
+  # crash between commit and persist, or a Log written by a pre-#462 binary. Pixir
+  # synthesizes the missing output for exactly that id and retries once.
+  #
+  # ADR 0036: the retry is inside the same live Turn and doubly bounded — once per id, and
+  # at most @dangling_call_recovery_budget times in total across all ids, since the
+  # validator names a fresh id per round when several outputs are missing. Once the budget
+  # is spent the provider error surfaces unchanged. The synthesis is durable Log evidence,
+  # so the Log never pretends the call ran. The error must name the id structurally
+  # (`:dangling_tool_call` classification carries the parsed `call_id`); prose is never
+  # substring-matched here.
+  defp recover_from_dangling_call(_ctx, %{dangling_call_recovery_budget: 0}, _error, _history),
+    do: :no_recovery
+
+  defp recover_from_dangling_call(ctx, state, error, history) do
+    with {:ok, call_id} <- dangling_call_id(error),
+         false <- MapSet.member?(state.dangling_call_recoveries, call_id),
+         false <- persisted_call_id?(history, call_id),
+         :ok <- session_recovery_budget_left(ctx.session_id, history),
+         :ok <- record_dangling_call_recovery(ctx.session_id, call_id) do
+      {:recovered,
+       %{
+         state
+         | dangling_call_recoveries: MapSet.put(state.dangling_call_recoveries, call_id),
+           dangling_call_recovery_budget: state.dangling_call_recovery_budget - 1
+       }}
+    else
+      _no_recovery -> :no_recovery
+    end
+  end
+
+  defp dangling_call_id(%{error: %{kind: :dangling_tool_call, details: %{call_id: call_id}}})
+       when is_binary(call_id),
+       do: {:ok, call_id}
+
+  defp dangling_call_id(_error), do: :no_recovery
+
+  # #462 round 3: the per-Turn budget bounds ONE Turn. A provider naming fresh ids every
+  # Turn would reset it and could append two durable events per recovery forever across a
+  # Session's life. This is the Session-scoped ceiling: the synthesized markers already in
+  # the Log are the count, so it costs one pass over a history that was folded anyway and
+  # needs no new state to survive a restart. Well above any real poisoning (the issue's
+  # own recipe is seven calls in one Turn), so a legitimately poisoned Session still
+  # heals; past it the provider's own error surfaces with an honest reason.
+  defp session_recovery_budget_left(sid, history) do
+    spent = Enum.count(history, &(&1.type == :tool_call and is_map(&1.data["synthesized"])))
+
+    if spent < @dangling_call_session_budget do
+      :ok
+    else
+      Logger.warning("dangling tool call recovery refused: Session-lifetime budget spent",
+        session_id: sid,
+        synthesized_pairs_in_log: spent,
+        session_budget: @dangling_call_session_budget
+      )
+
+      :no_recovery
+    end
+  end
+
+  defp persisted_call_id?(history, call_id) do
+    Enum.any?(history, fn
+      %{type: :tool_call, data: %{"call_id" => ^call_id}} -> true
+      _event -> false
+    end)
+  end
+
+  # The synthesized pair reuses the orphan reconciliation vocabulary (`orphan_tool_call`)
+  # so replay, diagnostics, and Monitor read one shape, not two. `reason` names this
+  # recovery so the Log distinguishes it from an ordinary interrupt reconciliation.
+  defp record_dangling_call_recovery(sid, call_id) do
+    call_event =
+      Event.new(sid, :tool_call, %{
+        "call_id" => call_id,
+        "name" => @dangling_call_tool_name,
+        "args" => %{},
+        "synthesized" => %{"reason" => "provider_dangling_tool_call"}
+      })
+
+    result_event =
+      Event.tool_result(sid, call_id, %{
+        "ok" => false,
+        "error" => %{
+          "kind" => "orphan_tool_call",
+          "message" =>
+            "Pixir synthesized a cancelled tool output for a call the Provider had " <>
+              "but the Log did not",
+          "details" => %{
+            "call_id" => call_id,
+            "tool" => @dangling_call_tool_name,
+            "reason" => "provider_dangling_tool_call"
+          }
+        }
+      })
+
+    # `safe_session_record/3`, not `Session.record/2`: a gone Session EXITS the caller
+    # rather than returning `{:error, map}`, so the `else` below would never run and the
+    # Turn Task would die instead of surfacing `:no_recovery`. This path executes right
+    # after a provider error, which is exactly when a shutdown race is plausible (#462
+    # round 3).
+    with {:ok, _} <- safe_session_record(sid, call_event, "tool_call"),
+         {:ok, _} <- safe_session_record(sid, result_event, "tool_result") do
+      :ok
+    else
+      # Partial write is safe by construction: if the `tool_call` persisted and its result
+      # did not, the Log carries a well-formed orphan the existing reconciliation closes
+      # on the next `start_turn`/`interrupt`. No retry is issued either way.
+      {:error, error} ->
+        Logger.warning(
+          "dangling tool call recovery could not be recorded; a synthesized tool_call " <>
+            "may be left for orphan reconciliation to close",
+          session_id: sid,
+          call_id: call_id,
+          # #462 CR: the kind alone. `error` here comes from `safe_session_record/3`, whose
+          # `:session_record_unavailable` details carry an `inspect`ed `GenServer.call` exit
+          # reason — and that reason embeds the `{:record, event}` request term. Logging it
+          # whole would put the event's own payload on a log line.
+          failure_class: declare_failure_class(error)
+        )
+
+        :no_recovery
     end
   end
 
@@ -527,20 +716,28 @@ defmodule Pixir.Turn do
           |> turn_failure_data(sid)
           |> put_in(["details", "partial_text_length"], String.length(text))
 
-        {:ok, _} =
-          Session.record(
-            sid,
-            Event.assistant_message(sid, text,
-              metadata: %{
-                "partial" => true,
-                "terminal_status" => failure_data["terminal_status"],
-                "error_kind" => failure_data["error_kind"],
-                "error_message" => failure_data["error_message"]
-              }
-            )
+        partial_event =
+          Event.assistant_message(sid, text,
+            metadata: %{
+              "partial" => true,
+              "terminal_status" => failure_data["terminal_status"],
+              "error_kind" => failure_data["error_kind"],
+              "error_message" => failure_data["error_message"]
+            }
           )
 
-        {:ok, _} = Session.record(sid, Event.turn_failed(sid, failure_data))
+        case safe_session_record(sid, partial_event, "assistant_message") do
+          {:ok, _} ->
+            :ok
+
+          {:error, record_error} ->
+            Logger.warning("partial assistant text could not be recorded on a failed turn",
+              session_id: sid,
+              failure_class: get_in(record_error, [:error, :kind])
+            )
+        end
+
+        record_turn_failure(sid, failure_data)
         Session.emit(sid, Event.status(sid, "error"))
         {:error, error}
 
@@ -549,15 +746,30 @@ defmodule Pixir.Turn do
         # shows *why* the turn failed instead of an empty turn (ADR 0009 §4). This
         # path also records audit-only failure evidence so the Log accounts for
         # the terminal Turn without pretending there was assistant text.
-        {:ok, _} =
-          Session.record(
-            sid,
-            Event.turn_failed(sid, turn_failure_data(error, sid))
-          )
-
+        record_turn_failure(sid, turn_failure_data(error, sid))
         Session.emit(sid, Event.text_delta(sid, human_error(error)))
         Session.emit(sid, Event.status(sid, "error"))
         {:error, error}
+    end
+  end
+
+  # #470: a terminal record must never out-crash the Turn it is reporting. Against a
+  # dead or stalled Session the evidence has nowhere to land; the miss is logged with
+  # a bounded class only (never the raw exit term — it embeds the request), and the
+  # caller still returns the ORIGINAL error as the Turn's result.
+  defp record_turn_failure(sid, failure_data) do
+    case safe_session_record(sid, Event.turn_failed(sid, failure_data), "turn_failed") do
+      {:ok, _} ->
+        :ok
+
+      {:error, record_error} ->
+        Logger.warning("terminal turn_failed could not be recorded",
+          session_id: sid,
+          terminal_status: failure_data["terminal_status"],
+          failure_class: get_in(record_error, [:error, :kind])
+        )
+
+        :degraded
     end
   end
 
@@ -1086,6 +1298,10 @@ defmodule Pixir.Turn do
   defp session_unavailable_exit?({:normal, _call}), do: true
   defp session_unavailable_exit?({:shutdown, _call}), do: true
   defp session_unavailable_exit?({{:shutdown, _reason}, _call}), do: true
+  # #470: a record that cannot get an answer out of the Session is as undeliverable as
+  # one aimed at a dead Session. Classifying the call timeout here keeps every
+  # safe_session_record caller on the structured path instead of re-exiting.
+  defp session_unavailable_exit?({:timeout, {GenServer, :call, _call}}), do: true
   defp session_unavailable_exit?(_reason), do: false
 
   # ADR 0020 pressure-gauge evidence on provider_usage. Namespace seam: this
@@ -1226,7 +1442,7 @@ defmodule Pixir.Turn do
 
       true ->
         case walk_output_items(ctx, state, output_items) do
-          :ok -> loop(ctx, iteration + 1, state)
+          {:ok, state} -> loop(ctx, iteration + 1, state)
           {:terminal_tool_error, result} -> finish_tool_error(ctx.session_id, result)
           {:error, error} -> {:error, error}
         end
@@ -1251,12 +1467,145 @@ defmodule Pixir.Turn do
       # `rs_` ahead of its paired `fc_` (the Executor records each `tool_call` in turn).
       with :ok <- record_reasoning(sid, reasoning_items, state) do
         case run_calls(ctx, calls, state) do
-          :ok -> loop(ctx, iteration + 1, state)
+          {:ok, state} -> loop(ctx, iteration + 1, state)
           {:error, error} -> finish_tool_error(sid, error)
         end
       end
     end
   end
+
+  # #462 layer 1: the Provider calls this the instant a `function_call` output item
+  # completes on the wire — mid-stream, from inside the streaming process, long before
+  # `stream/2` returns. That is the only point early enough: `Session.interrupt/1` kills
+  # the Turn Task (and the stream with it) brutally, so a call still held in the stream
+  # accumulator dies undeclared and unpersisted, and the next Turn's request omits its
+  # output — which the Responses API rejects.
+  #
+  # The hand-off is a synchronous `GenServer.call`, deliberately, not a cast like
+  # `on_delta`: the point is that the call is in the Session's mailbox-and-state before
+  # the stream reads another chunk. A cast would reopen the very race this closes (the
+  # kill could land while the message is still in flight). Losing a delta is cosmetic;
+  # losing a committed call is the bug.
+  # The generation is captured HERE, at Turn start, and stamped on every declaration this
+  # Turn's stream makes (#462 round 3). That is what makes the Session able to tell this
+  # Turn's calls from a dead Turn's stragglers: the runner is unlinked on the default
+  # StreamIdle topology, so it can outlive the Turn Task and declare while a SUCCESSOR
+  # Turn is already alive. Without the stamp the Session sees only "some Turn is running"
+  # and files the straggler under the wrong Turn, which then drops it at its clean end.
+  defp committed_call_handler(sid, generation) do
+    fn call -> safe_declare_committed_call(sid, call, generation) end
+  end
+
+  # Swallowed on purpose, and the swallow is now TRUE (#462 round 3). The failure this
+  # documents — a gone Session — arrives as an EXIT from `GenServer.call`, not as
+  # `{:error, map}`, so the `{:error, …}` clause alone never fired for it: the exit
+  # escaped the stream reducer and killed the Turn, the exact outcome the comment claimed
+  # to avoid. A dead Session has nothing left to drain, so there is no evidence to lose,
+  # and killing the stream over bookkeeping is the wrong trade. A `:timeout` exit is
+  # swallowed for the same reason: a Session busy in a long `Log.fold` is a bookkeeping
+  # stall, and letting it escape makes StreamIdle classify it `:network` — which IS
+  # provider-retryable, so a stalled Log fold would trigger a re-stream.
+  #
+  # #462 round 5: anything ELSE returns a STRUCTURED error rather than re-exiting. The
+  # re-exit was written to make an unclassified fault loud, but it was not loud — it was
+  # laundered. The declare runs inside `Pixir.Provider.StreamIdle.run_stream/3`, whose
+  # `catch` turns every throw and exit into `Tool.error(:network, …)`, and `:network` is
+  # exactly what `Pixir.Provider.attempt/5` retries. So an unclassified Session crash came
+  # back as a transport blip AND triggered a re-stream, whose re-committed calls are the
+  # amplifier for the duplicate-declare poison closed above. The structured return travels
+  # the Provider's ordinary stream-error path, where `retryable?/1` does not match
+  # `:session_record_unavailable`: the fault ends the stream once, named for what it is.
+  defp safe_declare_committed_call(sid, call, generation) do
+    case Session.declare_committed_calls(sid, [call], generation) do
+      :ok -> :ok
+      {:error, error} -> warn_undeclared_call(sid, call, error)
+    end
+  catch
+    :exit, reason ->
+      if session_unavailable_exit?(reason) or declare_timeout_exit?(reason) do
+        warn_undeclared_call(sid, call, reason)
+      else
+        undeclarable_call_error(sid, call, reason)
+      end
+  end
+
+  # The existing `:session_record_unavailable` kind, not a new one: this IS "the Session
+  # could not take a record", and the vocabulary is deliberately curated (ADR 0005 rule 3).
+  # Non-retryable by construction — `Pixir.Provider.retryable?/1` matches only `:network`,
+  # `:rate_limited` and 5xx/flagged `:provider_http_error` — which is the whole point.
+  defp undeclarable_call_error(sid, call, reason) do
+    Logger.error("committed tool call declaration failed with an unclassified Session exit",
+      session_id: sid,
+      call_id: Map.get(call, :call_id),
+      failure_class: declare_failure_class(reason)
+    )
+
+    {:error,
+     Tool.error(
+       :session_record_unavailable,
+       "The Session could not accept a Provider-committed tool call declaration.",
+       %{
+         "call_id" => Map.get(call, :call_id),
+         "failure_class" => declare_failure_class(reason)
+       }
+     )}
+  end
+
+  defp declare_timeout_exit?(:timeout), do: true
+  defp declare_timeout_exit?({:timeout, _call}), do: true
+  defp declare_timeout_exit?(_reason), do: false
+
+  defp warn_undeclared_call(sid, call, reason) do
+    Logger.warning("committed tool call could not be declared mid-stream",
+      session_id: sid,
+      call_id: Map.get(call, :call_id),
+      failure_class: declare_failure_class(reason)
+    )
+
+    :ok
+  end
+
+  # #462 CR: the declare hand-off is a `GenServer.call`, and a `GenServer.call` exit
+  # reason EMBEDS THE REQUEST TERM — here `{:declare_committed_calls, [call], generation}`,
+  # where `call` carries the tool's ARGUMENTS. `inspect(reason)` therefore leaked whatever
+  # the model asked the tool to do (paths, secrets pasted into a command, credentials in a
+  # URL) into a Logger metadata line and, on the unclassified path, into the durable
+  # `turn_failed` details — evidence that outlives the process and is read by presenters.
+  #
+  # So nothing derived from the term is emitted except a BOUNDED CLASS from a closed set.
+  # The outermost exit tag is admitted only when it is a bare atom (`:noproc`, `:kaboom`),
+  # which by construction carries no payload; anything structured collapses to
+  # `"unclassified_exit"`. A structured `{:error, %{error: %{kind: …}}}` from the Session's
+  # own return path contributes only its curated `kind`, never its details.
+  @declare_failure_class_timeout "timeout"
+  @declare_failure_class_unavailable "session_unavailable"
+  @declare_failure_class_unclassified "unclassified_exit"
+
+  defp declare_failure_class(reason) do
+    cond do
+      declare_timeout_exit?(reason) -> @declare_failure_class_timeout
+      session_unavailable_exit?(reason) -> @declare_failure_class_unavailable
+      true -> unclassified_failure_class(reason)
+    end
+  end
+
+  # A structured Session rejection (the `{:error, map}` return, not an exit): its `kind` is
+  # curated vocabulary (ADR 0005 rule 3), so it is safe to name. `message`/`details` are
+  # not — the details may echo the rejected call.
+  defp unclassified_failure_class(%{error: %{kind: kind}}) when is_atom(kind),
+    do: Atom.to_string(kind)
+
+  defp unclassified_failure_class(%{error: %{kind: kind}}) when is_binary(kind), do: kind
+
+  # A BARE atom tag only. `{:kaboom, {GenServer, :call, [...]}}` is the shape that carries
+  # the request — and the args with it — so only the tag is taken, never the tuple.
+  defp unclassified_failure_class(reason) when is_atom(reason),
+    do: @declare_failure_class_unclassified <> ":" <> Atom.to_string(reason)
+
+  defp unclassified_failure_class({tag, _payload}) when is_atom(tag),
+    do: @declare_failure_class_unclassified <> ":" <> Atom.to_string(tag)
+
+  defp unclassified_failure_class(_reason), do: @declare_failure_class_unclassified
 
   defp capped?(_iteration, :infinity), do: false
   defp capped?(iteration, cap) when is_integer(cap) and cap > 0, do: iteration + 1 >= cap
@@ -1269,23 +1618,23 @@ defmodule Pixir.Turn do
   defp normalize_max_iterations(_other), do: :infinity
 
   defp walk_output_items(ctx, state, output_items) do
-    Enum.reduce_while(output_items, :ok, fn
-      {:reasoning, item}, :ok ->
+    Enum.reduce_while(output_items, {:ok, state}, fn
+      {:reasoning, item}, {:ok, state} ->
         case record_reasoning(ctx.session_id, [item], state) do
-          :ok -> {:cont, :ok}
+          :ok -> {:cont, {:ok, state}}
           {:error, error} -> {:halt, {:error, error}}
         end
 
-      {:function_call, call}, :ok ->
+      {:function_call, call}, {:ok, state} ->
         case run_calls(ctx, [call], state) do
-          :ok -> {:cont, :ok}
+          {:ok, state} -> {:cont, {:ok, state}}
           {:error, error} -> {:halt, {:terminal_tool_error, error}}
         end
 
-      {:provider_hosted_tool, _item}, :ok ->
-        {:cont, :ok}
+      {:provider_hosted_tool, _item}, {:ok, state} ->
+        {:cont, {:ok, state}}
 
-      {kind, _item}, :ok ->
+      {kind, _item}, {:ok, state} ->
         # Unknown kinds are skipped fail-open for forward compatibility, but never
         # silently: dropped evidence must be visible (ADR 0007).
         Logger.warning("walk_output_items skipped an unrecognized item kind",
@@ -1293,15 +1642,15 @@ defmodule Pixir.Turn do
           session_id: ctx.session_id
         )
 
-        {:cont, :ok}
+        {:cont, {:ok, state}}
 
-      item, :ok ->
+      item, {:ok, state} ->
         Logger.warning("walk_output_items skipped a malformed output item",
           item: inspect(item),
           session_id: ctx.session_id
         )
 
-        {:cont, :ok}
+        {:cont, {:ok, state}}
     end)
   end
 
@@ -1317,7 +1666,8 @@ defmodule Pixir.Turn do
   end
 
   defp run_calls(ctx, calls, state) do
-    Enum.reduce_while(calls, :ok, fn %{call_id: id, name: name, args: args}, :ok ->
+    Enum.reduce_while(calls, {:ok, state}, fn %{call_id: id, name: name, args: args},
+                                              {:ok, state} ->
       result =
         Executor.run(
           %{call_id: id, name: name, args: args},
@@ -1340,17 +1690,38 @@ defmodule Pixir.Turn do
 
       case result do
         {:error, error} ->
-          if terminal_tool_error?(error), do: {:halt, {:error, error}}, else: {:cont, :ok}
+          if write_policy_denial?(error) do
+            state = Map.update!(state, :write_policy_strikes, &(&1 + 1))
+
+            # Strike 1 is recoverable feedback: the already-recorded `tool_result`
+            # carrying the structured denial reaches the model on the next provider
+            # round-trip, so it can write inside the allowlist, fall back to
+            # read-only work, or finish honestly. Strike 2 is turn-fatal — a model
+            # that keeps pushing at the boundary after being told once does not get
+            # a third try (#446, fail-closed backstop at N = 2).
+            if state.write_policy_strikes >= @write_policy_strike_limit do
+              {:halt, {:error, error}}
+            else
+              {:cont, {:ok, state}}
+            end
+          else
+            {:cont, {:ok, state}}
+          end
 
         _result ->
-          {:cont, :ok}
+          {:cont, {:ok, state}}
       end
     end)
   end
 
-  defp terminal_tool_error?(%{error: %{kind: :write_policy_denied}}), do: true
-  defp terminal_tool_error?(%{error: %{"kind" => "write_policy_denied"}}), do: true
-  defp terminal_tool_error?(_error), do: false
+  # A bounded-write denial, whichever rule raised it: allowlist miss, deny match,
+  # protected path, workspace-root target, child broadening, bash token, or a
+  # denial surfaced through `apply_virtual_diff`. The strike is keyed on the
+  # denial kind, never on a list of tool names. `:bash_disabled` is a distinct,
+  # deliberately non-terminal kind and never strikes.
+  defp write_policy_denial?(%{error: %{kind: :write_policy_denied}}), do: true
+  defp write_policy_denial?(%{error: %{"kind" => "write_policy_denied"}}), do: true
+  defp write_policy_denial?(_error), do: false
 
   defp finish_tool_error(sid, error) do
     failure_data =
@@ -1358,7 +1729,7 @@ defmodule Pixir.Turn do
       |> turn_failure_data(sid)
       |> Map.put("terminal_status", "tool_error")
 
-    {:ok, _} = Session.record(sid, Event.turn_failed(sid, failure_data))
+    record_turn_failure(sid, failure_data)
     Session.emit(sid, Event.text_delta(sid, human_error(error)))
     Session.emit(sid, Event.status(sid, "error"))
     {:error, error}

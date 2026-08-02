@@ -189,7 +189,10 @@ defmodule PixirMonitor.FollowStateContractTest do
 
     test "stale generations from in-flight navigation are discarded", %{js: js} do
       assert js =~ "if (expectedGeneration !== null && expectedGeneration !== state.generation) return SUPERSEDED;"
-      assert length(String.split(js, "fetchJSON(")) == 6
+      # 7 since #438: the single-mode inventory acquisition behind a
+      # run_not_found dead end. The workspace-set branch reuses
+      # refetchWorkspaceList, so no second call site was opened there.
+      assert length(String.split(js, "fetchJSON(")) == 7
       assert length(String.split(js, "fetchJSON(\"/api/workspaces/\" + encodeURIComponent(workspace) + \"/runs\", null)")) == 2
       assert js =~ "return refetchWorkspaceList(workspace, null)"
       assert js =~ "await refetchWorkspaceList(workspace, null)"

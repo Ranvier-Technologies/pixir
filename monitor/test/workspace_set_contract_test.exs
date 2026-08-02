@@ -168,9 +168,13 @@ defmodule PixirMonitor.WorkspaceSetContractTest do
     refute schema_valid?("invalidation_frame", Map.put(valid_frame, "extra", true))
     refute schema_valid?("invalidation_frame", %{valid_frame | "workspace" => "undeclared key"})
 
+    # Bounded-N (#442): 3 keys is now VALID; the cardinality drift cases are one
+    # key and one key past the bound of 8.
+    assert schema_valid?("shell_config", %{"mode" => "workspace_set", "workspaces" => ["left", "right", "third"]})
+
     for shell <- [
           %{"mode" => "workspace_set", "workspaces" => ["left"]},
-          %{"mode" => "workspace_set", "workspaces" => ["left", "right", "third"]},
+          %{"mode" => "workspace_set", "workspaces" => Enum.map(1..9, &"lane#{&1}")},
           %{"mode" => "workspace_set", "workspaces" => ["left", "left"]},
           %{"mode" => "fleet", "workspaces" => ["left", "right"]}
         ] do
@@ -544,7 +548,7 @@ defmodule PixirMonitor.WorkspaceSetContractTest do
 
     cases = [
       {["left=#{left}"], "workspace_declaration_single_keyed"},
-      {["left=#{left}", "right=#{right}", "third=#{left}"], "workspace_declaration_too_many"},
+      {Enum.map(1..9, &"lane#{&1}=#{left}"), "workspace_declaration_too_many"},
       {["left=#{left}", right], "workspace_declaration_mixed"},
       {[left, right], "workspace_declaration_unkeyed_pair"},
       {["left=#{left}", "left=#{right}"], "workspace_declaration_duplicate_key"},
