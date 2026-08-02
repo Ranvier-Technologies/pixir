@@ -24,6 +24,7 @@ pixir acp
 
 - [Source repository](https://github.com/Ranvier-Technologies/pixir): Pixir source, tests, docs, ADRs, benchmarks, and site content.
 - [README](https://github.com/Ranvier-Technologies/pixir/blob/main/README.md): Quickstart, install paths, authentication, first run, runtime boundary, ACP usage, preview scope, and development commands.
+- [CLI contract](https://github.com/Ranvier-Technologies/pixir/blob/main/docs/cli-contract.md): Checked-in contract for the one-shot, resume, delegate, and tree machine surfaces, with pinned stable fields and exit-code semantics.
 - [Architecture vocabulary](https://github.com/Ranvier-Technologies/pixir/blob/main/CONTEXT.md): Project language for Harness, Session, Agent, Skill, Workflow, Subagent, Event, Log, History, Workspace, Tool, Provider, Credential, and related terms.
 - [Architecture decisions](https://github.com/Ranvier-Technologies/pixir/tree/main/docs/adr/): ADRs for the runtime model, evidence contract, permissions, ACP, Skills, Subagents, Workflows, package scope, and provider behavior.
 - [Scale evidence directory](https://github.com/Ranvier-Technologies/pixir/tree/main/docs/benchmarks/scale/): Benchmark reports and companion evidence for the public scale notes.

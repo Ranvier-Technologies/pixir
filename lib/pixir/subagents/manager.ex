@@ -15,6 +15,7 @@ defmodule Pixir.Subagents.Manager do
     Subagents,
     Subagents.DelegationContext,
     Subagents.Scheduler,
+    Subagents.WarmStart,
     Subagents.WorkspaceSnapshot,
     Tool,
     Turn,
@@ -322,7 +323,7 @@ defmodule Pixir.Subagents.Manager do
 
     with {:ok, agent} <- fetch_agent(state, parent_sid, id),
          :ok <- ensure_closeable(agent) do
-      {agent, event} = close_or_cancel_agent(agent)
+      {agent, event} = close_or_cancel_agent(agent, opts)
       state = put_agent(state, agent)
       state = cancel_timer(state, agent)
       state = record_parent_event(state, agent, event, agent.status, terminal_event_fields(agent))
@@ -618,8 +619,12 @@ defmodule Pixir.Subagents.Manager do
       # opportunistically; new runtime knobs must enter through opts from day
       # one.
       index = Keyword.get(opts, :index)
+      # Warm-start seeding is runtime-owned lineage, so it rides opts and is never
+      # read from args: a forged args value must not be able to name a seed Session.
+      seed_session_id = Keyword.get(opts, :seed_session_id)
 
       with :ok <- validate_optional_non_negative_integer("index", index),
+           {:ok, warm_start} <- validate_optional_seed(seed_session_id, workspace),
            :ok <- validate_optional_binary("model", provider_model),
            {:ok, web_search} <- validate_optional_web_search(web_search),
            :ok <- validate_optional_reasoning_effort(reasoning_effort),
@@ -665,7 +670,9 @@ defmodule Pixir.Subagents.Manager do
            write_policy: Keyword.get(opts, :write_policy),
            skills_opts: Keyword.get(opts, :skills_opts, []),
            agents_opts: agents_opts,
-           delegation_context: Keyword.get(opts, :delegation_context, %{})
+           delegation_context: Keyword.get(opts, :delegation_context, %{}),
+           seed_session_id: seed_session_id,
+           warm_start: warm_start
          }}
       end
     end
@@ -703,6 +710,8 @@ defmodule Pixir.Subagents.Manager do
       created_at: now(),
       updated_at: now()
     })
+    |> Map.put_new(:seed_session_id, nil)
+    |> Map.put_new(:warm_start, nil)
   end
 
   defp validate_positive_integer(_field, value) when is_integer(value) and value > 0, do: :ok
@@ -719,6 +728,15 @@ defmodule Pixir.Subagents.Manager do
 
   defp validate_optional_non_negative_integer(field, value),
     do: validate_non_negative_integer(field, value)
+
+  # A bad seed reference must be rejected here, during normalization, so no child
+  # Session, workspace snapshot, or partial child Log is ever created for it (#435).
+  # The seed is resolved against the DELEGATE workspace, which owns the seed Log;
+  # the child's snapshot workspace does not exist yet and never holds seed Logs.
+  defp validate_optional_seed(nil, _workspace), do: {:ok, nil}
+
+  defp validate_optional_seed(seed_session_id, workspace),
+    do: WarmStart.validate(seed_session_id, workspace: workspace)
 
   defp validate_attachments(attachments) when is_list(attachments) do
     if Enum.all?(attachments, &valid_attachment?/1) do
@@ -920,8 +938,9 @@ defmodule Pixir.Subagents.Manager do
 
   defp start_agent(agent, state) do
     with {:ok, child_workspace, workspace_snapshot} <- prepare_workspace(agent),
+         {:ok, allocated_sid, warm_start} <- allocate_child_session(agent, child_workspace),
          {:ok, child_sid, child_pid} <-
-           SessionSupervisor.start_session(workspace: child_workspace, role: :subagent) do
+           start_child_session(allocated_sid, child_workspace, warm_start) do
       deadline_at = deadline_at(agent.timeout_ms)
       child_log_path = Log.path(child_sid, workspace: child_workspace)
 
@@ -933,6 +952,8 @@ defmodule Pixir.Subagents.Manager do
           workspace_snapshot: workspace_snapshot,
           deadline_at: deadline_at
       }
+
+      turn_agent = Map.put(turn_agent, :warm_start, warm_start)
 
       with :ok <- subscribe_child_events(child_sid),
            :ok <- persist_child_permission_posture(turn_agent, child_sid),
@@ -1000,6 +1021,50 @@ defmodule Pixir.Subagents.Manager do
     end
   end
 
+  # A warm-started child's Log is written to disk BEFORE its Session starts. If the
+  # start then fails, that Log must go: leaving it behind strands replayed conversation
+  # content under an id nothing will ever open, and breaks the same invariant the
+  # rejected-seed path already holds (a failed spawn leaves .pixir/sessions untouched).
+  defp start_child_session(allocated_sid, child_workspace, warm_start) do
+    case SessionSupervisor.start_session(
+           id: allocated_sid,
+           workspace: child_workspace,
+           role: :subagent
+         ) do
+      {:ok, _child_sid, _child_pid} = ok ->
+        ok
+
+      other ->
+        if is_map(warm_start) do
+          _ = File.rm_rf(Log.path(allocated_sid, workspace: child_workspace))
+        end
+
+        other
+    end
+  end
+
+  # Cold children keep the historical shape exactly: the Session generates its own
+  # id and opens on an empty Log. A warm-started child needs its id up front, because
+  # the seeded Log must exist BEFORE the Session process folds it — that fold is what
+  # derives `fork_root_session_id`, and therefore the `s_` cache-family segment, from
+  # the seq-0 lineage Event (ADR 0020/0024).
+  defp allocate_child_session(%{warm_start: %{} = _lineage} = agent, child_workspace) do
+    child_sid = Session.gen_id()
+
+    # The seed Log is read from the delegate workspace that owns it and written into
+    # the child's workspace: an isolated child runs in a snapshot that excludes .pixir,
+    # so the two are not the same directory.
+    case WarmStart.seed_child_log(child_sid, agent.seed_session_id,
+           workspace: agent.workspace,
+           child_workspace: child_workspace
+         ) do
+      {:ok, lineage} -> {:ok, child_sid, lineage}
+      {:error, _error} = error -> error
+    end
+  end
+
+  defp allocate_child_session(_agent, _child_workspace), do: {:ok, Session.gen_id(), nil}
+
   defp restart_agent(agent, prompt, _opts, state) when is_binary(prompt) and prompt != "" do
     deadline_at = deadline_at(agent.timeout_ms)
     turn_agent = %{agent | prompt: prompt, deadline_at: deadline_at}
@@ -1060,12 +1125,61 @@ defmodule Pixir.Subagents.Manager do
       "permission_mode" => permission_mode_string(agent.permission_mode),
       "write_policy" => WritePolicy.metadata(agent.write_policy),
       "workspace_mode" => agent.workspace_mode,
-      "workspace" => agent.child_workspace
+      "workspace" => agent.child_workspace,
+      # Warm-start lineage is evidence, never policy input: this record is written
+      # AFTER the seeded prefix and is the only posture that governs the child.
+      "warm_start" => WarmStart.envelope_projection(Map.get(agent, :warm_start))
     }
 
     case Session.record(child_sid, Event.subagent_event(child_sid, data)) do
       {:ok, _event} -> :ok
       {:error, _error} = error -> error
+    end
+  end
+
+  # Terminal cancellation statement on the CHILD's own Log (issue #444).
+  #
+  # Reuses the `:subagent_event` seam already used for the child's permission
+  # posture at spawn, and the existing `cancelled_by_parent` vocabulary: a reader
+  # of the child Log alone can tell "cancelled by my parent" from "the process died
+  # mid-write". The parent-side `:subagent_event`, the manager status record, and
+  # the Workflow step record stay authoritative and untouched — a child Log that
+  # cannot be written (child Session gone, lease lost, write error) degrades to the
+  # parent-only evidence rather than failing the cancellation or killing the Manager.
+  defp persist_child_cancellation(%{child_session_id: child_sid} = agent, opts)
+       when is_binary(child_sid) and child_sid != "" do
+    data =
+      %{
+        "event" => "cancelled_by_parent",
+        "scope" => "session",
+        "lineage" => "child",
+        "source" => "subagent_close",
+        "status" => "cancelled",
+        "reason" => "cancelled_by_parent",
+        "subagent_id" => agent.id,
+        "parent_session_id" => agent.parent_session_id,
+        "child_session_id" => child_sid
+      }
+      # Absent, never null-filled, when no Workflow is above this cancellation.
+      |> maybe_put_event("workflow_id", Keyword.get(opts, :workflow_id))
+      |> maybe_put_event("workflow_step_id", Keyword.get(opts, :workflow_step_id))
+      |> maybe_put_event("workflow_close_outcome", workflow_close_outcome(opts))
+
+    case safe_record(child_sid, Event.subagent_event(child_sid, data)) do
+      {:ok, _event} -> :ok
+      {:error, _error} = error -> error
+    end
+  end
+
+  defp persist_child_cancellation(_agent, _opts), do: {:error, :no_child_session}
+
+  defp workflow_close_outcome(opts) do
+    case Keyword.get(opts, :workflow_id) do
+      id when is_binary(id) and id != "" ->
+        Keyword.get(opts, :workflow_close_outcome)
+
+      _ ->
+        nil
     end
   end
 
@@ -1552,8 +1666,14 @@ defmodule Pixir.Subagents.Manager do
     :exit, _ -> :ok
   end
 
-  defp close_or_cancel_agent(%{status: "running"} = agent) do
+  defp close_or_cancel_agent(%{status: "running"} = agent, opts) do
     _ = safe_interrupt(agent.child_session_id)
+
+    # The child Log must be self-sufficient evidence of its own cancellation, so
+    # the terminal statement lands AFTER the interrupt tore down the Turn and its
+    # orphan_tool_call reconciliation wrote its repairs: a fold of the child Log
+    # ends on the cancellation, not on a dangling tool_call/tool_result pair.
+    _ = persist_child_cancellation(agent, opts)
 
     {%{
        agent
@@ -1566,7 +1686,7 @@ defmodule Pixir.Subagents.Manager do
      }, "cancelled"}
   end
 
-  defp close_or_cancel_agent(%{status: "queued"} = agent) do
+  defp close_or_cancel_agent(%{status: "queued"} = agent, _opts) do
     {%{
        agent
        | status: "closed",
@@ -1577,7 +1697,7 @@ defmodule Pixir.Subagents.Manager do
      }, "closed"}
   end
 
-  defp close_or_cancel_agent(agent) do
+  defp close_or_cancel_agent(agent, _opts) do
     {%{
        agent
        | status: "closed",
@@ -1686,6 +1806,8 @@ defmodule Pixir.Subagents.Manager do
       workspace_snapshot: data["workspace_snapshot"],
       workspace_snapshot_opts: [],
       delegation_context: data["delegation_context"] || %{},
+      seed_session_id: get_in(data, ["warm_start", "seed_session_id"]),
+      warm_start: restored_warm_start(data["warm_start"]),
       retry_attempt_index: data["retry_attempts"] || 0,
       retry_max_attempts: data["retry_max_attempts"] || Subagents.default_limits().retry_attempts,
       retry_jitter_ms: Subagents.default_limits().retry_jitter_ms,
@@ -1726,6 +1848,12 @@ defmodule Pixir.Subagents.Manager do
       {:error, _error} -> nil
     end
   end
+
+  # A cold child restores to `nil`, which is exactly what `envelope_projection/1`
+  # already renders as the cold shape — so a parent Log written before this field
+  # existed reconstructs to the same envelope it reported live.
+  defp restored_warm_start(%{"warm_started" => true} = lineage), do: lineage
+  defp restored_warm_start(_lineage), do: nil
 
   defp restored_permission_mode("auto"), do: :auto
   defp restored_permission_mode("ask"), do: :ask
@@ -2193,6 +2321,10 @@ defmodule Pixir.Subagents.Manager do
       |> maybe_put_event("child_log_path", child_log_path(agent))
       |> maybe_put_event("workspace_snapshot", agent.workspace_snapshot)
       |> maybe_put_event("write_policy", WritePolicy.metadata(Map.get(agent, :write_policy)))
+      # The parent Log is the ONLY durable evidence `restored_agent/3` reads, so
+      # lineage that is not written here does not survive a Manager restart: the
+      # envelope would silently downgrade a warm child to the cold projection (#435).
+      |> Map.put("warm_start", WarmStart.envelope_projection(Map.get(agent, :warm_start)))
       |> Map.merge(extra)
       |> maybe_put_event("delegation_context", DelegationContext.from_agent(agent))
 
@@ -2374,6 +2506,7 @@ defmodule Pixir.Subagents.Manager do
     |> maybe_put_public("elapsed_ms", agent.elapsed_ms)
     |> maybe_put_public("reason", agent.timeout_reason)
     |> maybe_put_public("next_actions", non_empty(agent.next_actions))
+    |> Map.put("warm_start", WarmStart.envelope_projection(Map.get(agent, :warm_start)))
   end
 
   defp parent_log_path(%{parent_log_path: path}) when is_binary(path) and path != "", do: path

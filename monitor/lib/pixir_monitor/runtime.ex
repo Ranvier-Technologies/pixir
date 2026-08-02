@@ -1,10 +1,12 @@
 defmodule PixirMonitor.Runtime do
   @moduledoc """
-  Coordinates active-port discovery, one-use launch issuance, and browser handoff.
+  Issues one-use launch capabilities and runs the bounded macOS browser launcher.
 
   Capability-bearing URLs stay in memory and cross into macOS automation through the
   private environment of a short-lived launcher process, never in process arguments,
-  diagnostics, stdout, or regular files.
+  diagnostics, stdout, or regular files. The launch lifecycle itself — platform
+  gating, outcome reporting, and operator re-entry — belongs to
+  `PixirMonitor.LaunchSurface`, so no launch failure here can end serving.
   """
 
   @spec issue_launch_url(pos_integer()) :: {:ok, String.t()} | {:error, map()}
@@ -14,46 +16,12 @@ defmodule PixirMonitor.Runtime do
     end
   end
 
-  @spec launch_browser() :: :ok | {:error, map()}
-  def launch_browser do
-    with :ok <- supported_platform(),
-         {:ok, port} <- PixirMonitor.PortRegistry.wait(),
-         {:ok, url} <- issue_launch_url(port),
-         :ok <- browser_launcher().(url) do
-      :ok
-    else
-      {:error, _} = error -> error
-      # A launcher return outside its :ok | {:error, map} contract is reported
-      # as a fixed atom: an arbitrary term must never be inspected into
-      # diagnostics from this boundary.
-      _other -> browser_error(:launcher_contract_violation)
-    end
-  rescue
-    # Same boundary rule as the contract-violation clause above: a raised
-    # exception message can carry the capability launch URL (issue_launch_url
-    # runs just before the launcher), so it must never reach diagnostics.
-    # Report a fixed atom instead of Exception.message/1.
-    _error -> browser_error(:launcher_raised)
-  end
-
-  defp supported_platform do
-    case :os.type() do
-      {:unix, :darwin} ->
-        :ok
-
-      type ->
-        {:error, %{kind: "unsupported_platform", message: "Automatic browser launch is supported only on macOS", details: %{platform: inspect(type)}, next_actions: ["Run Pixir Monitor on macOS"]}}
-    end
-  end
-
-  defp browser_launcher do
-    Application.get_env(:pixir_monitor, :browser_launcher, &launch_darwin/1)
-  end
-
   @launch_url_env "PIXIR_MONITOR_LAUNCH_URL"
   @launcher_timeout_ms 5_000
 
-  defp launch_darwin(url) do
+  @doc false
+  @spec launch_darwin(String.t()) :: :ok | {:error, map()}
+  def launch_darwin(url) do
     {executable, args, env} = darwin_launch_command(url)
     run_launcher_bounded(executable, args, env, @launcher_timeout_ms)
   end

@@ -176,6 +176,8 @@
         "status": "indeterminate",
         "observed_paths": [],
         "observed_semantics": "unknown",
+        "basis": "no_write_evidence",
+        "write_denials": [],
         "evidence_refs": [
           "e-envelope-wave3"
         ],
@@ -288,6 +290,8 @@
     "status": "indeterminate",
     "observed_paths": [],
     "observed_semantics": "unknown",
+    "basis": "no_write_evidence",
+    "write_denials": [],
     "evidence_refs": [
       "e-envelope-wave3"
     ],
@@ -390,5 +394,15 @@
   "limitations": [
     "usage_fixture_minimized",
     "mutation_evidence_incomplete"
-  ]
+  ],
+  "post_terminal_child_activity": {
+    "state": "none",
+    "basis": "child_events_after_parent_terminal_boundary",
+    "boundary_at": "2026-07-10T18:31:41.544246Z",
+    "boundary_basis": "terminal_subagent_lifecycle_ts",
+    "event_count": 0,
+    "latest_event_at": null,
+    "child_session_ids": [],
+    "evidence_refs": []
+  }
 }

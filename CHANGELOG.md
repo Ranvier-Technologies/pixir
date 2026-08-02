@@ -9,6 +9,236 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-08-02
+
+### Added
+- New `:dangling_tool_call` error kind in the provider family of the `Pixir.Tool`
+  error taxonomy (#462). It classifies the Responses API's in-band rejection of a
+  request whose input carries a `function_call` with no matching
+  `function_call_output` — delivered as `invalid_request_error` over HTTP 200 with
+  `param: "input"` — and carries the rejected `call_id` in `details`. The
+  structural gate comes first, and only once it passes is the `call_id` parsed
+  out of the message; prose alone never classifies. The kind is
+  never retryable at the provider layer; the bounded recovery that consumes it
+  lives in the Turn.
+- Delegate admission fails closed on short caller horizons (#433): a declared
+  `--timeout-ms` shorter than the plan's critical path is rejected with a
+  structured error and a `suggested_timeout_ms`, the dry-run carries the same
+  verdict as a non-mutating `would_reject` advisory, and
+  `--allow-short-horizon` remains the explicit break-glass. Envelope schema
+  revision 6.
+- Dry-run plans carry an advisory `plan_warnings[]` (#443): when a declared
+  workflow timeout caps a step's own declared budget, the warning names the
+  offending step (`step_index`/`step_id`/`json_pointer`/`path`), the declared
+  and capping timeouts, and the `effective_step_timeout_ms` the step will
+  actually receive. Advisory only — it never changes `would_reject`, an
+  admission verdict, or an exit code. Envelope schema revision 7.
+- Workflow steps can opt in to scheduling against an unverified dependency
+  (#436): `allow_unverified_depends_on` names, per step, the specific upstream
+  dependencies the step may start against when their checkpoint exists but has
+  not passed verification — for lanes that audit on partial results. The step's
+  own checkpoint then confesses it: `verification.unverified_dependencies` plus
+  a `"ran_against_unverified_dependencies"` known limitation. The default
+  remains verified-only; the opt-in is per step and per named dependency,
+  never global.
+- A child cancelled by its parent now gets a terminal `cancelled_by_parent`
+  event appended to its own Log (#444), so the child's record ends with an
+  honest terminal instead of trailing off mid-Turn.
+- ACP `session/prompt` results carry machine-readable turn-failure facts
+  (#465): `_meta.pixir.turn_failure` is attached exactly when a `turn_failed`
+  event was observed during the prompt — bounded, type-guarded fields
+  (`terminal_status`, `error_kind`), never the message or details, which
+  already travel as chat content. The chat rendering of ADR 0009 §5 (content +
+  `stopReason:"end_turn"`) is unchanged; the ADR is amended in place.
+- Monitor: a child Session id resolves to its owning parent run (#438), child
+  write evidence and policy denials fold into the mutation basis (#439), owner
+  residency is reported separately from owner brokenness in liveness (#440),
+  keyed workspace sets widen to a bounded 2..8 sources (#442), and child
+  activity arriving after the parent run went terminal is reported instead of
+  dropped (#447).
+
+### Changed
+- Delegate child entries carry a `warm_start` lineage projection (#435), on
+  `subagents` children and workflow steps alike: `warm_started`,
+  `seed_session_id`, `fork_root_session_id`, `replay_event_count`, `strategy`,
+  and `boundary_marker_kind`. The key is unconditional — a cold child reports
+  the absence of a seed rather than omitting it, so a consumer can tell a cold
+  run from an unreported one. `tasks[]` entries and workflow steps accept an
+  optional `seed_session_id` spec key to request the warm start. The delegate
+  envelope's additive schema revision is now `9`; the
+  `pixir.delegate.envelope.v1` family name is unchanged.
+- A bounded-write denial is recoverable feedback instead of an unconditional
+  Turn kill (#446). The first denial in a Turn no longer halts the tool loop:
+  the remaining calls of that provider response still run, and the structured
+  denial — denied tool, requested and normalized path, matched rule, policy
+  identity, `next_actions` — is delivered to the model as that call's tool
+  output on the next round-trip, so a worker that probes a path can write inside
+  the allowlist, fall back to read-only work, or finish with an honest report
+  instead of costing a coordinator a full adjudication and a `pixir resume`. The
+  **second** denial in the same Turn is turn-fatal, unchanged in shape:
+  `turn_failed` with the terminal tool-error record and the same exit code. N = 2
+  is fixed — no flag, no policy key, no environment variable. The strike is keyed
+  on the denial kind, so allowlist misses, workspace-root targets,
+  child-broadening refusals, outside-workspace bash tokens, and denials surfaced
+  through `apply_virtual_diff` all count the same; `bash_disabled` remains
+  non-terminal and never strikes. The counter is Turn-scoped and resets on every
+  Turn including a resumed one, so prior denials in a Session's Log are never
+  recounted.
+- A bash command whose path reaches outside the workspace now raises the
+  `write_policy_denied` kind rather than `outside_workspace` **when a bounded
+  write policy is in force** (#446). It is a boundary probe like any other, so it
+  strikes, is turn-fatal on the second strike, and enters the confession — the
+  three surfaces now classify one set of events instead of three. The rule that
+  refused the command survives unchanged in `matched_rule: "outside_workspace"`,
+  and the plain workspace-confinement error raised outside any bounded-write run
+  keeps the `outside_workspace` kind, since it is not a policy denial at all.
+- Every denial, recoverable or fatal, is still a `permission_decision` Log Event
+  with `gate: "write_policy"` and its policy identity intact — recoverability does
+  not reduce the audit record. Identity now survives the confinement and root
+  denials too (`path_outside_workspace`, `workspace_root_not_writable`,
+  `symlink_path_component`, `path_not_inspectable`), which are raised before the
+  allowlist is consulted and previously carried no `policy_id`/`policy_hash`/
+  `policy_version` for the coordinator to reconcile against.
+- Delegate envelopes and workflow checkpoints gained a mandatory `write_denials`
+  confession (#446). It appears at the envelope top level and on each child entry,
+  and in the `workflow_checkpoint.v1` checkpoint payload, present even when there
+  were no denials — and even when the run produced no children at all — so its
+  absence is a schema violation rather than an ambiguous silence. Every
+  bounded-write checkpoint carries it, including held, virtual-overlay, and
+  apply steps that never spawn a subagent and so confess an empty one. Each entry
+  reports the tool, the target it aimed at — the requested path, or the denied
+  command, or the tool name for the two denials that aim at no path at all
+  (`child_policy_override_unsupported`, `unsupported_mutating_tool`). The target
+  is always the aim and never where a refusal stopped: a write to
+  `link/deep/out.txt` refused at the `link` component confesses the full
+  requested path, with the failing component reported beside it in its own
+  `symlink_component` / `uninspectable_component` key, so the coordinator can
+  tell *which* write under `link/` was refused. Each entry also reports the
+  matched rule, the policy identity, and a
+  `disposition` of `recovered`, `fatal`, or `unresolved`.
+  `unresolved` is the honest reading of a denial whose **own** Turn never reached
+  a terminal event in the Log — a crash mid-Turn, an interrupt, a partial Log, a
+  fold of a running Session: Pixir does not infer recovery from missing evidence.
+  A Turn ends at its terminal event or at the `user_message` that opens the next
+  Turn, whichever comes first, so an interrupted or supervisor-killed Turn — which
+  records neither `assistant_message` nor `turn_failed` — has its denial frozen as
+  `unresolved` instead of being closed by the *next* Turn's terminal event on a
+  resumed Session. A Log that exists but cannot be read now confesses
+  `status: "unavailable"` with an `error` and **no** `count`, at the child level
+  and contagiously on the aggregate, so a coordinator summing counts can never
+  add a zero for evidence it never saw; a Session that simply never wrote a Log
+  is unaffected and still folds to `count: 0`. A
+  completed run with a non-empty `write_denials` is a signal to check whether the
+  worker's scope was drawn correctly, not a defect in the worker. `bash_disabled`
+  denials are excluded from the confession for the same reason they never strike:
+  the shell being off is a property of the mode, not a scope drawn too small.
+  They remain in the Log. The confession is scoped to terminal envelopes;
+  dry-run plans, detached start acknowledgements, and `status`/`attach` liveness
+  snapshots omit it rather than shipping a misleadingly empty one, as
+  `docs/cli-contract.md` now records. The delegate envelope's additive schema
+  revision is now `8`; the `pixir.delegate.envelope.v1` family name is unchanged.
+- The bounded write policy's verify allowlist is operator-declared (#445): a
+  policy's `bash` map accepts `verify_prefixes` alongside `verify`, so a writer
+  in a pnpm, Python, Go, or Rust workspace can verify its own work instead of
+  structurally finishing blind. A prefix is one or two literal tokens matched by
+  token (`pnpm typecheck` never admits `pnpm typechecker`), and declaring an
+  allowlist replaces the built-in `mix format` / `mix compile` default rather
+  than extending it. Every existing per-entry filter still applies unchanged —
+  no shell metacharacters, no parent-directory tokens, at most 8 entries,
+  workspace confinement at authorization time — and rejections now report the
+  allowlist actually in force so the operator can tell which one applied.
+  Omitting `verify_prefixes` leaves behavior and the durable policy hash
+  byte-identical, and `mix test` stays rejected under the default. On `resume`,
+  the restored and requested allowlists intersect by tokenwise coverage — a
+  prefix survives only when the durable side covers it, so `mix` against `mix
+  format` keeps `mix format` — and the shell is disabled when the `verify`
+  intersection is empty. The new `docs/bounded-write-policy.md` documents the
+  config shape.
+
+- The delegate envelope's schema revision derives from an append-only,
+  feature-keyed registry (#461): two parallel envelope PRs now collide as a
+  textual merge conflict instead of silently shipping several features under
+  one revision number, and a parity pinning test guards the registry's
+  contiguity, uniqueness, and the wave-elected 7/8/9 history. Consumers see no
+  shape change — `schema_version` stays an additive integer. Every additive
+  envelope change appends exactly one registry entry and one CHANGELOG line
+  naming its feature; the convention is stated in `docs/cli-contract.md`.
+- Monitor: each run-card copy slot names the fact it reports (#441), so a
+  card's copy can no longer read as a claim about a different lifecycle stage.
+
+### Fixed
+- A terminal record can no longer out-crash the Turn it reports (#470). The
+  three terminal finishers recorded `turn_failed` (and partial assistant text)
+  with a bare call that exited the Turn Task when the Session was already gone
+  — dying in the very path built to report the failure. Terminal writes now
+  degrade with a bounded-class log line, the ORIGINAL error survives as the
+  Turn's return value, and a record stalled past its call timeout classifies
+  as Session unavailability instead of escaping as a crash.
+- Cancelling a Turn mid-stream no longer poisons the Session (#462). A function
+  call the provider had committed on the wire but Pixir had not yet persisted
+  died with the killed Turn Task, and every later prompt on that Session was
+  rejected in-band by the Responses API — `invalid_request_error` over HTTP 200,
+  `param: "input"`, "No tool output found for function call `<id>`" — for an id
+  that appeared in no Log event, so the Session was unusable for good. Two
+  layers close it. **Drain to persistence:** each function call is now handed to
+  the Session process the instant its output item completes on the wire, from
+  inside the streaming path rather than after the stream returns, so a cancel
+  landing mid-stream still finds the call in the hands of a process that
+  survives the kill; the interrupt drains it to the Log as a `tool_call`, which
+  the existing orphan reconciliation closes with its usual `orphan_tool_call` /
+  `interrupt` result. Both transports inherit this — the seam is in the shared
+  event reducer, not in a transport. The streaming runner outlives the Turn it
+  belongs to on the default idle-watchdog topology, so declarations carry the
+  identity of the Turn that made them — a monotonic generation issued at Turn
+  start — rather than merely asserting that some Turn is running. A declaration
+  whose generation is no longer the running one is drained on the spot: both when
+  it lands with no Turn at all and when it lands while a *successor* Turn is
+  already alive, where attributing it to that successor would have let the
+  successor drop it at its own clean end. A Turn start drains whatever it finds
+  instead of clearing it. A declaration that cannot be handed over — a
+  Session that is gone or stalled — is logged and swallowed rather than killing
+  the stream, and is never reported as a retryable transport error.
+  **Build-time recovery:** a request rejected
+  for a dangling call id absent from the Log is healed by synthesizing a
+  cancelled output for exactly that id and retrying, which also repairs Sessions
+  already poisoned by older binaries. Classification is gated structurally first
+  — an `invalid_request_error` (or `bad_request`) on `param: "input"` — and only
+  then is the rejected id parsed out of the message; prose alone never
+  classifies, but a message rewording does silently disable the layer, so the
+  parse is not incidental. Recovery is bounded once per id, by a total budget per
+  Turn, and by a Session-lifetime ceiling counted off the synthesized markers
+  already in the Log; it refuses to fire for an id the Log already carries (that
+  remains the orphan reconciliation's job); and a second rejection surfaces the original
+  provider error unchanged. Every synthesis appends durable Log evidence — a
+  `tool_call` marked `synthesized` plus an `orphan_tool_call` result asserting
+  the call did **not** run — before the retry is issued, so the Log never
+  pretends a tool executed. A recovered Turn's envelope and exit code are those
+  of a normal Turn. This is the first TURN-LEVEL recovery retry in Pixir: the
+  first retry triggered by a structured `:dangling_tool_call` error that
+  *modifies the rebuilt request*, appending synthesized evidence before
+  re-sending it. Transport- and status-level retries of transient provider
+  failures already existed via `Pixir.Provider.attempt/5`, which re-sends the
+  request unchanged; ADR 0036 is amended to record this new class against that
+  ADR's own retry conditions.
+- Monitor: a launch handoff no longer ends `serve` (#437). The handoff is
+  auxiliary to serving, so a reader that races the FIFO writer, closes it early,
+  or never attaches now emits one `launch_degraded` frame and re-arms a fresh
+  private directory, FIFO, and bounded writer — announcing the newly valid
+  `fifo_path` in a new readiness frame — instead of exiting 1 with
+  `{:writer_exit, 74}` while the listener and projection were healthy. Re-arm is
+  bounded (16) and its exhaustion is a terminal `launch_surface_exhausted` frame,
+  after which the monitor keeps serving without a FIFO. A successful handoff also
+  re-arms, so a second browser session needs no restart; every handoff still
+  issues its own fresh, one-use, TTL-bounded capability, and no capability byte
+  reaches any frame, stdout, or stderr.
+- Monitor: darwin mode reports its launch outcome and accepts re-entry (#437).
+  The serving stdout frame now carries a bounded `launch` object distinguishing
+  `succeeded`, `failed`, and `not_attempted` (including `unsupported_platform`
+  off macOS), so a launcher failure is observable instead of fatal. `SIGUSR2`
+  mints a fresh one-use capability and relaunches without restarting the monitor,
+  replacing the previous one-shot token with no recovery path. SIGUSR1 is
+  deliberately avoided: ERTS reserves it for its crash-dump handler.
+
 ## [0.1.12] - 2026-07-21
 
 The contract-honesty cut: 11 pull requests since 0.1.11. A checked-in CLI

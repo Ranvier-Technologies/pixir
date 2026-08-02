@@ -15,7 +15,7 @@
 #
 # Artifacts in <out_dir>: spec.json, plan.json (rehearsal), envelope.json.
 # Exit codes: 0 all children completed · 3 partial (non-completed children
-# listed on stderr with their resume targets) · 2 usage/rehearsal failure.
+# listed on stderr with their resume targets) · 2 usage/rehearsal/admission failure.
 # Closure discipline: this script reports; reconciling summaries against
 # their contracts and dispositioning children remains the caller's job.
 
@@ -50,9 +50,17 @@ jq -n --arg role "$PIXIR_ROLE" --argjson mt "$max_threads" \
 
 if [[ "$PIXIR_SKIP_REHEARSAL" != "1" ]]; then
   if ! "$PIXIR_BIN" delegate --spec "$out_dir/spec.json" --dry-run --json \
-      >"$out_dir/plan.json" 2>&1; then
+      --timeout-ms "$PIXIR_TIMEOUT_MS" >"$out_dir/plan.json" 2>&1; then
     echo "rehearsal failed — structured errors and next_actions:" >&2
     jq -r '.error // .' "$out_dir/plan.json" >&2 || cat "$out_dir/plan.json" >&2
+    exit 2
+  fi
+  if ! jq -e . "$out_dir/plan.json" >/dev/null 2>&1; then
+    echo "error: rehearsal did not return valid JSON — inspect $out_dir/plan.json" >&2
+    exit 2
+  fi
+  if [[ "$(jq -r '.would_reject // false' "$out_dir/plan.json")" == "true" ]]; then
+    echo "rehearsal would reject the real run at PIXIR_TIMEOUT_MS=$PIXIR_TIMEOUT_MS; increase it to suggested_timeout_ms=$(jq -r '.suggested_timeout_ms // "unknown"' "$out_dir/plan.json") or follow plan.json next_actions" >&2
     exit 2
   fi
   echo "rehearsal: $(jq -r '.status' "$out_dir/plan.json") ($(jq -r '.beam_coordination.planned_child_count // "?"' "$out_dir/plan.json") children)" >&2
@@ -66,6 +74,27 @@ set -e
 
 if ! jq -e . "$out_dir/envelope.json" >/dev/null 2>&1; then
   echo "error: envelope did not parse as JSON (exit $run_ec) — treat run as failed" >&2
+  exit 2
+fi
+
+if jq -e '(.status == "rejected") or (.kind == "horizon_shorter_than_critical_path")' \
+    "$out_dir/envelope.json" >/dev/null; then
+  echo "delegate launch rejected before child traversal — actionable horizon context:" >&2
+  jq '{status, kind, message,
+       arithmetic: {
+         effective_timeout_ms: .details.effective_timeout_ms,
+         estimated_critical_path_ms: .details.estimated_critical_path_ms,
+         waves: .details.waves,
+         suggested_timeout_ms: .details.suggested_timeout_ms
+       },
+       binding: {
+         wait_horizon_explicit: .details.wait_horizon_explicit,
+         caller_horizon_ms: .details.caller_horizon_ms,
+         declared_workflow_timeout_ms: .details.declared_workflow_timeout_ms,
+         declared_workflow_timeout_explicit: .details.declared_workflow_timeout_explicit
+       },
+       next_actions: (.details.next_actions // .next_actions // [])}' \
+    "$out_dir/envelope.json" >&2
   exit 2
 fi
 

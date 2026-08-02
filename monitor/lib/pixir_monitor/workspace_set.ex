@@ -1,26 +1,47 @@
 defmodule PixirMonitor.WorkspaceSet do
   @moduledoc """
-  Read-only source scoping for the frozen two-workspace Workspace Overview.
+  Read-only source scoping for the bounded-N Workspace Overview.
+
+  The set holds between `min_sources/0` and `max_sources/0` explicitly declared
+  sources. The bound is a real bound: a configured list outside it is not
+  configured at all, never a truncation and never a silent drop of trailing
+  declarations.
 
   Roots remain process-local configuration. Public values expose only operator keys.
   """
 
   @key_regex ~r/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
   @max_key_bytes 256
+  @min_sources 2
+  @max_sources 8
 
   @type source :: %{required(:key) => String.t(), required(:path) => String.t()}
+
+  @doc "Smallest declared set size that enters workspace-set mode."
+  @spec min_sources() :: pos_integer()
+  def min_sources, do: @min_sources
+
+  @doc "Largest declared set size workspace-set mode accepts."
+  @spec max_sources() :: pos_integer()
+  def max_sources, do: @max_sources
 
   @spec configured() :: {:ok, [source()]} | {:error, map()}
   def configured do
     case Application.get_env(:pixir_monitor, :workspace_set) do
-      [first, second] = sources ->
-        if valid_source?(first) and valid_source?(second) and first.key != second.key,
-          do: {:ok, sources},
-          else: not_configured()
+      sources when is_list(sources) ->
+        if length(sources) in @min_sources..@max_sources and Enum.all?(sources, &valid_source?/1) and
+             unique_keys?(sources),
+           do: {:ok, sources},
+           else: not_configured()
 
       _ ->
         not_configured()
     end
+  end
+
+  defp unique_keys?(sources) do
+    keys = Enum.map(sources, & &1.key)
+    length(Enum.uniq(keys)) == length(keys)
   end
 
   @spec mode() :: {:ok, :single | :workspace_set}

@@ -6,7 +6,13 @@ defmodule Pixir.Delegate.CLIContract do
   small and testable: parse CLI flags, read a JSON spec, validate the contract, and emit
   a stable dry-run result, attached runtime result, or structured error. Runtime
   execution is delegated to `Pixir.Delegate.Runner` after the same parser accepts the
-  request.
+  request. Dry-runs expose a non-fatal critical-path horizon advisory with additive
+  workflow binding-source evidence, including whether the wait horizon was explicit or
+  defaulted from the delegate timeout, without changing the stable four-field override
+  projection. When they would reject, their next actions are the same recovery actions
+  as a real rejection rather than misleading run actions. Real attached and start
+  requests reject before runtime dispatch when that floor exceeds the caller
+  horizon, unless the explicit `--allow-short-horizon` override is present.
 
   The scaling rule is part of the contract: `delegate` should enter Pixir once and let
   BEAM coordinate fanout. Caller-side polling loops and process-per-child shell fanout
@@ -42,19 +48,70 @@ defmodule Pixir.Delegate.CLIContract do
   """
 
   alias Pixir.Agents
-  alias Pixir.Delegate.{Async, DaemonClient, DaemonCommand, Evidence, Progress, Runner}
+
+  alias Pixir.Delegate.{
+    Async,
+    CriticalPath,
+    DaemonClient,
+    DaemonCommand,
+    Evidence,
+    Progress,
+    Runner
+  }
+
   alias Pixir.Permissions.WritePolicy
   alias Pixir.Provider.OutputTruncationSummary
+  alias Pixir.Subagents.WarmStart
 
   @contract_version 1
-  # Revision 5: additive bounded Provider-output truncation evidence (#268).
-  # Revision 4: additive virtual-overlay child artifact/apply projection and
-  # dry-run bounded-overlay planning evidence (#284).
-  # Revision 3: additive dry-run children[].attachment_count (#250).
-  # Revision 2: additive children[].index + children_order envelope keys
-  # (#227). The pixir.delegate.envelope.v1 family name is reserved for
-  # breaking shape changes; additive keys bump this revision instead.
-  @envelope_schema_version 5
+  @envelope_schema_registry [
+    {
+      1,
+      :initial_v1_shape,
+      "baseline pixir.delegate.envelope.v1 shape; the v1 family name stays reserved for breaking shape changes"
+    },
+    {
+      2,
+      :children_index,
+      "additive children[].index + children_order envelope keys (#227)"
+    },
+    {
+      3,
+      :attachment_count,
+      "additive dry-run children[].attachment_count (#250)"
+    },
+    {
+      4,
+      :virtual_overlay,
+      "additive virtual-overlay child artifact/apply projection and dry-run bounded-overlay planning evidence (#284)"
+    },
+    {
+      5,
+      :output_truncation_evidence,
+      "additive bounded Provider-output truncation evidence (#268)"
+    },
+    {
+      6,
+      :horizon_admission,
+      "additive critical-path horizon admission and dry-run advisory (#433)"
+    },
+    {
+      7,
+      :plan_warnings,
+      "additive dry-run plan_warnings[] carrying step_budget_capped_by_workflow_timeout, advisory only (#443)"
+    },
+    {
+      8,
+      :write_denials,
+      "additive mandatory bounded-write write_denials confession at top level and per child (#446)"
+    },
+    {
+      9,
+      :warm_start,
+      "additive per-child children[].warm_start lineage projection plus the optional seed_session_id spec key (#435)"
+    }
+  ]
+  @envelope_schema_version length(@envelope_schema_registry)
   @max_spec_bytes 1_000_000
   @supported_strategies ~w(subagents workflow)
   @supported_modes [nil, "read_only", "bounded_write"]
@@ -125,11 +182,18 @@ defmodule Pixir.Delegate.CLIContract do
 
         case load_and_validate_spec(request, read_stdin, runtime_opts) do
           {:ok, spec, spec_meta} ->
-            if request.dry_run? do
-              dry_run_result(request, spec, spec_meta)
-              |> maybe_put_dry_run_counts(spec)
-            else
-              runtime_result(runner, request, spec, spec_meta, runtime_opts)
+            spec_meta = maybe_put_horizon_override(spec_meta, request)
+
+            cond do
+              request.dry_run? ->
+                dry_run_result(request, spec, spec_meta)
+                |> maybe_put_dry_run_counts(spec)
+
+              horizon_reject?(spec_meta, request) ->
+                error_result(CriticalPath.rejection(spec_meta["critical_path"]), request.json?)
+
+              true ->
+                runtime_result(runner, request, spec, spec_meta, runtime_opts)
             end
 
           {:error, error} ->
@@ -173,6 +237,10 @@ defmodule Pixir.Delegate.CLIContract do
         error_result(error, json?)
     end
   end
+
+  @doc false
+  @spec envelope_schema_registry() :: [{pos_integer(), atom(), String.t()}]
+  def envelope_schema_registry, do: @envelope_schema_registry
 
   @doc "Return the supported Delegate contract version."
   @spec contract_version() :: pos_integer()
@@ -275,6 +343,7 @@ defmodule Pixir.Delegate.CLIContract do
 
   defp parse_args(argv) do
     parse_args(argv, %{
+      allow_short_horizon?: false,
       dry_run?: false,
       fail_on_incomplete?: false,
       json?: "--json" in argv,
@@ -320,6 +389,9 @@ defmodule Pixir.Delegate.CLIContract do
 
   defp parse_args(["--spec" | _rest], acc),
     do: {:error, invalid_args("--spec requires a path or -", %{"usage" => usage()}), acc.json?}
+
+  defp parse_args(["--allow-short-horizon" | rest], acc),
+    do: parse_args(rest, %{acc | allow_short_horizon?: true})
 
   defp parse_args(["--dry-run" | rest], acc), do: parse_args(rest, %{acc | dry_run?: true})
   defp parse_args(["--json" | rest], acc), do: parse_args(rest, %{acc | json?: true})
@@ -404,7 +476,7 @@ defmodule Pixir.Delegate.CLIContract do
          :ok <- validate_workflow_shell_for_strict_keys(spec),
          :ok <- validate_workflow_steps_for_strict_keys(spec),
          :ok <- validate_subagents_shape_for_strict_keys(spec),
-         :ok <- validate_task_entries_for_strict_keys(spec),
+         :ok <- validate_task_entries_for_strict_keys(spec, workspace),
          :ok <- validate_virtual_overlay_contract(spec),
          :ok <- validate_subagent_model(spec),
          :ok <- validate_subagent_reasoning_effort(spec),
@@ -999,32 +1071,70 @@ defmodule Pixir.Delegate.CLIContract do
 
   defp validate_subagent_web_search(_spec), do: :ok
 
-  defp validate_task_entries_for_strict_keys(%{"tasks" => tasks}) when is_list(tasks) do
+  defp validate_task_entries_for_strict_keys(%{"tasks" => tasks} = spec, workspace)
+       when is_list(tasks) do
+    # A dry-run must read seed Logs from the same root the real run will: the runner
+    # resolves the spec's own `workspace` field first (normalize_workspace/2) and
+    # validates every seed against THAT root. Reading from the caller root instead
+    # would accept a seed the real run rejects, or the reverse (#435).
+    workspace = effective_spec_workspace(spec, workspace || File.cwd!())
+
     tasks
     |> Enum.with_index()
     |> Enum.reduce_while(:ok, fn {entry, index}, :ok ->
-      case validate_task_entry_for_strict_keys(entry, index) do
+      case validate_task_entry_for_strict_keys(entry, index, workspace) do
         :ok -> {:cont, :ok}
         {:error, error} -> {:halt, {:error, error}}
       end
     end)
   end
 
-  defp validate_task_entries_for_strict_keys(_spec), do: :ok
+  defp validate_task_entries_for_strict_keys(_spec, _workspace), do: :ok
 
-  defp validate_task_entry_for_strict_keys(entry, _index) when is_binary(entry), do: :ok
+  defp validate_task_entry_for_strict_keys(entry, _index, _workspace) when is_binary(entry),
+    do: :ok
 
-  defp validate_task_entry_for_strict_keys(%{} = entry, index) do
-    allowed = ["task", "attachments"]
+  defp validate_task_entry_for_strict_keys(%{} = entry, index, workspace) do
+    allowed = Runner.known_task_entry_keys()
 
     with :ok <- reject_unknown_task_entry_keys(entry, index, allowed),
          :ok <- validate_task_entry_text(entry, index),
-         :ok <- validate_task_entry_attachments(entry, index) do
+         :ok <- validate_task_entry_attachments(entry, index),
+         :ok <- validate_task_entry_seed(entry, index, workspace) do
       :ok
     end
   end
 
-  defp validate_task_entry_for_strict_keys(_entry, _index), do: :ok
+  defp validate_task_entry_for_strict_keys(_entry, _index, _workspace), do: :ok
+
+  # A dry-run must reject exactly the seeds the real run would reject, so an operator
+  # learns about an unusable seed before spending a Session on it (#435).
+  defp validate_task_entry_seed(entry, index, workspace) do
+    case Map.fetch(entry, "seed_session_id") do
+      :error ->
+        :ok
+
+      {:ok, seed_session_id} ->
+        case WarmStart.validate(seed_session_id, workspace: workspace || File.cwd!()) do
+          {:ok, _lineage} -> :ok
+          {:error, error} -> {:error, seed_spec_error(error, index)}
+        end
+    end
+  end
+
+  defp seed_spec_error(error, index) do
+    details =
+      error
+      |> error_details()
+      |> Map.merge(%{
+        "field" => "tasks[#{index + 1}].seed_session_id",
+        "json_pointer" => "/tasks/#{index}/seed_session_id",
+        "path" => ["tasks", index, "seed_session_id"],
+        "task_index" => index
+      })
+
+    invalid_spec(error_message(error, "delegate seed_session_id is unusable"), details)
+  end
 
   defp reject_unknown_task_entry_keys(entry, index, allowed) do
     known = MapSet.new(allowed)
@@ -1036,7 +1146,7 @@ defmodule Pixir.Delegate.CLIContract do
       key ->
         {:error,
          invalid_spec(
-           "delegate tasks entries may only include task and attachments",
+           "delegate tasks entries may only include task, attachments, and seed_session_id",
            %{
              "unknown_key" => key,
              "accepted_keys" => allowed,
@@ -1303,6 +1413,7 @@ defmodule Pixir.Delegate.CLIContract do
   defp parse_subcommand_argv(subcommand, argv) do
     parse_subcommand_args(argv, %{
       command: subcommand,
+      allow_short_horizon?: false,
       dry_run?: false,
       fail_on_incomplete?: false,
       json?: "--json" in argv,
@@ -1325,6 +1436,9 @@ defmodule Pixir.Delegate.CLIContract do
 
   defp parse_subcommand_args(["--quiet" | rest], acc),
     do: parse_subcommand_args(rest, %{acc | quiet?: true})
+
+  defp parse_subcommand_args(["--allow-short-horizon" | rest], acc),
+    do: parse_subcommand_args(rest, %{acc | allow_short_horizon?: true})
 
   defp parse_subcommand_args(["--dry-run" | rest], acc),
     do: parse_subcommand_args(rest, %{acc | dry_run?: true})
@@ -1472,7 +1586,13 @@ defmodule Pixir.Delegate.CLIContract do
         {:error,
          invalid_args("delegate start does not support these options yet", %{
            "unsupported_options" => unsupported,
-           "accepted_options" => ["--spec", "--json", "--contract-version", "--timeout-ms"],
+           "accepted_options" => [
+             "--spec",
+             "--json",
+             "--contract-version",
+             "--timeout-ms",
+             "--allow-short-horizon"
+           ],
            "next_actions" => ["remove_unsupported_options", "use_delegate_status_after_start"]
          }), acc.json?}
     end
@@ -1517,7 +1637,7 @@ defmodule Pixir.Delegate.CLIContract do
       {:error,
        invalid_args("delegate start requires --spec PATH or --spec -", %{
          "usage" =>
-           "pixir delegate start --spec <path|-> [--json] [--contract-version 1] [--timeout-ms N]",
+           "pixir delegate start --spec <path|-> [--json] [--contract-version 1] [--timeout-ms N] [--allow-short-horizon]",
          "next_actions" => ["provide_delegate_spec_path_or_stdin"]
        }), acc.json?}
 
@@ -1547,6 +1667,7 @@ defmodule Pixir.Delegate.CLIContract do
 
   defp unsupported_liveness_options(%{command: "attach"} = acc) do
     [
+      {"--allow-short-horizon", acc.allow_short_horizon?},
       {"--dry-run", acc.dry_run?},
       {"--fail-on-incomplete", acc.fail_on_incomplete?},
       {"--output-dir", not is_nil(acc.output_dir)},
@@ -1561,6 +1682,7 @@ defmodule Pixir.Delegate.CLIContract do
 
   defp unsupported_liveness_options(acc) do
     [
+      {"--allow-short-horizon", acc.allow_short_horizon?},
       {"--dry-run", acc.dry_run?},
       {"--fail-on-incomplete", acc.fail_on_incomplete?},
       {"--output-dir", not is_nil(acc.output_dir)},
@@ -1594,6 +1716,7 @@ defmodule Pixir.Delegate.CLIContract do
 
   defp unsupported_daemon_options(acc) do
     [
+      {"--allow-short-horizon", acc.allow_short_horizon?},
       {"--dry-run", acc.dry_run?},
       {"--fail-on-incomplete", acc.fail_on_incomplete?},
       {"--output-dir", not is_nil(acc.output_dir)},
@@ -1641,21 +1764,27 @@ defmodule Pixir.Delegate.CLIContract do
        ) do
     case load_and_validate_spec(request, read_stdin, Keyword.get(async_opts, :runtime_opts, [])) do
       {:ok, spec, spec_meta} ->
-        local_start = fn -> apply(async, :start, [request, spec, spec_meta, async_opts]) end
+        spec_meta = maybe_put_horizon_override(spec_meta, request)
 
-        dispatch_daemon_start_or_local(
-          daemon_client,
-          request,
-          async_opts,
-          %{
-            "request" => request_to_wire(request),
-            "spec" => spec,
-            "spec_meta" => spec_meta,
-            "runtime_opts" => []
-          },
-          local_start
-        )
-        |> render_async_dispatch(request)
+        if horizon_reject?(spec_meta, request) do
+          error_result(CriticalPath.rejection(spec_meta["critical_path"]), request.json?)
+        else
+          local_start = fn -> apply(async, :start, [request, spec, spec_meta, async_opts]) end
+
+          dispatch_daemon_start_or_local(
+            daemon_client,
+            request,
+            async_opts,
+            %{
+              "request" => request_to_wire(request),
+              "spec" => spec,
+              "spec_meta" => spec_meta,
+              "runtime_opts" => []
+            },
+            local_start
+          )
+          |> render_async_dispatch(request)
+        end
 
       {:error, error} ->
         error_result(error, request.json?)
@@ -1975,6 +2104,7 @@ defmodule Pixir.Delegate.CLIContract do
 
   defp request_to_wire(request) do
     %{
+      "allow_short_horizon?" => request.allow_short_horizon?,
       "json?" => request.json?,
       "spec_source" => request.spec_source,
       "timeout_ms" => request.timeout_ms,
@@ -1988,8 +2118,9 @@ defmodule Pixir.Delegate.CLIContract do
     with {:ok, raw, source_meta} <- read_spec(request.spec_source, read_stdin),
          {:ok, spec} <- decode_spec(raw),
          :ok <- validate_strict_spec_keys(spec, request.workspace, runtime_opts),
-         {:ok, spec_meta} <- validate_spec(spec, request.workspace, runtime_opts) do
-      {:ok, spec, Map.merge(source_meta, spec_meta)}
+         {:ok, spec_meta} <- validate_spec(spec, request.workspace, runtime_opts),
+         {:ok, critical_path} <- Runner.critical_path(request, spec, spec_meta, runtime_opts) do
+      {:ok, spec, Map.merge(source_meta, Map.put(spec_meta, "critical_path", critical_path))}
     end
   end
 
@@ -2233,7 +2364,7 @@ defmodule Pixir.Delegate.CLIContract do
   defp valid_task_entry?(%{"task" => task} = entry) when is_binary(task),
     do:
       String.trim(task) != "" and
-        Enum.all?(Map.keys(entry), &(&1 in ["task", "attachments"])) and
+        Enum.all?(Map.keys(entry), &(&1 in Runner.known_task_entry_keys())) and
         valid_task_attachments?(Map.get(entry, "attachments", []))
 
   defp valid_task_entry?(_task), do: false
@@ -2665,6 +2796,82 @@ defmodule Pixir.Delegate.CLIContract do
     end
   end
 
+  defp horizon_reject?(spec_meta, request) do
+    details = spec_meta["critical_path"] || %{}
+
+    details["effective_timeout_ms"] < details["estimated_critical_path_ms"] and
+      not request.allow_short_horizon?
+  end
+
+  defp maybe_put_horizon_override(spec_meta, request) do
+    details = spec_meta["critical_path"] || %{}
+
+    if request.allow_short_horizon? and
+         details["effective_timeout_ms"] < details["estimated_critical_path_ms"] do
+      Map.put(spec_meta, "horizon_override", CriticalPath.horizon_values(details))
+    else
+      spec_meta
+    end
+  end
+
+  defp put_critical_path_advisory(payload, spec_meta) do
+    details = spec_meta["critical_path"] || %{}
+    would_reject = details["effective_timeout_ms"] < details["estimated_critical_path_ms"]
+
+    payload =
+      details
+      |> CriticalPath.horizon_values()
+      |> Map.merge(
+        Map.take(details, [
+          "caller_horizon_ms",
+          "wait_horizon_explicit",
+          "declared_workflow_timeout_ms",
+          "declared_workflow_timeout_explicit"
+        ])
+      )
+      |> Map.put("would_reject", would_reject)
+      |> Map.merge(payload)
+      |> put_plan_warnings(details)
+
+    if would_reject do
+      recovery_actions =
+        details
+        |> CriticalPath.rejection()
+        |> get_in(["details", "next_actions"])
+
+      payload
+      |> Map.put("next_actions", recovery_actions)
+      |> Map.put(
+        "summary",
+        "Delegate dry-run advisory: #{details["estimated_critical_path_ms"]}ms estimated critical path exceeds #{details["effective_timeout_ms"]}ms horizon; a real run would reject before spawning."
+      )
+    else
+      payload
+    end
+  end
+
+  # Additive advisory warnings about the plan itself, kept in their own key so they never
+  # collide with the runtime `warnings` list, which carries Provider output-truncation
+  # evidence from real children. Emitted independently of `would_reject`: a plan carrying
+  # only a plan warning is still an accepted plan with its accepted exit code.
+  defp put_plan_warnings(payload, details) do
+    warnings =
+      [CriticalPath.capped_step_budget_warning(details["capped_step_budgets"] || [])]
+      |> Enum.reject(&is_nil/1)
+
+    if warnings == [] do
+      payload
+    else
+      Map.put(payload, "plan_warnings", warnings)
+    end
+  end
+
+  defp plan_warning_lines(%{"plan_warnings" => warnings}) when is_list(warnings) do
+    Enum.map_join(warnings, "", fn warning -> "\n" <> to_string(warning["summary"]) end)
+  end
+
+  defp plan_warning_lines(_payload), do: ""
+
   defp dry_run_result(request, spec, spec_meta) do
     dry_run_children = dry_run_children(spec, spec_meta)
 
@@ -2692,6 +2899,7 @@ defmodule Pixir.Delegate.CLIContract do
       |> put_if_present("children_order", dry_run_children_order(spec_meta, dry_run_children))
       |> put_if_present("role_validation", spec_meta["subagent_role_validation"])
       |> put_if_present("transport", spec_meta["transport"])
+      |> put_critical_path_advisory(spec_meta)
 
     {:ok, rendered(payload, request.json?, 0, human_success(payload))}
   end
@@ -2863,6 +3071,7 @@ defmodule Pixir.Delegate.CLIContract do
     |> Map.put_new("beam_coordination", beam_coordination(spec_meta))
     |> Map.put_new("host_boundary", host_boundary())
     |> Map.put_new("artifacts", [])
+    |> put_if_present("horizon_override", spec_meta["horizon_override"])
     |> Map.put_new("next_actions", [])
   end
 
@@ -3122,6 +3331,20 @@ defmodule Pixir.Delegate.CLIContract do
 
   defp invalid_spec(message, details), do: error_payload("invalid_spec", message, details)
 
+  # Tool.error/3 and the delegate error_payload/3 shape both reach these helpers, so
+  # accept atom-keyed structured errors and already-stringified payloads alike.
+  defp error_details(%{error: %{details: details}}) when is_map(details),
+    do: Map.new(details, fn {key, value} -> {to_string(key), value} end)
+
+  defp error_details(%{"details" => details}) when is_map(details), do: details
+  defp error_details(_error), do: %{}
+
+  defp error_message(%{error: %{message: message}}, _default) when is_binary(message),
+    do: message
+
+  defp error_message(%{"message" => message}, _default) when is_binary(message), do: message
+  defp error_message(_error, default), do: default
+
   defp unsupported_mode(mode) do
     error_payload("unsupported_mode", "delegate spec mode is unsupported", %{
       "observed" => mode,
@@ -3203,8 +3426,14 @@ defmodule Pixir.Delegate.CLIContract do
 
   defp exit_code(%{"status" => "unsupported"}), do: 2
 
-  defp exit_code(%{"kind" => kind}) when kind in ["invalid_args", "invalid_json", "invalid_spec"],
-    do: 2
+  defp exit_code(%{"kind" => kind})
+       when kind in [
+              "invalid_args",
+              "invalid_json",
+              "invalid_spec",
+              "horizon_shorter_than_critical_path"
+            ],
+       do: 2
 
   defp exit_code(%{"kind" => "spec_read_failed"}), do: 2
   defp exit_code(%{"kind" => "stdin_error"}), do: 2
@@ -3223,7 +3452,13 @@ defmodule Pixir.Delegate.CLIContract do
        do: 0
 
   defp runtime_exit_code(%{"kind" => kind}, _request)
-       when kind in ["invalid_args", "invalid_json", "invalid_spec", "unsupported_mode"],
+       when kind in [
+              "invalid_args",
+              "invalid_json",
+              "invalid_spec",
+              "unsupported_mode",
+              "horizon_shorter_than_critical_path"
+            ],
        do: 2
 
   defp runtime_exit_code(%{"kind" => kind}, _request)
@@ -3257,8 +3492,14 @@ defmodule Pixir.Delegate.CLIContract do
   defp subcommand_exit_code(_subcommand, payload, request),
     do: runtime_exit_code(payload, request)
 
+  defp human_success(%{"would_reject" => true} = payload) do
+    "delegate dry-run advisory: strategy #{payload["strategy"]}; a real run would reject before spawning" <>
+      plan_warning_lines(payload)
+  end
+
   defp human_success(payload) do
-    "delegate dry-run accepted: strategy #{payload["strategy"]}; no runtime executed"
+    "delegate dry-run accepted: strategy #{payload["strategy"]}; no runtime executed" <>
+      plan_warning_lines(payload)
   end
 
   defp human_runtime(payload) do
@@ -3270,8 +3511,8 @@ defmodule Pixir.Delegate.CLIContract do
   end
 
   defp usage do
-    "pixir delegate --spec <path|-> [--dry-run] [--json] [--contract-version 1] [--timeout-ms N]\n" <>
-      "pixir delegate start --spec <path|-> [--json] [--contract-version 1] [--timeout-ms N]\n" <>
+    "pixir delegate --spec <path|-> [--dry-run] [--json] [--contract-version 1] [--timeout-ms N] [--allow-short-horizon]\n" <>
+      "pixir delegate start --spec <path|-> [--json] [--contract-version 1] [--timeout-ms N] [--allow-short-horizon]\n" <>
       "pixir delegate status <delegate_id|parent_session_id> [--json] [--contract-version 1]\n" <>
       "pixir delegate attach <delegate_id|parent_session_id> [--json] [--contract-version 1] [--progress=stderr-jsonl] [--wait-horizon-ms N]\n" <>
       "pixir delegate cancel <delegate_id|parent_session_id> [--json] [--contract-version 1]\n" <>

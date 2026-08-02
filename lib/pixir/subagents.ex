@@ -74,7 +74,16 @@ defmodule Pixir.Subagents do
   def wait_outcome(parent_session_id, ids, timeout_ms \\ 30_000, opts \\ []),
     do: Manager.wait_outcome(parent_session_id, ids, timeout_ms, opts)
 
-  @doc "Cancel a running Subagent, or close a queued/terminal Subagent as cleanup."
+  @doc """
+  Cancel a running Subagent, or close a queued/terminal Subagent as cleanup.
+
+  Cancelling a running Subagent also appends a terminal `cancelled_by_parent`
+  `:subagent_event` to the **child's** own Log, so the child Log alone is evidence
+  of its cancellation. Callers that cancel on behalf of a Workflow may name the
+  canceller with `:workflow_id`, `:workflow_step_id`, and `:workflow_close_outcome`;
+  those fields are simply absent from the child event for a plain parent close. The
+  return contract (`status`, `reason`, `elapsed_ms`, `next_actions`) is unchanged.
+  """
   def close(parent_session_id, id, opts \\ []), do: Manager.close(parent_session_id, id, opts)
 
   @doc "List Subagents for a parent Session."
@@ -308,17 +317,72 @@ defmodule Pixir.Subagents do
   end
 
   defp mutation_attempt?(history) do
+    ran = succeeded_call_ids(history)
+
     Enum.any?(history, fn
-      %{type: :tool_call, data: %{"name" => name, "args" => args}} when is_binary(name) ->
-        Permissions.mutating?(name, if(is_map(args), do: args, else: %{}))
-
-      %{type: :tool_call, data: %{"name" => name}} when is_binary(name) ->
-        Permissions.mutating?(name, %{})
-
-      _event ->
-        false
+      %{type: :tool_call, data: data} when is_map(data) -> mutating_call?(data, ran)
+      _event -> false
     end)
   end
+
+  # Call ids the Log says actually produced a SUCCESSFUL result. `ok == false` is not in
+  # here on purpose: a failed result is not a claim that the call ran to effect, and the
+  # honest drain/synthesis pairing is exactly `ok: false` with an `orphan_tool_call` error.
+  defp succeeded_call_ids(history) do
+    for %{type: :tool_result, data: %{"call_id" => call_id} = data} <- history,
+        data["ok"] == true,
+        into: MapSet.new(),
+        do: call_id
+  end
+
+  # #462: a `tool_call` Pixir itself wrote to close a cancellation window is NOT evidence
+  # of a mutation attempt. Both markers name calls that provably never ran:
+  #
+  #   * `"synthesized"` — layer-2 recovery, whose name is the `"unknown"` placeholder;
+  #     `Permissions.mutating?/2` fails closed on unknown names, so without this a legacy
+  #     Log with no posture event would fail `resume_posture/2` closed with reason
+  #     "missing" over a call nothing executed;
+  #   * `"drained"` — layer-1 drain, which carries the call's real name but was persisted
+  #     precisely BECAUSE the Turn was killed before the Executor could run it.
+  #
+  # #462 round 5: the marker alone does not buy the exemption — the PAIRING does. Both
+  # markers are written by Pixir alongside a result asserting the call did not run, and
+  # that assertion is the whole basis for exempting them. A Log that carries the marker
+  # next to a SUCCESSFUL result is describing a call that ran, whatever the marker claims,
+  # and the marker key is an ordinary string any writer (a forged Log, a corrupted one, a
+  # future path that reuses the key for something that does execute) can place there.
+  # Keying on presence alone would let that hide a real write and resume the Session
+  # write-capable over it. So: exempt while no successful result exists for the id, and
+  # fall through to the ordinary classification the moment one does. A marker with no
+  # result at all stays exempt — that is the honest mid-drain shape, where the closing
+  # reconciliation has not run (or its Log append failed).
+  #
+  # The catch-all classification for ordinary unknown names is untouched: only Pixir's own
+  # markers, and only unpaired-with-success, are exempt.
+  defp mutating_call?(%{"synthesized" => marker, "call_id" => call_id} = data, ran)
+       when is_map(marker),
+       do: MapSet.member?(ran, call_id) and mutating_by_name?(data)
+
+  defp mutating_call?(%{"drained" => marker, "call_id" => call_id} = data, ran)
+       when is_map(marker),
+       do: MapSet.member?(ran, call_id) and mutating_by_name?(data)
+
+  # A marker with no readable `call_id` cannot be tied to any result, so nothing can vouch
+  # that it ran: it keeps the exemption, exactly as before round 5.
+  defp mutating_call?(%{"synthesized" => marker}, _ran) when is_map(marker), do: false
+  defp mutating_call?(%{"drained" => marker}, _ran) when is_map(marker), do: false
+
+  defp mutating_call?(data, _ran), do: mutating_by_name?(data)
+
+  # `Permissions.mutating?/2` fails closed on names it does not know, which is what makes
+  # the layer-2 `"unknown"` placeholder classify as a write once it is no longer exempt.
+  defp mutating_by_name?(%{"name" => name, "args" => args}) when is_binary(name),
+    do: Permissions.mutating?(name, if(is_map(args), do: args, else: %{}))
+
+  defp mutating_by_name?(%{"name" => name}) when is_binary(name),
+    do: Permissions.mutating?(name, %{})
+
+  defp mutating_by_name?(_data), do: false
 
   defp write_policy_decision?(history) do
     Enum.any?(history, fn
@@ -510,11 +574,71 @@ defmodule Pixir.Subagents do
   defp restrict_policy_bash("disabled", _requested), do: "disabled"
   defp restrict_policy_bash(_durable, "disabled"), do: "disabled"
 
-  defp restrict_policy_bash(%{"verify" => durable}, %{"verify" => requested}) do
-    %{"verify" => Enum.filter(requested, &(&1 in durable))}
+  defp restrict_policy_bash(%{"verify" => durable} = durable_bash, %{"verify" => requested} = req) do
+    verify = Enum.filter(requested, &(&1 in durable))
+
+    # The operator-declared verify allowlist (#445) must survive the intersection:
+    # dropping it would silently re-impose the Elixir default and reject the very
+    # commands both sides agreed on. A side that declared nothing contributes the
+    # default it was normalized under.
+    case intersect_verify_prefixes(durable_bash, req) do
+      # Nothing shared to authorize: the honest restriction is a disabled shell.
+      _prefixes when verify == [] ->
+        "disabled"
+
+      # Unreachable while `verify` is non-empty — a command both sides admitted
+      # was covered by a prefix on each side, and two prefixes covering the same
+      # command are always leading runs of it, so one covers the other. Kept as a
+      # fail-closed floor rather than emitting an empty allowlist, which normalize
+      # rejects as malformed.
+      [] ->
+        "disabled"
+
+      nil ->
+        %{"verify" => verify}
+
+      prefixes ->
+        %{"verify_prefixes" => prefixes, "verify" => verify}
+    end
   end
 
   defp restrict_policy_bash(_durable, _requested), do: "disabled"
+
+  # Prefixes are compared by tokenwise coverage, not as exact strings — the same
+  # relation `rule_set_covers?/2` applies to write rules just above. A prefix is
+  # a constraint on what may be admitted, so a survivor must be covered by the
+  # durable side: it survives only when some durable prefix is a tokenwise prefix
+  # of it, which means it admits a subset of what durable already admitted. The
+  # filter runs both ways, so each survivor is at least as narrow as both sides
+  # (durable `mix` against requested `mix format` keeps `mix format`).
+  #
+  # Exact string intersection was the bug: it dropped `mix` and `mix format` as
+  # unrelated, and the surviving `verify` command `mix format --check-formatted`
+  # was then left uncovered by the remaining prefixes. `WritePolicy.normalize/1`
+  # re-validates the restricted map, so an uncovered command failed resume closed
+  # on a command both sides had already authorized.
+  defp intersect_verify_prefixes(%{"verify_prefixes" => a}, %{"verify_prefixes" => b})
+       when is_list(a) and is_list(b) do
+    (Enum.filter(b, fn requested -> Enum.any?(a, &prefix_covers?(&1, requested)) end) ++
+       Enum.filter(a, fn durable -> Enum.any?(b, &prefix_covers?(&1, durable)) end))
+    |> Enum.uniq()
+  end
+
+  # Only one side declared. The other was normalized under the built-in default,
+  # and every surviving command was admitted by both, so the declaration stands.
+  defp intersect_verify_prefixes(%{"verify_prefixes" => a}, _requested) when is_list(a), do: a
+  defp intersect_verify_prefixes(_durable, %{"verify_prefixes" => b}) when is_list(b), do: b
+  defp intersect_verify_prefixes(_durable, _requested), do: nil
+
+  # `covering` admits everything `candidate` admits when its tokens are a leading
+  # run of `candidate`'s: `mix` covers `mix format`, `mix format` does not cover
+  # `mix`, and `mix` never covers `mixer` (token equality, never substring).
+  defp prefix_covers?(covering, candidate) do
+    covering_tokens = String.split(covering, ~r/\s+/, trim: true)
+    candidate_tokens = String.split(candidate, ~r/\s+/, trim: true)
+
+    Enum.take(candidate_tokens, length(covering_tokens)) == covering_tokens
+  end
 
   defp resume_posture_error(session_id, reason, extra_details \\ %{}) do
     Tool.error(
@@ -579,10 +703,12 @@ defmodule Pixir.Subagents do
   def reconstruct(history) when is_list(history) do
     history
     |> Enum.filter(&(&1.type == :subagent_event))
-    # Session-scoped posture evidence (root or child) is not a child lifecycle
-    # event: folding it here would fabricate a phantom nil-id child and flip
-    # delegate snapshots to incomplete.
-    |> Enum.reject(&(&1.data["event"] == "permission_posture"))
+    # Session-scoped evidence a Session writes about ITSELF (permission posture at
+    # spawn, the terminal `cancelled_by_parent` statement) is not a child lifecycle
+    # event: folding it here would fabricate a phantom child — a nil-id one for
+    # posture, or a self-referential entry for cancellation — and flip delegate
+    # snapshots to incomplete. Only the parent-side records describe children.
+    |> Enum.reject(&self_scoped_event?/1)
     |> Enum.reduce(%{}, fn %{data: data}, acc ->
       id = data["subagent_id"]
 
@@ -600,6 +726,13 @@ defmodule Pixir.Subagents do
       Map.put(acc, id, updated)
     end)
   end
+
+  defp self_scoped_event?(%{data: %{"event" => "permission_posture"}}), do: true
+
+  defp self_scoped_event?(%{data: %{"event" => "cancelled_by_parent", "lineage" => "child"}}),
+    do: true
+
+  defp self_scoped_event?(_event), do: false
 
   defp subagent_fields do
     [
@@ -621,6 +754,7 @@ defmodule Pixir.Subagents do
       "deadline_at",
       "permission_mode",
       "write_policy",
+      "warm_start",
       "elapsed_ms",
       "reason",
       "next_actions",

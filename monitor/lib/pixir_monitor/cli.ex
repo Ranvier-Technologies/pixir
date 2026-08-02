@@ -12,20 +12,32 @@ defmodule PixirMonitor.CLI do
   then the invocation working directory), validated as an existing readable
   directory, and never baked in at build time — see `resolve_workspace/1`.
 
+  The launch handoff is auxiliary, never a serving precondition: `serve` reaches and
+  keeps its serving state whatever the handoff does, and `PixirMonitor.LaunchSurface`
+  degrades and re-arms beside it. Only application load, workspace resolution, and
+  application start (which owns port binding) still exit nonzero.
+
   Dry-run output is bounded and capability-free. Real serve passes launch material only
   through the in-memory runtime handoff and never prints it. FIFO readiness contains
-  only the non-secret pipe path and is emitted on stderr, leaving stdout's final serving
-  contract unchanged. Errors are structured as `kind`, `message`, `details`, and
-  `next_actions`; JSON error output carries all four fields, while human-readable error
-  output prints `kind` and `message` only.
+  only the non-secret pipe path and is emitted on stderr — once per arm, so the newest
+  readiness frame always names the currently valid pipe — leaving stdout's serving
+  contract as a single line, now carrying a bounded `launch` outcome field. Errors are
+  structured as `kind`, `message`, `details`, and `next_actions`; JSON error output
+  carries all four fields, while human-readable error output prints `kind` and
+  `message` only.
   """
+
+  # Strictly above the 5_000 ms bounded launcher in PixirMonitor.Runtime, whose
+  # reap path can add a further System.cmd, so a slow-but-healthy darwin launch
+  # is reported as its real outcome instead of launch_surface_unavailable.
+  @launch_outcome_timeout_ms 30_000
 
   @help """
   pixir-monitor — loopback-only read-only Pixir presenter
 
   Usage:
     pixir-monitor serve [--workspace PATH] [--dry-run] [--json] [--launch-mode darwin|fifo]
-    pixir-monitor serve --workspace KEY=PATH --workspace KEY=PATH [--dry-run] [--json]
+    pixir-monitor serve --workspace KEY=PATH --workspace KEY=PATH [...] [--dry-run] [--json]
     pixir-monitor serve --help
     pixir-monitor self-check [--json]
     pixir-monitor --help
@@ -34,10 +46,25 @@ defmodule PixirMonitor.CLI do
     --launch-mode MODE  Launch handoff mode. Default: darwin (macOS automatic
                         browser launch). Use fifo for a portable, bounded external
                         reader handoff on systems with named-pipe support.
-    --workspace VALUE   One plain PATH keeps single-workspace mode. Exactly two
+
+                        A launch handoff never gates serving. In fifo mode a late
+                        reader, a closed reader, or an expired reader window emits
+                        one launch_degraded frame and the monitor re-arms a fresh
+                        FIFO, announcing the new path in a readiness frame; a
+                        supervisor should key on the newest readiness frame
+                        (event launch_ready, status ready) for the currently valid
+                        fifo_path. Re-arm is bounded; on exhaustion the monitor
+                        emits launch_surface_exhausted and keeps serving without a
+                        FIFO. In darwin mode the launcher outcome is reported in
+                        the serving frame's launch field, and SIGUSR2 re-enters:
+                        it mints a fresh one-use capability and launches again
+                        without restarting the monitor.
+    --workspace VALUE   One plain PATH keeps single-workspace mode. From 2 to 8
                         KEY=PATH declarations enter Workspace Overview mode;
                         keys use [A-Za-z0-9][A-Za-z0-9_-]* and declaration order
-                        is preserved. No discovery or browser path selection.
+                        is preserved. A 9th declaration is a serve-time error,
+                        never a truncation. No discovery or browser path
+                        selection.
                         Resolution precedence: --workspace, then runtime config
                         (:pixir_monitor, :projection_source, :workspace), then the
                         current working directory of this serve invocation.
@@ -162,7 +189,14 @@ defmodule PixirMonitor.CLI do
     end
   end
 
-  @doc "Resolves either the byte-compatible single source or exactly two keyed sources."
+  @doc """
+  Resolves either the byte-compatible single source or a bounded set of keyed sources.
+
+  Workspace-set mode is entered by between `WorkspaceSet.min_sources/0` and
+  `WorkspaceSet.max_sources/0` keyed declarations. Exceeding the upper bound is
+  a serve-time error carrying `workspace_declaration_too_many`; declarations are
+  never truncated, reordered, or dropped.
+  """
   @spec resolve_workspace_config(nil | [String.t()] | String.t()) ::
           {:ok, {:single, map()} | {:workspace_set, [map()]}} | {:error, map()}
   def resolve_workspace_config(nil) do
@@ -171,30 +205,40 @@ defmodule PixirMonitor.CLI do
 
   def resolve_workspace_config(value) when is_binary(value), do: resolve_workspace_config([value])
 
+  def resolve_workspace_config([]) do
+    declaration_error("workspace_declaration_empty", "A workspace declaration list cannot be empty")
+  end
+
   def resolve_workspace_config(values) when is_list(values) do
     keyed = Enum.map(values, &String.contains?(&1, "="))
+    count = length(values)
+    max = PixirMonitor.WorkspaceSet.max_sources()
 
     cond do
-      length(values) >= 3 ->
-        declaration_error("workspace_declaration_too_many", "Workspace set v1 accepts exactly two declarations")
+      count == 1 and hd(keyed) ->
+        declaration_error("workspace_declaration_single_keyed", "A keyed declaration requires at least one sibling")
 
-      length(values) == 1 and hd(keyed) ->
-        declaration_error("workspace_declaration_single_keyed", "A keyed declaration requires exactly one sibling")
-
-      length(values) == 1 ->
+      count == 1 ->
         with {:ok, workspace} <- resolve_workspace(hd(values)), do: {:ok, {:single, workspace}}
 
-      length(values) == 2 and Enum.any?(keyed) and not Enum.all?(keyed) ->
+      count >= 2 and Enum.any?(keyed) and not Enum.all?(keyed) ->
         declaration_error("workspace_declaration_mixed", "Keyed and plain declarations cannot be mixed")
 
-      length(values) == 2 and Enum.all?(keyed) ->
-        resolve_keyed_workspaces(values)
+      count >= 2 and not Enum.any?(keyed) ->
+        declaration_error(
+          "workspace_declaration_unkeyed_pair",
+          "Multiple workspace declarations must all use KEY=PATH"
+        )
 
-      length(values) == 2 ->
-        declaration_error("workspace_declaration_unkeyed_pair", "Two workspace declarations must both use KEY=PATH")
+      count > max ->
+        declaration_error(
+          "workspace_declaration_too_many",
+          "Workspace set accepts at most #{max} declarations",
+          %{max_workspaces: max, declared: count}
+        )
 
       true ->
-        declaration_error("workspace_declaration_mixed", "Workspace set mode requires keyed declarations")
+        resolve_keyed_workspaces(values)
     end
   end
 
@@ -212,7 +256,7 @@ defmodule PixirMonitor.CLI do
       Enum.any?(declarations, &(PixirMonitor.WorkspaceSet.validate_key(&1.key) != :ok)) ->
         declaration_error("workspace_declaration_invalid_key", "Workspace key does not match the safe-component grammar")
 
-      declarations |> Enum.map(& &1.key) |> Enum.uniq() |> length() != 2 ->
+      declarations |> Enum.map(& &1.key) |> Enum.uniq() |> length() != length(declarations) ->
         declaration_error("workspace_declaration_duplicate_key", "Workspace keys must be unique")
 
       true ->
@@ -229,8 +273,17 @@ defmodule PixirMonitor.CLI do
     end
   end
 
-  defp declaration_error(kind, message) do
-    {:error, %{kind: kind, message: message, details: %{}, next_actions: ["Declare one plain --workspace PATH or exactly two --workspace KEY=PATH values"]}}
+  defp declaration_error(kind, message, details \\ %{}) do
+    min = PixirMonitor.WorkspaceSet.min_sources()
+    max = PixirMonitor.WorkspaceSet.max_sources()
+
+    {:error,
+     %{
+       kind: kind,
+       message: message,
+       details: details,
+       next_actions: ["Declare one plain --workspace PATH or #{min} to #{max} --workspace KEY=PATH values"]
+     }}
   end
 
   defp workspace_error(kind, message, path, origin, reason \\ nil) do
@@ -281,6 +334,12 @@ defmodule PixirMonitor.CLI do
       action: "serve",
       dry_run: true,
       launch_mode: launch_mode,
+      launch_surface: %{
+        degrades_instead_of_exiting: true,
+        rearm_limit: PixirMonitor.LaunchSurface.rearm_limit(),
+        reentry: PixirMonitor.LaunchSurface.reentry_mechanism(),
+        readiness_event: "launch_ready"
+      },
       bind: %{address: "127.0.0.1", port: 0, port_strategy: "ephemeral"},
       source: "filesystem_logs",
       renderer: "spa_sse",
@@ -289,18 +348,77 @@ defmodule PixirMonitor.CLI do
     }
   end
 
+  # The launch handoff is auxiliary: only application load, workspace resolution,
+  # and application start (which owns port binding) are serving preconditions and
+  # may exit 1. Once those hold, the launch surface is started beside the serving
+  # process and every handoff outcome degrades into a reported frame instead of
+  # ending a monitor whose listener and projection are already healthy.
   defp serve(json?, workspace_arg, launch_mode) do
     with :ok <- load_monitor_application(),
          {:ok, config} <- resolve_workspace_config(workspace_arg),
          :ok <- install_workspace(config),
-         {:ok, _apps} <- Application.ensure_all_started(:pixir_monitor),
-         :ok <- launch(launch_mode, json?) do
-      if json?, do: IO.puts(Jason.encode!(%{ok: true, status: "serving"})), else: IO.puts("Pixir Monitor is serving on loopback. Close with Ctrl-C.")
-      Process.sleep(:infinity)
+         {:ok, _apps} <- Application.ensure_all_started(:pixir_monitor) do
+      launch = start_launch_surface(launch_mode, json?)
+      emit_serving(launch, json?)
+      block_forever()
     else
       {:error, error} ->
         emit_error(normalize_error(error), json?)
         {:error, 1}
+    end
+  end
+
+  defp emit_serving(launch, true), do: IO.puts(Jason.encode!(%{ok: true, status: "serving", launch: launch}))
+
+  defp emit_serving(launch, false) do
+    IO.puts("Pixir Monitor is serving on loopback. Close with Ctrl-C.")
+    IO.puts("  launch: #{launch.launch_mode} (#{launch.status})")
+  end
+
+  defp block_forever do
+    case Application.fetch_env(:pixir_monitor, :serve_blocker) do
+      {:ok, blocker} when is_function(blocker, 0) -> blocker.()
+      _ -> Process.sleep(:infinity)
+    end
+  end
+
+  # The surface starts unlinked and its own exits never propagate to the serving
+  # process: an auxiliary handoff must not be able to take serving down. It is
+  # named so the operator (and shutdown) can reach exactly one launch surface.
+  defp start_launch_surface(launch_mode, json?) do
+    emit = &emit_launch_frame(&1, json?)
+
+    opts = [
+      name: PixirMonitor.LaunchSurface,
+      launch_mode: launch_mode,
+      emit: emit,
+      install_reentry_trap: launch_mode == "darwin",
+      port: launch_port(launch_mode)
+    ]
+
+    case PixirMonitor.LaunchSurface.start_unlinked(opts) do
+      {:ok, surface} ->
+        # Above the bounded launcher in PixirMonitor.Runtime: darwin fires it
+        # inline during handle_continue, so a 5_000 ms call timeout would race
+        # the same 5_000 ms launcher bound and report launch_surface_unavailable
+        # for a healthy surface that is about to report `failed`.
+        Map.merge(%{launch_mode: launch_mode}, PixirMonitor.LaunchSurface.outcome(surface, @launch_outcome_timeout_ms))
+
+      _other ->
+        %{launch_mode: launch_mode, status: "not_attempted", kind: "launch_surface_unavailable"}
+    end
+  catch
+    :exit, _reason -> %{launch_mode: launch_mode, status: "not_attempted", kind: "launch_surface_unavailable"}
+  end
+
+  # FIFO mode arms asynchronously, so it does not wait on the port here; darwin
+  # fires its launcher during init and needs the discovered listener port.
+  defp launch_port("fifo"), do: nil
+
+  defp launch_port(_darwin) do
+    case PixirMonitor.PortRegistry.wait(15_000) do
+      {:ok, port} -> port
+      {:error, _} -> nil
     end
   end
 
@@ -326,43 +444,33 @@ defmodule PixirMonitor.CLI do
     end
   end
 
-  # Keep the default path as the pre-existing Darwin runtime call. FIFO mode is
-  # deliberately separate so it cannot invoke osascript or alter default behavior.
-  defp launch("darwin", _json?), do: PixirMonitor.Runtime.launch_browser()
-
-  defp launch("fifo", json?) do
-    with {:ok, port} <- PixirMonitor.PortRegistry.wait(15_000),
-         {:ok, prepared} <- PixirMonitor.FifoHandoff.prepare() do
-      emit_fifo_readiness(prepared.fifo, json?)
-
-      case PixirMonitor.FifoHandoff.handoff(prepared, fn ->
-             PixirMonitor.Runtime.issue_launch_url(port)
-           end) do
-        {:ok, warning} ->
-          emit_fifo_warning(warning, json?)
-          :ok
-
-        result ->
-          result
-      end
-    end
+  # Launch-surface frames stay on stderr so stdout keeps carrying exactly one
+  # serving contract line. The readiness frame keeps its historical
+  # `status: "ready"` on the wire so an existing supervisor still finds the FIFO
+  # path, and it is now re-emitted on every re-arm with the newly valid path; the
+  # surface-level event name travels beside it as `event`.
+  defp emit_launch_frame(frame, true) do
+    IO.puts(:stderr, Jason.encode!(wire_frame(frame)))
   end
 
-  defp emit_fifo_readiness(fifo, true) do
-    IO.puts(:stderr, Jason.encode!(%{ok: true, status: "ready", launch_mode: "fifo", fifo_path: fifo}))
-  end
-
-  defp emit_fifo_readiness(fifo, false) do
+  defp emit_launch_frame(%{status: "launch_ready", fifo_path: fifo}, false) do
     IO.puts(:stderr, "Pixir Monitor FIFO ready: #{fifo}")
   end
 
-  defp emit_fifo_warning(warning, true) do
-    IO.puts(:stderr, Jason.encode!(%{ok: true, status: "warning", warning: warning}))
+  defp emit_launch_frame(%{status: "launch_degraded"} = frame, false) do
+    IO.puts(:stderr, "Launch handoff degraded [#{frame.kind}]: re-arming the launch surface")
   end
 
-  defp emit_fifo_warning(warning, false) do
-    IO.puts(:stderr, "Warning [#{warning.kind}]: #{warning.message}")
+  defp emit_launch_frame(%{status: "launch_surface_exhausted"} = frame, false) do
+    IO.puts(:stderr, "Launch surface exhausted after #{frame.rearm_limit} re-arms; serving continues without a FIFO")
   end
+
+  defp emit_launch_frame(frame, false) do
+    IO.puts(:stderr, "Launch [#{frame.status}]")
+  end
+
+  defp wire_frame(%{status: "launch_ready"} = frame), do: frame |> Map.put(:event, "launch_ready") |> Map.put(:status, "ready")
+  defp wire_frame(frame), do: Map.put(frame, :event, frame.status)
 
   defp install_workspace({:single, %{path: path}}) do
     Application.delete_env(:pixir_monitor, :workspace_set)
@@ -410,6 +518,9 @@ defmodule PixirMonitor.CLI do
 
     IO.puts("  bind: #{value.bind.address}:ephemeral")
     IO.puts("  launch mode: #{value.launch_mode}")
+    IO.puts("  launch handoff: degrades and re-arms; it never ends serving")
+    IO.puts("  re-arm limit: #{value.launch_surface.rearm_limit}")
+    IO.puts("  re-entry: #{value.launch_surface.reentry}")
     IO.puts("  source: append-only filesystem Logs")
     IO.puts("  mode: read-only SPA with bounded SSE hints")
     IO.puts("  next: #{value.next_action}")

@@ -89,6 +89,10 @@
           "label": "Live"
         },
         {
+          "value": "externally_owned",
+          "label": "Externally owned"
+        },
+        {
           "value": "stale_handle",
           "label": "Stale handle"
         },
@@ -134,6 +138,7 @@
       "held": "warning",
       "unknown": "muted",
       "live": "good",
+      "externally_owned": "muted",
       "stale_handle": "warning",
       "owner_unavailable": "warning",
       "not_applicable": "muted",

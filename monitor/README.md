@@ -20,18 +20,56 @@ mix escript.build
 `serve` defaults to the existing Darwin-only automatic browser launch. For a Codex
 sidecar or another external reader, opt in with `--launch-mode fifo`. The Monitor
 creates its own private `0700` temporary directory and `0600` named pipe, then emits
-one readiness frame on stderr containing only the non-secret FIFO path (`--json`
+a readiness frame on stderr containing only the non-secret FIFO path (`--json`
 selects a bounded JSON frame). Open that path for reading; only after the reader is
 connected (within the bounded 60-second reader window) does Monitor issue the
-30-second, one-use launch capability and write its
-URL through the pipe. The pipe is closed and its private directory removed after the
-single handoff. Do not pass a FIFO path to Monitor; caller-owned paths are not
-accepted. Normal stdout retains the final serving status contract.
+30-second, one-use launch capability and write its URL through the pipe. Do not pass
+a FIFO path to Monitor; caller-owned paths are not accepted.
 
-Dry-runs report the selected launch mode but create neither a FIFO nor a launch
-capability. FIFO mode is portable where named pipes are supported and never invokes
-macOS browser automation. Its bounded writer requires `sh`, `kill`, and `perl` on the
-local host; setup fails structurally before readiness when any is unavailable.
+## The launch handoff never ends serving
+
+A launch handoff is auxiliary. Once the listener and the workspace projection are
+healthy, `serve` reaches its serving state and stays there whatever the handoff does.
+Only failures that make serving itself impossible — application load, workspace
+resolution, port acquisition — still exit nonzero.
+
+**Attach the reader before or promptly after the readiness frame.** The reader is
+expected to open the announced path within the bounded 60-second reader window. It no
+longer has to win a race: if the reader arrives after the writer is gone, closes the
+pipe early, or never arrives at all, Monitor emits one `launch_degraded` frame naming
+the failing `kind` and **re-arms** a fresh private directory, FIFO, and bounded writer,
+announcing the new path in a new readiness frame. The previous attempt's private
+directory is removed, so at most one is live at a time.
+
+An automated supervisor keys on these stderr frames:
+
+| frame | meaning |
+| --- | --- |
+| `status: "ready"`, `event: "launch_ready"`, `fifo_path` | this path is the currently valid FIFO; a later readiness frame supersedes an earlier one |
+| `status: "launch_degraded"`, `kind` | that attempt failed; a readiness frame follows unless the bound is exhausted |
+| `status: "launch_surface_exhausted"`, `rearm_limit` | terminal: no further FIFO will be armed, and serving continues without one. Carries `kind` when the surface stopped on an unclassified handoff error rather than on the re-arm bound |
+
+**The re-arm bound is 16 re-arms** after the initial arm. It is reported in the
+dry-run plan as `launch_surface.rearm_limit`. On exhaustion Monitor keeps serving.
+
+A **successful** handoff also re-arms, so a second browser session needs no restart.
+The capability itself stays strictly one-use: every handoff issues its own fresh,
+TTL-bounded capability from the vault, none is reused or retained, and no capability
+byte appears in any frame, error, log, or on stdout. When the vault refuses issuance
+(`launch_limit`), Monitor reports the refusal and keeps serving.
+
+In darwin mode the serving stdout frame carries a bounded `launch` object whose
+`status` is `succeeded`, `failed` (with the `browser_open_failed` kind), or
+`not_attempted` (for example `unsupported_platform` off macOS). A launcher failure is
+reported there, never as exit 1. Send **`SIGUSR2`** to re-enter: Monitor mints a fresh
+one-use capability and hands it to the launcher again without a restart. SIGUSR1 is
+deliberately not used — ERTS reserves it for its crash-dump handler.
+
+Dry-runs report the selected launch mode, the re-arm bound, and the re-entry signal,
+but create neither a FIFO nor a launch capability. FIFO mode is portable where named
+pipes are supported and never invokes macOS browser automation. Its bounded writer
+requires `sh`, `kill`, and `perl` on the local host; setup fails structurally before
+readiness when any is unavailable.
 
 `self-check` exercises the built escript over real HTTP on its ephemeral
 `127.0.0.1` listener. It performs the one-use bootstrap internally, fetches the

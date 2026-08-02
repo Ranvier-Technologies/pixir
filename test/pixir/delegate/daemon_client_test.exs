@@ -15,6 +15,7 @@ defmodule Pixir.Delegate.DaemonClientTest do
          "workspace" => request.workspace,
          "spec_task" => spec["task"],
          "planned_child_count" => spec_meta["planned_child_count"],
+         "allow_short_horizon_seen" => Map.get(request, :allow_short_horizon?),
          "runtime_opts_seen" => Keyword.get(opts, :runtime_opts),
          "owner" => %{"state" => "live_delegate_owner"},
          "host_boundary" => %{
@@ -233,6 +234,33 @@ defmodule Pixir.Delegate.DaemonClientTest do
     assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1_000
     assert {:ok, endpoint_path} = DaemonEndpoint.path(ws)
     refute File.exists?(endpoint_path)
+  end
+
+  test "daemon start preserves the short-horizon override across real IPC", %{ws: ws} do
+    assert {:ok, pid} = DaemonServer.start_link(workspace: ws, async: FakeAsync)
+
+    on_exit(fn ->
+      stop_daemon(pid)
+    end)
+
+    assert {:ok,
+            %{
+              "kind" => "delegate_start",
+              "allow_short_horizon_seen" => true
+            }} =
+             DaemonClient.call(
+               "delegate_start",
+               %{
+                 "request" => %{
+                   "json?" => true,
+                   "contract_version" => 1,
+                   "allow_short_horizon?" => true
+                 },
+                 "spec" => %{"task" => "inspect"},
+                 "spec_meta" => %{"planned_child_count" => 1}
+               },
+               workspace: ws
+             )
   end
 
   test "daemon status reports absent endpoint without failing the status command", %{ws: ws} do

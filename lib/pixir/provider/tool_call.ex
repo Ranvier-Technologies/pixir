@@ -9,7 +9,21 @@ defmodule Pixir.Provider.ToolCall do
 
   alias Pixir.Tool
 
-  @identity_re ~r/\A[A-Za-z0-9_.:-]+\z/
+  # ONE alphabet, exported so no other module has to restate it (#462 round 5). A second
+  # copy is how `Pixir.Provider`'s dangling-id extractor drifted: it captured a narrower
+  # class than the one that validates the id here, so ids this module accepts were
+  # extracted truncated or missed outright.
+  @identity_alphabet "A-Za-z0-9_.:-"
+  @identity_re Regex.compile!("\\A[#{@identity_alphabet}]+\\z")
+
+  @doc """
+  The character class (regex-body form, no brackets) a tool-call identity may use.
+
+  Read it rather than restating it: an extractor built from a private copy of this class
+  silently diverges from the validator the moment either side moves.
+  """
+  @spec identity_alphabet() :: String.t()
+  def identity_alphabet, do: @identity_alphabet
 
   @doc "Validate a finalized call whose arguments are still encoded JSON."
   @spec from_json(term(), term(), term()) :: {:ok, map()} | {:error, map()}

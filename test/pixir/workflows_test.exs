@@ -99,6 +99,91 @@ defmodule Pixir.WorkflowsTest do
     end
   end
 
+  # Issues one write outside the allowlist, then finishes. The denial is
+  # recoverable (#446), so the step still reaches checkpoint_ready while the
+  # checkpoint payload confesses it.
+  defmodule DeniedWriteProvider do
+    def stream(%{history: history}, _opts) do
+      denied? =
+        Enum.any?(history, fn
+          %{type: :tool_call, data: %{"call_id" => "denied-write"}} -> true
+          _event -> false
+        end)
+
+      if denied? do
+        {:ok,
+         %{
+           text: "summary:probed the boundary and stopped",
+           reasoning: "",
+           reasoning_items: [],
+           function_calls: [],
+           finish_reason: :stop
+         }}
+      else
+        {:ok,
+         %{
+           text: "",
+           reasoning: "",
+           reasoning_items: [],
+           function_calls: [
+             %{
+               call_id: "denied-write",
+               name: "write",
+               args: %{"path" => "outside.txt", "content" => "nope"}
+             }
+           ],
+           finish_reason: :tool_calls
+         }}
+      end
+    end
+  end
+
+  # Completes every child and self-declares the checkpoint_status named by the
+  # step id prefix (`partial_*`, `failed_*`, `needs_orchestrator_*`); anything
+  # else completes without a marker and therefore defaults to checkpoint_ready.
+  defmodule MarkerProvider do
+    def stream(%{history: history}, opts) do
+      prompt =
+        history
+        |> Enum.find(&(&1.type == :user_message))
+        |> then(&((&1 && &1.data["text"]) || ""))
+
+      step =
+        prompt
+        |> String.split("\n")
+        |> Enum.find_value("unknown", fn
+          "Step: " <> id -> id
+          _ -> nil
+        end)
+
+      if pid = Keyword.get(opts, :test_pid), do: send(pid, {:marker_prompt, step, prompt})
+
+      text =
+        cond do
+          String.starts_with?(step, "partial") ->
+            "checkpoint_status: partial\nwrote the files"
+
+          String.starts_with?(step, "failed") ->
+            "checkpoint_status: failed\ngave up"
+
+          String.starts_with?(step, "needs_orchestrator") ->
+            "checkpoint_status: needs_orchestrator"
+
+          true ->
+            "summary:#{step}"
+        end
+
+      {:ok,
+       %{
+         text: text,
+         reasoning: "",
+         reasoning_items: [],
+         function_calls: [],
+         finish_reason: :stop
+       }}
+    end
+  end
+
   setup do
     ws =
       Path.join(
@@ -557,7 +642,21 @@ defmodule Pixir.WorkflowsTest do
 
     assert result["status"] == "completed"
     assert File.read!(Path.join(ws, "applied.txt")) == content
-    assert [_producer, %{"virtual_diff_apply" => %{"status" => "applied"}}] = result["steps"]
+
+    assert [producer, %{"virtual_diff_apply" => %{"status" => "applied"}} = apply] =
+             result["steps"]
+
+    # Virtual-overlay and apply steps run under the policy without spawning a
+    # subagent, so they have no child Log to fold — and still owe the confession.
+    # A coordinator reading the durable checkpoint must never have to tell an
+    # absent key apart from a step that was never gated.
+    for step <- [producer, apply] do
+      assert [%{"schema_id" => "workflow_checkpoint.v1", "payload" => payload}] =
+               step["checkpoint"]["typed_payloads"]
+
+      assert payload["write_denials"] == %{"count" => 0, "denials" => []},
+             "#{step["id"]} (#{step["posture"]}) dropped write_denials"
+    end
   end
 
   test "apply_from conflict keeps target untouched with engine evidence", %{sid: sid, ws: ws} do
@@ -1278,6 +1377,26 @@ defmodule Pixir.WorkflowsTest do
 
     assert {:ok, [agent]} = Subagents.list(sid, workspace: ws)
     assert agent["status"] == "cancelled"
+
+    # Every child cancelled by the deadline names that workflow in its own Log.
+    child_sid = agent["child_session_id"]
+    assert is_binary(child_sid)
+    assert {:ok, child_history} = Log.fold(child_sid, workspace: agent["workspace"])
+
+    assert [terminal] =
+             Enum.filter(
+               child_history,
+               &(&1.type == :subagent_event and &1.data["event"] == "cancelled_by_parent")
+             )
+
+    assert terminal.data["reason"] == "cancelled_by_parent"
+    assert terminal.data["lineage"] == "child"
+    assert terminal.data["parent_session_id"] == sid
+    assert terminal.data["subagent_id"] == agent["id"]
+    assert terminal.data["workflow_id"] == "workflow_timeout"
+    assert terminal.data["workflow_step_id"] == "slow_writer"
+    assert terminal.data["workflow_close_outcome"] == "closed_by_workflow_timeout"
+    assert List.last(child_history).seq == terminal.seq
   end
 
   test "rejects unknown dependencies and cycles", %{ws: ws} do
@@ -1562,6 +1681,478 @@ defmodule Pixir.WorkflowsTest do
     refute source =~ "CommandBoundary"
     refute source =~ "/bin/bash"
     refute source =~ "/bin/sh"
+  end
+
+  # ── write_denials confession (#446) ────────────────────────────────────────
+
+  defp denial_workflow_spec do
+    %{
+      "id" => "write_denials",
+      "steps" => [
+        %{
+          "id" => "writer",
+          "task" => "write inside the allowlist",
+          "write_set" => ["notes.txt"]
+        }
+      ]
+    }
+  end
+
+  test "a step that recovered from a denial still reaches checkpoint_ready and confesses it", %{
+    sid: sid,
+    ws: ws
+  } do
+    {:ok, policy} = workflow_policy(["notes.txt"])
+
+    assert {:ok, result} =
+             Workflows.run(sid, denial_workflow_spec(),
+               workspace: ws,
+               write_policy: policy,
+               provider: DeniedWriteProvider,
+               poll_ms: 10,
+               timeout_ms: 5_000
+             )
+
+    assert result["status"] == "completed"
+    assert [step] = result["steps"]
+    assert step["checkpoint_status"] == "checkpoint_ready"
+    refute File.exists?(Path.join(ws, "outside.txt"))
+
+    assert [%{"schema_id" => "workflow_checkpoint.v1", "payload" => payload}] =
+             step["checkpoint"]["typed_payloads"]
+
+    confession = payload["write_denials"]
+    assert confession, "the checkpoint payload must always carry write_denials"
+    assert confession["count"] == 1
+
+    assert [denial] = confession["denials"]
+    assert denial["tool"] == "write"
+    assert denial["normalized_path"] == "outside.txt"
+    assert denial["matched_rule"] == "no_allow_match"
+    assert denial["disposition"] == "recovered"
+  end
+
+  test "a bounded-write step with no denial still carries an empty write_denials", %{
+    sid: sid,
+    ws: ws
+  } do
+    {:ok, policy} = workflow_policy(["notes.txt"])
+
+    assert {:ok, result} =
+             Workflows.run(sid, denial_workflow_spec(),
+               workspace: ws,
+               write_policy: policy,
+               provider: EchoProvider,
+               poll_ms: 10,
+               timeout_ms: 5_000
+             )
+
+    assert result["status"] == "completed"
+    assert [step] = result["steps"]
+
+    assert [%{"schema_id" => "workflow_checkpoint.v1", "payload" => payload}] =
+             step["checkpoint"]["typed_payloads"]
+
+    assert payload["write_denials"] == %{"count" => 0, "denials" => []}
+  end
+
+  # The confession is mandatory on the `workflow_checkpoint.v1` projection of
+  # EVERY bounded-write step, not only the ones that ran a subagent to
+  # completion. A held step never spawned a child and so has nothing to confess,
+  # but "nothing to confess" is a zero count, not a missing key: absence is
+  # defined as a schema violation, and a coordinator reading a durable
+  # checkpoint cannot tell an absent key from a step that was never gated.
+  test "a held bounded-write step still carries an empty write_denials", %{sid: sid, ws: ws} do
+    {:ok, policy} = workflow_policy(["scratch/**"])
+
+    spec = %{
+      "id" => "held_confession",
+      "max_concurrency" => 2,
+      "steps" => [
+        %{"id" => "ready", "task" => "ready", "agent" => "explorer"},
+        %{"id" => "fail", "task" => "fail", "agent" => "explorer"},
+        %{
+          "id" => "held",
+          "task" => "held",
+          "agent" => "explorer",
+          "depends_on" => ["fail"]
+        }
+      ]
+    }
+
+    assert {:ok, result} =
+             Workflows.run(sid, spec,
+               workspace: ws,
+               provider: PartialProvider,
+               poll_ms: 10,
+               timeout_ms: 5_000,
+               write_policy: policy
+             )
+
+    assert [held] = result["held_steps"]
+    assert held["checkpoint_status"] == "held"
+
+    assert [%{"schema_id" => "workflow_checkpoint.v1", "payload" => payload}] =
+             held["checkpoint"]["typed_payloads"]
+
+    assert payload["write_denials"] == %{"count" => 0, "denials" => []},
+           "a held bounded-write step must confess an empty write_denials"
+
+    # The failed and completed steps of the same run carry it too: every
+    # bounded-write checkpoint projection does, whatever the status.
+    for step <- result["steps"] do
+      assert [%{"payload" => step_payload}] = step["checkpoint"]["typed_payloads"]
+
+      assert step_payload["write_denials"],
+             "step #{step["id"]} (#{step["checkpoint_status"]}) dropped write_denials"
+    end
+  end
+
+  # ── unverified dependency basis ────────────────────────────────────────────
+
+  describe "allow_unverified_depends_on" do
+    defp audit_spec(id, audit_step_overrides) do
+      %{
+        "id" => id,
+        "steps" => [
+          %{"id" => "partial_writer", "task" => "write", "agent" => "explorer"},
+          Map.merge(
+            %{
+              "id" => "audit",
+              "task" => "audit the writer",
+              "agent" => "explorer",
+              "depends_on" => ["partial_writer"]
+            },
+            audit_step_overrides
+          )
+        ]
+      }
+    end
+
+    defp run_marker(sid, ws, spec) do
+      Workflows.run(sid, spec,
+        workspace: ws,
+        provider: MarkerProvider,
+        poll_ms: 10,
+        timeout_ms: 5_000
+      )
+    end
+
+    test "an opted-in audit step schedules against a completed-but-partial dependency", %{
+      sid: sid,
+      ws: ws
+    } do
+      spec =
+        audit_spec("audit_unverified", %{"allow_unverified_depends_on" => ["partial_writer"]})
+
+      assert {:ok, result} = run_marker(sid, ws, spec)
+
+      assert Enum.map(result["steps"], & &1["id"]) == ["partial_writer", "audit"]
+      assert result["held_steps"] == []
+
+      assert %{"id" => "audit", "checkpoint_status" => "checkpoint_ready"} =
+               Enum.find(result["steps"], &(&1["id"] == "audit"))
+
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+      held =
+        history
+        |> workflow_events()
+        |> Enum.filter(&(&1.data["kind"] == "step_held"))
+
+      assert held == []
+    end
+
+    test "the same workflow without the opt-in still holds the audit step", %{sid: sid, ws: ws} do
+      assert {:ok, result} = run_marker(sid, ws, audit_spec("audit_strict", %{}))
+
+      assert result["status"] == "partial"
+      assert [%{"id" => "audit", "checkpoint_status" => "held"} = held] = result["held_steps"]
+      assert held["held_reason"] == "dependency_not_checkpoint_ready"
+      assert held["checkpoint"]["known_limitations"] == ["dependency_not_checkpoint_ready"]
+      assert held["safe_next_actions"] == ["rerun_after_dependencies_checkpoint_ready"]
+    end
+
+    test "the audit checkpoint bundle and typed payload record the unverified basis", %{
+      sid: sid,
+      ws: ws
+    } do
+      spec = audit_spec("audit_basis", %{"allow_unverified_depends_on" => ["partial_writer"]})
+
+      assert {:ok, result} = run_marker(sid, ws, spec)
+
+      audit = Enum.find(result["steps"], &(&1["id"] == "audit"))
+      checkpoint = audit["checkpoint"]
+
+      assert checkpoint["verification"]["unverified_dependencies"] == ["partial_writer"]
+      assert "ran_against_unverified_dependencies" in checkpoint["known_limitations"]
+
+      assert [%{"schema_id" => "workflow_checkpoint.v1", "payload" => payload}] =
+               checkpoint["typed_payloads"]
+
+      assert payload["unverified_dependencies"] == ["partial_writer"]
+      assert "ran_against_unverified_dependencies" in payload["known_limitations"]
+      assert payload["verification_source"] == "subagent_terminal_summary"
+    end
+
+    test "the opt-in never launders the upstream dependency's own status", %{sid: sid, ws: ws} do
+      assert {:ok, relaxed} =
+               run_marker(
+                 sid,
+                 ws,
+                 audit_spec("audit_no_launder", %{
+                   "allow_unverified_depends_on" => ["partial_writer"]
+                 })
+               )
+
+      assert {:ok, strict} = run_marker(sid, ws, audit_spec("audit_no_launder_strict", %{}))
+
+      relaxed_writer = Enum.find(relaxed["steps"], &(&1["id"] == "partial_writer"))
+      strict_writer = Enum.find(strict["steps"], &(&1["id"] == "partial_writer"))
+
+      assert relaxed_writer["checkpoint_status"] == "partial"
+      assert relaxed_writer["checkpoint"]["dependent_safe"] == false
+      assert relaxed_writer["checkpoint"]["known_limitations"] == ["checkpoint_not_ready"]
+
+      assert relaxed_writer["checkpoint_status"] == strict_writer["checkpoint_status"]
+
+      assert relaxed_writer["checkpoint"]["dependent_safe"] ==
+               strict_writer["checkpoint"]["dependent_safe"]
+
+      assert relaxed_writer["checkpoint"]["known_limitations"] ==
+               strict_writer["checkpoint"]["known_limitations"]
+
+      assert relaxed["summary"]["partial_steps"] == 1
+      assert relaxed["summary"]["partial_steps"] == strict["summary"]["partial_steps"]
+      assert Enum.map(relaxed["partial_steps"], & &1["id"]) == ["partial_writer"]
+      assert relaxed["usable_checkpoints"] |> Enum.map(& &1["step_id"]) == ["audit"]
+      assert relaxed["status"] == "partial"
+    end
+
+    for {label, producer_id} <- [
+          {"a completed child self-declaring failed", "failed_writer"},
+          {"a completed child self-declaring needs_orchestrator", "needs_orchestrator_writer"}
+        ] do
+      test "the opt-in does not admit #{label}", %{sid: sid, ws: ws} do
+        producer_id = unquote(producer_id)
+
+        spec = %{
+          "id" => "audit_inadmissible_#{producer_id}",
+          "steps" => [
+            %{"id" => producer_id, "task" => "write", "agent" => "explorer"},
+            %{
+              "id" => "audit",
+              "task" => "audit",
+              "agent" => "explorer",
+              "depends_on" => [producer_id],
+              "allow_unverified_depends_on" => [producer_id]
+            }
+          ]
+        }
+
+        assert {:ok, result} = run_marker(sid, ws, spec)
+
+        assert result["status"] == "partial"
+        assert [%{"id" => "audit", "checkpoint_status" => "held"} = held] = result["held_steps"]
+        assert held["held_reason"] == "dependency_not_checkpoint_ready"
+      end
+    end
+
+    test "the opt-in does not admit a dependency whose child timed out", %{sid: sid, ws: ws} do
+      spec = %{
+        "id" => "audit_timeout",
+        "steps" => [
+          %{"id" => "slow_writer", "task" => "slow", "agent" => "explorer"},
+          %{
+            "id" => "audit",
+            "task" => "audit",
+            "agent" => "explorer",
+            "depends_on" => ["slow_writer"],
+            "allow_unverified_depends_on" => ["slow_writer"]
+          }
+        ]
+      }
+
+      test_pid = self()
+
+      task =
+        Task.async(fn ->
+          Workflows.run(sid, spec,
+            workspace: ws,
+            provider: BlockingProvider,
+            provider_opts: [test_pid: test_pid],
+            timeout_ms: 1_000,
+            poll_ms: 10
+          )
+        end)
+
+      assert_receive {:blocking_provider_started, _pid}, 2_000
+      assert {:ok, result} = Task.await(task, 5_000)
+
+      assert result["status"] == "partial"
+      assert [%{"id" => "audit", "checkpoint_status" => "held"} = held] = result["held_steps"]
+      assert held["held_reason"] == "workflow_timeout"
+    end
+
+    test "the opt-in does not admit a dependency that was itself held", %{sid: sid, ws: ws} do
+      spec = %{
+        "id" => "audit_held_dep",
+        "steps" => [
+          %{"id" => "failed_root", "task" => "root", "agent" => "explorer"},
+          %{
+            "id" => "partial_middle",
+            "task" => "middle",
+            "agent" => "explorer",
+            "depends_on" => ["failed_root"]
+          },
+          %{
+            "id" => "audit",
+            "task" => "audit",
+            "agent" => "explorer",
+            "depends_on" => ["partial_middle"],
+            "allow_unverified_depends_on" => ["partial_middle"]
+          }
+        ]
+      }
+
+      assert {:ok, result} = run_marker(sid, ws, spec)
+
+      assert result["status"] == "partial"
+
+      assert ["audit", "partial_middle"] ==
+               result["held_steps"] |> Enum.map(& &1["id"]) |> Enum.sort()
+
+      audit = Enum.find(result["steps"], &(&1["id"] == "audit"))
+      assert audit["held_reason"] == "dependency_not_checkpoint_ready"
+    end
+
+    test "the opt-in relaxes only the dependencies it names", %{sid: sid, ws: ws} do
+      spec = %{
+        "id" => "audit_partial_relax",
+        "max_concurrency" => 2,
+        "steps" => [
+          %{"id" => "partial_named", "task" => "named", "agent" => "explorer"},
+          %{"id" => "partial_unnamed", "task" => "unnamed", "agent" => "explorer"},
+          %{
+            "id" => "audit",
+            "task" => "audit",
+            "agent" => "explorer",
+            "depends_on" => ["partial_named", "partial_unnamed"],
+            "allow_unverified_depends_on" => ["partial_named"]
+          }
+        ]
+      }
+
+      assert {:ok, result} = run_marker(sid, ws, spec)
+
+      assert result["status"] == "partial"
+      assert [%{"id" => "audit", "checkpoint_status" => "held"} = held] = result["held_steps"]
+      assert held["held_reason"] == "dependency_not_checkpoint_ready"
+    end
+
+    test "naming a dependency the step does not depend on is a validation error", %{ws: ws} do
+      spec =
+        audit_spec("audit_bad_ref", %{
+          "allow_unverified_depends_on" => ["not_a_dependency"]
+        })
+
+      assert {:error, %{ok: false, error: error}} = Workflows.dry_run(spec, workspace: ws)
+      assert error.kind == :invalid_args
+
+      assert error.message =~
+               "allow_unverified_depends_on must reference a declared dependency"
+
+      assert error.details["id"] == "audit"
+      assert error.details["allow_unverified_depends_on"] == ["not_a_dependency"]
+      assert error.details["unknown"] == ["not_a_dependency"]
+    end
+
+    test "the opt-in is a first-class part of the step contract", %{ws: ws} do
+      assert "allow_unverified_depends_on" in Workflows.workflow_step_keys()
+
+      step_properties =
+        Pixir.Tools.RunWorkflow.__tool__()
+        |> get_in([:parameters, "properties", "steps", "items", "properties"])
+
+      assert %{"type" => "array", "items" => %{"type" => "string"}, "description" => description} =
+               step_properties["allow_unverified_depends_on"]
+
+      assert description =~ "unverified"
+
+      spec = audit_spec("audit_dry_run", %{"allow_unverified_depends_on" => ["partial_writer"]})
+
+      assert {:ok, plan} = Workflows.dry_run(spec, workspace: ws)
+
+      audit_plan = Enum.find(plan["would_run"], &(&1["id"] == "audit"))
+      assert audit_plan["allow_unverified_depends_on"] == ["partial_writer"]
+
+      writer_plan = Enum.find(plan["would_run"], &(&1["id"] == "partial_writer"))
+      refute Map.has_key?(writer_plan, "allow_unverified_depends_on")
+    end
+
+    test "an engine-completed virtual_overlay audit records the unverified basis too", %{
+      sid: sid,
+      ws: ws
+    } do
+      spec = %{
+        "id" => "audit_virtual",
+        "steps" => [
+          %{"id" => "partial_writer", "task" => "write", "agent" => "explorer"},
+          %{
+            "id" => "audit",
+            "task" => "inspect the source",
+            "workspace_mode" => "virtual_overlay",
+            "read_set" => ["source.txt"],
+            "virtual_commands" => ["cat source.txt"],
+            "depends_on" => ["partial_writer"],
+            "allow_unverified_depends_on" => ["partial_writer"]
+          }
+        ]
+      }
+
+      assert {:ok, result} = run_marker(sid, ws, spec)
+
+      assert result["held_steps"] == []
+
+      audit = Enum.find(result["steps"], &(&1["id"] == "audit"))
+      assert audit["checkpoint_status"] == "checkpoint_ready"
+
+      assert audit["checkpoint"]["verification"]["unverified_dependencies"] == ["partial_writer"]
+
+      assert "ran_against_unverified_dependencies" in audit["checkpoint"]["known_limitations"]
+
+      assert [%{"payload" => %{"unverified_dependencies" => ["partial_writer"]}}] =
+               audit["checkpoint"]["typed_payloads"]
+    end
+
+    test "a run whose steps all reach checkpoint_ready still reports completed", %{
+      sid: sid,
+      ws: ws
+    } do
+      spec = %{
+        "id" => "audit_all_ready",
+        "steps" => [
+          %{"id" => "writer", "task" => "write", "agent" => "explorer"},
+          %{
+            "id" => "audit",
+            "task" => "audit",
+            "agent" => "explorer",
+            "depends_on" => ["writer"],
+            "allow_unverified_depends_on" => ["writer"]
+          }
+        ]
+      }
+
+      assert {:ok, result} = run_marker(sid, ws, spec)
+
+      assert result["ok"] == true
+      assert result["status"] == "completed"
+      assert result["summary"]["checkpoint_ready_steps"] == 2
+
+      audit = Enum.find(result["steps"], &(&1["id"] == "audit"))
+      refute Map.has_key?(audit["checkpoint"]["verification"], "unverified_dependencies")
+      refute "ran_against_unverified_dependencies" in audit["checkpoint"]["known_limitations"]
+    end
   end
 
   defp conflict_workflow do

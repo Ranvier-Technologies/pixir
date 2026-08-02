@@ -64,7 +64,7 @@
       ],
       "artifacts": [],
       "usage": {"source": "provider_usage_fold", "complete": true, "calls": 2, "groups": [{"provider": "unknown", "model": "gpt-test", "calls": 2, "input_tokens": 300, "output_tokens": 30, "reasoning_tokens": 0, "total_tokens": 330, "cached_tokens": 60, "cache_creation_tokens": 0, "cache_read_tokens": 60}], "evidence_refs": ["e-child-1", "e-child-4"], "limitations": []},
-      "mutation": {"status": "read_only", "observed_paths": [], "observed_semantics": "none", "evidence_refs": ["e-envelope-resume"], "limitations": []},
+      "mutation": {"status": "read_only", "observed_paths": [], "observed_semantics": "none", "basis": "no_write_evidence", "write_denials": [], "evidence_refs": ["e-envelope-resume"], "limitations": []},
       "attention": {"required": false, "reasons": [], "evidence_refs": []},
       "safe_actions": [],
       "evidence_refs": ["e-envelope-resume", "e-parent-0", "e-parent-1", "e-parent-2", "e-parent-3", "e-child-0", "e-child-1", "e-child-3", "e-child-4"],
@@ -72,7 +72,7 @@
     }
   ],
   "usage": {"source": "provider_usage_fold", "complete": true, "calls": 2, "groups": [{"provider": "unknown", "model": "gpt-test", "calls": 2, "input_tokens": 300, "output_tokens": 30, "reasoning_tokens": 0, "total_tokens": 330, "cached_tokens": 60, "cache_creation_tokens": 0, "cache_read_tokens": 60}], "evidence_refs": ["e-child-1", "e-child-4"], "limitations": []},
-  "mutation": {"status": "read_only", "observed_paths": [], "observed_semantics": "none", "evidence_refs": ["e-envelope-resume"], "limitations": []},
+  "mutation": {"status": "read_only", "observed_paths": [], "observed_semantics": "none", "basis": "no_write_evidence", "write_denials": [], "evidence_refs": ["e-envelope-resume"], "limitations": []},
   "safe_actions": [],
   "evidence": [
     {"id": "e-envelope-resume", "authority": "derived", "source_kind": "terminal_envelope", "session_id": "parent-resume-reuse", "seq": null, "description": "Envelope supplies run identity and read-only mode."},
@@ -85,5 +85,15 @@
     {"id": "e-child-3", "authority": "canonical", "source_kind": "child_log", "session_id": "child-reused", "seq": 3, "description": "Second user-message epoch starts."},
     {"id": "e-child-4", "authority": "canonical", "source_kind": "child_log", "session_id": "child-reused", "seq": 4, "description": "Second epoch provider usage."}
   ],
-  "limitations": []
+  "limitations": [],
+  "post_terminal_child_activity": {
+    "state": "none",
+    "basis": "child_events_after_parent_terminal_boundary",
+    "boundary_at": "2026-07-10T20:10:10Z",
+    "boundary_basis": "terminal_subagent_lifecycle_ts",
+    "event_count": 0,
+    "latest_event_at": null,
+    "child_session_ids": [],
+    "evidence_refs": []
+  }
 }

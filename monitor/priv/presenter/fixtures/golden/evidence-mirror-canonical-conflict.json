@@ -14,14 +14,14 @@
     "advisory": {"present": false, "verdict": "unknown", "mergeable": null, "declared_gate": null, "parse_status": "not_present", "summary": null, "major_count": null, "minor_count": null, "evidence_refs": []},
     "attempts": [], "artifacts": [],
     "usage": {"source": "none", "complete": true, "calls": 0, "groups": [], "evidence_refs": [], "limitations": []},
-    "mutation": {"status": "read_only", "observed_paths": [], "observed_semantics": "none", "evidence_refs": ["e-envelope-conflict"], "limitations": []},
+    "mutation": {"status": "read_only", "observed_paths": [], "observed_semantics": "none", "basis": "no_write_evidence", "write_denials": [], "evidence_refs": ["e-envelope-conflict"], "limitations": []},
     "attention": {"required": true, "reasons": ["canonical_source_conflict"], "evidence_refs": ["e-primary-1", "e-primary-2", "e-mirror-1", "e-mirror-2"]},
     "safe_actions": [],
     "evidence_refs": ["e-envelope-conflict", "e-primary-0", "e-primary-1", "e-primary-2", "e-mirror-1", "e-mirror-2"],
     "limitations": ["canonical_source_conflict"]
   }],
   "usage": {"source": "none", "complete": true, "calls": 0, "groups": [], "evidence_refs": [], "limitations": []},
-  "mutation": {"status": "read_only", "observed_paths": [], "observed_semantics": "none", "evidence_refs": ["e-envelope-conflict"], "limitations": []},
+  "mutation": {"status": "read_only", "observed_paths": [], "observed_semantics": "none", "basis": "no_write_evidence", "write_denials": [], "evidence_refs": ["e-envelope-conflict"], "limitations": []},
   "safe_actions": [],
   "evidence": [
     {"id": "e-envelope-conflict", "authority": "derived", "source_kind": "terminal_envelope", "session_id": "parent-conflict", "seq": null, "description": "Envelope supplies run identity and read-only mode."},
@@ -31,5 +31,15 @@
     {"id": "e-mirror-1", "authority": "canonical", "source_kind": "evidence_mirror", "session_id": "parent-conflict", "seq": 1, "description": "Retained mirror copy conflicts with the primary checkpoint."},
     {"id": "e-mirror-2", "authority": "canonical", "source_kind": "evidence_mirror", "session_id": "parent-conflict", "seq": 2, "description": "Retained mirror copy conflicts with the primary terminal state."}
   ],
-  "limitations": ["canonical_source_conflict"]
+  "limitations": ["canonical_source_conflict"],
+  "post_terminal_child_activity": {
+    "state": "none",
+    "basis": "child_events_after_parent_terminal_boundary",
+    "boundary_at": "2026-07-10T20:30:05Z",
+    "boundary_basis": "workflow_finished_event_ts",
+    "event_count": 0,
+    "latest_event_at": null,
+    "child_session_ids": [],
+    "evidence_refs": []
+  }
 }

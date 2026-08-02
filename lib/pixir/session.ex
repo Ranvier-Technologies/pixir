@@ -31,6 +31,8 @@ defmodule Pixir.Session do
 
   use GenServer
 
+  require Logger
+
   alias Pixir.{Event, Events, Fork, Log, SessionId, SessionLease}
 
   @registry Pixir.Sessions.Registry
@@ -41,7 +43,8 @@ defmodule Pixir.Session do
           session_id: String.t(),
           workspace: String.t(),
           role: role(),
-          fork_root_session_id: String.t()
+          fork_root_session_id: String.t(),
+          turn_generation: pos_integer()
         }
 
   # ── child / lifecycle ───────────────────────────────────────────────────
@@ -106,6 +109,53 @@ defmodule Pixir.Session do
   def start_turn(session_id, turn_fun) when is_function(turn_fun, 1),
     do: call_session(session_id, {:start_turn, turn_fun})
 
+  @declare_timeout_ms 30_000
+
+  @doc """
+  Declare the function calls the Provider committed for the current Turn, before the
+  Executor starts running them (#462, layer 1).
+
+  `interrupt/1` kills the Turn Task outright, so no Turn-side cleanup can be trusted to
+  run. A call the Provider already committed but Pixir has not yet persisted would then
+  exist only provider-side, and the next Turn's request would omit its output — which
+  the Responses API rejects with "No tool output found for function call <id>". Holding
+  the committed set in the Session (which survives the kill) lets `interrupt/1` drain it
+  to the Log before the Turn closes.
+
+  Entries are `%{call_id, name, args}` maps. Recording the real `tool_call` clears its
+  id, so only genuinely un-persisted calls are ever drained. The set is Turn-scoped: it
+  is cleared when the Turn ends (and drained when the Turn is killed or crashes), so a
+  declaration the Executor never reached cannot leak into a later interrupt. A
+  declaration that lands with no Turn running is drained on the spot rather than
+  accumulated: the streaming runner outlives the Turn it belonged to, so a late
+  declaration is real evidence with no Turn left to own it.
+
+  `generation` is the caller's TURN IDENTITY, not merely a claim that some Turn is
+  running (#462 round 3). Keying the drain on turn STATE alone (nil vs alive) is not
+  enough: the surviving runner of a killed Turn can declare while a NEW Turn is already
+  alive, and a state-only check accumulates that straggler into the successor, which
+  then drops it at its own clean end — the same silent evidence loss one Turn over.
+  Each Turn captures its generation at Turn start and stamps every declaration with it,
+  so the Session can tell "my live Turn's call" from "a dead Turn's straggler" and drain
+  the latter on the spot. Passing `nil` means "no identity claimed" and is always treated
+  as a straggler; it is never accumulated into the live Turn.
+
+  This call carries its own generous timeout rather than the `GenServer.call/2` default
+  of 5 s (#462 round 3). The Session serializes Log appends and `Log.fold/2` history
+  folds, so a big Log can hold this call for longer than the default while nothing is
+  actually wrong — and a mid-stream timeout is worse than a slow one: the caller lives
+  inside the provider stream reducer, where an escaping exit is classified `:network`
+  and IS provider-retryable, so a stalled fold would re-stream the request.
+  """
+  @spec declare_committed_calls(String.t(), [map()], pos_integer() | nil) :: :ok | {:error, map()}
+  def declare_committed_calls(session_id, calls, generation \\ nil) when is_list(calls),
+    do:
+      call_session(
+        session_id,
+        {:declare_committed_calls, calls, generation},
+        @declare_timeout_ms
+      )
+
   @doc "Kill the currently running Turn's Task, if any."
   @spec interrupt(String.t()) :: :ok | {:error, :no_turn} | {:error, map()}
   def interrupt(session_id), do: call_session(session_id, :interrupt)
@@ -128,9 +178,9 @@ defmodule Pixir.Session do
     call_session(session_id, {:register_pressure_warning, checkpoint_to_seq, tier})
   end
 
-  defp call_session(session_id, message) do
+  defp call_session(session_id, message, timeout \\ 5_000) do
     with :ok <- SessionId.validate(session_id) do
-      GenServer.call(via(session_id), message)
+      GenServer.call(via(session_id), message, timeout)
     end
   end
 
@@ -181,6 +231,11 @@ defmodule Pixir.Session do
                 seq: next_seq(history),
                 fork_root_session_id: Fork.fork_root_session_id(history, id),
                 turn: nil,
+                # #462 round 3: monotonic Turn identity. Lives above `turn` on purpose —
+                # it must keep counting across `turn: nil` so a generation is never reused
+                # and a dead Turn's straggler can never match a later Turn.
+                turn_generation: 0,
+                committed_calls: [],
                 pressure_warnings: MapSet.new(),
                 writer_lease: writer_lease,
                 writer_lease_timer_ref: nil,
@@ -233,24 +288,125 @@ defmodule Pixir.Session do
 
   def handle_call({:record, event}, _from, state) do
     case record_event(state, event) do
-      {:ok, stamped, next_state} -> {:reply, {:ok, stamped}, next_state}
-      {:error, _} = error -> {:reply, error, state}
+      {:ok, stamped, next_state} ->
+        {:reply, {:ok, stamped}, forget_committed_call(next_state, stamped)}
+
+      {:error, _} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  # The declaration belongs to the Turn that is actually running: accumulate it, to be
+  # drained if that Turn is killed or crashes and cleared if it ends cleanly. The match is
+  # on the GENERATION, not on `turn` being non-nil — see the straggler clause below.
+  #
+  # #462 round 5: a call id already declared for THIS generation is ignored, not appended.
+  # The Provider retries transient failures itself (`Pixir.Provider.attempt/5`) with the
+  # same `on_committed_call` hand-off, and a retried Responses request re-emits the
+  # `function_call` output items the first attempt already committed. Appending blindly
+  # made `committed_calls` hold the same id twice, the interrupt drain then wrote two
+  # `tool_call` events for it, and the single reconciled `tool_result` left the next
+  # request with two `function_call` items and one output — the shape the API rejects, and
+  # one layer 2 will not heal because `persisted_call_id?/2` is already true for that id.
+  # Permanent poison, built by the fix meant to prevent it.
+  #
+  # De-duplication is by call_id ALONE: an id the Provider has committed identifies one
+  # call, and re-declaring it can only be the same call arriving twice. Comparing the whole
+  # entry instead would let a retry whose arguments re-serialized differently slip a second
+  # declaration through.
+  def handle_call(
+        {:declare_committed_calls, calls, generation},
+        _from,
+        %{turn: %{generation: generation}} = state
+      )
+      when not is_nil(generation) do
+    declared = Enum.flat_map(calls, &normalize_committed_call/1)
+    known = MapSet.new(state.committed_calls, & &1.call_id)
+
+    fresh =
+      declared
+      |> Enum.reject(&MapSet.member?(known, &1.call_id))
+      |> Enum.uniq_by(& &1.call_id)
+
+    {:reply, :ok, %{state | committed_calls: state.committed_calls ++ fresh}}
+  end
+
+  # #462 round 3: a STRAGGLER — a declaration whose Turn is no longer the running one.
+  # The default StreamIdle topology runs the stream in an unlinked `spawn_monitor` child,
+  # so `interrupt/1` kills the Turn Task but not the runner: the runner can complete one
+  # more `function_call` output item and declare it AFTER the interrupt drain has run.
+  #
+  # Two shapes reach here, and both are the same bug. With NO Turn running, accumulating
+  # would lose it — `interrupt` with no turn never drains, and `start_turn` used to reset
+  # the list. With a NEW Turn already running, keying on turn state alone would attribute
+  # a dead Turn's evidence to its successor, which then drops it at its own clean end:
+  # the same loss, one Turn over, and the reason the gate is identity and not state.
+  # Either way it is real evidence with no live Turn to own it, so it is drained on the
+  # spot under its own reason, and the next `start_turn`/`interrupt` reconciliation closes
+  # it like any other drained call. On the Open Responses backend (no layer 2) losing it
+  # instead would be permanent poison.
+  def handle_call({:declare_committed_calls, calls, generation}, _from, state) do
+    declared = Enum.flat_map(calls, &normalize_committed_call/1)
+    reason = straggler_drain_reason(state.turn, generation)
+
+    # The straggler is drained through a state whose `committed_calls` holds ONLY the
+    # straggler, then the live Turn's own accumulated set is restored. A live successor
+    # may be holding declarations of its own; draining over them would persist another
+    # Turn's un-reached calls as evidence, and clearing them would be the very loss this
+    # clause exists to stop. `drain_committed_calls/2` empties the list on entry, so both
+    # branches restore explicitly rather than relying on what it left behind.
+    live = state.committed_calls
+
+    case drain_committed_calls(%{state | committed_calls: declared}, reason) do
+      {:ok, drained_state} ->
+        {:reply, :ok, %{drained_state | committed_calls: live}}
+
+      # The Log itself is failing, so durable evidence is impossible. Loud and named, and
+      # the straggler is dropped rather than carried into an unrelated later Turn.
+      {:error, error, failed_state} ->
+        Logger.error("#462 drain of a straggling committed-call declaration failed",
+          session_id: failed_state.id,
+          drain_reason: reason,
+          undrained_call_ids: Enum.map(declared, & &1.call_id),
+          error: inspect(error)
+        )
+
+        {:reply, :ok, %{failed_state | committed_calls: live}}
     end
   end
 
   def handle_call({:start_turn, turn_fun}, _from, %{turn: nil} = state) do
-    case reconcile_pending_tool_calls(state, "before_start_turn") do
-      {:ok, state} ->
-        ctx = %{
-          session_id: state.id,
-          workspace: state.workspace,
-          role: state.role,
-          fork_root_session_id: state.fork_root_session_id
-        }
+    # #462 round 3: DRAIN leftover declarations, never reset them. Resetting silently
+    # un-protects a call the Provider committed — the exact evidence loss layer 1 exists
+    # to stop. Draining before the reconciliation below is what makes one pass enough.
+    with {:ok, state} <- drain_committed_calls(state, "before_start_turn"),
+         {:ok, state} <- reconcile_pending_tool_calls(state, "before_start_turn") do
+      # #462 round 3: a fresh TURN IDENTITY per Turn. Monotonic and never reused, so a
+      # killed Turn's surviving stream runner can never be mistaken for its successor no
+      # matter how late it speaks. It rides in `ctx` exactly as `session_id` does, and the
+      # Turn stamps every declaration with it.
+      generation = state.turn_generation + 1
 
-        task = Task.Supervisor.async_nolink(@turn_supervisor, fn -> turn_fun.(ctx) end)
-        {:reply, {:ok, task.ref}, %{state | turn: %{ref: task.ref, pid: task.pid}}}
+      ctx = %{
+        session_id: state.id,
+        workspace: state.workspace,
+        role: state.role,
+        fork_root_session_id: state.fork_root_session_id,
+        turn_generation: generation
+      }
 
+      task = Task.Supervisor.async_nolink(@turn_supervisor, fn -> turn_fun.(ctx) end)
+
+      # `committed_calls` is already `[]` — the drain above emptied it. Stated, not reset,
+      # so a future edit cannot reintroduce the drop this drain replaced.
+      {:reply, {:ok, task.ref},
+       %{
+         state
+         | turn: %{ref: task.ref, pid: task.pid, generation: generation},
+           turn_generation: generation,
+           committed_calls: []
+       }}
+    else
       {:error, error, state} ->
         {:reply, {:error, error}, state}
     end
@@ -265,12 +421,17 @@ defmodule Pixir.Session do
     _ = Task.Supervisor.terminate_child(@turn_supervisor, pid)
     Events.publish(Event.status(state.id, "interrupted"))
 
-    case reconcile_pending_tool_calls(%{state | turn: nil}, "interrupt") do
-      {:ok, state} -> {:reply, :ok, state}
+    with {:ok, state} <- drain_committed_calls(%{state | turn: nil}, "interrupt"),
+         {:ok, state} <- reconcile_pending_tool_calls(state, "interrupt") do
+      {:reply, :ok, state}
+    else
       {:error, error, state} -> {:reply, {:error, error}, state}
     end
   end
 
+  # No Turn running: there is no live Turn whose committed calls could still be
+  # un-persisted, so this path reconciles persisted orphans only and never drains
+  # declarations (#462). A stray SIGINT at the prompt must not fabricate a tool_call.
   def handle_call(:interrupt, _from, state) do
     case reconcile_pending_tool_calls(state, "interrupt_no_turn") do
       {:ok, state} -> {:reply, {:error, :no_turn}, state}
@@ -301,12 +462,48 @@ defmodule Pixir.Session do
   @impl true
   def handle_info({ref, _result}, %{turn: %{ref: ref}} = state) do
     Process.demonitor(ref, [:flush])
-    {:noreply, %{state | turn: nil}}
+    # #462: a Turn that returned did its own reconciliation; any declaration the Executor
+    # never reached (a strike-2 write denial or a terminal tool error abandons the rest of
+    # the batch) belongs to that Turn alone. Carrying it forward would let a later
+    # interrupt — including one with no Turn running — drain it as fabricated evidence.
+    {:noreply, %{state | turn: nil, committed_calls: []}}
   end
 
-  # Turn Task crashed (or was killed before we flushed): clear it.
+  # Turn Task crashed (or was killed before we flushed): clear it. The declarations are
+  # drained here rather than dropped — a crash between commit and persist is the very
+  # window layer 1 exists to close, and `interrupt/1` demonitors before terminating, so
+  # this clause never races the interrupt drain.
+  #
+  # Scoped to the drain only. Reconciling persisted orphans here too would be a behavior
+  # change beyond #462: those orphans already have a home (the next `start_turn`/
+  # `interrupt` reconciles them), and closing them at crash time under a new reason string
+  # would push an unannounced value into a `reason` vocabulary Monitor and ACP read. The
+  # drained calls this clause writes are themselves left pending on purpose — the very
+  # next `start_turn` closes them through the existing `before_start_turn` reconciliation,
+  # using the reason vocabulary that already exists.
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{turn: %{ref: ref}} = state) do
-    {:noreply, %{state | turn: nil}}
+    state = %{state | turn: nil}
+    # Captured before the drain: `drain_committed_calls/2` clears the list on entry, so the
+    # failure branch would otherwise report nothing.
+    declared_ids = Enum.map(state.committed_calls, & &1.call_id)
+
+    case drain_committed_calls(state, "turn_crashed") do
+      {:ok, state} ->
+        {:noreply, state}
+
+      # A Log-append failure here loses the evidence layer 1 exists to preserve, and the
+      # crash path has no caller to return the error to. Durable evidence is impossible
+      # (the Log is precisely what is failing), so this is at minimum loud, and it names
+      # the ids so the loss is diagnosable.
+      {:error, error, state} ->
+        Logger.error("#462 drain of Provider-committed calls failed after a Turn crash",
+          session_id: state.id,
+          undrained_call_ids: declared_ids,
+          error: inspect(error)
+        )
+
+        {:noreply, %{state | committed_calls: []}}
+    end
   end
 
   def handle_info(:writer_lease_heartbeat, state) do
@@ -339,6 +536,108 @@ defmodule Pixir.Session do
       {:error, _} = error ->
         error
     end
+  end
+
+  # #462 layer 1: persist every Provider-committed call the killed Turn never recorded,
+  # in declaration order, as a `tool_call` the ordinary orphan reconciliation below then
+  # closes. Draining before reconciling is what makes one pass enough.
+  # A straggler that lands while a live Turn is running is a DIFFERENT diagnosis from one
+  # that lands into an idle Session: the first means a dead Turn's runner outlived its Turn
+  # and spoke over a SUCCESSOR, the second that it spoke into the gap. Both are drained on
+  # the spot; the distinct reason keeps them apart in the Log, which is the only place this
+  # is observable at all.
+  defp straggler_drain_reason(nil, _generation), do: "declared_without_turn"
+  defp straggler_drain_reason(%{}, _generation), do: "stale_turn_generation"
+
+  defp drain_committed_calls(%{committed_calls: []} = state, _reason), do: {:ok, state}
+
+  defp drain_committed_calls(%{committed_calls: calls} = state, reason) do
+    state = %{state | committed_calls: []}
+
+    case Log.fold(state.id, workspace: state.workspace) do
+      {:ok, history} ->
+        seen = history |> known_call_ids() |> MapSet.new()
+
+        # #462 round 5: `seen` is the Log as it was BEFORE this drain, so a `reject` run
+        # once over the batch cannot stop a duplicate that arrives inside the batch itself
+        # — the second copy would be tested against a set that predates the first copy's
+        # append. Two independent guards close that, and both are kept because they fail
+        # differently: `uniq_by` collapses duplicates in the declaration list (first
+        # declaration wins, so wire order is preserved), and the skip test moved INSIDE the
+        # fold, over a `seen` grown after each successful append, keeps the check honest
+        # about what this drain has already written. The declare clause above also refuses
+        # same-id re-declares; a drain trusting only that would re-open this the moment any
+        # other caller assembled the list.
+        calls
+        |> Enum.uniq_by(& &1.call_id)
+        |> Enum.reduce_while({:ok, state, seen}, fn call, {:ok, state, seen} ->
+          if MapSet.member?(seen, call.call_id) do
+            {:cont, {:ok, state, seen}}
+          else
+            event =
+              Event.new(state.id, :tool_call, %{
+                "call_id" => call.call_id,
+                "name" => call.name,
+                "args" => call.args,
+                "drained" => %{"reason" => reason}
+              })
+
+            case record_event(state, event) do
+              {:ok, _event, next_state} ->
+                {:cont, {:ok, next_state, MapSet.put(seen, call.call_id)}}
+
+              {:error, error} ->
+                {:halt, {:error, error, state}}
+            end
+          end
+        end)
+        |> case do
+          {:ok, state, _seen} -> {:ok, state}
+          {:error, error, state} -> {:error, error, state}
+        end
+
+      {:error, error} ->
+        {:error, error, state}
+    end
+  end
+
+  # Every call id the Log MENTIONS, closed or not — "seen", not "pending". The drain must
+  # skip a call the Executor already recorded whether or not it also has a result;
+  # `pending_tool_calls/1` a few lines below is the genuinely-pending set and means the
+  # opposite thing.
+  defp known_call_ids(history) do
+    Enum.flat_map(history, fn
+      %{type: type, data: %{"call_id" => call_id}} when type in [:tool_call, :tool_result] ->
+        [call_id]
+
+      _event ->
+        []
+    end)
+  end
+
+  defp forget_committed_call(%{committed_calls: []} = state, _event), do: state
+
+  defp forget_committed_call(state, %{type: :tool_call, data: %{"call_id" => call_id}}),
+    do: %{state | committed_calls: Enum.reject(state.committed_calls, &(&1.call_id == call_id))}
+
+  defp forget_committed_call(state, _event), do: state
+
+  defp normalize_committed_call(%{call_id: call_id, name: name, args: args})
+       when is_binary(call_id) and is_binary(name) and is_map(args),
+       do: [%{call_id: call_id, name: name, args: args}]
+
+  # Dropped evidence must be visible (ADR 0007). A malformed entry vanishing silently
+  # un-protects that call — #462's own failure mode one layer down — so it is named,
+  # exactly as `Pixir.Turn.walk_output_items/3` names an unrecognized output item.
+  defp normalize_committed_call(call) do
+    # The entry is inlined in the MESSAGE, not left in metadata: the default console
+    # formatter drops metadata, and evidence a reader never sees is not visible evidence.
+    Logger.warning(
+      "#462 dropped a malformed Provider-committed call declaration: " <>
+        inspect(call, limit: 5, printable_limit: 120)
+    )
+
+    []
   end
 
   defp reconcile_pending_tool_calls(state, reason) do

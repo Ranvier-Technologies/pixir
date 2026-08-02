@@ -76,7 +76,8 @@ defmodule Pixir.Tool do
       `:session_writer_ambiguous`, `:session_writer_lost`
     * **provider** — `:provider_http_error`, `:model_not_supported`, `:usage_limit_reached`,
       `:rate_limited`, `:network`, `:provider_refusal`, `:unsupported_transport`,
-      `:unsupported_backend_capability`, `:context_overflow`, `:stream_idle_timeout`
+      `:unsupported_backend_capability`, `:context_overflow`, `:stream_idle_timeout`,
+      `:dangling_tool_call`
     * **auth** — `:not_authenticated`, `:insecure_auth_transport`,
       `:token_request_failed`, `:no_account_id`, `:invalid_response`, `:corrupt_auth`,
       `:auth_read_failed`, `:auth_write_failed`, `:device_auth_failed`,
@@ -128,6 +129,7 @@ defmodule Pixir.Tool do
           | :unsupported_backend_capability
           | :context_overflow
           | :stream_idle_timeout
+          | :dangling_tool_call
           | :not_authenticated
           | :insecure_auth_transport
           | :token_request_failed

@@ -5,9 +5,16 @@ defmodule Pixir.ModelsRefreshTest do
   alias Pixir.Providers.ErrBody
 
   setup do
+    # Randomised suffix, not just `System.unique_integer/1`: that counter restarts low
+    # on every node, so a crashed suite can leave a dirty dir the next run reuses. A
+    # leftover auth store inside it would restore subscription-over-key (#464).
     dir =
-      Path.join(System.tmp_dir!(), "pixir-models-refresh-#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "pixir-models-refresh-" <> Base.encode16(:crypto.strong_rand_bytes(6), case: :lower)
+      )
 
+    File.rm_rf!(dir)
     File.mkdir_p!(dir)
     config_path = Path.join(dir, "config.json")
     on_exit(fn -> File.rm_rf!(dir) end)
@@ -15,6 +22,7 @@ defmodule Pixir.ModelsRefreshTest do
   end
 
   test "refreshes both providers, computes diffs, preserves foreign keys, and stamps UTC", %{
+    dir: dir,
     config_path: path
   } do
     File.write!(
@@ -26,7 +34,7 @@ defmodule Pixir.ModelsRefreshTest do
       })
     )
 
-    auth = start_auth("sk-openai")
+    auth = start_auth(dir, "sk-openai")
     now = ~U[2026-03-10 12:34:56Z]
 
     http = fn request ->
@@ -69,6 +77,7 @@ defmodule Pixir.ModelsRefreshTest do
   end
 
   test "oauth skips OpenAI while an Anthropic success updates only its owned key", %{
+    dir: dir,
     config_path: path
   } do
     original = %{
@@ -78,7 +87,7 @@ defmodule Pixir.ModelsRefreshTest do
     }
 
     File.write!(path, Jason.encode!(original))
-    auth = start_subscription_auth()
+    auth = start_subscription_auth(dir)
 
     http = fn request ->
       refute request.url =~ "openai.com"
@@ -104,10 +113,13 @@ defmodule Pixir.ModelsRefreshTest do
     assert written["foreign"] == 7
   end
 
-  test "non-200 is bounded and fail-closed with config byte-identical", %{config_path: path} do
+  test "non-200 is bounded and fail-closed with config byte-identical", %{
+    dir: dir,
+    config_path: path
+  } do
     original = Jason.encode!(%{"models" => ["gpt-existing"], "foreign" => true}, pretty: true)
     File.write!(path, original)
-    auth = start_auth("sk-openai")
+    auth = start_auth(dir, "sk-openai")
     oversized = String.duplicate("x", ErrBody.max_bytes() * 2)
 
     assert {:ok, result} =
@@ -129,10 +141,11 @@ defmodule Pixir.ModelsRefreshTest do
   end
 
   test "non-200 marker records only actual byte drops at the exact cap", %{
+    dir: dir,
     config_path: path
   } do
     original = Jason.encode!(%{"models" => ["gpt-existing"], "foreign" => true}, pretty: true)
-    auth = start_auth("sk-openai")
+    auth = start_auth(dir, "sk-openai")
     cap = ErrBody.max_bytes()
 
     for {received_bytes, expected_truncated} <- [
@@ -167,14 +180,14 @@ defmodule Pixir.ModelsRefreshTest do
     end
   end
 
-  test "garbage JSON response is fail-closed", %{config_path: path} do
+  test "garbage JSON response is fail-closed", %{dir: dir, config_path: path} do
     original = ~s({"models":["gpt-existing"],"foreign":"same"})
     File.write!(path, original)
 
     assert {:ok, result} =
              ModelsRefresh.refresh(
                config_path: path,
-               auth: start_auth("sk-openai"),
+               auth: start_auth(dir, "sk-openai"),
                env: fn _ -> nil end,
                http: fn _ -> {:ok, %{status: 200, body: "not-json"}} end
              )
@@ -184,14 +197,14 @@ defmodule Pixir.ModelsRefreshTest do
     assert File.read!(path) == original
   end
 
-  test "both endpoint failures leave config byte-identical", %{config_path: path} do
+  test "both endpoint failures leave config byte-identical", %{dir: dir, config_path: path} do
     original = "{\n  \"models\": [\"gpt-existing\"],\n  \"foreign\": \"untouched\"\n}\n"
     File.write!(path, original)
 
     assert {:ok, result} =
              ModelsRefresh.refresh(
                config_path: path,
-               auth: start_auth("sk-openai"),
+               auth: start_auth(dir, "sk-openai"),
                env: fn "ANTHROPIC_API_KEY" -> "sk-anthropic" end,
                http: fn request ->
                  if request.url =~ "openai.com" do
@@ -208,20 +221,104 @@ defmodule Pixir.ModelsRefreshTest do
     assert File.read!(path) == original
   end
 
-  test "both providers skipped do not call HTTP or touch config", %{config_path: path} do
+  test "both providers skipped do not call HTTP or touch config", %{
+    dir: dir,
+    config_path: path
+  } do
     original = "{\n  \"foreign\": true\n}\n"
     File.write!(path, original)
 
     assert {:ok, result} =
              ModelsRefresh.refresh(
                config_path: path,
-               auth: start_auth(nil),
+               auth: start_auth(dir, nil),
                env: fn _ -> nil end,
                http: fn _ -> flunk("HTTP must not be called without credentials") end
              )
 
     assert result["providers"]["openai"]["reason"] == "no_credential"
     assert result["providers"]["anthropic"]["reason"] == "no_credential"
+    assert result["wrote_config"] == false
+    assert File.read!(path) == original
+  end
+
+  test "auth store paths are private so a stale credential cannot leak in", %{
+    dir: dir,
+    config_path: path
+  } do
+    original = "{\n  \"foreign\": true\n}\n"
+    File.write!(path, original)
+
+    # Simulate the cross-run collision behind #464 without ever writing outside this
+    # test's own tmp dir. `prior` is a previous run's dir and `current` is this run's;
+    # `System.unique_integer/1` restarts low on every node, so both runs can hand the
+    # helper the SAME auth name. A run that leaked its store into a process-wide root
+    # would make the second Auth inherit the first's subscription credential.
+    #
+    # The failure this pins is not "no credential": it is a test that DOES supply an
+    # API key still ending up on the subscription skip branch, where err_body is nil.
+    name = auth_name()
+    prior = Path.join(dir, "prior-run")
+    current = Path.join(dir, "current-run")
+    File.mkdir_p!(prior)
+    File.mkdir_p!(current)
+
+    # The prior run persists a real subscription credential through the real helper.
+    prior_auth_name = :"prior_#{name}"
+    prior_auth = start_auth(prior, prior_auth_name, nil)
+
+    :ok =
+      Auth.set_credential(prior_auth, %{
+        kind: :subscription,
+        access_token: "oauth-token",
+        refresh_token: "refresh-token",
+        account_id: "account",
+        expires_at: System.system_time(:millisecond) + 60_000,
+        obtained_at: System.system_time(:millisecond)
+      })
+
+    # It landed in the prior run's dir, and nowhere else.
+    assert File.exists?(auth_store_path(prior, prior_auth_name))
+
+    # Plant that exact leftover, BEFORE start_auth/3 runs, under the name the current
+    # run is about to take. `prior` stands in for the process-wide tmp root the
+    # pre-fix helper resolved against, so the shipped test writes only under `dir`
+    # while still reproducing the collision.
+    leftover = File.read!(auth_store_path(prior, prior_auth_name))
+    File.write!(auth_store_path(prior, name), leftover)
+
+    # Now the current run starts an Auth under the colliding name WITH a real API key,
+    # exactly as every err_body test in this file does. Post-fix the store resolves
+    # under `current`, which is empty, so the planted subscription does not load and
+    # env_api_key stands: kind is :api_key. Pre-fix the store resolved against a root
+    # shared with `prior`, the stale subscription loaded and WON over env_api_key in
+    # Pixir.Auth, so refresh_openai/2 took the "unsupported auth kind" skip branch and
+    # emitted no err_body at all: the nil-err_body failure filed in #464.
+    auth = start_auth(current, name, "sk-openai")
+
+    status = Auth.status(auth)
+    assert status.authenticated?
+    assert status.kind == :api_key
+
+    # Drive one real refresh down the 503 path. Under the bug this provider entry is a
+    # "skipped" map and err_body is nil; the assertion below is the exact field #464
+    # reported missing.
+    assert {:ok, result} =
+             ModelsRefresh.refresh(
+               config_path: path,
+               auth: auth,
+               env: fn _ -> nil end,
+               http: fn request ->
+                 assert {"authorization", "Bearer sk-openai"} in request.headers
+                 {:ok, %{status: 503, body: "upstream unavailable"}}
+               end
+             )
+
+    openai = result["providers"]["openai"]
+    assert openai["status"] == "error"
+    assert openai["kind"] == "provider_http_error"
+    assert openai["status_code"] == 503
+    assert openai["err_body"] == "upstream unavailable"
     assert result["wrote_config"] == false
     assert File.read!(path) == original
   end
@@ -243,15 +340,25 @@ defmodule Pixir.ModelsRefreshTest do
     assert catalog["models_refreshed_at"] == "2026-01-02T03:04:05Z"
   end
 
-  defp start_auth(key) do
-    name = :"models_auth_#{System.unique_integer([:positive])}"
-    path = Path.join(System.tmp_dir!(), "#{name}.json")
+  defp start_auth(dir, key), do: start_auth(dir, auth_name(), key)
+
+  # The store path must live under this test's own `dir` (removed on exit), never
+  # the shared tmp root: `System.unique_integer/1` restarts low on every node, so a
+  # run reusing a past run's integer would load that run's leftover auth.json and
+  # inherit a subscription credential the test never set (#464). `auth_store_path/2`
+  # is the single resolution point pinned by the "stale credential" test below.
+  defp start_auth(dir, name, key) do
+    path = auth_store_path(dir, name)
     {:ok, _pid} = Auth.start_link(name: name, store_path: path, env_api_key: key)
     name
   end
 
-  defp start_subscription_auth do
-    auth = start_auth(nil)
+  defp auth_name, do: :"models_auth_#{System.unique_integer([:positive])}"
+
+  defp auth_store_path(dir, name), do: Path.join(dir, "#{name}.json")
+
+  defp start_subscription_auth(dir) do
+    auth = start_auth(dir, nil)
 
     :ok =
       Auth.set_credential(auth, %{

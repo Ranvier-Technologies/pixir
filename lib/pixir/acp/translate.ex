@@ -250,7 +250,9 @@ defmodule Pixir.ACP.Translate do
   Map a terminal `await` outcome to an ACP stopReason. `cancel_requested?` covers the
   cancel-vs-terminal race: if `session/cancel` arrived, resolve `"cancelled"` even if a
   `done`/`error` slipped in first. A turn-level error is reported as content, not a
-  protocol error, so it resolves `"end_turn"` (ADR 0009 §5).
+  protocol error, so it resolves `"end_turn"` (ADR 0009 §5) — the machine-readable
+  failure signal rides separately on the prompt RESULT as `_meta.pixir.turn_failure`
+  when a `turn_failed` event was observed (#465, ADR 0009 §5 amendment).
   """
   @spec stop_reason(await_outcome(), boolean()) :: String.t()
   def stop_reason(_outcome, true), do: "cancelled"

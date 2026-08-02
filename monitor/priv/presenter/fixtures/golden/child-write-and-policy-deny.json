@@ -1,0 +1,309 @@
+{
+  "schema": "pixir.presenter.run",
+  "schema_version": 1,
+  "projection_id": "projection:child-write-and-policy-deny",
+  "projected_at": "2026-07-30T11:12:09Z",
+  "run": {
+    "id": "dlg-child-write-deny",
+    "delegate_id": "dlg-child-write-deny",
+    "parent_session_id": "parent-child-write-deny",
+    "workflow_id": null,
+    "strategy": "subagents",
+    "mode": "bounded_write",
+    "title": null,
+    "evidence_refs": [
+      "e-envelope-child-write-deny"
+    ]
+  },
+  "source": {
+    "mode": "reconstructed",
+    "durable_origin": "fixture",
+    "as_of_seq": 1,
+    "last_durable_at": "2026-07-30T11:12:09Z",
+    "live_observed_at": null,
+    "freshness": "terminal",
+    "limitations": []
+  },
+  "execution": {
+    "state": "failed",
+    "terminal": true,
+    "basis": "subagent_event_fold",
+    "evidence_refs": [
+      "e-parent-1"
+    ]
+  },
+  "liveness": {
+    "state": "not_applicable",
+    "reachable": false,
+    "basis": "terminal_execution",
+    "observed_at": null,
+    "evidence_refs": []
+  },
+  "counts": {
+    "planned_units": 1,
+    "observed_units": 1,
+    "running_units": 0,
+    "completed_units": 0,
+    "attention_units": 1
+  },
+  "graph": null,
+  "units": [
+    {
+      "logical_id": "delegate:dlg-child-write-deny:subagent:sub-writer",
+      "unit_kind": "subagent",
+      "label": "worker",
+      "agent": "worker",
+      "execution_kind": "subagent",
+      "workspace_mode": "shared",
+      "posture": "unknown",
+      "depends_on": [],
+      "execution": {
+        "state": "failed",
+        "terminal": true,
+        "basis": "subagent_event_fold",
+        "evidence_refs": [
+          "e-parent-1"
+        ]
+      },
+      "liveness": {
+        "state": "not_applicable",
+        "reachable": false,
+        "basis": "terminal_execution",
+        "observed_at": null,
+        "evidence_refs": []
+      },
+      "gate": {
+        "state": "not_applicable",
+        "dependent_safe": null,
+        "basis": "not_applicable",
+        "evidence_refs": []
+      },
+      "advisory": {
+        "present": false,
+        "verdict": "unknown",
+        "mergeable": null,
+        "declared_gate": null,
+        "parse_status": "not_present",
+        "summary": null,
+        "major_count": null,
+        "minor_count": null,
+        "evidence_refs": []
+      },
+      "attempts": [
+        {
+          "attempt_id": "delegate:dlg-child-write-deny:subagent:sub-writer:attempt:0",
+          "ordinal": 0,
+          "relation": "fresh",
+          "predecessor_attempt_id": null,
+          "child_session_id": "child-writer",
+          "status": "failed",
+          "started_at": "2026-07-30T11:12:00Z",
+          "ended_at": "2026-07-30T11:12:09Z",
+          "error_kind": null,
+          "summary": "Wrote inside the lane; one write outside the allowlist was denied.",
+          "evidence_refs": [
+            "e-parent-0",
+            "e-parent-1"
+          ],
+          "limitations": [],
+          "materialization": "durable",
+          "status_basis": "parent_log",
+          "child_event_window": {
+            "session_id": "child-writer",
+            "from_seq": null,
+            "to_seq_exclusive": null,
+            "basis": "whole_child_log_single_attempt",
+            "evidence_refs": []
+          }
+        }
+      ],
+      "artifacts": [],
+      "usage": {
+        "source": "none",
+        "complete": true,
+        "calls": 0,
+        "groups": [],
+        "evidence_refs": [],
+        "limitations": []
+      },
+      "mutation": {
+        "status": "partial",
+        "observed_paths": [
+          "lib/pixir/monitor_note.ex"
+        ],
+        "observed_semantics": "at_least",
+        "basis": "child_log_derived",
+        "write_denials": [
+          {
+            "evidence_refs": [
+              "e-child-3"
+            ],
+            "matched_rule": "no_allow_match",
+            "normalized_path": "docs/adr/0039-out-of-lane.md",
+            "policy_hash": "sha256:0f2c1a9d",
+            "policy_id": "policy-writer-lane",
+            "requested_path": "docs/adr/0039-out-of-lane.md",
+            "tool": "write"
+          }
+        ],
+        "evidence_refs": [
+          "e-envelope-child-write-deny",
+          "e-child-1",
+          "e-child-2",
+          "e-child-3"
+        ],
+        "limitations": []
+      },
+      "safe_actions": [
+        {
+          "id": "inspect_child_session_log",
+          "scope": "delegate:dlg-child-write-deny:subagent:sub-writer",
+          "kind": "inspect",
+          "effect": "read_only",
+          "presentation": "informational",
+          "command": null,
+          "evidence_refs": [
+            "e-envelope-child-write-deny"
+          ],
+          "source_field": "next_actions"
+        }
+      ],
+      "evidence_refs": [
+        "e-envelope-child-write-deny",
+        "e-parent-0",
+        "e-parent-1",
+        "e-child-1",
+        "e-child-2",
+        "e-child-3"
+      ],
+      "limitations": [],
+      "materialization": "durable",
+      "attention": {
+        "required": true,
+        "reasons": [
+          "execution_failed",
+          "mutation_partial"
+        ],
+        "evidence_refs": [
+          "e-envelope-child-write-deny",
+          "e-parent-0",
+          "e-parent-1",
+          "e-child-1",
+          "e-child-2",
+          "e-child-3"
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "source": "none",
+    "complete": true,
+    "calls": 0,
+    "groups": [],
+    "evidence_refs": [],
+    "limitations": []
+  },
+  "mutation": {
+    "status": "partial",
+    "observed_paths": [
+      "lib/pixir/monitor_note.ex"
+    ],
+    "observed_semantics": "at_least",
+    "basis": "child_log_derived",
+    "write_denials": [
+      {
+        "evidence_refs": [
+          "e-child-3"
+        ],
+        "matched_rule": "no_allow_match",
+        "normalized_path": "docs/adr/0039-out-of-lane.md",
+        "policy_hash": "sha256:0f2c1a9d",
+        "policy_id": "policy-writer-lane",
+        "requested_path": "docs/adr/0039-out-of-lane.md",
+        "tool": "write"
+      }
+    ],
+    "evidence_refs": [
+      "e-envelope-child-write-deny",
+      "e-child-1",
+      "e-child-2",
+      "e-child-3"
+    ],
+    "limitations": []
+  },
+  "safe_actions": [
+    {
+      "id": "inspect_child_session_log",
+      "scope": "delegate:dlg-child-write-deny:subagent:sub-writer",
+      "kind": "inspect",
+      "effect": "read_only",
+      "presentation": "informational",
+      "command": null,
+      "evidence_refs": [
+        "e-envelope-child-write-deny"
+      ],
+      "source_field": "next_actions"
+    }
+  ],
+  "evidence": [
+    {
+      "id": "e-envelope-child-write-deny",
+      "authority": "derived",
+      "source_kind": "terminal_envelope",
+      "session_id": "parent-child-write-deny",
+      "seq": null,
+      "description": "Delegate envelope supplies run identity and bounded derived fields."
+    },
+    {
+      "id": "e-parent-0",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-child-write-deny",
+      "seq": 0,
+      "description": "Worker started."
+    },
+    {
+      "id": "e-parent-1",
+      "authority": "canonical",
+      "source_kind": "parent_log",
+      "session_id": "parent-child-write-deny",
+      "seq": 1,
+      "description": "Worker failed."
+    },
+    {
+      "id": "e-child-1",
+      "authority": "canonical",
+      "source_kind": "child_log",
+      "session_id": "child-writer",
+      "seq": 1,
+      "description": "Write tool call targeted the observed path."
+    },
+    {
+      "id": "e-child-2",
+      "authority": "canonical",
+      "source_kind": "child_log",
+      "session_id": "child-writer",
+      "seq": 2,
+      "description": "Write tool result succeeded."
+    },
+    {
+      "id": "e-child-3",
+      "authority": "canonical",
+      "source_kind": "child_log",
+      "session_id": "child-writer",
+      "seq": 3,
+      "description": "Canonical permission_decision event from the child Session."
+    }
+  ],
+  "limitations": [],
+  "post_terminal_child_activity": {
+    "state": "none",
+    "basis": "child_events_after_parent_terminal_boundary",
+    "boundary_at": "2026-07-30T11:12:09Z",
+    "boundary_basis": "terminal_subagent_lifecycle_ts",
+    "event_count": 0,
+    "latest_event_at": null,
+    "child_session_ids": [],
+    "evidence_refs": []
+  }
+}

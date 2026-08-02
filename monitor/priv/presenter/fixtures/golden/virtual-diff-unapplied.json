@@ -129,6 +129,8 @@
         "status": "isolated_only",
         "observed_paths": [],
         "observed_semantics": "none",
+        "basis": "no_write_evidence",
+        "write_denials": [],
         "evidence_refs": [
           "e-parent-2",
           "e-artifact-virtual"
@@ -182,6 +184,8 @@
     "status": "not_applied",
     "observed_paths": [],
     "observed_semantics": "none",
+    "basis": "no_write_evidence",
+    "write_denials": [],
     "evidence_refs": [
       "e-parent-2",
       "e-artifact-virtual"
@@ -248,5 +252,15 @@
   ],
   "limitations": [
     "virtual_diff_not_applied"
-  ]
+  ],
+  "post_terminal_child_activity": {
+    "state": "none",
+    "basis": "child_events_after_parent_terminal_boundary",
+    "boundary_at": "2026-07-10T19:50:03Z",
+    "boundary_basis": "workflow_finished_event_ts",
+    "event_count": 0,
+    "latest_event_at": null,
+    "child_session_ids": [],
+    "evidence_refs": []
+  }
 }

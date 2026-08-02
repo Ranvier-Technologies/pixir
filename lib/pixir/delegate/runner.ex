@@ -12,10 +12,19 @@ defmodule Pixir.Delegate.Runner do
     * terminal status comes from `wait_outcome/4` or the Workflow result envelope;
     * durable truth remains the parent and child Session Logs plus Workflow Events.
 
-  It also exposes a start-only primitive for the current-runtime Delegate owner. It
-  deliberately does not implement streaming attach, cross-invocation daemon residency,
-  merge-back/apply, or any process-per-child shell fanout. Bounded-write Workflow support
-  is attached-only, requires explicit per-step write sets, and reports where writes land.
+  It also exposes a start-only primitive for the current-runtime Delegate owner. Before
+  either attached or start-only execution creates a parent Session, shared limit
+  resolution and pure critical-path estimation enforce the caller horizon unless an
+  explicit short-horizon override was requested. Workflow admission retains the
+  normalized declared workflow timeout, whether that timeout was explicitly present in
+  the normalized workflow spec before default injection, the caller wait horizon, and
+  `wait_horizon_explicit` binding evidence as separate fields while runtime still
+  receives their same effective minimum. The wait-horizon evidence is true only when
+  the request or `limits.wait_horizon_ms` supplied it, and false when the horizon
+  defaulted from the delegate timeout. The runner deliberately does not implement
+  streaming attach, cross-invocation daemon residency, merge-back/apply, or any
+  process-per-child shell fanout. Bounded-write Workflow support is attached-only,
+  requires explicit per-step write sets, and reports where writes land.
 
   Delegate task attachments are operator-supplied Session Resource links under ADR 0021;
   they are consumed by each child Session's first user message and are not echoed in
@@ -29,9 +38,21 @@ defmodule Pixir.Delegate.Runner do
   `pixir delegate --spec` pretend to be a detached daemon.
   """
 
-  alias Pixir.{Config, Conversation, Log, RecoveryCommands, Subagents, Workflows}
-  alias Pixir.Delegate.{Evidence, Handle, Owner}
-  alias Pixir.Permissions.WritePolicy
+  alias Pixir.{
+    Config,
+    Conversation,
+    Event,
+    Log,
+    RecoveryCommands,
+    Session,
+    Subagents,
+    Workflows
+  }
+
+  alias Pixir.Subagents.WarmStart
+
+  alias Pixir.Delegate.{CriticalPath, Evidence, Handle, Owner}
+  alias Pixir.Permissions.{WriteDenials, WritePolicy}
   alias Pixir.Tools.Workspace
 
   @supported_modes [nil, "read_only", "bounded_write"]
@@ -45,10 +66,138 @@ defmodule Pixir.Delegate.Runner do
     service_unavailable_error server_is_overloaded overloaded server_error
   )
   @root_limit_keys ~w(child_timeout_ms delegate_timeout_ms timeout_ms wait_horizon_ms)
+  # Shared with Pixir.Delegate.CLIContract so dry-run rejects exactly the tasks[]
+  # entries the real run rejects. `seed_session_id` names a prior Session to
+  # warm-start this child from (#435); omitting it keeps the cold child behavior.
+  @known_task_entry_keys ~w(task attachments seed_session_id)
 
   @doc false
   @spec root_limit_keys() :: [String.t()]
   def root_limit_keys, do: @root_limit_keys
+
+  @doc "Accepted keys inside one `tasks[]` object entry."
+  @spec known_task_entry_keys() :: [String.t()]
+  def known_task_entry_keys, do: @known_task_entry_keys
+
+  @doc "Resolve Delegate caller and child limits from the shared runtime precedence rules."
+  @spec resolve_limits(map(), map()) :: {:ok, map()} | {:error, map()}
+  def resolve_limits(request, spec) when is_map(request) and is_map(spec),
+    do: normalize_timeouts(request, spec)
+
+  @doc "Estimate the spec critical path using the same limits consumed by runtime."
+  @spec critical_path(map(), map(), map(), keyword()) :: {:ok, map()} | {:error, map()}
+  def critical_path(request, spec, %{"strategy" => "subagents"} = spec_meta, _opts) do
+    with {:ok, limits} <- resolve_limits(request, spec),
+         {:ok, max_threads} <- normalize_positive_integer(spec, ["subagents", "max_threads"]),
+         {:ok, estimate} <-
+           CriticalPath.estimate_subagents(
+             spec_meta["planned_child_count"],
+             max_threads,
+             limits.child_timeout_ms
+           ) do
+      {:ok,
+       estimate
+       |> stringify_estimate(limits.wait_horizon_ms)
+       |> Map.put("wait_horizon_explicit", limits.wait_horizon_explicit)
+       |> Map.put("strategy", "subagents")}
+    end
+  end
+
+  def critical_path(request, spec, %{"strategy" => "workflow"}, opts) do
+    with {:ok, limits} <- resolve_limits(request, spec),
+         {:ok, mode} <- normalize_mode(Map.get(spec, "mode")),
+         {:ok, write_policy} <- normalize_write_policy(spec, mode),
+         {:ok, workflow_spec, effective_timeout_ms, declared_workflow_timeout_ms,
+          declared_workflow_timeout_explicit} <-
+           normalize_effective_workflow_spec(spec, mode, limits),
+         {:ok, estimate} <-
+           Workflows.critical_path(
+             workflow_spec,
+             opts
+             |> Keyword.put(:workspace, Map.get(request, :workspace) || File.cwd!())
+             |> Keyword.put(:timeout_ms, effective_timeout_ms)
+             |> maybe_put_opt(:write_policy, write_policy)
+           ) do
+      {:ok,
+       estimate
+       |> stringify_estimate()
+       |> Map.put("caller_horizon_ms", limits.wait_horizon_ms)
+       |> Map.put("wait_horizon_explicit", limits.wait_horizon_explicit)
+       |> Map.put("declared_workflow_timeout_ms", declared_workflow_timeout_ms)
+       |> Map.put(
+         "declared_workflow_timeout_explicit",
+         declared_workflow_timeout_explicit
+       )
+       |> put_capped_step_budgets(
+         workflow_spec,
+         declared_workflow_timeout_ms,
+         declared_workflow_timeout_explicit,
+         source_steps_path(spec)
+       )
+       |> Map.put("strategy", "workflow")}
+    end
+  end
+
+  # Advisory-only evidence: the normalized workflow spec preserves raw step order, so
+  # `<steps_path>/<index>/timeout_ms` addresses the same step the estimate points at.
+  # `normalize_workflow_spec/2` flattens the nested `workflow.steps` shell into a
+  # top-level `steps` list, so the emitted location must be rebased onto the path the
+  # caller actually submitted or a machine caller would patch a pointer that does not
+  # exist. This never participates in the horizon verdict.
+  defp put_capped_step_budgets(
+         details,
+         workflow_spec,
+         declared_workflow_timeout_ms,
+         declared_workflow_timeout_explicit,
+         source_steps_path
+       ) do
+    case CriticalPath.capped_step_budgets(
+           Map.get(workflow_spec, "steps", []),
+           declared_workflow_timeout_ms,
+           declared_workflow_timeout_explicit,
+           source_steps_path
+         ) do
+      [] -> details
+      entries -> Map.put(details, "capped_step_budgets", entries)
+    end
+  end
+
+  # Mirrors the precedence in `normalize_workflow_spec/2`: a top-level `steps` list wins
+  # over the nested `workflow.steps` shell.
+  defp source_steps_path(spec) do
+    case spec do
+      %{"steps" => _top_level} -> ["steps"]
+      %{"workflow" => %{"steps" => _nested}} -> ["workflow", "steps"]
+      _other -> ["steps"]
+    end
+  end
+
+  @doc false
+  @spec admit_horizon(map(), map(), map(), keyword()) :: {:ok, map() | nil} | {:error, map()}
+  def admit_horizon(request, spec, spec_meta, opts \\ []) do
+    with {:ok, details} <- critical_path(request, spec, spec_meta, opts) do
+      cond do
+        details["effective_timeout_ms"] >= details["estimated_critical_path_ms"] ->
+          {:ok, nil}
+
+        Map.get(request, :allow_short_horizon?, false) ->
+          {:ok, CriticalPath.horizon_values(details)}
+
+        true ->
+          {:error, CriticalPath.rejection(details)}
+      end
+    end
+  end
+
+  defp stringify_estimate(estimate, effective_timeout_ms \\ nil) do
+    estimate = Map.new(estimate, fn {key, value} -> {to_string(key), value} end)
+
+    if is_nil(effective_timeout_ms) do
+      estimate
+    else
+      Map.put(estimate, "effective_timeout_ms", effective_timeout_ms)
+    end
+  end
 
   @doc "Run a validated Delegate spec through the attached runtime path."
   @spec run(map(), map(), map(), keyword()) :: {:ok, map()} | {:error, map()}
@@ -56,6 +205,8 @@ defmodule Pixir.Delegate.Runner do
 
   def run(request, spec, %{"strategy" => "subagents"} = spec_meta, opts) do
     with {:ok, runtime} <- normalize_subagents_runtime(request, spec, spec_meta),
+         {:ok, horizon_override} <- admit_horizon(request, spec, spec_meta, opts),
+         runtime <- Map.put(runtime, :horizon_override, horizon_override),
          {:ok, parent_session_id} <- start_parent_session(runtime) do
       refresh_lifecycle_evidence(parent_session_id, runtime, [])
 
@@ -86,6 +237,8 @@ defmodule Pixir.Delegate.Runner do
 
   def run(request, spec, %{"strategy" => "workflow"} = spec_meta, opts) do
     with {:ok, runtime} <- normalize_workflow_runtime(request, spec, spec_meta),
+         {:ok, horizon_override} <- admit_horizon(request, spec, spec_meta, opts),
+         runtime <- Map.put(runtime, :horizon_override, horizon_override),
          {:ok, parent_session_id} <- start_parent_session(runtime),
          {:ok, result} <- run_workflow(parent_session_id, runtime, opts) do
       {:ok,
@@ -121,6 +274,8 @@ defmodule Pixir.Delegate.Runner do
 
   def start(request, spec, %{"strategy" => "subagents"} = spec_meta, opts) do
     with {:ok, runtime} <- normalize_subagents_runtime(request, spec, spec_meta),
+         {:ok, horizon_override} <- admit_horizon(request, spec, spec_meta, opts),
+         runtime <- Map.put(runtime, :horizon_override, horizon_override),
          {:ok, parent_session_id} <- start_parent_session(runtime) do
       refresh_lifecycle_evidence(parent_session_id, runtime, [])
 
@@ -352,7 +507,7 @@ defmodule Pixir.Delegate.Runner do
     if task == "" do
       {:error, invalid_task_entry(index)}
     else
-      {:ok, %{task: task, index: index, attachments: []}}
+      {:ok, %{task: task, index: index, attachments: [], seed_session_id: nil}}
     end
   end
 
@@ -360,12 +515,52 @@ defmodule Pixir.Delegate.Runner do
     with :ok <- reject_unknown_task_entry_keys(entry, index),
          {:ok, task} <- normalize_task_text(Map.get(entry, "task"), index),
          {:ok, attachments} <-
-           normalize_task_attachments(Map.get(entry, "attachments", []), index, workspace) do
-      {:ok, %{task: task, index: index, attachments: attachments}}
+           normalize_task_attachments(Map.get(entry, "attachments", []), index, workspace),
+         {:ok, seed_session_id} <-
+           normalize_task_seed(Map.get(entry, "seed_session_id"), index, workspace) do
+      {:ok,
+       %{
+         task: task,
+         index: index,
+         attachments: attachments,
+         seed_session_id: seed_session_id
+       }}
     end
   end
 
   defp normalize_task_entry(_entry, index, _workspace), do: {:error, invalid_task_entry(index)}
+
+  # Warm-start seeding is validated here, before any child Session exists (#435): an
+  # unusable seed must be rejected with a structured error rather than leaving a
+  # partial child Log behind.
+  defp normalize_task_seed(nil, _index, _workspace), do: {:ok, nil}
+
+  defp normalize_task_seed(seed_session_id, index, workspace) do
+    case WarmStart.validate(seed_session_id, workspace: workspace) do
+      {:ok, _lineage} ->
+        {:ok, seed_session_id}
+
+      {:error, error} ->
+        {:error, seed_error(error, index)}
+    end
+  end
+
+  defp seed_error(error, index) do
+    error
+    |> normalize_error()
+    |> Map.update("details", seed_location_details(index), fn details ->
+      Map.merge(details, seed_location_details(index))
+    end)
+  end
+
+  defp seed_location_details(index) do
+    %{
+      "field" => "tasks[#{index + 1}].seed_session_id",
+      "json_pointer" => "/tasks/#{index}/seed_session_id",
+      "path" => ["tasks", index, "seed_session_id"],
+      "task_index" => index
+    }
+  end
 
   defp normalize_task_text(task, index) when is_binary(task) do
     task = String.trim(task)
@@ -375,7 +570,7 @@ defmodule Pixir.Delegate.Runner do
   defp normalize_task_text(_task, index), do: {:error, invalid_task_entry(index)}
 
   defp reject_unknown_task_entry_keys(entry, index) do
-    allowed = MapSet.new(["task", "attachments"])
+    allowed = MapSet.new(@known_task_entry_keys)
 
     case Enum.find(Map.keys(entry), &(not MapSet.member?(allowed, &1))) do
       nil ->
@@ -385,10 +580,10 @@ defmodule Pixir.Delegate.Runner do
         {:error,
          task_entry_error(
            index,
-           "delegate tasks entries may only include task and attachments",
+           "delegate tasks entries may only include task, attachments, and seed_session_id",
            %{
              "unknown_key" => key,
-             "accepted_keys" => ["task", "attachments"],
+             "accepted_keys" => @known_task_entry_keys,
              "next_actions" => ["remove_unknown_field", "check_delegate_spec_contract"]
            }
          )}
@@ -506,6 +701,11 @@ defmodule Pixir.Delegate.Runner do
   defp task_attachments(%{attachments: attachments}) when is_list(attachments), do: attachments
   defp task_attachments(_task), do: []
 
+  defp task_seed_session_id(%{seed_session_id: seed}) when is_binary(seed) and seed != "",
+    do: seed
+
+  defp task_seed_session_id(_task), do: nil
+
   defp invalid_tasks do
     error_payload("invalid_spec", "subagents delegate spec requires non-empty task text", %{
       "missing_any_of" => ["task", "tasks"],
@@ -521,13 +721,16 @@ defmodule Pixir.Delegate.Runner do
         {key, timeout_candidate(spec, ["limits", key])}
       end)
 
+    spec_wait_horizon_candidate = Map.fetch!(root_limit_candidates, "wait_horizon_ms")
+
+    spec_legacy_candidates = [
+      Map.fetch!(root_limit_candidates, "timeout_ms"),
+      timeout_candidate(spec, ["timeout_ms"])
+    ]
+
     with {:ok, legacy_timeout_ms} <-
            normalize_timeout_candidate(
-             [
-               request_timeout_candidate(request),
-               Map.fetch!(root_limit_candidates, "timeout_ms"),
-               timeout_candidate(spec, ["timeout_ms"])
-             ],
+             [request_timeout_candidate(request) | spec_legacy_candidates],
              default_timeout_ms,
              "limits.timeout_ms"
            ),
@@ -542,25 +745,39 @@ defmodule Pixir.Delegate.Runner do
              [
                Map.fetch!(root_limit_candidates, "child_timeout_ms"),
                timeout_candidate(spec, ["subagents", "timeout_ms"])
+               | spec_legacy_candidates
              ],
-             legacy_timeout_ms,
+             default_timeout_ms,
              "limits.child_timeout_ms"
            ),
          {:ok, wait_horizon_ms} <-
            normalize_timeout_candidate(
              [
                request_wait_horizon_candidate(request),
-               Map.fetch!(root_limit_candidates, "wait_horizon_ms")
+               spec_wait_horizon_candidate
              ],
              delegate_timeout_ms,
              "limits.wait_horizon_ms"
            ) do
+      wait_horizon_explicit =
+        Enum.any?(
+          [
+            request_wait_horizon_candidate(request),
+            spec_wait_horizon_candidate
+          ],
+          fn
+            {value, _field} -> not is_nil(value)
+            nil -> false
+          end
+        )
+
       {:ok,
        %{
          legacy_timeout_ms: legacy_timeout_ms,
          delegate_timeout_ms: delegate_timeout_ms,
          child_timeout_ms: child_timeout_ms,
-         wait_horizon_ms: wait_horizon_ms
+         wait_horizon_ms: wait_horizon_ms,
+         wait_horizon_explicit: wait_horizon_explicit
        }}
     end
   end
@@ -911,7 +1128,9 @@ defmodule Pixir.Delegate.Runner do
          {:ok, mode} <- normalize_mode(Map.get(spec, "mode")),
          {:ok, write_policy} <- normalize_write_policy(spec, mode),
          {:ok, timeouts} <- normalize_timeouts(request, spec),
-         {:ok, workflow_spec} <- normalize_workflow_spec(spec, mode),
+         {:ok, workflow_spec, effective_timeout_ms, _declared_workflow_timeout_ms,
+          _declared_workflow_timeout_explicit} <-
+           normalize_effective_workflow_spec(spec, mode, timeouts),
          :ok <- ensure_workflow_child_count(workflow_spec, spec_meta) do
       {:ok,
        %{
@@ -921,10 +1140,28 @@ defmodule Pixir.Delegate.Runner do
          write_policy: write_policy,
          timeout_ms: timeouts.legacy_timeout_ms,
          delegate_timeout_ms: timeouts.delegate_timeout_ms,
+         workflow_timeout_ms: effective_timeout_ms,
          child_timeout_ms: timeouts.child_timeout_ms,
          wait_horizon_ms: timeouts.wait_horizon_ms,
          planned_step_count: spec_meta["planned_child_count"]
        }}
+    end
+  end
+
+  defp normalize_effective_workflow_spec(spec, mode, limits) do
+    with {:ok, workflow_spec} <- normalize_workflow_spec(spec, mode) do
+      declared_workflow_timeout_explicit = Map.has_key?(workflow_spec, "timeout_ms")
+
+      with {:ok, declared_timeout_ms} <-
+             normalize_timeout_value(
+               Map.get(workflow_spec, "timeout_ms", limits.delegate_timeout_ms),
+               "workflow.timeout_ms"
+             ) do
+        effective_timeout_ms = min(declared_timeout_ms, limits.wait_horizon_ms)
+
+        {:ok, Map.put(workflow_spec, "timeout_ms", effective_timeout_ms), effective_timeout_ms,
+         declared_timeout_ms, declared_workflow_timeout_explicit}
+      end
     end
   end
 
@@ -999,7 +1236,28 @@ defmodule Pixir.Delegate.Runner do
            permission_mode: parent_permission_mode(runtime.mode),
            write_policy: runtime.write_policy
          ) do
-      {:ok, session_id} -> {:ok, session_id}
+      {:ok, session_id} ->
+        with :ok <- record_horizon_override(session_id, runtime.horizon_override) do
+          {:ok, session_id}
+        end
+
+      {:error, error} ->
+        {:error, normalize_error(error)}
+    end
+  end
+
+  defp record_horizon_override(_session_id, nil), do: :ok
+
+  defp record_horizon_override(session_id, horizon_override) when is_map(horizon_override) do
+    data = %{
+      "event" => "horizon_override",
+      "source" => "allow_short_horizon",
+      "scope" => "delegate",
+      "horizon_override" => CriticalPath.horizon_values(horizon_override)
+    }
+
+    case Session.record(session_id, Event.subagent_event(session_id, data)) do
+      {:ok, _event} -> :ok
       {:error, error} -> {:error, normalize_error(error)}
     end
   end
@@ -1034,6 +1292,9 @@ defmodule Pixir.Delegate.Runner do
         |> Keyword.take([:provider, :provider_opts, :skills_opts, :agents_opts])
         |> Keyword.put(:workspace, runtime.workspace)
         |> maybe_put_opt(:index, task_index(task))
+        # Runtime-owned lineage rides opts, never args: a spec-forged args value must
+        # not be able to name a seed Session (#435).
+        |> maybe_put_opt(:seed_session_id, task_seed_session_id(task))
         |> Keyword.put(:permission_mode, runtime_permission_mode(runtime))
         |> Keyword.put(:write_policy, runtime.write_policy)
         |> maybe_put_opt(:virtual_overlay, runtime.virtual_overlay)
@@ -1083,7 +1344,7 @@ defmodule Pixir.Delegate.Runner do
       |> Keyword.put(:workspace, runtime.workspace)
       |> Keyword.put(:permission_mode, runtime_permission_mode(runtime))
       |> Keyword.put(:write_policy, runtime.write_policy)
-      |> Keyword.put(:timeout_ms, runtime.delegate_timeout_ms)
+      |> Keyword.put(:timeout_ms, runtime.workflow_timeout_ms)
 
     workflow_runner.(parent_session_id, runtime.workflow_spec, workflow_opts)
   end
@@ -1144,7 +1405,15 @@ defmodule Pixir.Delegate.Runner do
   defp result_payload(parent_session_id, runtime, agents, outcome) do
     {:ok, handle} = Handle.build(parent_session_id)
     status = delegate_status(outcome)
-    children = Enum.map(outcome["subagents"] || agents, &child_result(&1, :delegate_result))
+
+    children =
+      (outcome["subagents"] || agents)
+      |> Enum.map(fn agent ->
+        agent
+        |> child_result(:delegate_result)
+        |> maybe_put_child_write_denials(agent, runtime)
+      end)
+
     timeout_diagnostics = timeout_diagnostics(runtime, outcome, children)
 
     %{
@@ -1197,19 +1466,36 @@ defmodule Pixir.Delegate.Runner do
       },
       "next_actions" => delegate_next_actions(status, outcome)
     }
+    |> maybe_put("horizon_override", runtime.horizon_override)
+    |> put_write_denials(runtime, Enum.map(children, & &1["write_denials"]))
   end
+
+  defp maybe_put_child_write_denials(%{} = child, agent, %{mode: "bounded_write"} = runtime) do
+    Map.put(child, "write_denials", child_write_denials(agent, runtime))
+  end
+
+  defp maybe_put_child_write_denials(child, _agent, _runtime), do: child
+
+  # The child's Log lives in the child's own workspace, which is the delegate's
+  # only under `shared`; an isolated child gets its own directory.
+  defp child_write_denials(%{"child_session_id" => sid} = agent, %{workspace: workspace})
+       when is_binary(sid) do
+    WriteDenials.from_session(sid, agent["workspace"] || workspace)
+  end
+
+  defp child_write_denials(_agent, _runtime), do: WriteDenials.empty()
 
   defp workflow_result_payload(parent_session_id, runtime, result) do
     {:ok, handle} = Handle.build(parent_session_id)
     status = workflow_delegate_status(result)
     steps = result["steps"] || []
     observed_applied_writes_by_step = workflow_observed_applied_writes_by_step(runtime, steps)
+    write_denials_by_step = workflow_write_denials_by_step(runtime, steps)
 
     children =
-      steps
-      |> Enum.zip(observed_applied_writes_by_step)
-      |> Enum.map(fn {step, observed_applied_writes} ->
-        workflow_child_result(step, observed_applied_writes)
+      [steps, observed_applied_writes_by_step, write_denials_by_step]
+      |> Enum.zip_with(fn [step, observed_applied_writes, write_denials] ->
+        workflow_child_result(step, observed_applied_writes, write_denials)
       end)
 
     %{
@@ -1273,6 +1559,8 @@ defmodule Pixir.Delegate.Runner do
       },
       "next_actions" => workflow_next_actions(status, result)
     }
+    |> maybe_put("horizon_override", runtime.horizon_override)
+    |> put_write_denials(runtime, write_denials_by_step)
   end
 
   defp workflow_projection(result) do
@@ -1289,7 +1577,7 @@ defmodule Pixir.Delegate.Runner do
   defp workflow_delegate_status(%{"status" => "completed"}), do: "completed"
   defp workflow_delegate_status(_result), do: "partial"
 
-  defp workflow_child_result(step, observed_applied_writes) do
+  defp workflow_child_result(step, observed_applied_writes, write_denials) do
     %{
       "step_id" => step["step_id"] || step["id"],
       "subagent_id" => step["agent_id"],
@@ -1302,13 +1590,23 @@ defmodule Pixir.Delegate.Runner do
       "task" => step["task"],
       "workspace_mode" => step["workspace_mode"],
       "writes_applied_to" => workflow_step_write_destination(step),
+      # Unconditional, matching child_result_base/1: a cold child reports the ABSENCE
+      # of a seed rather than omitting the distinction (#435).
+      "warm_start" => WarmStart.envelope_projection(step["warm_start"]),
       "checkpoint" => step["checkpoint"],
       "next_actions" => step["safe_next_actions"] || []
     }
     |> maybe_put("timeout_ms", step["timeout_ms"])
     |> maybe_put("write_policy", step["write_policy"])
     |> maybe_put_observed_applied_writes(observed_applied_writes)
+    |> put_step_write_denials(write_denials)
   end
+
+  # `nil` here means the run is not `bounded_write` (see
+  # `workflow_write_denials_by_step/2`), the one case with no confession to make.
+  # Under `bounded_write` the step always carries one, empty or not.
+  defp put_step_write_denials(step, nil), do: step
+  defp put_step_write_denials(step, confession), do: Map.put(step, "write_denials", confession)
 
   defp workflow_delegate_summary("completed", result) do
     summary = result["summary"] || %{}
@@ -1432,6 +1730,66 @@ defmodule Pixir.Delegate.Runner do
     |> Enum.uniq()
   end
 
+  # The mandatory bounded-write confession (#446). Every bounded-write run
+  # carries it — top level and per child — present with a zero value when
+  # nothing was denied, so a clean status after a recovered denial cannot read
+  # as a boundary-free run. Non-bounded runs have no boundary to confess.
+  defp workflow_write_denials_by_step(%{mode: "bounded_write"} = runtime, steps) do
+    Enum.map(steps, &step_write_denials(runtime, &1))
+  end
+
+  defp workflow_write_denials_by_step(_runtime, steps), do: Enum.map(steps, fn _ -> nil end)
+
+  # A step's checkpoint already carries the confession when Workflows built it;
+  # a step that reached us without one is folded from its own child Log.
+  defp step_write_denials(_runtime, %{"checkpoint" => %{"write_denials" => %{} = confession}}),
+    do: confession
+
+  defp step_write_denials(%{workspace: workspace}, %{"child_session_id" => sid} = step)
+       when is_binary(sid) do
+    WriteDenials.from_session(sid, step["workspace"] || workspace)
+  end
+
+  defp step_write_denials(_runtime, _step), do: WriteDenials.empty()
+
+  # The confession is unconditional on a terminal bounded-write envelope, never
+  # `maybe_put`: a run with no children at all — a spawn failure, a workflow that
+  # died before its first step — is exactly when a coordinator reads the envelope,
+  # and an omitted key would read as "nothing was denied" on no evidence. Absence
+  # is a schema violation (#446), so the empty confession is put structurally
+  # rather than derived from the children that happen to exist.
+  #
+  # Non-bounded-write runs have no write policy and therefore no confession to
+  # make; the key stays absent for them, as it always has.
+  defp put_write_denials(payload, %{mode: "bounded_write"}, per_child),
+    do: Map.put(payload, "write_denials", aggregate_write_denials(per_child))
+
+  defp put_write_denials(payload, _runtime, _per_child), do: payload
+
+  # Unavailability is contagious upward. If any child's Log could not be read,
+  # the aggregate cannot honestly claim a total: a top-level `count` would let a
+  # coordinator sum an unreadable child's denials as zero, which is the exact
+  # fail-open the per-child `"unavailable"` status closes. The denials that *were*
+  # read are still reported; the total is withheld and the reason named.
+  defp aggregate_write_denials(per_child) do
+    present = Enum.reject(per_child, &is_nil/1)
+    denials = Enum.flat_map(present, &(&1["denials"] || []))
+
+    case Enum.filter(present, &(&1["status"] == "unavailable")) do
+      [] ->
+        %{"count" => length(denials), "denials" => denials}
+
+      unavailable ->
+        %{
+          "status" => "unavailable",
+          "error" =>
+            "#{length(unavailable)} child Log(s) could not be read: " <>
+              Enum.map_join(unavailable, "; ", &(&1["error"] || "unknown error")),
+          "denials" => denials
+        }
+    end
+  end
+
   defp workflow_observed_applied_writes_by_step(%{mode: "bounded_write"} = runtime, steps) do
     Enum.map(steps, &workflow_observed_applied_writes(runtime, &1))
   end
@@ -1526,59 +1884,61 @@ defmodule Pixir.Delegate.Runner do
     {:ok, owner} = Owner.live_owner_state(handle, %{"runtime_residency" => runtime_residency()})
     children = Enum.map(agents, &child_result/1)
 
-    payload = %{
-      "ok" => is_nil(spawn_error),
-      "status" => status,
-      "kind" => "delegate_start",
-      "strategy" => "subagents",
-      "delegate_id" => handle["delegate_id"],
-      "parent_session_id" => parent_session_id,
-      "session_id" => parent_session_id,
-      "handle" => handle,
-      "workspace" => runtime.workspace,
-      "children" => children,
-      "summary" => start_summary(status, runtime, agents, spawn_error),
-      "artifacts" => [],
-      "diagnostics" => diagnostics(parent_session_id, runtime.workspace),
-      "timeout_diagnostics" => start_timeout_diagnostics(runtime, children, spawn_error),
-      "limits" => %{
-        "timeout_ms" => runtime.timeout_ms,
-        "delegate_timeout_ms" => runtime.delegate_timeout_ms,
-        "child_timeout_ms" => runtime.child_timeout_ms,
-        "wait_horizon_ms" => runtime.wait_horizon_ms,
-        "timeout_semantics" => timeout_semantics(),
-        "max_threads" => runtime.max_threads,
-        "transport" => runtime.provider_transport,
-        "max_depth" => runtime.max_depth,
-        "mode" => runtime.mode,
-        "workspace_mode" => runtime.workspace_mode,
-        "write_policy" => WritePolicy.metadata(runtime.write_policy)
-      },
-      "owner" => owner,
-      "service_state" => owner["state"],
-      "runtime_residency" => runtime_residency(),
-      "beam_coordination" => %{
-        "mode" => "owner_start",
-        "entrypoint" => "single_pixir_process",
-        "fanout_model" => "BEAM Subagents through Pixir.Subagents.Manager",
+    payload =
+      %{
+        "ok" => is_nil(spawn_error),
+        "status" => status,
+        "kind" => "delegate_start",
         "strategy" => "subagents",
-        "planned_child_count" => runtime.planned_child_count,
-        "spawned_child_count" => length(agents),
-        "completed_child_count" => 0
-      },
-      "host_boundary" => %{
-        "external_process_spawns" => 0,
-        "external_process_spawns_scope" => "delegate_start_entrypoint_only_not_child_tools",
-        "measurement" => "static_contract_assertion_not_global_host_metric",
-        "nested_pixir_processes" => 0,
-        "nested_mix_processes" => 0,
-        "shell_polling" => false,
-        "host_command_execution" => "none_in_delegate_start",
-        "child_host_commands" => "inspect_child_session_logs_and_diagnostics",
-        "rule" => "treat every external process spawn as a scarce observable boundary crossing"
-      },
-      "next_actions" => start_next_actions(status)
-    }
+        "delegate_id" => handle["delegate_id"],
+        "parent_session_id" => parent_session_id,
+        "session_id" => parent_session_id,
+        "handle" => handle,
+        "workspace" => runtime.workspace,
+        "children" => children,
+        "summary" => start_summary(status, runtime, agents, spawn_error),
+        "artifacts" => [],
+        "diagnostics" => diagnostics(parent_session_id, runtime.workspace),
+        "timeout_diagnostics" => start_timeout_diagnostics(runtime, children, spawn_error),
+        "limits" => %{
+          "timeout_ms" => runtime.timeout_ms,
+          "delegate_timeout_ms" => runtime.delegate_timeout_ms,
+          "child_timeout_ms" => runtime.child_timeout_ms,
+          "wait_horizon_ms" => runtime.wait_horizon_ms,
+          "timeout_semantics" => timeout_semantics(),
+          "max_threads" => runtime.max_threads,
+          "transport" => runtime.provider_transport,
+          "max_depth" => runtime.max_depth,
+          "mode" => runtime.mode,
+          "workspace_mode" => runtime.workspace_mode,
+          "write_policy" => WritePolicy.metadata(runtime.write_policy)
+        },
+        "owner" => owner,
+        "service_state" => owner["state"],
+        "runtime_residency" => runtime_residency(),
+        "beam_coordination" => %{
+          "mode" => "owner_start",
+          "entrypoint" => "single_pixir_process",
+          "fanout_model" => "BEAM Subagents through Pixir.Subagents.Manager",
+          "strategy" => "subagents",
+          "planned_child_count" => runtime.planned_child_count,
+          "spawned_child_count" => length(agents),
+          "completed_child_count" => 0
+        },
+        "host_boundary" => %{
+          "external_process_spawns" => 0,
+          "external_process_spawns_scope" => "delegate_start_entrypoint_only_not_child_tools",
+          "measurement" => "static_contract_assertion_not_global_host_metric",
+          "nested_pixir_processes" => 0,
+          "nested_mix_processes" => 0,
+          "shell_polling" => false,
+          "host_command_execution" => "none_in_delegate_start",
+          "child_host_commands" => "inspect_child_session_logs_and_diagnostics",
+          "rule" => "treat every external process spawn as a scarce observable boundary crossing"
+        },
+        "next_actions" => start_next_actions(status)
+      }
+      |> maybe_put("horizon_override", runtime.horizon_override)
 
     payload =
       if spawn_error do
@@ -1625,6 +1985,7 @@ defmodule Pixir.Delegate.Runner do
         "write_policy" => WritePolicy.metadata(runtime.write_policy)
       }
     }
+    |> maybe_put("horizon_override", runtime.horizon_override)
   end
 
   defp refresh_evidence_payload(payload) do
@@ -1953,7 +2314,11 @@ defmodule Pixir.Delegate.Runner do
       "output_warning_count" => agent["output_warning_count"] || 0,
       "output_warnings" => agent["output_warnings"] || [],
       "output_warning_reasons" => agent["output_warning_reasons"] || [],
-      "output_warnings_truncated" => agent["output_warnings_truncated"] || false
+      "output_warnings_truncated" => agent["output_warnings_truncated"] || false,
+      # Unconditional: a cold child reports the ABSENCE of a seed rather than
+      # omitting the distinction, so an operator can tell warm from cold without
+      # reading Logs (#435).
+      "warm_start" => WarmStart.envelope_projection(agent["warm_start"])
     }
     |> maybe_put("index", agent["index"])
     |> maybe_put("timeout_ms", agent["timeout_ms"])

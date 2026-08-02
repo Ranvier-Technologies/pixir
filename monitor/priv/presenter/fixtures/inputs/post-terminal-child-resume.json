@@ -1,0 +1,175 @@
+{
+  "fixture_schema": "pixir.presenter.fixture",
+  "fixture_version": 1,
+  "scenario": "post-terminal-child-resume",
+  "source_class": "synthetic_from_workflow_contract",
+  "observed_at": "2026-07-30T11:00:00Z",
+  "inputs": {
+    "terminal_envelope": {
+      "kind": "delegate_result",
+      "delegate_id": "dlg-post-terminal",
+      "parent_session_id": "parent-post-terminal",
+      "strategy": "workflow",
+      "mode": "read_only",
+      "workflow_id": "wf-post-terminal",
+      "status": "partial",
+      "safe_next_actions": [
+        "inspect_child_session_log",
+        "ask_user_or_orchestrator"
+      ]
+    },
+    "delegate_snapshot": null,
+    "parent_log": [
+      {
+        "seq": 0,
+        "ts": "2026-07-30T10:00:00Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "workflow_started",
+          "workflow_id": "wf-post-terminal",
+          "workflow_name": "Cancelled by timeout, resumed at the child",
+          "graph": {
+            "steps": [
+              {
+                "id": "worker",
+                "agent": "worker",
+                "depends_on": [],
+                "execution_kind": "subagent",
+                "workspace_mode": "shared",
+                "posture": "read_only"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "seq": 1,
+        "ts": "2026-07-30T10:00:01Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "started",
+          "status": "running",
+          "subagent_id": "sub-post-terminal",
+          "child_session_id": "child-post-terminal",
+          "agent": "worker",
+          "delegation_context": {
+            "step_id": "worker"
+          }
+        }
+      },
+      {
+        "seq": 2,
+        "ts": "2026-07-30T10:00:02Z",
+        "type": "subagent_event",
+        "data": {
+          "event": "timed_out",
+          "status": "timed_out",
+          "subagent_id": "sub-post-terminal",
+          "child_session_id": "child-post-terminal",
+          "agent": "worker",
+          "reason": "close_failed_after_workflow_timeout",
+          "next_actions": [
+            "inspect_child_session_log",
+            "ask_user_or_orchestrator"
+          ],
+          "delegation_context": {
+            "step_id": "worker"
+          }
+        }
+      },
+      {
+        "seq": 3,
+        "ts": "2026-07-30T10:00:03Z",
+        "type": "workflow_event",
+        "data": {
+          "kind": "workflow_finished",
+          "workflow_id": "wf-post-terminal",
+          "status": "partial",
+          "ok": false,
+          "safe_next_actions": [
+            "inspect_child_session_log",
+            "ask_user_or_orchestrator"
+          ]
+        }
+      }
+    ],
+    "parent_log_origin": "fixture",
+    "child_logs": {
+      "child-post-terminal": [
+        {
+          "seq": 0,
+          "ts": "2026-07-30T10:00:01Z",
+          "type": "user_message",
+          "data": {}
+        },
+        {
+          "seq": 1,
+          "ts": "2026-07-30T10:00:02Z",
+          "type": "provider_usage",
+          "data": {
+            "model": "gpt-5.6-sol",
+            "usage_summary": {
+              "input_tokens": 1200,
+              "output_tokens": 180,
+              "reasoning_tokens": 120,
+              "total_tokens": 1380,
+              "cached_tokens": 0,
+              "cache": {
+                "creation_tokens": 0,
+                "read_tokens": 0
+              }
+            }
+          }
+        },
+        {
+          "seq": 2,
+          "ts": "2026-07-30T10:05:00Z",
+          "type": "user_message",
+          "data": {}
+        },
+        {
+          "seq": 3,
+          "ts": "2026-07-30T10:40:00Z",
+          "type": "provider_usage",
+          "data": {
+            "model": "gpt-5.6-sol",
+            "usage_summary": {
+              "input_tokens": 4800,
+              "output_tokens": 640,
+              "reasoning_tokens": 410,
+              "total_tokens": 5440,
+              "cached_tokens": 0,
+              "cache": {
+                "creation_tokens": 0,
+                "read_tokens": 0
+              }
+            }
+          }
+        },
+        {
+          "seq": 4,
+          "ts": "2026-07-30T10:41:00Z",
+          "type": "assistant_message",
+          "data": {}
+        }
+      ]
+    },
+    "runtime_diagnostics": null,
+    "owner_state": {
+      "state": "stale_handle",
+      "reachable": false,
+      "reason": "workflow ended partial; no owner handle remains"
+    },
+    "evidence_mirror": null
+  },
+  "completeness": {
+    "parent_log": "complete",
+    "child_logs": "complete_through_observed_at"
+  },
+  "sanitization": {
+    "absolute_paths_removed": true,
+    "identifiers_replaced": true,
+    "model_content_minimized": true,
+    "secrets_removed": true
+  }
+}

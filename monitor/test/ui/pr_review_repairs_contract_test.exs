@@ -51,12 +51,21 @@ defmodule PixirMonitor.UI.PRReviewRepairsContractTest do
                }
            """
 
-    assert length(String.split(@app_js, "fetchJSON(")) == 6
+    # The network surface stays closed and enumerated. Issue #438 added exactly
+    # ONE call site — the single-mode inventory acquisition behind a
+    # run_not_found dead end — and reuses refetchWorkspaceList unchanged for the
+    # workspace-set branch rather than opening a second one.
+    assert length(String.split(@app_js, "fetchJSON(")) == 7
     assert length(String.split(@app_js, "fetchJSON(\"/api/workspaces/\" + encodeURIComponent(workspace) + \"/runs\", null)")) == 2
     assert @app_js =~ "return refetchWorkspaceList(workspace, null)"
     assert @app_js =~ "await refetchWorkspaceList(workspace, null)"
+    assert @app_js =~ "? refetchWorkspaceList(route.workspace, null)"
     assert @app_js =~ "fetchJSON(\"/api/workspaces/\" + encodeURIComponent(workspace) + \"/runs\" + suffix, current)"
     assert @app_js =~ "fetchJSON(\"/api/runs\", current)"
+    # The #438 acquisition commits under the generation captured before it is
+    # issued, so it too is arbitrated and cannot overwrite newer inventory.
+    assert @app_js =~ "fetchJSON(\"/api/runs\", acquisitionGeneration)"
+    refute @app_js =~ "fetchJSON(\"/api/runs\", null)"
     assert @app_js =~ "fetchJSON(\"/api/runs/\" + encodeURIComponent(route.runId), current)"
   end
 

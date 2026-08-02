@@ -28,7 +28,10 @@ Another presenter over `Conversation` + the Events bus (ADR 0008) — the core i
   no deltas. See [[pixir-canonical-vs-presentation]].
 - **Turn error → content, not protocol error:** a failed turn resolves `stopReason:"end_turn"`
   with the error text as a chunk; JSON-RPC errors are only for protocol faults (-32601 unknown
-  method, -32602 bad params/unknown session, -32700 parse, -32600 invalid request).
+  method, -32602 bad params/unknown session, -32700 parse, -32600 invalid request). The
+  machine-readable signal rides on the prompt RESULT as `_meta.pixir.turn_failure`, attached
+  exactly when a `turn_failed` event was observed during the prompt (evidence-based, bounded
+  fields; #465, ADR 0009 §5 amendment).
 - **Current ACP v1 surface:** `initialize`, `authenticate`, `logout`, `session/new`,
   `session/prompt`, `session/cancel`, `session/load`, `session/resume`,
   `session/set_mode`, `session/set_config_option`, and outbound

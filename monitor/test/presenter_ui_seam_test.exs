@@ -62,9 +62,14 @@ defmodule PixirMonitor.PresenterUiSeamTest do
              "triples" => 16384
            }
 
+    # Issue #438: parent-observed child resolution is executed, not pinned as
+    # source text. The case count is exact so a family cannot be quietly
+    # dropped from the checker.
+    assert result["child_resolution_cases"] == 11
+
     # The checks themselves are proven to bite: each family must have gone RED
     # against a deliberately broken seam before the green run counts (the #362
     # red-proof idiom).
-    assert result["red_proof_families"] == 3
+    assert result["red_proof_families"] == 4
   end
 end

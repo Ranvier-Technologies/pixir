@@ -46,6 +46,71 @@ valuable, but it is not a successful completion.
 Downstream steps unlock only from `checkpoint_ready`, never from raw Subagent
 `completed` alone.
 
+## Which workflow shape to reach for
+
+**For implementation lanes the canonical shape is a single-step workflow whose
+verification is performed by the parent.** Multi-step in-workflow gating remains
+fully supported and is not deprecated — it is the right tool for read-only
+pipelines and for lanes whose steps can run their own checks.
+
+The discriminator is not the number of steps or the kind of work; it is
+**whether a step can verify its own work**. A step that can run the build, the
+tests, or the linter produces a `checkpoint_ready` checkpoint that honestly
+unblocks its dependents. A step that cannot — a bounded writer with no shell
+being the clearest case — has no way to reach `checkpoint_ready` on its own
+merits, so a graph that gates a dependent on it is fail-by-default: the
+dependent is held with `dependency_not_checkpoint_ready` and the whole run
+terminates `partial`. Splitting such a lane across steps buys ordering the
+parent already has, at the cost of a run that cannot complete.
+
+| Lane | Blessed shape | Why |
+| --- | --- | --- |
+| Implementation (a writer that cannot run checks) | Single-step workflow; the parent verifies and sequences | The writer cannot self-verify, so nothing downstream can honestly gate on it |
+| Read-only pipeline (survey → synthesize, propose → review) | Multi-step gating | Read-only steps reach `checkpoint_ready` on completion; gating is real |
+| Checks-capable lane (a step that runs build/tests itself) | Multi-step gating | The step's own checks are the evidence that unblocks dependents |
+| Writer whose audit *is* the verification | Multi-step with `allow_unverified_depends_on` | See below; the gate relaxation is an operator assertion, not runtime proof |
+
+### The unverified-dependency opt-in
+
+`allow_unverified_depends_on` is a per-step, per-dependency escape hatch that
+makes in-workflow audit viable for shell-less writer lanes. A step lists a
+subset of its own `depends_on` ids; each named dependency then unblocks the step
+under a narrow admission rule:
+
+> The named dependency's child reached a **successful terminal completion** and
+> its derived `checkpoint_status` is **`partial`**.
+
+Everything else stays inadmissible: a completed child self-declaring `failed` or
+`needs_orchestrator`, a child that timed out or was cancelled, and a dependency
+that was itself `held`. The opt-in is never a default and never global — absent
+the flag the strict `checkpoint_ready` gate is unchanged for every step and
+posture, and a dependency the flag does not name still gates strictly even when
+a sibling dependency is named. Naming an id that is not in the step's own
+`depends_on` is a normalization error; the workflow never launches.
+
+**The evidence caveat is the point.** The runtime cannot distinguish "finished
+the work but could not self-verify" from "genuinely did not finish": both are a
+completed child that marked itself `partial`. There is no new terminal state and
+none is planned. So using the flag is an *operator assertion about the lane*,
+not a runtime-proven property, and the runtime records that honestly instead of
+pretending otherwise:
+
+- The opted-in step's checkpoint bundle carries
+  `verification.unverified_dependencies` naming the dependency ids that supplied
+  the unverified basis, and adds `ran_against_unverified_dependencies` to its
+  `known_limitations`.
+- The same information appears in the step's `workflow_checkpoint.v1` typed
+  payload as `unverified_dependencies`, alongside `verification_source` and
+  `known_limitations`, so a consumer reading only the checkpoint bundle can tell
+  that these conclusions rest on unverified upstream work.
+- The opt-in **never launders the upstream dependency**. The writer keeps its
+  derived `checkpoint_status`, its `dependent_safe: false`, and its own
+  `known_limitations`, and it still counts as `partial` in workflow-level
+  rollups. A run whose writer stayed `partial` still terminates `partial`.
+
+The flag is visible in `dry_run` step plans, so an operator can confirm the gate
+relaxation before launching.
+
 ## WorkflowRun decision
 
 Do not introduce a durable `WorkflowRun` GenServer in this slice.

@@ -2,7 +2,7 @@ defmodule Pixir.Tools.ExecutorTest do
   use ExUnit.Case, async: false
 
   alias Pixir.{Events, Log, SessionSupervisor}
-  alias Pixir.Permissions.WritePolicy
+  alias Pixir.Permissions.{WriteDenials, WritePolicy}
   alias Pixir.Test.WorkspaceFixtures
   alias Pixir.Tools.Executor
 
@@ -652,6 +652,110 @@ defmodule Pixir.Tools.ExecutorTest do
       assert List.last(history).data["error"]["kind"] == "write_policy_denied"
     end
 
+    # Confinement and root denials never reach the allowlist check, so they are
+    # the sites where policy identity is easiest to lose. They strike in Turn
+    # and land in the confession like any other write denial, and a confession
+    # entry that cannot be attributed to a policy — or that names no target — is
+    # one the coordinator cannot reconcile. Pinned end to end, on the real
+    # Executor stamp rather than a hand-built event.
+    test "confinement and root denials confess their policy and their target", %{
+      ctx: ctx,
+      sid: sid,
+      ws: ws
+    } do
+      {:ok, policy} = write_policy(["**/*"])
+      ctx = Map.put(ctx, :permission, %{mode: :auto, policy: policy})
+
+      assert {:error, %{error: %{kind: :write_policy_denied}}} =
+               Executor.run(
+                 %{
+                   call_id: "outside",
+                   name: "write",
+                   args: %{"path" => "../escape.txt", "content" => "no"}
+                 },
+                 ctx
+               )
+
+      assert {:error, %{error: %{kind: :write_policy_denied}}} =
+               Executor.run(
+                 %{call_id: "root", name: "write", args: %{"path" => ".", "content" => "no"}},
+                 ctx
+               )
+
+      refute File.exists?(Path.join(ws, "../escape.txt"))
+
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+      decisions = Enum.filter(history, &(&1.type == :permission_decision))
+      assert length(decisions) == 2
+
+      for decision <- decisions do
+        assert decision.data["gate"] == "write_policy"
+        assert decision.data["decision"] == "deny"
+        assert decision.data["tool"] == "write"
+        assert decision.data["policy_id"] == "executor-test"
+        assert decision.data["policy_hash"] == policy["hash"]
+        assert decision.data["policy_version"] == 1
+      end
+
+      [outside, root] = decisions
+      assert outside.data["matched_rule"] == "path_outside_workspace"
+      assert outside.data["requested_path"] == "../escape.txt"
+      assert root.data["matched_rule"] == "workspace_root_not_writable"
+      assert root.data["normalized_path"] == "."
+
+      assert %{"count" => 2, "denials" => [outside_denial, root_denial]} =
+               WriteDenials.from_history(history)
+
+      assert outside_denial["normalized_path"] == "../escape.txt"
+      assert outside_denial["policy_id"] == "executor-test"
+      assert root_denial["normalized_path"] == "."
+      assert root_denial["policy_id"] == "executor-test"
+    end
+
+    # The symlink walk stops at the first bad component, but the component is not
+    # the aim: a write to `link/deep/out.txt` refused at `link` must confess the
+    # path the call actually named, or the coordinator cannot tell *which* write
+    # under `link/` was refused. Pinned through the production shape — real
+    # Executor stamp, real Log, `WriteDenials.from_history` — because the same
+    # assertion against `authorize_tool/4` details alone would survive a revert
+    # of the Log plumbing that carries the component through.
+    test "a symlink denial confesses the requested path and keeps the component", %{
+      ctx: ctx,
+      sid: sid,
+      ws: ws
+    } do
+      File.mkdir_p!(Path.join(ws, "real/deep"))
+      File.ln_s!(Path.join(ws, "real"), Path.join(ws, "link"))
+
+      {:ok, policy} = write_policy(["**/*"])
+      ctx = Map.put(ctx, :permission, %{mode: :auto, policy: policy})
+
+      assert {:error, %{error: %{kind: :write_policy_denied}}} =
+               Executor.run(
+                 %{
+                   call_id: "symlink",
+                   name: "write",
+                   args: %{"path" => "link/deep/out.txt", "content" => "no"}
+                 },
+                 ctx
+               )
+
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+      [decision] = Enum.filter(history, &(&1.type == :permission_decision))
+
+      assert decision.data["matched_rule"] == "symlink_path_component"
+      assert decision.data["requested_path"] == "link/deep/out.txt"
+      # The failing component survives the Executor's stamp in its own key, so
+      # the coordinator learns both the aim and where the walk stopped.
+      assert decision.data["symlink_component"] == "link"
+
+      assert %{"count" => 1, "denials" => [denial]} = WriteDenials.from_history(history)
+
+      assert denial["normalized_path"] == "link/deep/out.txt"
+      assert denial["symlink_component"] == "link"
+      assert denial["policy_id"] == "executor-test"
+    end
+
     test "bounded write policy keeps unsafe bash disabled", %{ctx: ctx, ws: ws} do
       {:ok, policy} = write_policy(["allowed/**"])
       ctx = Map.put(ctx, :permission, %{mode: :auto, policy: policy})
@@ -669,7 +773,7 @@ defmodule Pixir.Tools.ExecutorTest do
                Executor.run(%{call_id: "safe", name: "bash", args: %{"command" => "ls"}}, ctx)
     end
 
-    test "bounded write policy preserves outside_workspace for bash read escapes", %{
+    test "bounded write policy strikes on bash read escapes, keeping the rule", %{
       ctx: ctx,
       sid: sid,
       ws: ws
@@ -680,7 +784,10 @@ defmodule Pixir.Tools.ExecutorTest do
       {:ok, policy} = write_policy(["allowed/**"])
       ctx = Map.put(ctx, :permission, %{mode: :auto, policy: policy})
 
-      assert {:error, %{error: %{kind: :outside_workspace, details: details}}} =
+      # Reaching outside the workspace under a bounded write policy is a boundary
+      # probe, so the kind is `write_policy_denied` and it strikes (#446). The
+      # specific rule that refused it survives in `matched_rule`.
+      assert {:error, %{error: %{kind: :write_policy_denied, details: details}}} =
                Executor.run(
                  %{
                    call_id: "outside",
@@ -693,6 +800,7 @@ defmodule Pixir.Tools.ExecutorTest do
       assert details["tool"] == "bash"
       assert details["token"] == fixture.outside_file
       assert details["matched_rule"] == "outside_workspace"
+      assert details["requested_command"] == "cat #{fixture.outside_file}"
 
       File.write!(Path.join(ws, "README.md"), "inside")
 
@@ -715,7 +823,7 @@ defmodule Pixir.Tools.ExecutorTest do
           event.type == :tool_result and event.data["call_id"] == "outside"
         end)
 
-      assert outside_result.data["error"]["kind"] == "outside_workspace"
+      assert outside_result.data["error"]["kind"] == "write_policy_denied"
     end
   end
 

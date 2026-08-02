@@ -6,13 +6,16 @@ defmodule PixirMonitor.ProjectionParityTest do
 
   @package Path.expand("../../priv/presenter", __DIR__)
   @scenarios ~w(
+    child-write-and-policy-deny
     evidence-mirror-canonical-conflict
+    externally-owned-running-advancing
     f4-advisory-retry-reconstructed
     held-missing-child-log
     invalid-model-advisory
     live-runtime-only-no-log
     mixed-running-current
     partial-write-indeterminate
+    post-terminal-child-resume
     resume-reused-child-session
     stale-running-no-owner
     timeout-needs-orchestrator

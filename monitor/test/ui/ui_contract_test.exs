@@ -9,9 +9,9 @@ defmodule PixirMonitor.UIContractTest do
     {:ok, js: File.read!(@js), css: File.read!(@css)}
   end
 
-  test "all thirteen golden projections have a deterministic Runs row and group" do
+  test "all sixteen golden projections have a deterministic Runs row and group" do
     manifest = Jason.decode!(File.read!(Path.join(@fixture_root, "manifest.json")))
-    assert length(manifest["scenarios"]) == 13
+    assert length(manifest["scenarios"]) == 16
 
     rows =
       Enum.map(manifest["scenarios"], fn %{"id" => id} ->
@@ -34,9 +34,16 @@ defmodule PixirMonitor.UIContractTest do
         }
       end)
 
-    assert Enum.count(rows, &(&1.group == "Needs attention")) == 10
-    assert Enum.count(rows, &(&1.group == "Recent")) == 3
+    assert Enum.count(rows, &(&1.group == "Needs attention")) == 12
+    assert Enum.count(rows, &(&1.group == "Recent")) == 4
     assert Enum.any?(rows, &(&1.group == "Recent" and &1.strategy == "workflow"))
+
+    # Regression pin for #440: a healthy externally observed run is nonterminal
+    # and healthy at the same time. It must not be filed under Needs attention
+    # purely because this process does not own the Delegate.
+    external = Enum.find(rows, &(&1.liveness == "externally_owned"))
+    assert external.execution == "running"
+    assert external.group == "Recent"
   end
 
   test "F4 Workflow and Unit flows keep execution, gate, advisory, attempts, and usage separate", %{js: js} do
@@ -51,14 +58,26 @@ defmodule PixirMonitor.UIContractTest do
     assert Enum.map(review["attempts"], & &1["child_session_id"]) == ["child-f4-a", "child-f4-b"]
     assert review["usage"]["calls"] == 2
 
-    # Six per the frozen #363/#336 contract: execution, liveness, gate, advisory,
-    # run-scoped source, attention. The rail renders exactly six cards.
-    assert js =~ "Six independent truth dimensions"
+    # Seven since #447: the frozen #363/#336 six — execution, liveness, gate,
+    # advisory, run-scoped source, attention — plus post-terminal child
+    # activity, which reports rather than reclassifies any of them.
+    assert js =~ "Seven independent truth dimensions"
+    assert js =~ ~s|card.dataset.truthDimension = "post_terminal_child_activity";|
     assert js =~ "Advisory does not control the runtime gate."
     assert js =~ "attempt.ordinal + 1"
     assert js =~ "\"Provisional\""
     assert js =~ "Attempt activity via evidence references"
     assert js =~ "Evidence-derived usage"
+
+    # #441 copy contract: every slot names the fact it reports. The usage
+    # completeness word is scoped to the evidence so it cannot be read as run
+    # state; the run subtitle carries one `projection` token, not two; and the
+    # advisory `unknown` bucket is labeled rather than shown as a raw token.
+    assert js =~ ~s|"Evidence complete" : "Evidence incomplete"|
+    refute js =~ ~s|(usage && usage.complete ? "Complete" : "Incomplete")|
+    refute js =~ ~s|" · projection " + scalar(run.projection_id, "unknown")|
+    refute js =~ "projection projection:"
+    assert js =~ ~s|const ADVISORY_DISPLAY_ALIASES = Object.freeze({unknown: "unclassified verdict"});|
   end
 
   test "fan-out is a parent/sibling tree and never derives dependency edges", %{js: js} do

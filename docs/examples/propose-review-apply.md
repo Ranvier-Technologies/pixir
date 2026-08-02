@@ -134,3 +134,25 @@ that would land, and the mutation is a single explicit, policy-gated,
 hash-checked event with durable evidence at every hop. See ADR 0028 (workspace
 strategies and the virtual overlay), ADR 0029 (virtual-diff artifacts), and
 ADR 0030 (explicit apply and merge-back) for the design lineage.
+
+## When multi-step gating is the right tool — and when it is not
+
+This example is a read-only pipeline with an engine step at the end: the
+propose step reaches `checkpoint_ready` from its own artifact, and the review
+step reaches it on completion. Multi-step in-workflow gating is exactly right
+here.
+
+It is *not* the blessed shape for implementation lanes. A bounded writer with
+no shell cannot run the build or the tests, so it cannot honestly reach
+`checkpoint_ready`, and any dependent gated on it is held with
+`dependency_not_checkpoint_ready` while the run terminates `partial`. For those
+lanes the canonical shape is a **single-step workflow whose verification is
+performed by the parent**. The discriminator is whether the step can verify its
+own work, not how many steps the plan has.
+
+When the audit step *is* the verification of a shell-less writer, the narrow
+`allow_unverified_depends_on` per-step opt-in lets that audit schedule against a
+completed-but-unverified dependency and records the unverified basis in its own
+checkpoint. See the workflow contract design note
+(`docs/design/0003-workflow-contract-and-workflowrun-slice.md`) and ADR 0014 for
+the admission rule and the evidence caveat.

@@ -8,6 +8,33 @@ defmodule Pixir.Tools.Executor do
   before running and the `tool_result` Event after (both via `Pixir.Session`, so they
   get a `seq`, hit the Log, and publish). `execute_call/2` is the side-effect-free core
   (no Events) used directly in unit tests.
+
+  ## Bounded-write denials: feedback once, fatal on the second strike
+
+  A bounded-write policy denial is **not** unconditionally terminal (#446). The
+  Executor decides and records the denial; `Pixir.Turn` decides what it costs:
+
+  - **Strike 1 is recoverable.** The `tool_result` recorded here for the denied
+    call — carrying the denied tool, the requested and normalized path, the
+    matched rule, the policy identity, and `next_actions` — reaches the model as
+    that call's tool output on the next provider round-trip, so it can adapt
+    instead of losing the Turn. The rest of the response's tool calls still run.
+  - **Strike 2 is turn-fatal.** N = 2 is fixed by owner decision. The strike is
+    keyed on the `:write_policy_denied` kind, so every raising site counts:
+    allowlist miss, deny match, protected path, workspace-root target, child
+    broadening, an outside-workspace bash token, and denials surfaced through
+    `apply_virtual_diff`. Each keeps its own `matched_rule`; only the kind is
+    shared, so the strike counter never has to enumerate rules or tool names.
+  - **Always logged.** Both strikes record a `permission_decision` Event with
+    `decision: "deny"` and `gate: "write_policy"`. Recoverability never reduces
+    the audit record.
+  - **Always confessed.** Both appear in the `write_denials` field of delegate
+    envelopes and workflow checkpoints, which is present even when empty. The
+    confession classifies exactly the events the strike counter classifies.
+
+  `:bash_disabled` is a distinct denial kind: never terminal, never a strike,
+  never confessed. The shell being off is a property of the bounded-write mode,
+  not a boundary the worker probed.
   """
 
   alias Pixir.{Event, Paths, Permissions, Session, Tool}
@@ -496,8 +523,16 @@ defmodule Pixir.Tools.Executor do
 
   # Consult the bounded write policy before permission mode. This is a headless
   # executor guard, not an interactive approval flow: denial is structured and
-  # auditable. Write-allowlist denials are terminal for the Turn loop; a
-  # bash_disabled denial is not (the model adapts with native tools, #218).
+  # auditable.
+  #
+  # A `write_policy_denied` denial is recoverable feedback, not an unconditional
+  # halt (#446): the Turn delivers the structured denial to the model as the tool
+  # output for the denied call so it can adapt, and only the SECOND denial in the
+  # same Turn is turn-fatal. Both denials are recorded here as
+  # `permission_decision` Events regardless — recoverability never reduces the
+  # audit record — and both are confessed in `write_denials`. A `bash_disabled`
+  # denial is a distinct kind that is never terminal and never a strike (the
+  # model adapts with native tools, #218).
   defp authorize_write_policy(name, args, call_id, context) do
     policy = get_in(context, [:permission, :policy])
 
@@ -562,6 +597,13 @@ defmodule Pixir.Tools.Executor do
 
   defp apply_virtual_diff_policy_error(error), do: error
 
+  # The durable projection of a write-policy denial. It is an allowlist, not a
+  # passthrough: the Log carries only the keys the confession and the audit
+  # trail are specified to carry. The two component keys are part of that set —
+  # a confinement walk that stops at `link` for a write to `link/deep/out.txt`
+  # confesses the requested path as its target, and *where* the walk stopped is
+  # a second fact that has to survive alongside it rather than replace it. Drop
+  # them here and the confession can name the aim but never the reason.
   defp policy_decision_details(details) do
     %{
       "gate" => "write_policy",
@@ -573,6 +615,8 @@ defmodule Pixir.Tools.Executor do
       "token" => Map.get(details, "token"),
       "requested_path" => Map.get(details, "requested_path"),
       "normalized_path" => Map.get(details, "normalized_path"),
+      "symlink_component" => Map.get(details, "symlink_component"),
+      "uninspectable_component" => Map.get(details, "uninspectable_component"),
       "matched_rule" => Map.get(details, "matched_rule") || Map.get(details, "rule"),
       "rule" => Map.get(details, "rule")
     }

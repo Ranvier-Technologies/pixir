@@ -9,6 +9,60 @@ defmodule Pixir.Delegate.CLIContractTest do
     end
   end
 
+  defmodule HorizonRunner do
+    def run(request, _spec, spec_meta, opts) do
+      send(Keyword.fetch!(opts, :test_pid), {:runner_called, request, spec_meta})
+
+      {:ok,
+       %{
+         "ok" => true,
+         "status" => "completed",
+         "kind" => "delegate_result",
+         "children" => []
+       }}
+    end
+  end
+
+  defmodule HorizonDaemonClient do
+    def call("delegate_start", body, _opts) do
+      send(Process.get(:horizon_test_pid), {:daemon_start, body})
+
+      {:ok,
+       %{
+         "ok" => true,
+         "status" => "running",
+         "kind" => "delegate_result",
+         "horizon_override" => get_in(body, ["spec_meta", "horizon_override"])
+       }}
+    end
+  end
+
+  defp short_horizon_spec("subagents") do
+    %{
+      "contract_version" => 1,
+      "strategy" => "subagents",
+      "tasks" => ["first", "second"],
+      "subagents" => %{"max_threads" => 1, "timeout_ms" => 60_000}
+    }
+  end
+
+  defp short_horizon_spec("workflow") do
+    %{
+      "contract_version" => 1,
+      "strategy" => "workflow",
+      "mode" => "read_only",
+      "steps" => [
+        %{"id" => "first", "task" => "first", "timeout_ms" => 60_000},
+        %{
+          "id" => "second",
+          "task" => "second",
+          "timeout_ms" => 60_000,
+          "depends_on" => ["first"]
+        }
+      ]
+    }
+  end
+
   defp tmp_workspace(prefix) do
     path =
       Path.join(
@@ -71,6 +125,794 @@ defmodule Pixir.Delegate.CLIContractTest do
     assert details["step_json_pointer"] == "/steps/#{step_index}/#{field}"
     assert details["step_path"] == ["steps", step_index, field]
     assert details["step_index"] == step_index
+  end
+
+  test "envelope schema registry is contiguous and matches emitted schema version" do
+    registry = CLIContract.envelope_schema_registry()
+    revisions = Enum.map(registry, fn {revision, _feature, _description} -> revision end)
+    features = Enum.map(registry, fn {_revision, feature, _description} -> feature end)
+    descriptions = Enum.map(registry, fn {_revision, _feature, description} -> description end)
+    workspace = tmp_workspace("cli-contract-schema-registry")
+    spec = "subagents" |> short_horizon_spec() |> Jason.encode!()
+
+    assert {:ok, %{payload: %{"schema_version" => emitted_schema_version}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end,
+               workspace: workspace
+             )
+
+    assert revisions == Enum.to_list(1..emitted_schema_version)
+    assert length(registry) == emitted_schema_version
+    assert Enum.all?(features, &is_atom/1)
+    assert MapSet.size(MapSet.new(features)) == length(features)
+    assert Enum.all?(descriptions, &(is_binary(&1) and String.trim(&1) != ""))
+
+    assert {7, :plan_warnings, _plan_warnings_description} =
+             Enum.find(registry, fn {revision, _feature, _description} -> revision == 7 end)
+
+    assert {8, :write_denials, _write_denials_description} =
+             Enum.find(registry, fn {revision, _feature, _description} -> revision == 8 end)
+
+    assert {9, :warm_start, _warm_start_description} =
+             Enum.find(registry, fn {revision, _feature, _description} -> revision == 9 end)
+  end
+
+  test "short-horizon dry-runs advise without rejecting for both strategies" do
+    for strategy <- ["subagents", "workflow"] do
+      spec = strategy |> short_horizon_spec() |> Jason.encode!()
+
+      assert {:ok,
+              %{
+                exit_code: 0,
+                payload:
+                  %{
+                    "ok" => true,
+                    "status" => "planned",
+                    "strategy" => ^strategy,
+                    "effective_timeout_ms" => 100_000,
+                    "estimated_critical_path_ms" => 120_000,
+                    "waves" => 2,
+                    "suggested_timeout_ms" => 120_000,
+                    "would_reject" => true
+                  } = payload
+              }} =
+               CLIContract.run(
+                 ["--spec", "-", "--timeout-ms", "100000", "--dry-run", "--json"],
+                 read_stdin: fn -> spec end
+               )
+
+      assert payload["schema_version"] == 9
+      assert payload["summary"] =~ "100000"
+      assert payload["summary"] =~ "120000"
+      assert "increase_delegate_timeout_to_suggested_timeout_ms" in payload["next_actions"]
+      assert "rerun_with_--allow-short-horizon" in payload["next_actions"]
+      refute Enum.any?(payload["next_actions"], &String.starts_with?(&1, "run_without_--dry-run"))
+
+      if strategy == "workflow" do
+        assert payload["caller_horizon_ms"] == 100_000
+        assert payload["declared_workflow_timeout_ms"] == 100_000
+        assert payload["declared_workflow_timeout_explicit"] == false
+        assert "increase_delegate_timeout_to_suggested_timeout_ms" in payload["next_actions"]
+        refute "increase_workflow_timeout_to_suggested_timeout_ms" in payload["next_actions"]
+
+        refute "increase_delegate_and_workflow_timeouts_to_suggested_timeout_ms" in payload[
+                 "next_actions"
+               ]
+
+        assert "reduce_workflow_dependency_waves" in payload["next_actions"]
+        assert "reduce_workflow_step_timeouts" in payload["next_actions"]
+        refute "reduce_delegate_task_count" in payload["next_actions"]
+      else
+        assert "reduce_delegate_task_count" in payload["next_actions"]
+        assert "increase_subagents_max_threads" in payload["next_actions"]
+        refute "reduce_workflow_dependency_waves" in payload["next_actions"]
+      end
+    end
+  end
+
+  test "workflow-only binding dry-run is nonfatal and prescribes only workflow recovery" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "mode" => "read_only",
+        "timeout_ms" => 150_000,
+        "steps" => [
+          %{"id" => "first", "task" => "first", "timeout_ms" => 100_000},
+          %{
+            "id" => "second",
+            "task" => "second",
+            "timeout_ms" => 100_000,
+            "depends_on" => ["first"]
+          }
+        ]
+      })
+
+    assert {:ok,
+            %{
+              exit_code: 0,
+              payload: %{
+                "ok" => true,
+                "status" => "planned",
+                "strategy" => "workflow",
+                "caller_horizon_ms" => 350_000,
+                "declared_workflow_timeout_ms" => 150_000,
+                "declared_workflow_timeout_explicit" => true,
+                "effective_timeout_ms" => 150_000,
+                "estimated_critical_path_ms" => 200_000,
+                "waves" => 2,
+                "suggested_timeout_ms" => 200_000,
+                "would_reject" => true,
+                "next_actions" => next_actions
+              }
+            }} =
+             CLIContract.run(
+               ["--spec", "-", "--timeout-ms", "350000", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+
+    assert "increase_workflow_timeout_to_suggested_timeout_ms" in next_actions
+    refute "increase_delegate_timeout_to_suggested_timeout_ms" in next_actions
+    refute "increase_delegate_and_workflow_timeouts_to_suggested_timeout_ms" in next_actions
+    refute Enum.any?(next_actions, &String.starts_with?(&1, "run_without_--dry-run"))
+  end
+
+  test "dry-runs that fit retain the attached-run next action for both strategies" do
+    for strategy <- ["subagents", "workflow"] do
+      spec = strategy |> short_horizon_spec() |> Jason.encode!()
+
+      assert {:ok, %{payload: %{"would_reject" => false, "next_actions" => next_actions}}} =
+               CLIContract.run(
+                 ["--spec", "-", "--timeout-ms", "120000", "--dry-run", "--json"],
+                 read_stdin: fn -> spec end
+               )
+
+      assert Enum.any?(next_actions, &String.starts_with?(&1, "run_without_--dry-run"))
+    end
+  end
+
+  test "short attached delegates reject before runner entry with no parent or children" do
+    for strategy <- ["subagents", "workflow"] do
+      spec = strategy |> short_horizon_spec() |> Jason.encode!()
+
+      assert {:error,
+              %{
+                exit_code: 2,
+                payload:
+                  %{
+                    "ok" => false,
+                    "status" => "rejected",
+                    "kind" => "horizon_shorter_than_critical_path",
+                    "message" => message,
+                    "details" => %{
+                      "effective_timeout_ms" => 100_000,
+                      "estimated_critical_path_ms" => 120_000,
+                      "waves" => 2,
+                      "suggested_timeout_ms" => 120_000,
+                      "next_actions" => next_actions
+                    }
+                  } = payload
+              }} =
+               CLIContract.run(["--spec", "-", "--timeout-ms", "100000", "--json"],
+                 read_stdin: fn -> spec end,
+                 runner: HorizonRunner,
+                 runtime_opts: [test_pid: self()]
+               )
+
+      assert message =~ "2"
+      assert message =~ "60000"
+      assert message =~ "120000"
+      assert "increase_delegate_timeout_to_suggested_timeout_ms" in next_actions
+      assert "rerun_with_--allow-short-horizon" in next_actions
+      refute Map.has_key?(payload, "session_id")
+      assert Map.get(payload, "children", []) == []
+      refute_received {:runner_called, _, _}
+    end
+  end
+
+  test "a horizon equal to the estimate proceeds through the attached runner" do
+    spec = "subagents" |> short_horizon_spec() |> Jason.encode!()
+
+    assert {:ok, %{exit_code: 0, payload: %{"status" => "completed"}}} =
+             CLIContract.run(["--spec", "-", "--timeout-ms", "120000", "--json"],
+               read_stdin: fn -> spec end,
+               runner: HorizonRunner,
+               runtime_opts: [test_pid: self()]
+             )
+
+    assert_receive {:runner_called, %{allow_short_horizon?: false}, _spec_meta}
+  end
+
+  test "allow-short-horizon launches and records the exact advisory values" do
+    spec = "subagents" |> short_horizon_spec() |> Jason.encode!()
+
+    assert {:ok,
+            %{
+              exit_code: 0,
+              payload: %{
+                "status" => "completed",
+                "horizon_override" => %{
+                  "effective_timeout_ms" => 100_000,
+                  "estimated_critical_path_ms" => 120_000,
+                  "waves" => 2,
+                  "suggested_timeout_ms" => 120_000
+                }
+              }
+            }} =
+             CLIContract.run(
+               [
+                 "--spec",
+                 "-",
+                 "--timeout-ms",
+                 "100000",
+                 "--allow-short-horizon",
+                 "--json"
+               ],
+               read_stdin: fn -> spec end,
+               runner: HorizonRunner,
+               runtime_opts: [test_pid: self()]
+             )
+
+    assert_receive {:runner_called, %{allow_short_horizon?: true}, _spec_meta}
+  end
+
+  test "an omitted child budget that fits the default horizon remains launchable" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "one default-budget child"
+      })
+
+    assert {:ok, %{payload: %{"status" => "completed"}}} =
+             CLIContract.run(["--spec", "-", "--json"],
+               read_stdin: fn -> spec end,
+               runner: HorizonRunner,
+               runtime_opts: [test_pid: self()]
+             )
+
+    assert_receive {:runner_called, _request, _spec_meta}
+  end
+
+  test "suggested timeout is a fixed point for omitted subagent child budgets" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "tasks" => ["first", "second", "third"],
+        "subagents" => %{"max_threads" => 1}
+      })
+
+    assert {:ok,
+            %{
+              payload: %{
+                "effective_timeout_ms" => 120_000,
+                "estimated_critical_path_ms" => 360_000,
+                "suggested_timeout_ms" => 360_000,
+                "would_reject" => true
+              }
+            }} =
+             CLIContract.run(
+               ["--spec", "-", "--timeout-ms", "120000", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+
+    assert {:ok,
+            %{
+              payload: %{
+                "effective_timeout_ms" => 360_000,
+                "estimated_critical_path_ms" => 360_000,
+                "suggested_timeout_ms" => 360_000,
+                "would_reject" => false
+              }
+            }} =
+             CLIContract.run(
+               ["--spec", "-", "--timeout-ms", "360000", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+
+    assert {:ok, %{payload: %{"status" => "completed"}}} =
+             CLIContract.run(["--spec", "-", "--timeout-ms", "360000", "--json"],
+               read_stdin: fn -> spec end,
+               runner: HorizonRunner,
+               runtime_opts: [test_pid: self()]
+             )
+
+    assert_receive {:runner_called, _request, _spec_meta}
+  end
+
+  test "suggested timeout is a fixed point for sequential omitted workflow budgets" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "mode" => "read_only",
+        "steps" => [
+          %{"id" => "first", "task" => "first"},
+          %{"id" => "second", "task" => "second", "depends_on" => ["first"]}
+        ]
+      })
+
+    assert {:ok,
+            %{
+              payload: %{
+                "effective_timeout_ms" => 90_000,
+                "estimated_critical_path_ms" => 180_000,
+                "suggested_timeout_ms" => 240_000,
+                "would_reject" => true
+              }
+            }} =
+             CLIContract.run(
+               ["--spec", "-", "--timeout-ms", "90000", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+
+    assert {:ok,
+            %{
+              payload: %{
+                "effective_timeout_ms" => 240_000,
+                "estimated_critical_path_ms" => 240_000,
+                "suggested_timeout_ms" => 240_000,
+                "would_reject" => false
+              }
+            }} =
+             CLIContract.run(
+               ["--spec", "-", "--timeout-ms", "240000", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+
+    assert {:ok, %{payload: %{"status" => "completed"}}} =
+             CLIContract.run(["--spec", "-", "--timeout-ms", "240000", "--json"],
+               read_stdin: fn -> spec end,
+               runner: HorizonRunner,
+               runtime_opts: [test_pid: self()]
+             )
+
+    assert_receive {:runner_called, _request, _spec_meta}
+  end
+
+  test "limits.wait_horizon_ms shortens delegate_timeout_ms for rejection" do
+    spec =
+      "subagents"
+      |> short_horizon_spec()
+      |> Map.put("limits", %{
+        "delegate_timeout_ms" => 150_000,
+        "wait_horizon_ms" => 100_000
+      })
+      |> Jason.encode!()
+
+    assert {:error,
+            %{
+              exit_code: 2,
+              payload: %{
+                "kind" => "horizon_shorter_than_critical_path",
+                "details" => %{
+                  "effective_timeout_ms" => 100_000,
+                  "estimated_critical_path_ms" => 120_000,
+                  "suggested_timeout_ms" => 120_000
+                }
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--json"],
+               read_stdin: fn -> spec end,
+               runner: HorizonRunner,
+               runtime_opts: [test_pid: self()]
+             )
+
+    refute_received {:runner_called, _, _}
+  end
+
+  test "dry-run identifies explicit wait horizon separately from delegate-derived default" do
+    base = %{
+      "contract_version" => 1,
+      "strategy" => "subagents",
+      "task" => "one child with a 120 second floor",
+      "limits" => %{
+        "child_timeout_ms" => 120_000,
+        "delegate_timeout_ms" => 150_000
+      }
+    }
+
+    assert {:ok,
+            %{
+              payload: %{
+                "wait_horizon_explicit" => false,
+                "effective_timeout_ms" => 150_000,
+                "estimated_critical_path_ms" => 120_000,
+                "would_reject" => false
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> Jason.encode!(base) end
+             )
+
+    explicit = put_in(base, ["limits", "wait_horizon_ms"], 100_000)
+
+    assert {:ok,
+            %{
+              payload: %{
+                "wait_horizon_explicit" => true,
+                "effective_timeout_ms" => 100_000,
+                "estimated_critical_path_ms" => 120_000,
+                "suggested_timeout_ms" => 120_000,
+                "would_reject" => true,
+                "next_actions" => next_actions
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> Jason.encode!(explicit) end
+             )
+
+    assert "increase_wait_horizon_to_suggested_timeout_ms" in next_actions
+    refute "increase_delegate_timeout_to_suggested_timeout_ms" in next_actions
+  end
+
+  defp capped_budget_spec(overrides \\ %{}) do
+    Map.merge(
+      %{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "mode" => "read_only",
+        "timeout_ms" => 600_000,
+        "steps" => [
+          %{"id" => "long", "task" => "long", "timeout_ms" => 1_800_000},
+          %{"id" => "short", "task" => "short", "timeout_ms" => 60_000}
+        ]
+      },
+      overrides
+    )
+  end
+
+  test "dry-run warns that a declared workflow timeout caps a declared step budget" do
+    spec = Jason.encode!(capped_budget_spec())
+
+    assert {:ok,
+            %{
+              exit_code: 0,
+              text: text,
+              payload:
+                %{
+                  "ok" => true,
+                  "status" => "planned",
+                  "kind" => "delegate_plan",
+                  "would_reject" => false,
+                  "declared_workflow_timeout_ms" => 600_000,
+                  "declared_workflow_timeout_explicit" => true,
+                  "plan_warnings" => [warning]
+                } = payload
+            }} =
+             CLIContract.run(
+               ["--spec", "-", "--dry-run", "--json", "--timeout-ms", "3600000"],
+               read_stdin: fn -> spec end
+             )
+
+    assert %{
+             "kind" => "step_budget_capped_by_workflow_timeout",
+             "declared_workflow_timeout_ms" => 600_000,
+             "next_actions" => warning_actions,
+             "summary" => warning_summary,
+             "steps" => [
+               %{
+                 "step_index" => 0,
+                 "step_id" => "long",
+                 "json_pointer" => "/steps/0/timeout_ms",
+                 "path" => ["steps", 0, "timeout_ms"],
+                 "declared_step_timeout_ms" => 1_800_000,
+                 "declared_workflow_timeout_ms" => 600_000,
+                 "effective_step_timeout_ms" => 600_000,
+                 "message" => step_message
+               }
+             ]
+           } = warning
+
+    assert step_message ==
+             "step budget 1800000 ms is capped by workflow timeout 600000 ms and will be cancelled at 600000 ms"
+
+    assert "increase_workflow_timeout_to_cover_declared_step_timeouts" in warning_actions
+    assert "reduce_workflow_step_timeouts" in warning_actions
+    assert "retry_workflow_with_larger_timeout" in warning_actions
+    assert warning_summary =~ step_message
+
+    # The accepted dry-run keeps its accepted summary and run next_actions.
+    assert payload["summary"] =~ "Delegate dry-run accepted"
+    assert "run_without_--dry-run_for_attached_workflow" in payload["next_actions"]
+
+    assert text =~
+             "step budget 1800000 ms is capped by workflow timeout 600000 ms and will be cancelled at 600000 ms"
+  end
+
+  test "capped-budget warning addresses the nested workflow.steps path the caller submitted" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "mode" => "read_only",
+        "timeout_ms" => 600_000,
+        "workflow" => %{
+          "steps" => [
+            %{"id" => "short", "task" => "short", "timeout_ms" => 60_000},
+            %{"id" => "long", "task" => "long", "timeout_ms" => 1_800_000}
+          ]
+        }
+      })
+
+    assert {:ok, %{exit_code: 0, payload: %{"plan_warnings" => [warning]}}} =
+             CLIContract.run(
+               ["--spec", "-", "--dry-run", "--json", "--timeout-ms", "3600000"],
+               read_stdin: fn -> spec end
+             )
+
+    assert %{
+             "kind" => "step_budget_capped_by_workflow_timeout",
+             "steps" => [
+               %{
+                 "step_index" => 1,
+                 "step_id" => "long",
+                 "json_pointer" => "/workflow/steps/1/timeout_ms",
+                 "path" => ["workflow", "steps", 1, "timeout_ms"],
+                 "declared_step_timeout_ms" => 1_800_000,
+                 "effective_step_timeout_ms" => 600_000
+               }
+             ]
+           } = warning
+  end
+
+  test "no capped-budget warning when the workflow timeout was defaulted" do
+    spec =
+      capped_budget_spec()
+      |> Map.delete("timeout_ms")
+      |> Jason.encode!()
+
+    assert {:ok, %{payload: %{"declared_workflow_timeout_explicit" => false} = payload}} =
+             CLIContract.run(
+               ["--spec", "-", "--dry-run", "--json", "--timeout-ms", "600000"],
+               read_stdin: fn -> spec end
+             )
+
+    refute Map.has_key?(payload, "plan_warnings")
+  end
+
+  test "no capped-budget warning for a step that omitted its budget" do
+    spec =
+      capped_budget_spec(%{
+        "steps" => [
+          %{"id" => "omitted", "task" => "omitted"},
+          %{"id" => "short", "task" => "short", "timeout_ms" => 60_000}
+        ]
+      })
+      |> Jason.encode!()
+
+    assert {:ok, %{payload: payload}} =
+             CLIContract.run(
+               ["--spec", "-", "--dry-run", "--json", "--timeout-ms", "3600000"],
+               read_stdin: fn -> spec end
+             )
+
+    refute Map.has_key?(payload, "plan_warnings")
+  end
+
+  test "no capped-budget warning when every declared step budget fits the workflow timeout" do
+    spec =
+      capped_budget_spec(%{
+        "steps" => [
+          %{"id" => "equal", "task" => "equal", "timeout_ms" => 600_000},
+          %{"id" => "short", "task" => "short", "timeout_ms" => 60_000}
+        ]
+      })
+      |> Jason.encode!()
+
+    assert {:ok, %{payload: payload}} =
+             CLIContract.run(
+               ["--spec", "-", "--dry-run", "--json", "--timeout-ms", "3600000"],
+               read_stdin: fn -> spec end
+             )
+
+    refute Map.has_key?(payload, "plan_warnings")
+  end
+
+  test "capped-budget warning coexists with a horizon rejection advisory" do
+    spec =
+      capped_budget_spec(%{
+        "steps" => [
+          %{"id" => "long", "task" => "long", "timeout_ms" => 1_800_000},
+          %{
+            "id" => "second",
+            "task" => "second",
+            "timeout_ms" => 1_800_000,
+            "depends_on" => ["long"]
+          }
+        ]
+      })
+      |> Jason.encode!()
+
+    assert {:ok,
+            %{
+              exit_code: 0,
+              payload: %{
+                "would_reject" => true,
+                "summary" => summary,
+                "kind" => "delegate_plan",
+                "next_actions" => next_actions,
+                "plan_warnings" => [%{"kind" => "step_budget_capped_by_workflow_timeout"}]
+              }
+            }} =
+             CLIContract.run(
+               ["--spec", "-", "--dry-run", "--json", "--timeout-ms", "900000"],
+               read_stdin: fn -> spec end
+             )
+
+    assert summary =~ "Delegate dry-run advisory"
+    assert "rerun_with_--allow-short-horizon" in next_actions
+  end
+
+  test "subagents dry-runs never carry the capped-budget warning" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "tasks" => ["first", "second"],
+        "subagents" => %{"max_threads" => 2, "timeout_ms" => 1_800_000}
+      })
+
+    assert {:ok, %{payload: payload}} =
+             CLIContract.run(
+               ["--spec", "-", "--dry-run", "--json", "--timeout-ms", "3600000"],
+               read_stdin: fn -> spec end
+             )
+
+    refute Map.has_key?(payload, "plan_warnings")
+    assert payload["would_reject"] == false
+  end
+
+  test "a capped-budget spec still reaches the runner on a real run" do
+    spec = Jason.encode!(capped_budget_spec())
+
+    assert {:ok, %{payload: %{"status" => "completed"}}} =
+             CLIContract.run(["--spec", "-", "--json", "--timeout-ms", "3600000"],
+               read_stdin: fn -> spec end,
+               runner: HorizonRunner,
+               runtime_opts: [test_pid: self()]
+             )
+
+    assert_receive {:runner_called, _request, _spec_meta}
+  end
+
+  test "a capped-budget spec reaches the same real-run rejection verdict as before" do
+    spec =
+      capped_budget_spec(%{
+        "steps" => [
+          %{"id" => "long", "task" => "long", "timeout_ms" => 1_800_000},
+          %{
+            "id" => "second",
+            "task" => "second",
+            "timeout_ms" => 1_800_000,
+            "depends_on" => ["long"]
+          }
+        ]
+      })
+      |> Jason.encode!()
+
+    assert {:error,
+            %{
+              exit_code: 2,
+              payload: %{
+                "ok" => false,
+                "status" => "rejected",
+                "kind" => "horizon_shorter_than_critical_path",
+                "details" => %{"next_actions" => next_actions}
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--json", "--timeout-ms", "900000"],
+               read_stdin: fn -> spec end,
+               runner: HorizonRunner,
+               runtime_opts: [test_pid: self()]
+             )
+
+    assert "rerun_with_--allow-short-horizon" in next_actions
+    refute_received {:runner_called, _, _}
+  end
+
+  test "delegate start rejects a short horizon before daemon dispatch and override preserves it" do
+    Process.put(:horizon_test_pid, self())
+    on_exit(fn -> Process.delete(:horizon_test_pid) end)
+    spec = "subagents" |> short_horizon_spec() |> Jason.encode!()
+
+    assert {:error,
+            %{
+              exit_code: 2,
+              payload: %{
+                "kind" => "horizon_shorter_than_critical_path",
+                "details" => %{"suggested_timeout_ms" => 120_000}
+              }
+            }} =
+             CLIContract.run(["start", "--spec", "-", "--timeout-ms", "100000", "--json"],
+               read_stdin: fn -> spec end,
+               daemon_client: HorizonDaemonClient
+             )
+
+    refute_received {:daemon_start, _}
+
+    assert {:ok,
+            %{
+              payload: %{
+                "status" => "running",
+                "horizon_override" => %{
+                  "effective_timeout_ms" => 100_000,
+                  "estimated_critical_path_ms" => 120_000,
+                  "waves" => 2,
+                  "suggested_timeout_ms" => 120_000
+                }
+              }
+            }} =
+             CLIContract.run(
+               [
+                 "start",
+                 "--spec",
+                 "-",
+                 "--timeout-ms",
+                 "100000",
+                 "--allow-short-horizon",
+                 "--json"
+               ],
+               read_stdin: fn -> spec end,
+               daemon_client: HorizonDaemonClient
+             )
+
+    assert_receive {:daemon_start,
+                    %{
+                      "request" => %{"allow_short_horizon?" => true},
+                      "spec_meta" => %{
+                        "horizon_override" => %{
+                          "effective_timeout_ms" => 100_000,
+                          "estimated_critical_path_ms" => 120_000,
+                          "waves" => 2,
+                          "suggested_timeout_ms" => 120_000
+                        }
+                      }
+                    }}
+  end
+
+  test "workflow tie diagnostics preserve raw fixed-point suggestion and lowest source index" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "mode" => "read_only",
+        "timeout_ms" => 130_000,
+        "steps" => [
+          %{"id" => "first", "task" => "first", "timeout_ms" => 130_000},
+          %{"id" => "second", "task" => "second", "timeout_ms" => 130_000},
+          %{
+            "id" => "third",
+            "task" => "third",
+            "timeout_ms" => 130_000,
+            "depends_on" => ["first", "second"]
+          }
+        ]
+      })
+
+    assert {:error,
+            %{
+              payload: %{
+                "kind" => "horizon_shorter_than_critical_path",
+                "details" => %{
+                  "effective_timeout_ms" => 120_000,
+                  "estimated_critical_path_ms" => 240_000,
+                  "waves" => 2,
+                  "suggested_timeout_ms" => 260_000,
+                  "json_pointer" => "/steps/0/timeout_ms",
+                  "path" => ["steps", 0, "timeout_ms"],
+                  "step_index" => 0
+                }
+              }
+            }} =
+             CLIContract.run(["--spec", "-", "--timeout-ms", "120000", "--json"],
+               read_stdin: fn -> spec end,
+               runner: HorizonRunner,
+               runtime_opts: [test_pid: self()]
+             )
+
+    refute_received {:runner_called, _, _}
   end
 
   test "workflow rehearsal rejects cyclic dry-run plans" do
@@ -192,7 +1034,7 @@ defmodule Pixir.Delegate.CLIContractTest do
     assert details["duplicates"] == ["dup"]
   end
 
-  test "workflow rehearsal accepts valid diamond dry-run without payload changes" do
+  test "valid diamond dry-run remains planned but advises on its three-wave short horizon" do
     spec =
       Jason.encode!(%{
         "contract_version" => 1,
@@ -214,6 +1056,11 @@ defmodule Pixir.Delegate.CLIContractTest do
                   "ok" => true,
                   "status" => "planned",
                   "strategy" => "workflow",
+                  "effective_timeout_ms" => 120_000,
+                  "estimated_critical_path_ms" => 360_000,
+                  "waves" => 3,
+                  "suggested_timeout_ms" => 360_000,
+                  "would_reject" => true,
                   "next_actions" => next_actions
                 } = payload
             }} =
@@ -225,7 +1072,11 @@ defmodule Pixir.Delegate.CLIContractTest do
     # at runtime by step id, and planned_child_count is the plan-side evidence.
     refute Map.has_key?(payload, "children")
     assert payload["beam_coordination"]["planned_child_count"] == 4
-    assert "run_without_--dry-run_for_attached_workflow" in next_actions
+    assert "increase_delegate_timeout_to_suggested_timeout_ms" in next_actions
+    assert "reduce_workflow_dependency_waves" in next_actions
+    assert "reduce_workflow_step_timeouts" in next_actions
+    assert "rerun_with_--allow-short-horizon" in next_actions
+    refute Enum.any?(next_actions, &String.starts_with?(&1, "run_without_--dry-run"))
   end
 
   test "workflow rehearsal rejects nested cyclic workflow specs" do
@@ -400,13 +1251,13 @@ defmodule Pixir.Delegate.CLIContractTest do
     assert Enum.map(children, & &1["task"]) == ["first task", "second task", "third task"]
     assert Enum.map(children, & &1["index"]) == [0, 1, 2]
     assert Enum.map(children, & &1["attachment_count"]) == [0, 2, 0]
-    # Additive Provider-output evidence -> schema revision 5 (family v1 unchanged).
-    assert payload["schema_version"] == 5
+    # Additive horizon advisory evidence -> schema revision 6 (family v1 unchanged).
+    assert payload["schema_version"] == 9
     assert order_note =~ "unspecified"
     assert order_note =~ "children[].index"
   end
 
-  test "Delegate schema 5 bounds distinct child/output warnings at 255/256/257" do
+  test "Delegate schema 7 bounds distinct child/output warnings at 255/256/257" do
     spec =
       Jason.encode!(%{
         "contract_version" => 1,
@@ -456,7 +1307,7 @@ defmodule Pixir.Delegate.CLIContractTest do
                  runtime_opts: [fixture_payload: fixture]
                )
 
-      assert payload["schema_version"] == 5
+      assert payload["schema_version"] == 9
       assert payload["warning_count"] == count
       assert length(payload["warnings"]) == min(count, 256)
       assert payload["warnings_truncated"] == (count == 257)
@@ -791,6 +1642,37 @@ defmodule Pixir.Delegate.CLIContractTest do
              )
   end
 
+  test "bounded_write dry-run accepts an operator-declared verify allowlist" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "mode" => "bounded_write",
+        "task" => "typecheck only",
+        "write_policy" => %{
+          "version" => 1,
+          "allow_writes" => ["notes/**"],
+          "bash" => %{
+            "verify_prefixes" => ["pnpm typecheck"],
+            "verify" => ["pnpm typecheck"]
+          }
+        }
+      })
+
+    assert {:ok, %{payload: payload}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+               read_stdin: fn -> spec end
+             )
+
+    assert payload["status"] == "planned"
+    assert payload["verify_command_count"] == 1
+
+    assert payload["write_policy"]["bash"] == %{
+             "verify_prefixes" => ["pnpm typecheck"],
+             "verify" => ["pnpm typecheck"]
+           }
+  end
+
   test "virtual_overlay dry-run accepts bounded operator context and projects it" do
     spec =
       Jason.encode!(%{
@@ -809,7 +1691,7 @@ defmodule Pixir.Delegate.CLIContractTest do
             %{
               payload: %{
                 "status" => "planned",
-                "schema_version" => 5,
+                "schema_version" => 9,
                 "children" => [
                   %{
                     "workspace_mode" => "virtual_overlay",
@@ -1210,8 +2092,32 @@ defmodule Pixir.Delegate.CLIContractTest do
     assert Pixir.Workflows.workflow_step_keys() ==
              ~w(
                id task agent apply_from workspace_mode read_set virtual_commands limits write_set model
-               reasoning_effort attachments depends_on timeout_ms permission_mode sandbox_mode
+               reasoning_effort attachments depends_on allow_unverified_depends_on timeout_ms
+               permission_mode sandbox_mode seed_session_id
              )
+  end
+
+  test "workflow steps accept the unverified-dependency opt-in as a known key" do
+    spec =
+      Jason.encode!(%{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "workflow" => %{
+          "steps" => [
+            %{"id" => "writer", "task" => "write", "permission_mode" => "read_only"},
+            %{
+              "id" => "audit",
+              "task" => "audit",
+              "permission_mode" => "read_only",
+              "depends_on" => ["writer"],
+              "allow_unverified_depends_on" => ["writer"]
+            }
+          ]
+        }
+      })
+
+    assert {:ok, %{payload: %{"status" => "planned", "strategy" => "workflow"}}} =
+             CLIContract.run(["--spec", "-", "--dry-run", "--json"], read_stdin: fn -> spec end)
   end
 
   test "the accessor matches the step keys the normalizer source actually reads" do
@@ -1558,13 +2464,13 @@ defmodule Pixir.Delegate.CLIContractTest do
     assert normalizer =~ "Map.new(root_limit_keys()"
     assert normalizer =~ ~s|timeout_candidate(spec, ["limits", key])|
 
-    consumed =
+    consumed_keys =
       ~r/Map\.fetch!\(root_limit_candidates, "([a-z_]+)"\)/
       |> Regex.scan(normalizer, capture: :all_but_first)
       |> List.flatten()
-      |> Enum.sort()
+      |> MapSet.new()
 
-    assert consumed == Pixir.Delegate.Runner.root_limit_keys()
+    assert consumed_keys == MapSet.new(Pixir.Delegate.Runner.root_limit_keys())
 
     # A fifth knob consumed via a raw literal read (bypassing the accessor
     # loop) must fail here, not slip past the fetch-set equality above.

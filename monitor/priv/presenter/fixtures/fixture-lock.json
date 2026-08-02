@@ -6,23 +6,33 @@
   "files": [
     {
       "path": "schema/pixir.presenter.fixture.v1.schema.json",
-      "bytes": 9749,
-      "sha256": "sha256:8daa4c77e5d9642a3377902da204978cff5fdf18d1ef5e81667f71ad5281474d"
+      "bytes": 10357,
+      "sha256": "sha256:e34d1fc3dc37d2f5055eba0e8b11ff328cf8db81e672cf4a467d062d700e87fb"
     },
     {
       "path": "schema/pixir.presenter.run.v1.schema.json",
-      "bytes": 19616,
-      "sha256": "sha256:b50f41fe4cbbf6e5b02dc70b74a6c53c9626d1f23c28876115328a779045ab17"
+      "bytes": 22249,
+      "sha256": "sha256:33e17d72285f4ae75aed5d2db15ba16295d4353c116ef0dbffecf35a000b7554"
     },
     {
       "path": "fixtures/manifest.json",
-      "bytes": 5392,
-      "sha256": "sha256:644df7105c6ccb8c0d8b1b02c4325f3424d7b12bef9c25eab498e3bdc41a7742"
+      "bytes": 7241,
+      "sha256": "sha256:7eca32bea9df99f02a8179f38e554a4f1633f7e6eb800b8628e98460a8d00062"
+    },
+    {
+      "path": "fixtures/inputs/child-write-and-policy-deny.json",
+      "bytes": 3564,
+      "sha256": "sha256:28661cecef4052c8e629d21def5d3c749aca89e0af9b659ba604be6315549359"
     },
     {
       "path": "fixtures/inputs/evidence-mirror-canonical-conflict.json",
       "bytes": 3011,
       "sha256": "sha256:f9e77bd5f68586812e70b04bf8d874bf4337119bc9c5ca34cd0fd824a1c29fd2"
+    },
+    {
+      "path": "fixtures/inputs/externally-owned-running-advancing.json",
+      "bytes": 1867,
+      "sha256": "sha256:1e9fd5d24160ddef77e05cfbb74966c6f92a05fdbf7d66dfdaba42842b33c9c2"
     },
     {
       "path": "fixtures/inputs/f4-advisory-retry-reconstructed.json",
@@ -55,6 +65,11 @@
       "sha256": "sha256:da337aff00ac838b602ee5995c548bcaf788d04247d0cf58e6bf3eabb80e7da1"
     },
     {
+      "path": "fixtures/inputs/post-terminal-child-resume.json",
+      "bytes": 4728,
+      "sha256": "sha256:d3c84b8091735a86fbac235b669a4db2b6a1c5533913965e842f6c0cf03f7949"
+    },
+    {
       "path": "fixtures/inputs/resume-reused-child-session.json",
       "bytes": 3179,
       "sha256": "sha256:5472ec466f2abfb15e3e4061be6749968f909ae658782bdd48914427e3936b80"
@@ -85,69 +100,84 @@
       "sha256": "sha256:f63d6d7ad5e68ae803f002e9bb918a42e9cbdbfdb0adc4b4bd4649080f5e17a1"
     },
     {
+      "path": "fixtures/golden/child-write-and-policy-deny.json",
+      "bytes": 8241,
+      "sha256": "sha256:ddfdc17efb862bc54589217df6df905f121cebd6e53593b404993e62feabc4df"
+    },
+    {
       "path": "fixtures/golden/evidence-mirror-canonical-conflict.json",
-      "bytes": 4214,
-      "sha256": "sha256:b6b07baa5786fd6f42c6cf3f84df1672b85b782f708b21b755f74f7cd565cdf8"
+      "bytes": 4637,
+      "sha256": "sha256:349ef088eb4e69caebbddbd74ae4f53a0b1fb8ccb69d2847c560e189d65cd98e"
+    },
+    {
+      "path": "fixtures/golden/externally-owned-running-advancing.json",
+      "bytes": 6418,
+      "sha256": "sha256:544ab7aa466de8789e1aeae217757b478808609557adf84d9c7f6c9ac792d241"
     },
     {
       "path": "fixtures/golden/f4-advisory-retry-reconstructed.json",
-      "bytes": 16855,
-      "sha256": "sha256:b9b8e127729451266e72d3b41602800b32db9747cf5137f8ea25689d3210296f"
+      "bytes": 17441,
+      "sha256": "sha256:a7b4791f125a0d6f2bee1642104ce94770ce17215adfee7c1790f12afba3a6a2"
     },
     {
       "path": "fixtures/golden/held-missing-child-log.json",
-      "bytes": 9410,
-      "sha256": "sha256:507eed2ec0d132043b0b38315d80f26eb7c9b4b529bf43634c7bd1a5fca9efaa"
+      "bytes": 9918,
+      "sha256": "sha256:053b3f97c2659f5598a0153886998d71dd992f787bc6b0f0cedb1dae2cd86ae3"
     },
     {
       "path": "fixtures/golden/invalid-model-advisory.json",
-      "bytes": 5146,
-      "sha256": "sha256:38b93c1d38de0b076bd1ce9e3ac369798a19ac6a1cedbe5f4abae1fbc1edbae9"
+      "bytes": 5569,
+      "sha256": "sha256:b45f4fbe37bdf1f0ac0c458a73012524be0a7688bc788460da7e88b687555455"
     },
     {
       "path": "fixtures/golden/live-runtime-only-no-log.json",
-      "bytes": 5868,
-      "sha256": "sha256:f996a46b7811749658b2abc420d53726b575865bcde5f360a0e69d0eae96afb6"
+      "bytes": 6264,
+      "sha256": "sha256:f51a60a0a31f2bd4d2fd175510cc16f9dff8d636cd11e121f4ee590dbacf12b7"
     },
     {
       "path": "fixtures/golden/mixed-running-current.json",
-      "bytes": 7376,
-      "sha256": "sha256:8caee217f097d1a27da7a455294b30cf710f9ff88a3fbcf3ee6564dce40a0bc4"
+      "bytes": 7772,
+      "sha256": "sha256:078a1bba3ec8436b6ca15e0d96207f916d7fb01afb03a67442b1315dcd2463b6"
     },
     {
       "path": "fixtures/golden/partial-write-indeterminate.json",
-      "bytes": 7906,
-      "sha256": "sha256:f71b90133a00969b9b9395a3a829f4f133093997c1712b740526c1506ff3cdd2"
+      "bytes": 8371,
+      "sha256": "sha256:b7443355464df609f4ff336932b7ac8a45c41d3b9f7078ca3f8dee52354b7a16"
+    },
+    {
+      "path": "fixtures/golden/post-terminal-child-resume.json",
+      "bytes": 10351,
+      "sha256": "sha256:4e56ba7a7a72db6f28d4a0d11040f07c671d1ee47a73be5b2ee18655712066ad"
     },
     {
       "path": "fixtures/golden/resume-reused-child-session.json",
-      "bytes": 7436,
-      "sha256": "sha256:350e472f32d9ec9321b44d61dd73bd933cac86c6fb7a7ce14e9e14e016cfe0f2"
+      "bytes": 7863,
+      "sha256": "sha256:4d4bb1391ee278c175e4f6d00c49d2eb69dcd957aa561c5e17a4f1c2f068a73d"
     },
     {
       "path": "fixtures/golden/stale-running-no-owner.json",
-      "bytes": 4048,
-      "sha256": "sha256:d2ac2fef8ea23bd22f798e0cb60a29f033b671fc8d166b0654b8b9cf6ec0dbd7"
+      "bytes": 4420,
+      "sha256": "sha256:befc2257f7b1443b78480d7eb37d4909c2e2b4881ecddbd79bb66fec73b539f6"
     },
     {
       "path": "fixtures/golden/timeout-needs-orchestrator.json",
-      "bytes": 7960,
-      "sha256": "sha256:c069fad0284b3a43faf1e5a137d4eac314732e354704ffc86300bce0fa0a30d4"
+      "bytes": 8407,
+      "sha256": "sha256:40905071e7319950713333b337ce6bf41ae6e7a4556bef3996a4ef528c220f2c"
     },
     {
       "path": "fixtures/golden/virtual-diff-unapplied.json",
-      "bytes": 6293,
-      "sha256": "sha256:282f5c17fc58a831c1cd1ce24e3fbec9dda6196d36399d3f664f2e783314a7ef"
+      "bytes": 6740,
+      "sha256": "sha256:858f192b8146132c63b209546cbd72b9e2456a5488621baa1395d4ceca5ef831"
     },
     {
       "path": "fixtures/golden/wave1-parallel-audit-reconstructed.json",
-      "bytes": 13564,
-      "sha256": "sha256:4660c217ece2910cb6b87bab84b653046c0dd4616ef477240ef91b51a81c4447"
+      "bytes": 14146,
+      "sha256": "sha256:90cd5d01694fa7210813616d4608f909ab76a9893f0b643e7b85111f500f6787"
     },
     {
       "path": "fixtures/golden/wave3-transport-failure-reconstructed.json",
-      "bytes": 10536,
-      "sha256": "sha256:87fdb7f86eca7a559a9ddb2e6328f3e2d0ef3f22e8e92c4dfa47fa60429b6f75"
+      "bytes": 10994,
+      "sha256": "sha256:9b18f0b526afa4c98a17f007ab8412243ef12a84663f8002ffa824db33bbc6a4"
     }
   ]
 }

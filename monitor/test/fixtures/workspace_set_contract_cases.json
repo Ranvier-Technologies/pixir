@@ -6,7 +6,8 @@
     "ws-sid-collision",
     "ws-truncated-source",
     "ws-passthrough-parity",
-    "ws-failure-isolation"
+    "ws-failure-isolation",
+    "ws-bounded-n"
   ],
   "negative": [
     "set-frame-missing-workspace",

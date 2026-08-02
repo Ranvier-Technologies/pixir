@@ -63,6 +63,14 @@ defmodule Pixir.Delegate.RunnerTest do
     }
   end
 
+  defp read_session_events(workspace, session_id) do
+    [workspace, ".pixir", "sessions", "#{session_id}.ndjson"]
+    |> Path.join()
+    |> File.read!()
+    |> String.split("\n", trim: true)
+    |> Enum.map(&Jason.decode!/1)
+  end
+
   defp run_child_projection(workspace, child, mode) do
     spec = projection_spec(mode)
     terminal_status = child["status"]
@@ -484,13 +492,598 @@ defmodule Pixir.Delegate.RunnerTest do
                  )
       end
 
-      # An explicit wait_horizon_ms knob reaches the wait boundary untouched.
-      run.(%{"wait_horizon_ms" => 55_555})
+      # An explicit wait_horizon_ms knob reaches the wait boundary untouched when
+      # the configured child budget makes that caller horizon admissible.
+      run.(%{"wait_horizon_ms" => 55_555, "child_timeout_ms" => 55_555})
       assert_received {:wait_horizon_ms, 55_555}
 
       # The legacy knob cascades legacy -> delegate -> wait horizon.
       run.(%{"timeout_ms" => 44_444})
       assert_received {:wait_horizon_ms, 44_444}
+    end)
+  end
+
+  test "explicit wait horizons from request and limits are independently repairable" do
+    ws = tmp_workspace("pixir-delegate-explicit-wait-recovery")
+
+    base_spec = %{
+      "contract_version" => 1,
+      "strategy" => "subagents",
+      "task" => "one child with the runtime floor",
+      "limits" => %{
+        "child_timeout_ms" => 120_000,
+        "delegate_timeout_ms" => 150_000
+      }
+    }
+
+    spec_meta = %{"strategy" => "subagents", "planned_child_count" => 1}
+
+    assert {:error,
+            %{
+              "details" => %{
+                "wait_horizon_explicit" => true,
+                "effective_timeout_ms" => 100_000,
+                "estimated_critical_path_ms" => 120_000,
+                "suggested_timeout_ms" => 120_000,
+                "next_actions" => request_actions
+              }
+            }} =
+             Runner.admit_horizon(
+               %{workspace: ws, wait_horizon_ms: 100_000},
+               base_spec,
+               spec_meta
+             )
+
+    assert "increase_wait_horizon_to_suggested_timeout_ms" in request_actions
+    refute "increase_delegate_timeout_to_suggested_timeout_ms" in request_actions
+
+    # Applying the prescribed request knob is sufficient without changing the spec.
+    assert {:ok, nil} =
+             Runner.admit_horizon(
+               %{workspace: ws, wait_horizon_ms: 120_000},
+               base_spec,
+               spec_meta
+             )
+
+    limits_spec = put_in(base_spec, ["limits", "wait_horizon_ms"], 100_000)
+
+    assert {:error, %{"details" => %{"next_actions" => limits_actions}}} =
+             Runner.admit_horizon(%{workspace: ws}, limits_spec, spec_meta)
+
+    assert "increase_wait_horizon_to_suggested_timeout_ms" in limits_actions
+    refute "increase_delegate_timeout_to_suggested_timeout_ms" in limits_actions
+
+    repaired_limits_spec = put_in(limits_spec, ["limits", "wait_horizon_ms"], 120_000)
+    assert {:ok, nil} = Runner.admit_horizon(%{workspace: ws}, repaired_limits_spec, spec_meta)
+  end
+
+  test "workflow explicit wait and workflow horizons prescribe their combined fixed point" do
+    ws = tmp_workspace("pixir-delegate-workflow-explicit-wait-recovery")
+
+    spec = %{
+      "contract_version" => 1,
+      "strategy" => "workflow",
+      "mode" => "read_only",
+      "timeout_ms" => 100_000,
+      "limits" => %{"delegate_timeout_ms" => 150_000},
+      "steps" => [
+        %{"id" => "first", "task" => "first"},
+        %{"id" => "second", "task" => "second", "depends_on" => ["first"]}
+      ]
+    }
+
+    assert {:error,
+            %{
+              "details" => %{
+                "wait_horizon_explicit" => true,
+                "declared_workflow_timeout_explicit" => true,
+                "suggested_timeout_ms" => 240_000,
+                "next_actions" => next_actions
+              }
+            }} =
+             Runner.admit_horizon(
+               %{workspace: ws, wait_horizon_ms: 100_000},
+               spec,
+               %{"strategy" => "workflow", "planned_child_count" => 2}
+             )
+
+    assert "increase_wait_horizon_and_workflow_timeouts_to_suggested_timeout_ms" in next_actions
+    refute "increase_delegate_and_workflow_timeouts_to_suggested_timeout_ms" in next_actions
+  end
+
+  test "omitted workflow timeout repairs explicit wait and derived delegate horizons once" do
+    ws = tmp_workspace("pixir-delegate-workflow-derived-timeout-recovery")
+
+    base_spec = %{
+      "contract_version" => 1,
+      "strategy" => "workflow",
+      "mode" => "read_only",
+      "limits" => %{"delegate_timeout_ms" => 150_000},
+      "steps" => [
+        %{"id" => "first", "task" => "first"},
+        %{"id" => "second", "task" => "second", "depends_on" => ["first"]}
+      ]
+    }
+
+    spec_meta = %{"strategy" => "workflow", "planned_child_count" => 2}
+
+    cases = [
+      %{
+        source: "request.wait_horizon_ms",
+        initial_request: %{workspace: ws, wait_horizon_ms: 100_000},
+        initial_spec: base_spec,
+        wait_repaired_request: %{workspace: ws, wait_horizon_ms: 240_000},
+        wait_repaired_spec: base_spec,
+        fully_repaired_request: %{workspace: ws, wait_horizon_ms: 240_000},
+        fully_repaired_spec: put_in(base_spec, ["limits", "delegate_timeout_ms"], 240_000)
+      },
+      %{
+        source: "limits.wait_horizon_ms",
+        initial_request: %{workspace: ws},
+        initial_spec: put_in(base_spec, ["limits", "wait_horizon_ms"], 100_000),
+        wait_repaired_request: %{workspace: ws},
+        wait_repaired_spec: put_in(base_spec, ["limits", "wait_horizon_ms"], 240_000),
+        fully_repaired_request: %{workspace: ws},
+        fully_repaired_spec:
+          base_spec
+          |> put_in(["limits", "wait_horizon_ms"], 240_000)
+          |> put_in(["limits", "delegate_timeout_ms"], 240_000)
+      }
+    ]
+
+    for scenario <- cases do
+      assert {:error,
+              %{
+                "kind" => "horizon_shorter_than_critical_path",
+                "details" => %{
+                  "caller_horizon_ms" => 100_000,
+                  "wait_horizon_explicit" => true,
+                  "declared_workflow_timeout_ms" => 150_000,
+                  "declared_workflow_timeout_explicit" => false,
+                  "effective_timeout_ms" => 100_000,
+                  "estimated_critical_path_ms" => 200_000,
+                  "suggested_timeout_ms" => 240_000,
+                  "next_actions" => [
+                    "increase_wait_horizon_and_delegate_timeout_to_suggested_timeout_ms",
+                    "reduce_workflow_dependency_waves",
+                    "reduce_workflow_step_timeouts",
+                    "rerun_with_--allow-short-horizon"
+                  ]
+                }
+              }} =
+               Runner.admit_horizon(
+                 scenario.initial_request,
+                 scenario.initial_spec,
+                 spec_meta
+               ),
+             scenario.source
+
+      # Raising only the explicit wait knob leaves the derived delegate horizon
+      # binding, so the first recovery suggestion must now target only delegate.
+      assert {:error,
+              %{
+                "kind" => "horizon_shorter_than_critical_path",
+                "details" => %{
+                  "caller_horizon_ms" => 240_000,
+                  "wait_horizon_explicit" => true,
+                  "declared_workflow_timeout_ms" => 150_000,
+                  "declared_workflow_timeout_explicit" => false,
+                  "effective_timeout_ms" => 150_000,
+                  "estimated_critical_path_ms" => 240_000,
+                  "suggested_timeout_ms" => 240_000,
+                  "next_actions" => [
+                    "increase_delegate_timeout_to_suggested_timeout_ms",
+                    "reduce_workflow_dependency_waves",
+                    "reduce_workflow_step_timeouts",
+                    "rerun_with_--allow-short-horizon"
+                  ]
+                }
+              }} =
+               Runner.admit_horizon(
+                 scenario.wait_repaired_request,
+                 scenario.wait_repaired_spec,
+                 spec_meta
+               ),
+             scenario.source
+
+      # Applying both values from the initial combined action is sufficient in
+      # one edit while the workflow itself and its omitted step budgets stay unchanged.
+      assert {:ok, nil} =
+               Runner.admit_horizon(
+                 scenario.fully_repaired_request,
+                 scenario.fully_repaired_spec,
+                 spec_meta
+               ),
+             scenario.source
+    end
+  end
+
+  test "workflow admission uses the delegate timeout when estimating sequential steps" do
+    ws = tmp_workspace("pixir-delegate-workflow-estimate-timeout")
+
+    spec = %{
+      "contract_version" => 1,
+      "strategy" => "workflow",
+      "mode" => "read_only",
+      "steps" => [
+        %{
+          "id" => "first",
+          "task" => "first",
+          "agent" => "explorer",
+          "timeout_ms" => 200_000
+        },
+        %{
+          "id" => "second",
+          "task" => "second",
+          "agent" => "explorer",
+          "depends_on" => ["first"],
+          "timeout_ms" => 200_000
+        }
+      ]
+    }
+
+    spec_meta = %{"strategy" => "workflow", "planned_child_count" => 2}
+
+    assert {:error,
+            %{
+              "kind" => "horizon_shorter_than_critical_path",
+              "details" => %{
+                "effective_timeout_ms" => 350_000,
+                "estimated_critical_path_ms" => 400_000,
+                "waves" => 2,
+                "suggested_timeout_ms" => 400_000
+              }
+            }} =
+             Runner.admit_horizon(%{workspace: ws, timeout_ms: 350_000}, spec, spec_meta)
+  end
+
+  test "workflow-only binding reports its knobs and is repaired by changing only the workflow timeout" do
+    ws = tmp_workspace("pixir-delegate-workflow-completion-budget")
+
+    base = %{
+      "contract_version" => 1,
+      "strategy" => "workflow",
+      "mode" => "read_only",
+      "steps" => [
+        %{
+          "id" => "first",
+          "task" => "first",
+          "agent" => "explorer",
+          "timeout_ms" => 100_000
+        },
+        %{
+          "id" => "second",
+          "task" => "second",
+          "agent" => "explorer",
+          "depends_on" => ["first"],
+          "timeout_ms" => 100_000
+        }
+      ]
+    }
+
+    spec = Map.put(base, "timeout_ms", 150_000)
+    request = %{workspace: ws, wait_horizon_ms: 350_000}
+    spec_meta = %{"strategy" => "workflow", "planned_child_count" => 2}
+
+    assert {:error,
+            %{
+              "kind" => "horizon_shorter_than_critical_path",
+              "details" => %{
+                "caller_horizon_ms" => 350_000,
+                "declared_workflow_timeout_ms" => 150_000,
+                "declared_workflow_timeout_explicit" => true,
+                "effective_timeout_ms" => 150_000,
+                "estimated_critical_path_ms" => 200_000,
+                "waves" => 2,
+                "suggested_timeout_ms" => 200_000,
+                "strategy" => "workflow",
+                "json_pointer" => "/steps/0/timeout_ms",
+                "next_actions" => next_actions
+              }
+            }} = Runner.admit_horizon(request, spec, spec_meta)
+
+    assert "increase_workflow_timeout_to_suggested_timeout_ms" in next_actions
+    refute "increase_delegate_timeout_to_suggested_timeout_ms" in next_actions
+    refute "increase_delegate_and_workflow_timeouts_to_suggested_timeout_ms" in next_actions
+
+    assert {:ok, nil} =
+             Runner.admit_horizon(request, Map.put(spec, "timeout_ms", 200_000), spec_meta)
+
+    # Preserve the legacy delegate-timeout fallback contract when no workflow
+    # timeout is declared.
+    assert {:error, %{"details" => %{"effective_timeout_ms" => 150_000}}} =
+             Runner.admit_horizon(
+               request,
+               Map.put(base, "limits", %{"delegate_timeout_ms" => 150_000}),
+               spec_meta
+             )
+  end
+
+  test "workflow admission uses the shorter caller horizon when workflow timeout is longer" do
+    ws = tmp_workspace("pixir-delegate-workflow-caller-horizon")
+
+    spec = %{
+      "contract_version" => 1,
+      "strategy" => "workflow",
+      "mode" => "read_only",
+      "timeout_ms" => 350_000,
+      "steps" => [
+        %{
+          "id" => "first",
+          "task" => "first",
+          "agent" => "explorer",
+          "timeout_ms" => 100_000
+        },
+        %{
+          "id" => "second",
+          "task" => "second",
+          "agent" => "explorer",
+          "depends_on" => ["first"],
+          "timeout_ms" => 100_000
+        }
+      ]
+    }
+
+    assert {:error,
+            %{
+              "kind" => "horizon_shorter_than_critical_path",
+              "details" => %{
+                "effective_timeout_ms" => 150_000,
+                "estimated_critical_path_ms" => 200_000,
+                "waves" => 2,
+                "suggested_timeout_ms" => 200_000
+              }
+            }} =
+             Runner.admit_horizon(
+               %{workspace: ws, wait_horizon_ms: 150_000},
+               spec,
+               %{"strategy" => "workflow", "planned_child_count" => 2}
+             )
+  end
+
+  test "workflow caller horizon caps both admission estimation and runtime workflow timeout" do
+    with_pixir_home("pixir-delegate-workflow-effective-horizon-home", fn ->
+      ws = tmp_workspace("pixir-delegate-workflow-effective-horizon")
+      test_pid = self()
+
+      spec = %{
+        "contract_version" => 1,
+        "strategy" => "workflow",
+        "mode" => "read_only",
+        "timeout_ms" => 600_000,
+        "steps" => [
+          %{
+            "id" => "first",
+            "task" => "first",
+            "agent" => "explorer",
+            "timeout_ms" => 200_000
+          },
+          %{
+            "id" => "second",
+            "task" => "second",
+            "agent" => "explorer",
+            "depends_on" => ["first"],
+            "timeout_ms" => 200_000
+          }
+        ]
+      }
+
+      spec_meta = %{"strategy" => "workflow", "planned_child_count" => 2}
+      request = %{workspace: ws, wait_horizon_ms: 120_000}
+
+      assert {:ok,
+              %{
+                "caller_horizon_ms" => 120_000,
+                "declared_workflow_timeout_ms" => 600_000,
+                "declared_workflow_timeout_explicit" => true,
+                "effective_timeout_ms" => 120_000,
+                "estimated_critical_path_ms" => 240_000,
+                "waves" => 2,
+                "suggested_timeout_ms" => 400_000
+              }} = Runner.critical_path(request, spec, spec_meta, [])
+
+      assert {:error, rejection} = Runner.admit_horizon(request, spec, spec_meta)
+      assert rejection["kind"] == "horizon_shorter_than_critical_path"
+
+      assert rejection["details"]["caller_horizon_ms"] == 120_000
+      assert rejection["details"]["declared_workflow_timeout_ms"] == 600_000
+      assert rejection["details"]["declared_workflow_timeout_explicit"] == true
+      next_actions = rejection["details"]["next_actions"]
+
+      assert "increase_wait_horizon_to_suggested_timeout_ms" in next_actions
+      refute "increase_delegate_timeout_to_suggested_timeout_ms" in next_actions
+      refute "increase_delegate_and_workflow_timeouts_to_suggested_timeout_ms" in next_actions
+      refute "increase_workflow_timeout_to_suggested_timeout_ms" in next_actions
+
+      workflow_runner = fn parent_session_id, workflow_spec, opts ->
+        send(test_pid, {:effective_workflow_runtime, workflow_spec, opts})
+
+        assert Enum.any?(read_session_events(ws, parent_session_id), fn event ->
+                 event["data"] == %{
+                   "event" => "horizon_override",
+                   "source" => "allow_short_horizon",
+                   "scope" => "delegate",
+                   "horizon_override" => %{
+                     "effective_timeout_ms" => 120_000,
+                     "estimated_critical_path_ms" => 240_000,
+                     "waves" => 2,
+                     "suggested_timeout_ms" => 400_000
+                   }
+                 }
+               end)
+
+        {:ok,
+         %{
+           "ok" => true,
+           "status" => "completed",
+           "workflow_id" => "wf_effective_horizon",
+           "steps" => [],
+           "summary" => %{"steps" => 0}
+         }}
+      end
+
+      assert {:ok, payload} =
+               Runner.run(
+                 Map.put(request, :allow_short_horizon?, true),
+                 spec,
+                 spec_meta,
+                 workflow_runner: workflow_runner
+               )
+
+      assert payload["horizon_override"] == %{
+               "effective_timeout_ms" => 120_000,
+               "estimated_critical_path_ms" => 240_000,
+               "waves" => 2,
+               "suggested_timeout_ms" => 400_000
+             }
+
+      assert_received {:effective_workflow_runtime, workflow_spec, opts}
+      assert workflow_spec["timeout_ms"] == 120_000
+      assert Keyword.fetch!(opts, :timeout_ms) == 120_000
+    end)
+  end
+
+  test "workflow horizon rejection offers workflow-specific next actions" do
+    ws = tmp_workspace("pixir-delegate-workflow-next-actions")
+
+    spec = %{
+      "contract_version" => 1,
+      "strategy" => "workflow",
+      "mode" => "read_only",
+      "timeout_ms" => 120_000,
+      "steps" => [
+        %{"id" => "first", "task" => "first", "timeout_ms" => 120_000},
+        %{
+          "id" => "second",
+          "task" => "second",
+          "depends_on" => ["first"],
+          "timeout_ms" => 120_000
+        }
+      ]
+    }
+
+    assert {:error,
+            %{
+              "details" => %{
+                "caller_horizon_ms" => 120_000,
+                "declared_workflow_timeout_ms" => 120_000,
+                "declared_workflow_timeout_explicit" => true,
+                "suggested_timeout_ms" => 240_000
+              }
+            } = rejection} =
+             Runner.admit_horizon(
+               %{workspace: ws},
+               spec,
+               %{"strategy" => "workflow", "planned_child_count" => 2}
+             )
+
+    next_actions = rejection["details"]["next_actions"]
+
+    assert "increase_delegate_and_workflow_timeouts_to_suggested_timeout_ms" in next_actions
+    refute "increase_delegate_timeout_to_suggested_timeout_ms" in next_actions
+    refute "increase_workflow_timeout_to_suggested_timeout_ms" in next_actions
+    assert "rerun_with_--allow-short-horizon" in next_actions
+    assert Enum.any?(next_actions, &String.contains?(&1, "workflow"))
+    refute "reduce_delegate_task_count" in next_actions
+    refute "increase_subagents_max_threads" in next_actions
+  end
+
+  test "normal Runner start payload omits a nil horizon override" do
+    with_pixir_home("pixir-delegate-no-horizon-override-home", fn ->
+      ws = tmp_workspace("pixir-delegate-no-horizon-override")
+
+      spec = %{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "task" => "inspect",
+        "limits" => %{"child_timeout_ms" => 1_000, "wait_horizon_ms" => 1_000}
+      }
+
+      spawn_agent = fn parent_session_id, _args, _opts ->
+        refute Enum.any?(read_session_events(ws, parent_session_id), fn event ->
+                 get_in(event, ["data", "event"]) == "horizon_override"
+               end)
+
+        {:ok,
+         %{
+           "id" => "subagent_normal_horizon",
+           "agent" => "explorer",
+           "status" => "queued",
+           "summary" => "queued"
+         }}
+      end
+
+      assert {:ok, %{payload: payload}} =
+               Runner.start(
+                 %{workspace: ws},
+                 spec,
+                 %{"strategy" => "subagents", "planned_child_count" => 1},
+                 spawn_agent: spawn_agent
+               )
+
+      refute Map.has_key?(payload, "horizon_override")
+
+      refute Enum.any?(read_session_events(ws, payload["parent_session_id"]), fn event ->
+               get_in(event, ["data", "event"]) == "horizon_override"
+             end)
+    end)
+  end
+
+  test "Runner start payload retains the accepted horizon override values" do
+    with_pixir_home("pixir-delegate-horizon-override-home", fn ->
+      ws = tmp_workspace("pixir-delegate-horizon-override")
+
+      spec = %{
+        "contract_version" => 1,
+        "strategy" => "subagents",
+        "tasks" => ["first", "second"],
+        "subagents" => %{"max_threads" => 1},
+        "limits" => %{"child_timeout_ms" => 100, "wait_horizon_ms" => 100}
+      }
+
+      spawn_agent = fn parent_session_id, args, _opts ->
+        override_events =
+          Enum.filter(read_session_events(ws, parent_session_id), fn event ->
+            get_in(event, ["data", "event"]) == "horizon_override"
+          end)
+
+        assert [override_event] = override_events
+
+        assert override_event["data"] == %{
+                 "event" => "horizon_override",
+                 "source" => "allow_short_horizon",
+                 "scope" => "delegate",
+                 "horizon_override" => %{
+                   "effective_timeout_ms" => 100,
+                   "estimated_critical_path_ms" => 200,
+                   "waves" => 2,
+                   "suggested_timeout_ms" => 200
+                 }
+               }
+
+        {:ok,
+         %{
+           "id" => "subagent_#{args["task"]}",
+           "agent" => "explorer",
+           "status" => "queued",
+           "summary" => "queued"
+         }}
+      end
+
+      assert {:ok, %{payload: payload}} =
+               Runner.start(
+                 %{workspace: ws, allow_short_horizon?: true},
+                 spec,
+                 %{"strategy" => "subagents", "planned_child_count" => 2},
+                 spawn_agent: spawn_agent
+               )
+
+      assert payload["horizon_override"] == %{
+               "effective_timeout_ms" => 100,
+               "estimated_critical_path_ms" => 200,
+               "waves" => 2,
+               "suggested_timeout_ms" => 200
+             }
     end)
   end
 
@@ -1817,6 +2410,32 @@ defmodule Pixir.Delegate.RunnerTest do
     end)
   end
 
+  test "request timeout changes only the caller horizon for omitted and legacy child budgets" do
+    request = %{timeout_ms: 360_000}
+
+    omitted_spec = %{
+      "strategy" => "subagents",
+      "tasks" => ["first", "second", "third"],
+      "subagents" => %{"max_threads" => 1}
+    }
+
+    assert {:ok,
+            %{
+              child_timeout_ms: 120_000,
+              delegate_timeout_ms: 360_000,
+              wait_horizon_ms: 360_000
+            }} = Runner.resolve_limits(request, omitted_spec)
+
+    legacy_spec = put_in(omitted_spec, ["limits"], %{"timeout_ms" => 60_000})
+
+    assert {:ok,
+            %{
+              child_timeout_ms: 60_000,
+              delegate_timeout_ms: 360_000,
+              wait_horizon_ms: 360_000
+            }} = Runner.resolve_limits(request, legacy_spec)
+  end
+
   test "subagents transport is nil when absent" do
     with_pixir_home("pixir-delegate-runner-home", fn ->
       ws = tmp_workspace("pixir-delegate-runner-no-transport")
@@ -1848,6 +2467,356 @@ defmodule Pixir.Delegate.RunnerTest do
       assert get_in(payload, ["limits", "transport"]) == nil
       assert_received {:spawn_agent_called, _parent_session_id, _args, opts}
       refute Keyword.has_key?(opts, :provider_transport)
+    end)
+  end
+
+  # ── write_denials confession (#446) ────────────────────────────────────────
+
+  defp bounded_write_denial_events(child_session_id) do
+    [
+      raw_event(child_session_id, 1, "tool_call", %{
+        "call_id" => "write-denied",
+        "name" => "write",
+        "args" => %{"path" => "secrets/out.md", "content" => "nope"}
+      }),
+      raw_event(child_session_id, 2, "permission_decision", %{
+        "call_id" => "write-denied",
+        "decision" => "deny",
+        "gate" => "write_policy",
+        "tool" => "write",
+        "requested_path" => "secrets/out.md",
+        "normalized_path" => "secrets/out.md",
+        "matched_rule" => "no_allow_match",
+        "rule" => "no_allow_match",
+        "policy_id" => "runner-policy",
+        "policy_hash" => "sha256:deadbeef",
+        "policy_version" => 1
+      }),
+      raw_event(child_session_id, 3, "tool_result", %{
+        "call_id" => "write-denied",
+        "ok" => false,
+        "error" => %{"kind" => "write_policy_denied"}
+      }),
+      raw_event(child_session_id, 4, "tool_call", %{
+        "call_id" => "write-ok",
+        "name" => "write",
+        "args" => %{"path" => "notes/out.md", "content" => "ok"}
+      }),
+      raw_event(child_session_id, 5, "tool_result", %{
+        "call_id" => "write-ok",
+        "ok" => true,
+        "output" => "wrote 2 bytes to notes/out.md"
+      }),
+      # The Turn's terminal event. Without it the Log does not say the worker
+      # survived the denial, and the confession honestly reads "unresolved".
+      raw_event(child_session_id, 6, "assistant_message", %{
+        "text" => "wrote notes/out.md after the denial"
+      })
+    ]
+  end
+
+  defp bounded_write_workflow_spec do
+    %{
+      "contract_version" => 1,
+      "strategy" => "workflow",
+      "mode" => "bounded_write",
+      "write_policy" => %{
+        "version" => 1,
+        "metadata" => %{"id" => "runner-policy"},
+        "allow_writes" => ["notes/out.md"]
+      },
+      "steps" => [
+        %{
+          "id" => "write",
+          "task" => "write notes",
+          "agent" => "worker",
+          "workspace_mode" => "shared",
+          "write_set" => ["notes/out.md"]
+        }
+      ]
+    }
+  end
+
+  defp bounded_write_spec_meta do
+    %{
+      "strategy" => "workflow",
+      "mode" => "bounded_write",
+      "write_policy" => %{
+        "version" => 1,
+        "id" => "runner-policy",
+        "allow_writes" => ["notes/out.md"],
+        "deny_writes" => [".pixir/**", ".git/**", "**/.env*", "**/secrets/**"],
+        "bash" => "disabled"
+      },
+      "planned_child_count" => 1
+    }
+  end
+
+  test "bounded_write envelope confesses a recovered denial alongside a completed status" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-write-denials")
+      child_session_id = "20260731T000001-child"
+
+      workflow_runner = fn _parent_session_id, _workflow_spec, _opts ->
+        write_raw_session_log(ws, child_session_id, bounded_write_denial_events(child_session_id))
+
+        {:ok,
+         %{
+           "ok" => true,
+           "status" => "completed",
+           "workflow_id" => "wf_write_denials",
+           "steps" => [
+             %{
+               "step_id" => "write",
+               "child_session_id" => child_session_id,
+               "status" => "completed",
+               "subagent_status" => "completed",
+               "checkpoint_status" => "checkpoint_ready",
+               "workspace_mode" => "shared",
+               "write_set" => ["notes/out.md"]
+             }
+           ],
+           "summary" => %{"steps" => 1},
+           "safe_next_actions" => []
+         }}
+      end
+
+      opts = [workflow_runner: workflow_runner]
+
+      assert {:ok, payload} =
+               Runner.run(
+                 %{workspace: ws},
+                 bounded_write_workflow_spec(),
+                 bounded_write_spec_meta(),
+                 opts
+               )
+
+      # A completed run and a non-empty confession coexist in one envelope.
+      assert payload["status"] == "completed"
+
+      confession = payload["write_denials"]
+      assert confession, "the envelope must always carry write_denials for a bounded-write run"
+      assert confession["count"] == 1
+
+      assert [denial] = confession["denials"]
+      assert denial["tool"] == "write"
+      assert denial["normalized_path"] == "secrets/out.md"
+      assert denial["matched_rule"] == "no_allow_match"
+      assert denial["disposition"] == "recovered"
+
+      assert [child] = payload["children"]
+      assert child["write_denials"]["count"] == 1
+      assert [child_denial] = child["write_denials"]["denials"]
+      assert child_denial["disposition"] == "recovered"
+    end)
+  end
+
+  test "bounded_write envelope carries an empty write_denials when nothing was denied" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-no-denials")
+      child_session_id = "20260731T000002-child"
+
+      workflow_runner = fn _parent_session_id, _workflow_spec, _opts ->
+        write_raw_session_log(ws, child_session_id, [
+          raw_event(child_session_id, 1, "tool_call", %{
+            "call_id" => "write-ok",
+            "name" => "write",
+            "args" => %{"path" => "notes/out.md", "content" => "ok"}
+          }),
+          raw_event(child_session_id, 2, "tool_result", %{
+            "call_id" => "write-ok",
+            "ok" => true,
+            "output" => "wrote 2 bytes to notes/out.md"
+          })
+        ])
+
+        {:ok,
+         %{
+           "ok" => true,
+           "status" => "completed",
+           "workflow_id" => "wf_no_denials",
+           "steps" => [
+             %{
+               "step_id" => "write",
+               "child_session_id" => child_session_id,
+               "status" => "completed",
+               "subagent_status" => "completed",
+               "checkpoint_status" => "checkpoint_ready",
+               "workspace_mode" => "shared",
+               "write_set" => ["notes/out.md"]
+             }
+           ],
+           "summary" => %{"steps" => 1},
+           "safe_next_actions" => []
+         }}
+      end
+
+      opts = [workflow_runner: workflow_runner]
+
+      assert {:ok, payload} =
+               Runner.run(
+                 %{workspace: ws},
+                 bounded_write_workflow_spec(),
+                 bounded_write_spec_meta(),
+                 opts
+               )
+
+      # Present with a zero value: absence is a schema violation, not silence.
+      assert payload["write_denials"] == %{"count" => 0, "denials" => []}
+      assert [child] = payload["children"]
+      assert child["write_denials"] == %{"count" => 0, "denials" => []}
+    end)
+  end
+
+  test "a bounded_write envelope with no steps still carries write_denials" do
+    # The confession must not vanish on the paths that produce no children: a
+    # workflow that failed before any step ran is exactly when a coordinator
+    # reads the envelope, and an omitted key would read as "no denials" only by
+    # convention. Absence is a schema violation, so it must be structurally
+    # impossible on a terminal bounded-write envelope.
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-no-steps")
+
+      workflow_runner = fn _parent_session_id, _workflow_spec, _opts ->
+        {:ok,
+         %{
+           "ok" => false,
+           "status" => "failed",
+           "workflow_id" => "wf_no_steps",
+           "steps" => [],
+           "summary" => %{"steps" => 0},
+           "safe_next_actions" => []
+         }}
+      end
+
+      assert {:ok, payload} =
+               Runner.run(
+                 %{workspace: ws},
+                 bounded_write_workflow_spec(),
+                 bounded_write_spec_meta(),
+                 workflow_runner: workflow_runner
+               )
+
+      assert payload["write_denials"] == %{"count" => 0, "denials" => []}
+    end)
+  end
+
+  test "a fatal second denial is confessed as the fatal strike" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-fatal-denial")
+      child_session_id = "20260731T000003-child"
+
+      workflow_runner = fn _parent_session_id, _workflow_spec, _opts ->
+        write_raw_session_log(ws, child_session_id, [
+          raw_event(child_session_id, 1, "permission_decision", %{
+            "call_id" => "d1",
+            "decision" => "deny",
+            "gate" => "write_policy",
+            "tool" => "write",
+            "normalized_path" => "secrets/a.md",
+            "matched_rule" => "no_allow_match",
+            "policy_id" => "runner-policy"
+          }),
+          raw_event(child_session_id, 2, "permission_decision", %{
+            "call_id" => "d2",
+            "decision" => "deny",
+            "gate" => "write_policy",
+            "tool" => "edit",
+            "normalized_path" => "secrets/b.md",
+            "matched_rule" => "no_allow_match",
+            "policy_id" => "runner-policy"
+          }),
+          raw_event(child_session_id, 3, "turn_failed", %{
+            "terminal_status" => "tool_error",
+            "error_kind" => "write_policy_denied"
+          })
+        ])
+
+        {:ok,
+         %{
+           "ok" => false,
+           "status" => "partial",
+           "workflow_id" => "wf_fatal_denial",
+           "steps" => [
+             %{
+               "step_id" => "write",
+               "child_session_id" => child_session_id,
+               "status" => "failed",
+               "subagent_status" => "failed",
+               "checkpoint_status" => "failed",
+               "workspace_mode" => "shared",
+               "write_set" => ["notes/out.md"]
+             }
+           ],
+           "summary" => %{"steps" => 1, "failed_steps" => 1},
+           "safe_next_actions" => ["retry_failed_steps"]
+         }}
+      end
+
+      opts = [workflow_runner: workflow_runner]
+
+      assert {:ok, payload} =
+               Runner.run(
+                 %{workspace: ws},
+                 bounded_write_workflow_spec(),
+                 bounded_write_spec_meta(),
+                 opts
+               )
+
+      assert payload["write_denials"]["count"] == 2
+      assert [first, second] = payload["write_denials"]["denials"]
+      assert first["disposition"] == "recovered"
+      assert second["disposition"] == "fatal"
+      assert second["tool"] == "edit"
+    end)
+  end
+
+  # Unavailability has to reach the top of the envelope. A coordinator that sums
+  # the aggregate `count` must not be handed a total that silently counts an
+  # unreadable child's Log as zero denials: the aggregate withholds the total and
+  # names the reason instead.
+  test "a child whose Log cannot be read makes the aggregate confession unavailable" do
+    with_pixir_home("pixir-delegate-runner-home", fn ->
+      ws = tmp_workspace("pixir-delegate-runner-unreadable-log")
+
+      workflow_runner = fn _parent_session_id, _workflow_spec, _opts ->
+        {:ok,
+         %{
+           "ok" => false,
+           "status" => "partial",
+           "workflow_id" => "wf_unreadable_log",
+           "steps" => [
+             %{
+               "step_id" => "write",
+               # An id the Log refuses outright: the evidence cannot be read.
+               "child_session_id" => "../../etc/passwd",
+               "status" => "failed",
+               "subagent_status" => "failed",
+               "checkpoint_status" => "failed",
+               "workspace_mode" => "shared",
+               "write_set" => ["notes/out.md"]
+             }
+           ],
+           "summary" => %{"steps" => 1, "failed_steps" => 1},
+           "safe_next_actions" => ["retry_failed_steps"]
+         }}
+      end
+
+      assert {:ok, payload} =
+               Runner.run(
+                 %{workspace: ws},
+                 bounded_write_workflow_spec(),
+                 bounded_write_spec_meta(),
+                 workflow_runner: workflow_runner
+               )
+
+      assert payload["write_denials"]["status"] == "unavailable"
+      assert payload["write_denials"]["count"] == nil
+      assert payload["write_denials"]["denials"] == []
+      assert is_binary(payload["write_denials"]["error"])
+
+      assert [child] = payload["children"]
+      assert child["write_denials"]["status"] == "unavailable"
     end)
   end
 end

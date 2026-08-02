@@ -138,6 +138,8 @@
         "status": "unknown",
         "observed_paths": [],
         "observed_semantics": "unknown",
+        "basis": "no_write_evidence",
+        "write_denials": [],
         "evidence_refs": [],
         "limitations": [
           "mutation_evidence_incomplete"
@@ -185,6 +187,8 @@
     "status": "unknown",
     "observed_paths": [],
     "observed_semantics": "unknown",
+    "basis": "no_write_evidence",
+    "write_denials": [],
     "evidence_refs": [],
     "limitations": [
       "mutation_evidence_incomplete"
@@ -222,5 +226,15 @@
     "volatile_attempt_not_durable",
     "usage_incomplete_missing_child_log",
     "mutation_evidence_incomplete"
-  ]
+  ],
+  "post_terminal_child_activity": {
+    "state": "not_applicable",
+    "basis": "nonterminal_execution",
+    "boundary_at": null,
+    "boundary_basis": null,
+    "event_count": null,
+    "latest_event_at": null,
+    "child_session_ids": [],
+    "evidence_refs": []
+  }
 }

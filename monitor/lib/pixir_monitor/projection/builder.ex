@@ -7,7 +7,11 @@ defmodule PixirMonitor.Projection.Builder do
   bounded caller-supplied input map.
   """
 
-  alias PixirMonitor.Projection.{Advisory, AttemptStatus, Gate, UnitIdentity, WorkflowGraph}
+  alias PixirMonitor.Projection.{Advisory, AttemptStatus, Gate, Temporal, UnitIdentity, WorkflowGraph}
+
+  # Pinned names for the post-terminal child-activity dimension (#447 Phase 1).
+  @post_terminal_basis "child_events_after_parent_terminal_boundary"
+  @post_terminal_limitation "post_terminal_child_activity_observed"
 
   @terminal ~w(completed failed timed_out cancelled detached closed)
   @lifecycle ~w(queued started input retrying finished failed timed_out cancelled detached closed)
@@ -17,6 +21,13 @@ defmodule PixirMonitor.Projection.Builder do
     "workspace_mode" => ~w(shared isolated virtual_overlay unknown),
     "posture" => ~w(read_only writer virtual_scratch apply unknown)
   }
+  # Caller-supplied activity assertion. The builder never derives this: it is the
+  # polling caller — the only component that legitimately holds
+  # observation-to-observation state — asserting whether the durable parent Log
+  # advanced for this run identity since its OWN prior observation. "advanced"
+  # is the sole admitted assertion; every other value (including absence) folds
+  # to the conservative "not asserted" path.
+  @activity_evidence_vocabulary ~w(advanced unchanged unknown)
   @input_enum_vocabulary %{
     run: %{
       "strategy" => ~w(workflow subagents unknown),
@@ -85,7 +96,8 @@ defmodule PixirMonitor.Projection.Builder do
             parent_id: envelope["parent_session_id"] || infer_parent(inputs, parent),
             origin: origin,
             observed_at: raw["observed_at"] || inputs["observed_at"],
-            completeness: raw["completeness"] || %{}
+            completeness: raw["completeness"] || %{},
+            activity_evidence: activity_evidence(inputs)
           }
 
           do_build(context)
@@ -114,9 +126,17 @@ defmodule PixirMonitor.Projection.Builder do
       root_usage = usage_for_units(units1)
       root_mutation = root_mutation(units1)
       root_actions = units1 |> Enum.flat_map(& &1["safe_actions"]) |> uniq_by(&{&1["scope"], &1["id"], &1["command"]})
-      limitations = units1 |> Enum.flat_map(& &1["limitations"]) |> Kernel.++(source["limitations"]) |> uniq()
+      activity = post_terminal_child_activity(ctx, execution)
+
+      limitations =
+        units1
+        |> Enum.flat_map(& &1["limitations"])
+        |> Kernel.++(source["limitations"])
+        |> maybe_add(activity["state"] == "observed", @post_terminal_limitation)
+        |> uniq()
+
       units_with_advisory_source = Enum.map(units1, &put_attention/1)
-      evidence = evidence(ctx, units_with_advisory_source, execution, source)
+      evidence = evidence(ctx, units_with_advisory_source, execution, source, activity)
       units = Enum.map(units_with_advisory_source, &strip_advisory_source/1)
 
       projection = %{
@@ -141,13 +161,38 @@ defmodule PixirMonitor.Projection.Builder do
         "mutation" => root_mutation,
         "safe_actions" => root_actions,
         "evidence" => evidence,
-        "limitations" => limitations
+        "limitations" => limitations,
+        "post_terminal_child_activity" => activity
       }
 
       projection = normalize_input_reachable_fields(projection, ctx)
       {:ok, normalize_provenance(projection, ctx)}
     end
   end
+
+  # Admits the optional caller-supplied activity assertion.
+  #
+  # Absent -> {"unknown", false}: today's conservative behavior, no limitation.
+  # Recognized -> {value, false}: folded as asserted evidence.
+  # Anything else -> {"unknown", true}: not asserted AND visibly recorded, so a
+  # malformed caller cannot silently buy a quieter projection.
+  defp activity_evidence(inputs) do
+    case Map.fetch(inputs, "activity_evidence") do
+      :error ->
+        %{"durable_evidence" => "unknown", "unrecognized" => false}
+
+      {:ok, nil} ->
+        %{"durable_evidence" => "unknown", "unrecognized" => false}
+
+      {:ok, %{"durable_evidence" => value}} when value in @activity_evidence_vocabulary ->
+        %{"durable_evidence" => value, "unrecognized" => false}
+
+      {:ok, _other} ->
+        %{"durable_evidence" => "unknown", "unrecognized" => true}
+    end
+  end
+
+  defp durable_evidence_advanced?(ctx), do: ctx.activity_evidence["durable_evidence"] == "advanced"
 
   defp require_inputs(inputs) when is_map(inputs) do
     required = ~w(terminal_envelope delegate_snapshot parent_log parent_log_origin child_logs runtime_diagnostics owner_state evidence_mirror)
@@ -346,6 +391,10 @@ defmodule PixirMonitor.Projection.Builder do
       cond do
         execution["terminal"] -> "terminal"
         has_durable and live in ~w(stale_handle owner_unavailable) -> "stale"
+        # Externally owned with asserted advancement: the durable Log is the
+        # evidence and it moved, so the run is current. Owner non-residency
+        # alone never buys "stale".
+        has_durable and live == "externally_owned" -> "current"
         mode in ~w(live mixed) -> "current"
         true -> "unknown"
       end
@@ -356,6 +405,7 @@ defmodule PixirMonitor.Projection.Builder do
       |> maybe_add(not has_durable, "durable_log_unavailable")
       |> maybe_add(child_logs_missing?(ctx), "child_log_missing")
       |> maybe_add(freshness == "stale", "source_stale")
+      |> maybe_add(ctx.activity_evidence["unrecognized"], "activity_evidence_unrecognized")
       |> maybe_add("subagent_may_still_be_running" in raw_limits, "subagent_may_still_be_running")
       |> maybe_add(
         malformed_event_timestamp_count > 0,
@@ -685,10 +735,12 @@ defmodule PixirMonitor.Projection.Builder do
   # space-separated form, but the schema's date-time format is RFC3339 with a
   # "T" separator, so a space-form value would pass here and then fail the
   # served validation. Require both.
-  defp valid_iso8601_datetime?(value) do
+  defp valid_iso8601_datetime?(value) when is_binary(value) do
     match?({:ok, _datetime, _utc_offset}, DateTime.from_iso8601(value)) and
       String.contains?(value, "T")
   end
+
+  defp valid_iso8601_datetime?(_value), do: false
 
   # Sanitize ALWAYS, then bound: a short raw value can still carry invalid
   # UTF-8, and projected strings must be text only.
@@ -1220,7 +1272,12 @@ defmodule PixirMonitor.Projection.Builder do
         true -> []
       end
 
-    mutation_decisive? = mutation["status"] in ~w(partial indeterminate workspace_applied not_applied)
+    # An observed deny is decisive evidence about the lane even when no write
+    # ever succeeded, so its refs must reach the unit's evidence drill-down.
+    mutation_decisive? =
+      mutation["status"] in ~w(partial indeterminate workspace_applied not_applied) or
+        (mutation["write_denials"] || []) != []
+
     mutation_refs = if mutation_decisive?, do: mutation["evidence_refs"], else: []
 
     identity_refs =
@@ -1401,12 +1458,29 @@ defmodule PixirMonitor.Projection.Builder do
 
     state =
       cond do
-        execution["terminal"] and "subagent_may_still_be_running" not in limits -> "not_applicable"
-        execution["terminal"] -> if(owner["state"] == "owner_unavailable", do: "owner_unavailable", else: "stale_handle")
-        owner["reachable"] == true -> "live"
-        owner["state"] == "owner_unavailable" -> "owner_unavailable"
-        execution["state"] in ~w(planned queued running) and owner["state"] in ~w(snapshot_only stale_handle) -> "stale_handle"
-        true -> "unknown"
+        execution["terminal"] and "subagent_may_still_be_running" not in limits ->
+          "not_applicable"
+
+        execution["terminal"] ->
+          if(owner["state"] == "owner_unavailable", do: "owner_unavailable", else: "stale_handle")
+
+        owner["reachable"] == true ->
+          "live"
+
+        owner["state"] == "owner_unavailable" ->
+          "owner_unavailable"
+
+        # Owner residency and activity evidence are two different claims. A
+        # non-resident owner is the ORDINARY condition for external observation:
+        # when the caller asserts the durable Log advanced since its own prior
+        # observation, the honest state is "externally owned, confirmed from
+        # durable evidence", not a broken handle. stale_handle stays reserved for
+        # nonterminal runs that nothing is confirming.
+        execution["state"] in ~w(planned queued running) and owner["state"] in ~w(snapshot_only stale_handle) ->
+          if(durable_evidence_advanced?(ctx), do: "externally_owned", else: "stale_handle")
+
+        true ->
+          "unknown"
       end
 
     cond do
@@ -1427,6 +1501,19 @@ defmodule PixirMonitor.Projection.Builder do
               do: compact([diagnostics_ref(ctx)]),
               else: compact([owner_ref(ctx), diagnostics_ref(ctx)])
             )
+        }
+
+      # The basis names what was actually relied on. This observer made no
+      # delegate-owner observation: it read the durable Log across its own
+      # successive polls. reachable stays false — the process is genuinely
+      # unverified from here — so no reachability claim is fabricated.
+      state == "externally_owned" ->
+        %{
+          "state" => state,
+          "reachable" => false,
+          "basis" => "durable_log_activity",
+          "observed_at" => nil,
+          "evidence_refs" => compact([owner_ref(ctx)] ++ execution["evidence_refs"])
         }
 
       map_size(owner) > 0 ->
@@ -1629,44 +1716,53 @@ defmodule PixirMonitor.Projection.Builder do
 
   defp unit_mutation(unit, ctx, artifacts) do
     mode = ctx.envelope["mode"]
+    envelope_paths = matching_envelope_child(unit, ctx)["observed_applied_writes"] || []
+    derived_paths = child_derived_write_paths(unit, ctx)
+    denials = child_write_denials(unit, ctx)
+    child_absent? = child_write_evidence_absent?(unit, ctx)
 
-    {status, semantics, paths} =
+    {status, semantics, paths, basis} =
       cond do
         unit["materialization"] == "volatile_only" ->
-          {"unknown", "unknown", []}
+          {"unknown", "unknown", [], write_basis(envelope_paths, [], child_absent?)}
 
         unit["execution_kind"] == "virtual_overlay" ->
-          {"isolated_only", "none", []}
+          {"isolated_only", "none", [], "no_write_evidence"}
 
         unit["execution_kind"] == "virtual_diff_apply" ->
           step = Enum.find(ctx.envelope["steps"] || [], &(&1["step_id"] == List.last(String.split(unit["logical_id"], ":")))) || %{}
           apply = get_in(step, ["checkpoint", "virtual_diff_apply"]) || %{}
           ps = for f <- apply["files"] || [], f["status"] == "applied", do: f["path"]
 
-          cond do
-            apply["status"] == "applied" -> {"workspace_applied", "exact", ps}
-            apply["status"] in ~w(failed conflicted) -> {"partial", "at_least", ps}
-            true -> {"indeterminate", "unknown", ps}
+          case apply["status"] do
+            "applied" -> {"workspace_applied", "exact", ps, "apply_checkpoint"}
+            s when s in ~w(failed conflicted) -> {"partial", "at_least", ps, "apply_checkpoint"}
+            _ -> {"indeterminate", "unknown", ps, "apply_checkpoint"}
           end
 
         mode == "read_only" ->
-          {"read_only", "none", []}
+          {"read_only", "none", [], "no_write_evidence"}
 
         true ->
-          child = matching_envelope_child(unit, ctx)
-          ps = child["observed_applied_writes"] || []
+          # Envelope-supplied writes take precedence; child-derived paths are a
+          # lower bound and may only widen the observed set, never the semantics.
+          ps = uniq(envelope_paths ++ derived_paths)
+          basis = write_basis(envelope_paths, derived_paths, child_absent?)
 
           cond do
-            get_in(ctx.envelope, ["write_destination", "contract_status"]) == "partial_repo_mutation" or ps != [] -> {"partial", "at_least", ps}
-            ctx.envelope["status"] in ~w(failed partial timed_out) -> {"indeterminate", "unknown", []}
-            Enum.any?(artifacts, &(&1["application_state"] == "not_applied")) -> {"not_applied", "none", []}
-            true -> {"none", "none", []}
+            get_in(ctx.envelope, ["write_destination", "contract_status"]) == "partial_repo_mutation" or ps != [] -> {"partial", "at_least", ps, basis}
+            ctx.envelope["status"] in ~w(failed partial timed_out) -> {"indeterminate", "unknown", [], basis}
+            child_absent? -> {"indeterminate", "unknown", [], basis}
+            Enum.any?(artifacts, &(&1["application_state"] == "not_applied")) -> {"not_applied", "none", [], basis}
+            true -> {"none", "none", [], basis}
           end
       end
 
     mutation_limitations =
       []
       |> maybe_add(status in ~w(unknown indeterminate), "mutation_evidence_incomplete")
+      |> maybe_add(basis == "no_child_evidence_available", "mutation_evidence_incomplete")
+      |> maybe_add(basis == "no_child_evidence_available" and child_logs_missing?(ctx), "child_log_missing")
       |> maybe_add(get_in(ctx.envelope, ["write_destination", "contract_status"]) == "partial_repo_mutation", "partial_repo_mutation")
 
     artifact_refs =
@@ -1674,13 +1770,120 @@ defmodule PixirMonitor.Projection.Builder do
       |> Enum.filter(&(&1["kind"] == "virtual_diff" and &1["application_state"] == "not_applied"))
       |> Enum.flat_map(& &1["evidence_refs"])
 
+    denial_refs = Enum.flat_map(denials, & &1["evidence_refs"])
+
     %{
       "status" => status,
       "observed_paths" => uniq(paths),
       "observed_semantics" => semantics,
-      "evidence_refs" => uniq(mutation_refs(unit, ctx) ++ artifact_refs),
+      "basis" => basis,
+      "write_denials" => denials,
+      "evidence_refs" => uniq(mutation_refs(unit, ctx) ++ artifact_refs ++ denial_refs),
       "limitations" => mutation_limitations
     }
+  end
+
+  # Derived provenance for the observed write set. Never asserted by input.
+  # A child path the envelope already reported corroborates the envelope; it does
+  # not make the fold mixed. Only child paths the envelope omitted do that.
+  defp write_basis(envelope_paths, derived_paths, child_absent?) do
+    child_only = derived_paths -- envelope_paths
+
+    cond do
+      envelope_paths != [] and child_only != [] -> "envelope_and_child_log"
+      envelope_paths != [] -> "envelope_observed_writes"
+      derived_paths != [] -> "child_log_derived"
+      child_absent? -> "no_child_evidence_available"
+      true -> "no_write_evidence"
+    end
+  end
+
+  @write_tools ~w(write edit apply_virtual_diff)
+
+  # Applied writes reconstructed from the unit's child Log: a write-class tool call
+  # correlated by call_id to an ok result. Lower-bound evidence only.
+  defp child_derived_write_paths(unit, ctx) do
+    events = unit_child_events(unit, ctx)
+    ok_calls = for e <- events, e["type"] == "tool_result", get_in(e, ["data", "ok"]) == true, into: MapSet.new(), do: get_in(e, ["data", "call_id"])
+
+    paths =
+      for event <- events,
+          event["type"] == "tool_call",
+          get_in(event, ["data", "name"]) in @write_tools,
+          MapSet.member?(ok_calls, get_in(event, ["data", "call_id"])),
+          path = workspace_relative_path(get_in(event, ["data", "args", "path"])),
+          path != nil,
+          do: path
+
+    uniq(paths)
+  end
+
+  # Write-policy denials from the unit's child Log. A deny is not a mutation.
+  defp child_write_denials(unit, ctx) do
+    child_session_id = matching_envelope_child(unit, ctx)["child_session_id"]
+
+    unit_child_events(unit, ctx)
+    |> Enum.filter(fn event ->
+      event["type"] == "permission_decision" and
+        get_in(event, ["data", "gate"]) == "write_policy" and
+        get_in(event, ["data", "decision"]) == "deny"
+    end)
+    |> Enum.map(fn event ->
+      data = event["data"] || %{}
+
+      %{
+        "normalized_path" => workspace_relative_path(data["normalized_path"] || data["requested_path"]),
+        "requested_path" => data["requested_path"] || data["normalized_path"],
+        "matched_rule" => data["matched_rule"] || data["rule"],
+        "policy_id" => data["policy_id"],
+        "policy_hash" => data["policy_hash"],
+        "tool" => data["tool"],
+        "evidence_refs" => [child_ref(child_session_id, event)]
+      }
+    end)
+    |> uniq_by(&denial_key/1)
+  end
+
+  # Out-of-lane targets normalize to nil, so the requested path carries the
+  # distinctness: two denied escapes must never collapse into one record.
+  defp denial_key(denial) do
+    {denial["normalized_path"] || denial["requested_path"], denial["matched_rule"], denial["policy_id"], denial["policy_hash"]}
+  end
+
+  # True when the unit could have child write evidence but none is readable.
+  defp child_write_evidence_absent?(unit, ctx) do
+    child_session_id = matching_envelope_child(unit, ctx)["child_session_id"]
+
+    child_session_id != nil and
+      unit_child_events(unit, ctx) == [] and
+      (ctx.completeness["child_logs"] in ~w(explicitly_missing unavailable minimized not_retained provider_usage_sampled) or
+         is_nil(get_in(ctx.inputs, ["child_logs", child_session_id])))
+  end
+
+  defp unit_child_events(unit, ctx), do: child_events(ctx, matching_envelope_child(unit, ctx)["child_session_id"])
+
+  # A write is only an observed path when it lands inside the unit's workspace.
+  # Absolute or escaping targets are rejected rather than normalized into the lane.
+  defp workspace_relative_path(path) when is_binary(path) do
+    trimmed = String.trim(path)
+
+    cond do
+      trimmed == "" -> nil
+      String.starts_with?(trimmed, "/") -> nil
+      String.starts_with?(trimmed, "~") -> nil
+      true -> confine_relative(trimmed)
+    end
+  end
+
+  defp workspace_relative_path(_path), do: nil
+
+  defp confine_relative(path) do
+    segments =
+      path
+      |> String.split("/")
+      |> Enum.reject(&(&1 in ["", "."]))
+
+    if ".." in segments or segments == [], do: nil, else: Enum.join(segments, "/")
   end
 
   defp root_mutation(units) do
@@ -1704,6 +1907,11 @@ defmodule PixirMonitor.Projection.Builder do
       |> maybe_add(Enum.any?(units, fn unit -> Enum.any?(unit["artifacts"], &(&1["kind"] == "virtual_diff" and &1["application_state"] == "not_applied")) end), "virtual_diff_not_applied")
       |> uniq()
 
+    denials =
+      ms
+      |> Enum.flat_map(&(&1["write_denials"] || []))
+      |> uniq_by(&{denial_key(&1), &1["evidence_refs"]})
+
     decisive_refs =
       if status == "workspace_applied" do
         ms
@@ -1718,9 +1926,19 @@ defmodule PixirMonitor.Projection.Builder do
       "status" => status,
       "observed_paths" => uniq(paths),
       "observed_semantics" => sem,
-      "evidence_refs" => decisive_refs,
+      "basis" => root_mutation_basis(ms),
+      "write_denials" => denials,
+      "evidence_refs" => uniq(decisive_refs ++ Enum.flat_map(denials, & &1["evidence_refs"])),
       "limitations" => mutation_limitations
     }
+  end
+
+  # Deterministic fold: the strongest evidence class any unit rests on wins.
+  @basis_precedence ~w(envelope_observed_writes child_log_derived envelope_and_child_log apply_checkpoint no_child_evidence_available no_write_evidence)
+
+  defp root_mutation_basis(ms) do
+    bases = Enum.map(ms, &(&1["basis"] || "no_write_evidence"))
+    Enum.find(@basis_precedence, "no_write_evidence", &(&1 in bases))
   end
 
   defp graph(ctx, units) do
@@ -1959,7 +2177,7 @@ defmodule PixirMonitor.Projection.Builder do
         fn {l, reason}, acc -> maybe_reason(acc, if(l in u["limitations"], do: reason)) end
       )
 
-  defp evidence(ctx, units, execution, source) do
+  defp evidence(ctx, units, execution, source, activity) do
     parent =
       Enum.map(ctx.parent, fn e ->
         %{
@@ -1978,6 +2196,29 @@ defmodule PixirMonitor.Projection.Builder do
           "id" => child_ref(sid, e),
           "authority" => "canonical",
           "source_kind" => "child_log",
+          "session_id" => sid,
+          "seq" => e["seq"],
+          "description" => child_event_description(e, events, sid, ctx)
+        }
+      end
+
+    # Child evidence resolved through a verified mirror entry (no `child_logs`
+    # row for that session) is citable too: the mirror IS the child Log here, so
+    # a projection that cites it must be able to list it. Precedence matches
+    # child_events/2 exactly — `child_logs` first, verified mirror second.
+    mirror_children =
+      for item <- get_in(ctx.inputs, ["evidence_mirror", "logs"]) || [],
+          item["role"] == "child",
+          verified_mirror?(item),
+          sid = item["session_id"],
+          is_binary(sid),
+          not is_list(get_in(ctx.inputs, ["child_logs", sid])),
+          events = item["events"] || [],
+          e <- events do
+        %{
+          "id" => child_ref(sid, e),
+          "authority" => "canonical",
+          "source_kind" => "evidence_mirror",
           "session_id" => sid,
           "seq" => e["seq"],
           "description" => child_event_description(e, events, sid, ctx)
@@ -2052,10 +2293,18 @@ defmodule PixirMonitor.Projection.Builder do
 
     mirror_evidence = conflicting_mirror_evidence(ctx)
 
-    used = projection_refs(%{"units" => units, "execution" => execution, "source" => source, "run" => run(ctx)}) |> MapSet.new()
+    used =
+      projection_refs(%{
+        "units" => units,
+        "execution" => execution,
+        "source" => source,
+        "run" => run(ctx),
+        "post_terminal_child_activity" => activity
+      })
+      |> MapSet.new()
 
     referenced_evidence =
-      (envelope_evidence ++ durable_evidence ++ children ++ volatile_evidence)
+      (envelope_evidence ++ durable_evidence ++ children ++ mirror_children ++ volatile_evidence)
       |> uniq_by(& &1["id"])
       |> Enum.filter(&MapSet.member?(used, &1["id"]))
 
@@ -2126,6 +2375,151 @@ defmodule PixirMonitor.Projection.Builder do
     |> Enum.reject(&is_nil/1)
     |> MapSet.new()
   end
+
+  # ------------------------------------------------------------------------
+  # Post-terminal child activity (#447 Phase 1).
+  #
+  # This dimension REPORTS; it never reclassifies. Canonical `execution` is
+  # untouched, `liveness` is untouched, and the frozen `temporal` schema is not
+  # repurposed. A child Log is durable evidence of PAST writes, so observing
+  # events after the parent's terminal boundary proves the run's narrative is
+  # incomplete — never that any process is reachable now.
+  #
+  # The boundary is derived from parent evidence only: the terminal
+  # `workflow_finished` timestamp when one exists, otherwise the max terminal
+  # subagent-lifecycle timestamp. No wall clock, no SSE receipt, no
+  # `projected_at` / `observed_at`.
+  #
+  # Four states are kept distinguishable and are never conflated; in particular
+  # an observed zero (`none`) and missing evidence (`undetermined`) are separate
+  # facts in the emitted document:
+  #
+  #   * `observed`      — child evidence present, events strictly after the boundary.
+  #   * `none`          — child evidence present (possibly an explicitly empty list),
+  #                       no events after the boundary. An OBSERVED zero.
+  #   * `undetermined`  — child evidence unavailable for at least one known child.
+  #                       Missing evidence never asserts "nothing happened".
+  #   * `not_applicable`— execution is nonterminal; there is no boundary to be after.
+  # ------------------------------------------------------------------------
+  defp post_terminal_child_activity(ctx, execution) do
+    if execution["terminal"] do
+      terminal_child_activity(ctx, terminal_boundary(ctx))
+    else
+      activity_row("not_applicable", "nonterminal_execution", nil, nil, nil, nil, [], [])
+    end
+  end
+
+  defp terminal_child_activity(ctx, {boundary_at, boundary_basis}) do
+    sessions = child_session_order(ctx)
+
+    cond do
+      is_nil(boundary_at) ->
+        activity_row("undetermined", "terminal_boundary_unavailable", nil, nil, nil, nil, [], [])
+
+      Enum.any?(sessions, &child_evidence_unavailable?(ctx, &1)) ->
+        activity_row("undetermined", "child_evidence_unavailable", boundary_at, boundary_basis, nil, nil, [], [])
+
+      true ->
+        observed_child_activity(ctx, sessions, boundary_at, boundary_basis)
+    end
+  end
+
+  defp observed_child_activity(ctx, sessions, boundary_at, boundary_basis) do
+    later =
+      for sid <- sessions,
+          event <- child_events(ctx, sid),
+          after_boundary?(event["ts"], boundary_at),
+          do: {sid, event}
+
+    count = length(later)
+    latest = later |> Enum.map(fn {_sid, event} -> event["ts"] end) |> Temporal.max_instant()
+    ids = later |> Enum.map(&elem(&1, 0)) |> uniq()
+    refs = later |> Enum.map(fn {sid, event} -> child_ref(sid, event) end) |> order_child_refs()
+
+    activity_row(
+      if(count > 0, do: "observed", else: "none"),
+      @post_terminal_basis,
+      boundary_at,
+      boundary_basis,
+      count,
+      latest,
+      ids,
+      refs
+    )
+  end
+
+  defp activity_row(state, basis, boundary_at, boundary_basis, count, latest, ids, refs) do
+    %{
+      "state" => state,
+      "basis" => basis,
+      "boundary_at" => boundary_at,
+      "boundary_basis" => boundary_basis,
+      "event_count" => count,
+      "latest_event_at" => latest,
+      "child_session_ids" => ids,
+      "evidence_refs" => refs
+    }
+  end
+
+  # A child id named by parent evidence whose Log resolves to neither a
+  # `child_logs` list nor a verified mirror entry is unavailable. Note that an
+  # explicit `[]` IS available (an observed zero) while `nil` or an absent key
+  # is not.
+  defp child_evidence_unavailable?(ctx, sid) do
+    not is_list(get_in(ctx.inputs, ["child_logs", sid])) and mirror_child_entry(ctx, sid) == nil
+  end
+
+  defp mirror_child_entry(ctx, sid) do
+    Enum.find(
+      get_in(ctx.inputs, ["evidence_mirror", "logs"]) || [],
+      &(&1["role"] == "child" and &1["session_id"] == sid and verified_mirror?(&1))
+    )
+  end
+
+  defp after_boundary?(ts, boundary_at) when is_binary(ts) and is_binary(boundary_at) do
+    with {:ok, event_at, _offset} <- DateTime.from_iso8601(ts),
+         {:ok, boundary, _boundary_offset} <- DateTime.from_iso8601(boundary_at) do
+      DateTime.compare(event_at, boundary) == :gt
+    else
+      _ -> false
+    end
+  end
+
+  defp after_boundary?(_ts, _boundary_at), do: false
+
+  @doc false
+  # Parent-only terminal boundary, shared verbatim with the list fold so a row
+  # and its detail projection can never disagree on when the parent ended.
+  @spec terminal_boundary_from_events([map()]) :: {String.t() | nil, String.t() | nil}
+  def terminal_boundary_from_events(parent) do
+    finish =
+      parent
+      |> Enum.filter(&(&1["type"] == "workflow_event" and get_in(&1, ["data", "kind"]) == "workflow_finished"))
+      |> List.last()
+
+    if finish do
+      # A `workflow_finished` event is the authoritative boundary, so a malformed
+      # timestamp on it is missing evidence, never a licence to fall back to an
+      # EARLIER lifecycle row: that would silently shrink the boundary and turn
+      # pre-terminal child events into "post-terminal" ones.
+      if valid_iso8601_datetime?(finish["ts"]), do: {finish["ts"], "workflow_finished_event_ts"}, else: {nil, nil}
+    else
+      parent
+      |> Enum.filter(fn event ->
+        event["type"] == "subagent_event" and
+          get_in(event, ["data", "event"]) in @lifecycle and
+          get_in(event, ["data", "status"]) in @terminal
+      end)
+      |> Enum.map(& &1["ts"])
+      |> Enum.filter(&is_binary/1)
+      |> case do
+        [] -> {nil, nil}
+        timestamps -> {Temporal.max_instant(timestamps), "terminal_subagent_lifecycle_ts"}
+      end
+    end
+  end
+
+  defp terminal_boundary(ctx), do: terminal_boundary_from_events(ctx.parent)
 
   defp child_logs_missing?(ctx), do: ctx.completeness["child_logs"] in ~w(explicitly_missing unavailable) and Enum.any?(ctx.parent, &(&1["type"] == "subagent_event"))
   defp child_logs_missing_for?(ctx, attempts), do: child_logs_missing?(ctx) and attempts != [] and Enum.all?(attempts, &(child_events(ctx, &1["child_session_id"]) == []))
@@ -2584,6 +2978,12 @@ defmodule PixirMonitor.Projection.Builder do
       (ctx.inputs["owner_state"] || %{})["reachable"] == true ->
         "Current runtime has a reachable Delegate owner."
 
+      # Non-residency is the ordinary condition for external observation. When
+      # the caller asserts the durable Log advanced, the honest description is
+      # "somebody else owns it", not "nothing is alive".
+      durable_evidence_advanced?(ctx) and (ctx.inputs["owner_state"] || %{})["state"] == "snapshot_only" ->
+        "Delegate owner is another process; durable Log evidence is advancing."
+
       true ->
         "Only a snapshot remains; no live Owner is reachable."
     end
@@ -2744,8 +3144,20 @@ defmodule PixirMonitor.Projection.Builder do
         sessions -> sessions |> Enum.with_index() |> Map.new(fn {session_id, index} -> {session_id, ordinal_label(index)} end)
       end
 
+    # Child-Session evidence keeps ONE reference identity regardless of which
+    # durable surface resolved it. A run whose child events came through a
+    # verified mirror entry must cite the same ids it would have cited from
+    # `child_logs`, so the two resolution paths stay indistinguishable to any
+    # consumer that follows a reference. Mirror entries for the PARENT Session
+    # keep their own `e-mirror-` identity and are untouched here.
+    child_session_ids = MapSet.new(child_sessions)
+
     evidence
-    |> Enum.filter(&(&1["source_kind"] == "child_log"))
+    |> Enum.filter(
+      &(&1["source_kind"] == "child_log" or
+          (&1["source_kind"] == "evidence_mirror" and
+             MapSet.member?(child_session_ids, &1["session_id"])))
+    )
     |> Map.new(fn item ->
       label = labels[item["session_id"]]
       normalized = if label, do: "e-child-#{label}-#{item["seq"]}", else: "e-child-#{item["seq"]}"
@@ -2816,7 +3228,7 @@ defmodule PixirMonitor.Projection.Builder do
 
     child_events(ctx, child_session_id)
     |> Enum.filter(fn event ->
-      (event["type"] == "tool_call" and get_in(event, ["data", "name"]) == "write") or
+      (event["type"] == "tool_call" and get_in(event, ["data", "name"]) in @write_tools) or
         (event["type"] == "tool_result" and get_in(event, ["data", "ok"]) == true)
     end)
     |> Enum.map(&child_ref(child_session_id, &1))

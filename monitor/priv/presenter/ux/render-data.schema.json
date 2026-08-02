@@ -140,9 +140,10 @@
               ]}
             },
             "liveness": {
-              "type": "array", "minItems": 5, "maxItems": 5, "uniqueItems": true,
+              "type": "array", "minItems": 6, "maxItems": 6, "uniqueItems": true,
               "items": {"enum": [
                 {"value": "live", "label": "Live"},
+                {"value": "externally_owned", "label": "Externally owned"},
                 {"value": "stale_handle", "label": "Stale handle"},
                 {"value": "owner_unavailable", "label": "Owner unavailable"},
                 {"value": "not_applicable", "label": "Not applicable"},
@@ -161,12 +162,12 @@
         },
         "tones": {
           "type": "object",
-          "minProperties": 21,
-          "maxProperties": 21,
+          "minProperties": 22,
+          "maxProperties": 22,
           "propertyNames": {"enum": [
             "planned", "queued", "running", "completed", "partial", "failed",
             "timed_out", "cancelled", "detached", "closed", "held", "unknown",
-            "live", "stale_handle", "owner_unavailable", "not_applicable",
+            "live", "externally_owned", "stale_handle", "owner_unavailable", "not_applicable",
             "checkpoint_ready", "needs_orchestrator", "pass", "stop", "needs_review"
           ]},
           "additionalProperties": {"enum": ["good", "warning", "danger", "muted", "active"]}

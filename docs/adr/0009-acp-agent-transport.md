@@ -114,6 +114,24 @@ input assembly, Provider transport, and `provider_usage` evidence.
    errors are reserved for genuine protocol faults (unknown method, invalid params,
    unknown session).
 
+   *Amended 2026-08-02 (issue #465).* The chat rendering above stands unchanged — but it
+   left a client unable to DISTINGUISH a failed Turn from a completed one without parsing
+   chat text, which is how a raw provider error ended up rendered as an ordinary
+   assistant message in the T3 investigation of 2026-07-31. The `session/prompt` RESULT
+   therefore additionally carries `_meta.pixir.turn_failure` exactly when a
+   `turn_failed` event was OBSERVED during the prompt. The contract is evidence-based:
+   key presence means a `turn_failed` was seen, never an inference from the terminal
+   shape — a refused prompt (`:busy`), a silent stall, or an idle timeout without
+   evidence all claim nothing. The fields stay bounded and type-guarded —
+   `terminal_status` and `error_kind`, each only when the producer recorded a binary;
+   never the error message or details, which already travel as chat content. The facts
+   ride REGARDLESS of the final `stopReason`: a cancel that raced a failure keeps
+   `stopReason:"cancelled"` with the facts attached, and a Turn that recorded
+   `turn_failed` but died before its terminal status carries them under the idle-timeout
+   resolution too. `_meta` is the ACP extension channel this server already uses
+   (`initialize._meta.pixir`, prompt `_meta` knobs), so clients that do not know the key
+   are unaffected, and JSON-RPC errors remain reserved for protocol faults.
+
 6. **Current ACP v1 surface.** Handle `initialize`, `authenticate`, `logout`,
    `session/new`, `session/prompt`, `session/cancel`, `session/load`, `session/resume`,
    `session/set_mode`, and `session/set_config_option`; emit `session/update`; originate

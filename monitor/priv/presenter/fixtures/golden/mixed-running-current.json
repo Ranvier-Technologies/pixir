@@ -180,6 +180,8 @@
         "status": "read_only",
         "observed_paths": [],
         "observed_semantics": "none",
+        "basis": "no_write_evidence",
+        "write_denials": [],
         "evidence_refs": [
           "e-snapshot-mixed"
         ],
@@ -228,6 +230,8 @@
     "status": "read_only",
     "observed_paths": [],
     "observed_semantics": "none",
+    "basis": "no_write_evidence",
+    "write_denials": [],
     "evidence_refs": [
       "e-snapshot-mixed"
     ],
@@ -284,5 +288,15 @@
       "description": "Current runtime has a reachable Delegate owner."
     }
   ],
-  "limitations": []
+  "limitations": [],
+  "post_terminal_child_activity": {
+    "state": "not_applicable",
+    "basis": "nonterminal_execution",
+    "boundary_at": null,
+    "boundary_basis": null,
+    "event_count": null,
+    "latest_event_at": null,
+    "child_session_ids": [],
+    "evidence_refs": []
+  }
 }

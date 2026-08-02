@@ -1,0 +1,58 @@
+{
+  "schema": "pixir.presenter.run", "schema_version": 1, "projection_id": "projection:externally-owned-running-advancing", "projected_at": "2026-07-31T09:15:30Z",
+  "run": {"delegate_id":"dlg-external","evidence_refs":["e-snapshot-external"],"id":"dlg-external","mode":"read_only","parent_session_id":"parent-external","strategy":"subagents","title":null,"workflow_id":null},
+  "source": {"as_of_seq":1,"durable_origin":"fixture","freshness":"current","last_durable_at":"2026-07-31T09:15:20Z","limitations":[],"live_observed_at":null,"mode":"reconstructed"},
+  "execution": {"basis":"subagent_event_fold","evidence_refs":["e-parent-0","e-parent-1"],"state":"running","terminal":false},
+  "liveness": {"basis":"durable_log_activity","evidence_refs":["e-owner-external","e-parent-0","e-parent-1"],"observed_at":null,"reachable":false,"state":"externally_owned"},
+  "counts": {"attention_units":0,"completed_units":0,"observed_units":2,"planned_units":2,"running_units":2},
+  "graph": null,
+  "units": [{
+    "logical_id": "delegate:dlg-external:subagent:sub-external-a", "unit_kind": "subagent", "materialization": "durable", "label": "explorer", "agent": "explorer", "execution_kind": "subagent", "workspace_mode": "unknown", "posture": "unknown", "depends_on": [],
+    "execution": {"basis":"subagent_event_fold","evidence_refs":["e-parent-0"],"state":"running","terminal":false},
+    "liveness": {"basis":"durable_log_activity","evidence_refs":["e-owner-external","e-parent-0"],"observed_at":null,"reachable":false,"state":"externally_owned"},
+    "gate": {"basis":"not_applicable","dependent_safe":null,"evidence_refs":[],"state":"not_applicable"},
+    "advisory": {"declared_gate":null,"evidence_refs":[],"major_count":null,"mergeable":null,"minor_count":null,"parse_status":"not_present","present":false,"summary":null,"verdict":"unknown"},
+    "attempts": [{"attempt_id":"delegate:dlg-external:subagent:sub-external-a:attempt:0","child_event_window":{"basis":"whole_child_log_single_attempt","evidence_refs":[],"from_seq":null,"session_id":"child-external-a","to_seq_exclusive":null},"child_session_id":"child-external-a","ended_at":null,"error_kind":null,"evidence_refs":["e-parent-0"],"limitations":[],"materialization":"durable","ordinal":0,"predecessor_attempt_id":null,"relation":"fresh","started_at":"2026-07-31T09:15:00Z","status":"running","status_basis":"parent_log","summary":null,"usage":{"calls":0,"complete":true,"evidence_refs":[],"groups":[],"limitations":[],"source":"none"}}],
+    "artifacts": [],
+    "usage": {"calls":0,"complete":true,"evidence_refs":[],"groups":[],"limitations":[],"source":"none"},
+    "mutation": {"basis":"no_write_evidence","evidence_refs":["e-snapshot-external"],"limitations":[],"observed_paths":[],"observed_semantics":"none","status":"read_only","write_denials":[]},
+    "attention": {"evidence_refs":[],"reasons":[],"required":false},
+    "safe_actions": [],
+    "evidence_refs": ["e-snapshot-external","e-parent-0","e-owner-external"],
+    "limitations": []
+  }, {
+    "logical_id": "delegate:dlg-external:subagent:sub-external-b", "unit_kind": "subagent", "materialization": "durable", "label": "explorer", "agent": "explorer", "execution_kind": "subagent", "workspace_mode": "unknown", "posture": "unknown", "depends_on": [],
+    "execution": {"basis":"subagent_event_fold","evidence_refs":["e-parent-1"],"state":"running","terminal":false},
+    "liveness": {"basis":"durable_log_activity","evidence_refs":["e-owner-external","e-parent-1"],"observed_at":null,"reachable":false,"state":"externally_owned"},
+    "gate": {"basis":"not_applicable","dependent_safe":null,"evidence_refs":[],"state":"not_applicable"},
+    "advisory": {"declared_gate":null,"evidence_refs":[],"major_count":null,"mergeable":null,"minor_count":null,"parse_status":"not_present","present":false,"summary":null,"verdict":"unknown"},
+    "attempts": [{"attempt_id":"delegate:dlg-external:subagent:sub-external-b:attempt:0","child_event_window":{"basis":"whole_child_log_single_attempt","evidence_refs":[],"from_seq":null,"session_id":"child-external-b","to_seq_exclusive":null},"child_session_id":"child-external-b","ended_at":null,"error_kind":null,"evidence_refs":["e-parent-1"],"limitations":[],"materialization":"durable","ordinal":0,"predecessor_attempt_id":null,"relation":"fresh","started_at":"2026-07-31T09:15:20Z","status":"running","status_basis":"parent_log","summary":null,"usage":{"calls":0,"complete":true,"evidence_refs":[],"groups":[],"limitations":[],"source":"none"}}],
+    "artifacts": [],
+    "usage": {"calls":0,"complete":true,"evidence_refs":[],"groups":[],"limitations":[],"source":"none"},
+    "mutation": {"basis":"no_write_evidence","evidence_refs":["e-snapshot-external"],"limitations":[],"observed_paths":[],"observed_semantics":"none","status":"read_only","write_denials":[]},
+    "attention": {"evidence_refs":[],"reasons":[],"required":false},
+    "safe_actions": [],
+    "evidence_refs": ["e-snapshot-external","e-parent-1","e-owner-external"],
+    "limitations": []
+  }],
+  "usage": {"calls":0,"complete":true,"evidence_refs":[],"groups":[],"limitations":[],"source":"none"},
+  "mutation": {"basis":"no_write_evidence","evidence_refs":["e-snapshot-external"],"limitations":[],"observed_paths":[],"observed_semantics":"none","status":"read_only","write_denials":[]},
+  "safe_actions": [],
+  "evidence": [
+    {"authority":"derived","description":"Snapshot supplies run identity and read-only mode.","id":"e-snapshot-external","seq":null,"session_id":"parent-external","source_kind":"delegate_snapshot"},
+    {"authority":"canonical","description":"Durable child execution remains running.","id":"e-parent-0","seq":0,"session_id":"parent-external","source_kind":"parent_log"},
+    {"authority":"canonical","description":"Durable child execution remains running.","id":"e-parent-1","seq":1,"session_id":"parent-external","source_kind":"parent_log"},
+    {"authority":"volatile","description":"Delegate owner is another process; durable Log evidence is advancing.","id":"e-owner-external","seq":null,"session_id":"parent-external","source_kind":"delegate_owner"}
+  ],
+  "limitations": [],
+  "post_terminal_child_activity": {
+    "state": "not_applicable",
+    "basis": "nonterminal_execution",
+    "boundary_at": null,
+    "boundary_basis": null,
+    "event_count": null,
+    "latest_event_at": null,
+    "child_session_ids": [],
+    "evidence_refs": []
+  }
+}

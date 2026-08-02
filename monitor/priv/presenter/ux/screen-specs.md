@@ -18,7 +18,10 @@ Primary operator question: **What happened, what is alive now, what is blocked, 
   may update liveness only.
 - Model summaries and review verdicts are always labeled **Advisory**.
 - Usage appears under an **Evidence-derived usage** disclosure. It shows exact
-  provider/model counters and completeness, never estimated money.
+  provider/model counters and completeness, never estimated money. The
+  completeness word always names its subject — **Evidence complete** or
+  **Evidence incomplete** — because `usage.complete` reports how complete the
+  usage evidence is and never as a claim about run execution state.
 - Mutating guidance may be displayed only when present in `safe_actions`; it is
   copy-only or informational. The read-only monitor has no execute, retry,
   resume, cancel, or apply control.
@@ -51,7 +54,7 @@ mistaking a reconstructed historical run for a live process.
 | Advisory | unit `advisory` summary | Show advisory attention separately from gate. |
 | Source | `source.mode`, `source.freshness` | Only Live, Reconstructed, or Mixed. |
 | Progress | `counts.completed_units`, `counts.planned_units` | Use observed/planned wording when the plan is incomplete. |
-| Mutation | `mutation.status`, `mutation.observed_semantics` | Show both effect and evidence semantics, for example “Workspace applied · exact”. |
+| Mutation | `mutation.status`, `mutation.observed_semantics`, `mutation.basis`, `mutation.write_denials` | Show effect, evidence semantics, and the basis the claim rests on, for example “Partial · at least · child log derived”. Surface observed write denials with their path, matched rule, and deciding policy so the operator never has to open a child Log to see them. |
 
 ### Grouping rules
 
@@ -86,6 +89,27 @@ There is no run-level mutation control.
 Explain the structure and outcome of one workflow or fan-out while keeping
 runtime truth, advisory judgment, and evidence provenance visibly distinct.
 
+### Run detail subtitle
+
+Beneath the run title, a subtitle names each fact it reports and is composed by
+joining only the segments that carry a value, in this order:
+
+1. Strategy, omitted entirely when `unknown`.
+2. **Workspace mode `<mode>`**, omitted entirely when `unknown`. A workspace mode
+   never renders as the bare token `unknown`: a naked enum tells the operator
+   nothing about which dimension is unknown. Populating `run.mode` upstream is a
+   separate concern from refusing to render an empty slot.
+3. `projection_id` renders verbatim, with no second human-facing `projection`
+   word, because the id is minted already carrying its `projection:` prefix and
+   operators cite it exactly as the snapshot spells it. It is omitted entirely
+   when absent, for the same reason as rules 1 and 2: a literal `unknown` in the
+   id slot is the bare token this subtitle exists to eliminate, and the copy
+   control announces the value as unavailable instead.
+
+Because the subtitle joins a filtered list, an omitted segment can never leave a
+doubled, leading, or trailing separator. The projection id stays selectable and
+carries a copy control.
+
 ### Header truth rail
 
 Five adjacent, equal-priority facts:
@@ -103,6 +127,16 @@ For display aggregation only, explicit advisory severity is frozen as
 `stop > needs_review > pass > unknown`. Invalid/unparseable advisories are
 counted separately and never receive an invented verdict. This ordering has no
 effect on execution, workflow gates, attention derivation, or safe actions.
+
+The `unknown` advisory bucket renders as **unclassified verdict**: a model
+advisory was present but its verdict matched none of the stop/needs-review/pass
+rules. That is a display label for an existing bucket, not a verdict. The bucket
+keeps its token, its frozen severity rank, and its marker tone, and the label is
+never applied to a unit with no advisory at all, which the `advisory.present`
+guard keeps out of every bucket. The same label is used at all three surfaces
+that count advisories — the Runs list Advisory column, the run truth rail card,
+and the semantic-zoom cluster summary row — so they can never disagree about what
+to call one bucket.
 
 ### Main canvas modes
 
@@ -212,7 +246,9 @@ current order must be labeled. Attempt sections themselves never reorder.
 
 - Fold only `provider_usage` evidence within the attempt.
 - Group by provider and model; display calls and exact token/cache counters.
-- Show **Complete** or **Incomplete** with limitations.
+- Show **Evidence complete** or **Evidence incomplete** with limitations. Both
+  polarities stay legible while the disclosure is collapsed; neither is ever
+  shortened to a bare completion word that could be read as run execution state.
 - Run/unit totals are sums of their attempt groups only when the underlying
   evidence is complete enough to support the stated total.
 - Never display dollars, estimated prices, or a fabricated cache-hit percentage.

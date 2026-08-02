@@ -33,9 +33,12 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
             quota or capacity — it reduces process, token, and reconciliation overhead
             for the same account. The runtime speaks the OpenAI Responses dialect — the
             same wire contract the <a href="https://www.openresponses.org/specification">Open
-            Responses</a> standard now formalizes. Today it binds to OpenAI's backends;
-            conformance with open implementations is tracked direction, not a shipped
-            feature.
+            Responses</a> standard now formalizes. Since v0.1.12 that contract is a
+            shipped mode, not a tracked direction: point the provider at any Open
+            Responses endpoint, hosted or local, with no OpenAI account required.
+            Compatibility is observed live against a local open-source server, and
+            every protocol deviation is confessed in the run's evidence rather than
+            papered over.
           </p>
 
           <div class="terminal" role="group" aria-label="Terminal transcript of the 64-worker run">
