@@ -9,6 +9,87 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-08-22
+
+### Added
+- Native OpenAI compaction is a default-on overlay after OpenAI Responses
+  resolve (#535, #537, #538; tracker #522 stays open). Overlay-on
+  `openai_responses` Turns whose host is `chatgpt_codex` or official
+  `api.openai.com` send product `compact_threshold` 200000
+  (`Pixir.Compaction.compact_threshold/0`). `open_responses` and Anthropic
+  stay off (`native_unavailable`); explicit `compaction.native: false` wins
+  (`overlay_off`). Local `history_compaction` remains the durable checkpoint;
+  `native_replay` is an optional replay window on that Event (ADR 0040).
+  Recovery stays local. Official `POST /responses/compact` is only
+  `https://api.openai.com/v1/responses/compact`. `chatgpt_codex` standalone
+  compact stays local and does not POST to the Codex `/compact` 404 host
+  (`Pixir.Provider.Compact.standalone_supported?/1`). This release does not
+  close #522 or #512.
+- ACP v1 presenter surface: `session/list`, `session/close`, and in-memory
+  `session/delete` (Log stays; no durable hide sidecar — #515 closed as
+  YAGNI), slash-as-Skills (`available_commands_update` on load/resume and
+  when the Skills fingerprint changes), `write`/`edit` diffs, stable
+  `messageId` on chunks, and `/compact` as a runtime command with a
+  structured completion and no fake usage gauge (#521, #524, #529).
+  `web_search` is a sticky `configOption` select (`on`/`off`) (#530).
+  Runtime-owned config changes push the complete `configOptions` list as
+  `config_option_update`; `update_plan` in plan mode is the live plan→build
+  producer (#560, #561; #520 closed after Zed dogfood). Epic #512 stays
+  open.
+- Monitor Instrument Manual plus the dotted-label affordance (#553). Compact
+  advisory-chip verdict words route through that shared classifier (#557).
+
+### Changed
+- Hosted `web_search` now defaults on only after the request resolves to
+  `chatgpt_codex`. `open_responses` and Anthropic stay off. An explicit
+  `false` from config, CLI, `_meta`, or spawn args still wins. Invalid
+  config cannot enable search by accident. Evidence remains `provider_usage`
+  (#527; Part of #523, #523-B).
+- Site terminal-proof copy reports `0.1.14` instead of the stale `0.1.12`
+  doctor version (`site/src/components/TerminalProof.astro`; #500 asked for
+  0.1.13 and is absorbed here).
+
+### Fixed
+- Delegate horizon overrides no longer reconstruct as phantom nil-id children (#479).
+- Name-less or non-binary-name tool calls now count as write-capable evidence during fail-closed resume posture restoration (#480).
+- Malformed Provider-committed call warnings no longer render tool argument values (#473).
+- Monitor child-log write evidence now requires a binary `call_id` on both the write call and successful result, preventing missing IDs from fabricating observed paths (#481).
+- ACP `session/prompt` admission reflects Session state: a busy or residual
+  turn is an explicit `-32602` refusal rather than an empty successful Turn (#486).
+- Warm Subagent resume posture is bound to lineage proof after the last valid
+  boundary; earlier posture in the seed Log is ignored (#487).
+- Session record failures on the Turn egress path classify as
+  `:session_record_unavailable` instead of crashing the Turn they report (#501).
+- Delegate horizon admission fails closed on the daemon async-start path as
+  well as the plan path (#502).
+- Delegate fanout validates process and envelope verdicts before treating a
+  child as completed (#504).
+- Failed child Session Resource staging is compensated so a partial stage
+  does not leave orphan dirs (#505).
+- Monitor launcher throw and exit are contained; a launch-surface failure
+  no longer takes down `serve` (#503).
+- Monitor activity-ledger identities are scoped to a stable workspace plus
+  run id, so two workspaces cannot share a ledger key (#506).
+- Turn declarations are fenced by Session incarnation, so a predecessor
+  Session cannot declare committed calls onto a successor (#509).
+- Logical Turn cancellation is fenced to the Turn that owns the interrupt,
+  so a successor is not cancelled by a stale signal (#510).
+- Committed function calls still declare after a dead native-threshold gate
+  (`:noproc`); a gone overlay Task no longer drops wire-committed calls (#536).
+- CLI INT-relay helper is reaped on port close so inherited fds do not hang
+  pipelines that consume pixir output (#547).
+- Subcommand-shaped argv (`pixir <word> --flag…`) is refused before any
+  Session starts, instead of falling through to auto-mode prompt (#546, #562).
+- Monitor names every unprojected Log in limitations (`id`, size, recency,
+  real error kind) instead of a silent drop (#550). Presentation-honesty
+  wave tightens truncation, run-unavailable, and provenance-absent copy
+  (#548). Unlinkable run ids are rejected at the list envelope and counted
+  as dropped (#559). Browser tmp globs are scoped per ExUnit run (#558).
+  Partial-fold of oversized logs (#549) is not in this release.
+- ExUnit no longer reads the operator `~/.pixir` or `~/.agents/skills`
+  (`PIXIR_HOME` / Skills `user_home`); planted bleed names fail the suite
+  if isolation is skipped (#563, #564).
+
 ## [0.1.13] - 2026-08-02
 
 ### Added

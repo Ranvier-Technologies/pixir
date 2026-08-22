@@ -169,14 +169,20 @@ defmodule Pixir.AuthTest do
   end
 
   setup do
-    path =
+    %{path: tmp_auth_store("pixir-auth-"), name: :"auth_#{System.unique_integer([:positive])}"}
+  end
+
+  defp tmp_auth_store(prefix) do
+    directory =
       Path.join(
         System.tmp_dir!(),
-        "pixir-auth-" <> Base.encode16(:crypto.strong_rand_bytes(6), case: :lower) <> ".json"
+        prefix <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower)
       )
 
-    on_exit(fn -> File.rm_rf!(path) end)
-    %{path: path, name: :"auth_#{System.unique_integer([:positive])}"}
+    File.rm_rf!(directory)
+    File.mkdir_p!(directory)
+    on_exit(fn -> File.rm_rf!(directory) end)
+    Path.join(directory, "auth.json")
   end
 
   defp start_auth(ctx, opts) do

@@ -1,0 +1,730 @@
+[
+  {
+    "term": "Liveness",
+    "surface_string": "Liveness",
+    "code_citation": "monitor/priv/static/app.js:1185 (truthRail), :968 (list column); vocabulary in monitor/priv/presenter/projection-v1.md:181-184",
+    "plain_definition": "Whether anything is running right now, and how that was observed. A separate dimension from what the durable Log says happened.",
+    "confused_with": "Execution. Execution is the durable record of the run's state; Liveness is a volatile observation about this instant. A terminal run has no Liveness.",
+    "slug": "liveness",
+    "concern": {
+      "key": "dimensions",
+      "title": "The truth dimensions",
+      "blurb": "The monitor never folds these into one status. Each answers a different question from a different evidence class, and a good-looking value in one says nothing about the others."
+    }
+  },
+  {
+    "term": "Execution",
+    "surface_string": "Execution",
+    "code_citation": "monitor/priv/static/app.js:1184 (truthRail), :968 (list column); vocabulary in monitor/priv/presenter/projection-v1.md:176-179",
+    "plain_definition": "The run's canonical state folded from the durable Log: planned, queued, running, completed, partial, failed, timed_out, and so on.",
+    "confused_with": "Liveness. A live process never upgrades Execution, and a volatile 'completed' before a durable terminal Event leaves Execution at running.",
+    "slug": "execution",
+    "concern": {
+      "key": "dimensions",
+      "title": "The truth dimensions",
+      "blurb": "The monitor never folds these into one status. Each answers a different question from a different evidence class, and a good-looking value in one says nothing about the others."
+    }
+  },
+  {
+    "term": "Dependency gate",
+    "surface_string": "Dependency gate",
+    "code_citation": "monitor/priv/static/app.js:1188 (truthRail card), :1409 (cluster row), :997 (list Gate column); vocabulary in monitor/priv/presenter/projection-v1.md:447-456",
+    "plain_definition": "The runtime's own answer to whether dependent Workflow steps may proceed. Only checkpoint_ready is dependent-safe.",
+    "confused_with": "Model advisory. The gate is the runtime's decision; the advisory is a model's opinion and cannot change it. The Unit Inspector labels this same dimension 'Runtime gate' (app.js:2078).",
+    "slug": "dependency-gate",
+    "concern": {
+      "key": "dimensions",
+      "title": "The truth dimensions",
+      "blurb": "The monitor never folds these into one status. Each answers a different question from a different evidence class, and a good-looking value in one says nothing about the others."
+    }
+  },
+  {
+    "term": "Runtime gate",
+    "surface_string": "Runtime gate",
+    "code_citation": "monitor/priv/static/app.js:2078 (Unit Inspector truthCard over unit.gate); rail label for the same dimension at :1188; vocabulary in monitor/priv/presenter/projection-v1.md:447-456",
+    "plain_definition": "The Unit Inspector's label for the runtime's own gate decision on one unit. Same dimension the Runs rail labels Dependency gate.",
+    "confused_with": "Dependency gate. One dimension, two labels: the rail says 'Dependency gate', the Unit Inspector says 'Runtime gate'. Also Declared gate, which is the model's advisory claim and never moves this value.",
+    "slug": "runtime-gate",
+    "concern": {
+      "key": "dimensions",
+      "title": "The truth dimensions",
+      "blurb": "The monitor never folds these into one status. Each answers a different question from a different evidence class, and a good-looking value in one says nothing about the others."
+    }
+  },
+  {
+    "term": "Declared gate",
+    "surface_string": "Declared gate: <state>",
+    "code_citation": "monitor/priv/static/app.js:2078 (Model advisory truthCard note over advisory.declared_gate); contract monitor/priv/presenter/projection-v1.md:501 and :519-522",
+    "plain_definition": "The checkpoint status the model declared about its own work. Advisory only: it never moves the runtime gate.",
+    "confused_with": "Runtime gate and Dependency gate, which are the runtime's own decision. When declared_gate differs from gate.state, v1 adds the advisory_gate_disagreement limitation and shows both values rather than resolving them.",
+    "slug": "declared-gate",
+    "concern": {
+      "key": "dimensions",
+      "title": "The truth dimensions",
+      "blurb": "The monitor never folds these into one status. Each answers a different question from a different evidence class, and a good-looking value in one says nothing about the others."
+    }
+  },
+  {
+    "term": "Model advisory",
+    "surface_string": "Model advisory",
+    "code_citation": "monitor/priv/static/app.js:1189 (truthRail card, 'Advisory does not control the runtime gate.'), :1275, :2079; contract monitor/priv/presenter/projection-v1.md:493-522",
+    "plain_definition": "A verdict a model wrote about its own work: stop, needs_review, pass, or unclassified. Advisory only, never a runtime control.",
+    "confused_with": "Dependency gate. A run can be gate checkpoint_ready while its advisory says stop; that disagreement is shown, not resolved. The advisory's own checkpoint claim is the Declared gate.",
+    "slug": "model-advisory",
+    "concern": {
+      "key": "dimensions",
+      "title": "The truth dimensions",
+      "blurb": "The monitor never folds these into one status. Each answers a different question from a different evidence class, and a good-looking value in one says nothing about the others."
+    }
+  },
+  {
+    "term": "Source (run-scoped)",
+    "surface_string": "Source (run-scoped)",
+    "code_citation": "monitor/priv/static/app.js:1190 (truthRail card), :1443 (semantic zoom line); modes in monitor/priv/presenter/projection-v1.md:68-77",
+    "plain_definition": "Which evidence class this projection rests on: reconstructed, mixed, or live, plus its durable origin and freshness.",
+    "confused_with": "Liveness. Source describes the evidence the view was built from; Liveness describes the process. Source is run-scoped, never per unit.",
+    "slug": "source-run-scoped",
+    "concern": {
+      "key": "dimensions",
+      "title": "The truth dimensions",
+      "blurb": "The monitor never folds these into one status. Each answers a different question from a different evidence class, and a good-looking value in one says nothing about the others."
+    }
+  },
+  {
+    "term": "Attention",
+    "surface_string": "Attention (parent-observed)",
+    "code_citation": "monitor/priv/static/app.js:1192 (truthRail card), :17 (filter label), :1676 (fan-out region); reason registry monitor/priv/presenter/projection-v1.md:458-491",
+    "plain_definition": "Units whose parent Log evidence gives a named reason to look: failed execution, an advisory stop, a stale handle, missing evidence.",
+    "confused_with": "A health score. Attention is a count of parent-observed reasons, not a severity grade, and its absence is not a clean bill of health.",
+    "slug": "attention",
+    "concern": {
+      "key": "dimensions",
+      "title": "The truth dimensions",
+      "blurb": "The monitor never folds these into one status. Each answers a different question from a different evidence class, and a good-looking value in one says nothing about the others."
+    }
+  },
+  {
+    "term": "Child after end",
+    "surface_string": "Child after end",
+    "code_citation": "monitor/priv/static/app.js:968 (list column), :1208 ('Child activity after end' card); contract monitor/priv/presenter/projection-v1.md:199-262",
+    "plain_definition": "Child Log writes recorded strictly after the parent run hit its terminal boundary. It reports; it never reclassifies the run.",
+    "confused_with": "Liveness. A child Log proves past writes, never a reachable process, so this can never make a run read as live or reopen it.",
+    "slug": "child-after-end",
+    "concern": {
+      "key": "dimensions",
+      "title": "The truth dimensions",
+      "blurb": "The monitor never folds these into one status. Each answers a different question from a different evidence class, and a good-looking value in one says nothing about the others."
+    }
+  },
+  {
+    "term": "Mutation",
+    "surface_string": "Mutation",
+    "code_citation": "monitor/priv/static/app.js:968 (list column), :1226 ('Mutation observation' panel); status vocabulary monitor/priv/presenter/projection-v1.md:563-575",
+    "plain_definition": "What the run did to files: read_only, workspace_applied, isolated_only, partial, indeterminate, not_applied, or unknown.",
+    "confused_with": "Success. A denied write is not a mutation, and an empty observed-path list never proves that nothing was written.",
+    "slug": "mutation",
+    "concern": {
+      "key": "dimensions",
+      "title": "The truth dimensions",
+      "blurb": "The monitor never folds these into one status. Each answers a different question from a different evidence class, and a good-looking value in one says nothing about the others."
+    }
+  },
+  {
+    "term": "provenance",
+    "surface_string": "Basis: <basis> / Evidence basis: <basis>",
+    "code_citation": "monitor/priv/static/app.js:1160 (truthCard Basis line), :1229 (mutation Evidence basis), :248 (data-provenance attribute)",
+    "plain_definition": "The named evidence a shown fact rests on. Every decision-bearing value in the monitor carries one instead of appearing unattributed.",
+    "confused_with": "A timestamp. Provenance names the evidence class, not when the page was drawn or when the fact was received.",
+    "slug": "provenance",
+    "concern": {
+      "key": "provenance",
+      "title": "Provenance vocabulary",
+      "blurb": "Every decision-bearing value names the evidence it rests on. These are the words that name it."
+    }
+  },
+  {
+    "term": "Evidence basis",
+    "surface_string": "Evidence basis: <basis>",
+    "code_citation": "monitor/priv/static/app.js:1229 (mutationPanel); mutation basis vocabulary monitor/priv/presenter/projection-v1.md:614-627",
+    "plain_definition": "For Mutation specifically, which evidence class the write record rests on: envelope, child-log-derived, apply checkpoint, or none available.",
+    "confused_with": "Observed semantics. Basis names where evidence came from; observed_semantics says whether the path list is exact or a lower bound.",
+    "slug": "evidence-basis",
+    "concern": {
+      "key": "provenance",
+      "title": "Provenance vocabulary",
+      "blurb": "Every decision-bearing value names the evidence it rests on. These are the words that name it."
+    }
+  },
+  {
+    "term": "reconstructed",
+    "surface_string": "Reconstructed",
+    "code_citation": "monitor/priv/static/app.js:9 (source filter vocabulary), :44 (marker tone); definition monitor/priv/presenter/projection-v1.md:70-71",
+    "plain_definition": "Source mode meaning durable evidence was read but no current runtime observation was included. The normal mode for a finished run.",
+    "confused_with": "Stale or wrong. Reconstructed is the strongest evidence class the monitor has; live is the degraded one.",
+    "slug": "reconstructed",
+    "concern": {
+      "key": "provenance",
+      "title": "Provenance vocabulary",
+      "blurb": "Every decision-bearing value names the evidence it rests on. These are the words that name it."
+    }
+  },
+  {
+    "term": "live (source mode)",
+    "surface_string": "Live",
+    "code_citation": "monitor/priv/static/app.js:9 (source filter vocabulary), :44; definition monitor/priv/presenter/projection-v1.md:74-77",
+    "plain_definition": "Source mode meaning only a volatile observation exists and no durable Log backs it. An honest degradation, never proof of completion.",
+    "confused_with": "Liveness live. Source live means the evidence is weak; Liveness live means a process was reached.",
+    "slug": "live-source-mode",
+    "concern": {
+      "key": "provenance",
+      "title": "Provenance vocabulary",
+      "blurb": "Every decision-bearing value names the evidence it rests on. These are the words that name it."
+    }
+  },
+  {
+    "term": "authoritative",
+    "surface_string": "Read-only · authoritative snapshots · N runs",
+    "code_citation": "monitor/priv/static/app.js:1131 (setStatus), :414 (SSE health), :1089 ('Authoritative, recomputable projections.')",
+    "plain_definition": "A snapshot fetched over HTTP from the server. Only an authoritative refetch may change what the view shows.",
+    "confused_with": "The Log itself. The snapshot is a recomputable projection over the Log; the append-only Log stays the source of truth.",
+    "slug": "authoritative",
+    "concern": {
+      "key": "provenance",
+      "title": "Provenance vocabulary",
+      "blurb": "Every decision-bearing value names the evidence it rests on. These are the words that name it."
+    }
+  },
+  {
+    "term": "as-of seq",
+    "surface_string": "as of seq <n>",
+    "code_citation": "monitor/priv/static/app.js:1864 (detail status line), :1175 ('As of parent seq' field); definition monitor/priv/presenter/projection-v1.md:79-80",
+    "plain_definition": "The highest parent Log sequence number this projection folded. It is the cut of history the whole view was computed from.",
+    "confused_with": "A clock. Seq is a Log position, not a time; two projections at different wall-clock times with the same seq are identical.",
+    "slug": "as-of-seq",
+    "concern": {
+      "key": "provenance",
+      "title": "Provenance vocabulary",
+      "blurb": "Every decision-bearing value names the evidence it rests on. These are the words that name it."
+    }
+  },
+  {
+    "term": "parent-observed",
+    "surface_string": "Attention observed: N · parent Log only",
+    "code_citation": "monitor/priv/static/app.js:976 (row basis), :959 ('Needs attention · N parent-observed'), :12-14 (attention honesty contract)",
+    "plain_definition": "The fact came from reading the parent Session Log alone. It is a claim about observed evidence, never a claim about global health.",
+    "confused_with": "Complete. Parent-observed absence means nothing was seen in that Log, not that nothing happened anywhere.",
+    "slug": "parent-observed",
+    "concern": {
+      "key": "provenance",
+      "title": "Provenance vocabulary",
+      "blurb": "Every decision-bearing value names the evidence it rests on. These are the words that name it."
+    }
+  },
+  {
+    "term": "non-run Logs",
+    "surface_string": "non-run Logs: N",
+    "code_citation": "monitor/priv/static/app.js:1094 (scanned inventory line), :1044 ('Non-run Session Logs' detail row)",
+    "plain_definition": "Session Logs in the scanned inventory that are not Delegate runs, so they project no row. Counted so the numbers reconcile.",
+    "confused_with": "Dropped logs. Non-run Logs are correctly excluded; dropped_logs are selected Logs that failed to project.",
+    "slug": "non-run-logs",
+    "concern": {
+      "key": "inventory",
+      "title": "Inventory accounting",
+      "blurb": "The Runs list confesses exactly what it scanned and what it could not turn into a row, so the visible count reconciles."
+    }
+  },
+  {
+    "term": "unprojected selected Logs",
+    "surface_string": "unprojected selected Logs: N",
+    "code_citation": "monitor/priv/static/app.js:1094 (scanned inventory line), :1044 ('Unprojected Selected Logs' detail row)",
+    "plain_definition": "Logs the monitor selected but could not turn into a run row. A confessed gap between the inventory and the visible list.",
+    "confused_with": "Non-run Logs. These were expected to project and did not; non-run Logs were never runs at all.",
+    "slug": "unprojected-selected-logs",
+    "concern": {
+      "key": "inventory",
+      "title": "Inventory accounting",
+      "blurb": "The Runs list confesses exactly what it scanned and what it could not turn into a row, so the visible count reconciles."
+    }
+  },
+  {
+    "term": "stale handle",
+    "surface_string": "Owner handle is stale; last observed evidence no longer confirms activity.",
+    "code_citation": "monitor/priv/static/app.js:579 (livenessCellNote), :44 (marker tone), :1505 (attention reason family); rules monitor/priv/presenter/projection-v1.md:115-132",
+    "plain_definition": "Liveness state where a nonterminal run has no current owner observation and nothing asserts the durable Log advanced.",
+    "confused_with": "externally_owned. Both mean the owner is not this process, but externally_owned adds evidence the run is still advancing.",
+    "slug": "stale-handle",
+    "concern": {
+      "key": "states",
+      "title": "States you will meet first",
+      "blurb": "Specific values whose plain reading is usually wrong on first encounter."
+    }
+  },
+  {
+    "term": "externally owned",
+    "surface_string": "Owner is another process; activity confirmed from durable Log evidence.",
+    "code_citation": "monitor/priv/static/app.js:1151 (livenessCardNote); doctrine monitor/priv/presenter/projection-v1.md:136-174",
+    "plain_definition": "Liveness state where another process owns the Delegate and the durable Log confirms progress. Ordinary for read-only observation.",
+    "confused_with": "A fault. Owner non-residency is the normal condition here, raises no attention reason, and never forces stale freshness.",
+    "slug": "externally-owned",
+    "concern": {
+      "key": "states",
+      "title": "States you will meet first",
+      "blurb": "Specific values whose plain reading is usually wrong on first encounter."
+    }
+  },
+  {
+    "term": "unobserved",
+    "surface_string": "Activity evidence unavailable at list scope (parent Log only). Detail may load owner diagnostics.",
+    "code_citation": "monitor/priv/static/app.js:578 (livenessCellNote), :8 (liveness filter vocabulary); rule monitor/priv/presenter/projection-v1.md:195-197",
+    "plain_definition": "The list-scope Liveness value: no activity evidence was consulted at all. An admission of not looking, not a finding.",
+    "confused_with": "Not running. The list never consults owner diagnostics, so opening the run can legitimately show a different Liveness.",
+    "slug": "unobserved",
+    "concern": {
+      "key": "states",
+      "title": "States you will meet first",
+      "blurb": "Specific values whose plain reading is usually wrong on first encounter."
+    }
+  },
+  {
+    "term": "checkpoint-ready",
+    "surface_string": "Ready",
+    "code_citation": "monitor/priv/static/app.js:1188 and :996 (alias {checkpoint_ready: \"ready\"}); rule monitor/priv/presenter/projection-v1.md:449-454",
+    "plain_definition": "The only gate state that is dependent-safe: downstream Workflow steps depending on this unit may proceed.",
+    "confused_with": "Completed. A unit can be execution-completed and still not checkpoint_ready, and its advisory may separately say stop.",
+    "slug": "checkpoint-ready",
+    "concern": {
+      "key": "states",
+      "title": "States you will meet first",
+      "blurb": "Specific values whose plain reading is usually wrong on first encounter."
+    }
+  },
+  {
+    "term": "unclassified verdict",
+    "surface_string": "unclassified verdict",
+    "code_citation": "monitor/priv/static/app.js:60 (ADVISORY_DISPLAY_ALIASES), :51-58 (advisory display contract)",
+    "plain_definition": "An advisory was present but its verdict could not be classified. A distinct fact from no advisory at all.",
+    "confused_with": "No advisory. Absence never reaches a bucket; the present===true guard keeps it out of every count.",
+    "slug": "unclassified-verdict",
+    "concern": {
+      "key": "states",
+      "title": "States you will meet first",
+      "blurb": "Specific values whose plain reading is usually wrong on first encounter."
+    }
+  },
+  {
+    "term": "invalid (advisory)",
+    "surface_string": "Invalid",
+    "code_citation": "monitor/priv/static/app.js:59 (ADVISORY_BUCKET_ORDER), :1187 (invalidReader on parse_status); rule monitor/priv/presenter/projection-v1.md:506-508",
+    "plain_definition": "The advisory JSON could not be parsed. Counted in its own bucket and never given an invented verdict.",
+    "confused_with": "unclassified verdict. Invalid means the document was unparseable; unclassified means it parsed but said nothing decisive.",
+    "slug": "invalid-advisory",
+    "concern": {
+      "key": "states",
+      "title": "States you will meet first",
+      "blurb": "Specific values whose plain reading is usually wrong on first encounter."
+    }
+  },
+  {
+    "term": "undetermined",
+    "surface_string": "Undetermined (child evidence unavailable)",
+    "code_citation": "monitor/priv/static/app.js:595 (postTerminalLabel), :607 (postTerminalNote), :46-49 (tone comment); table monitor/priv/presenter/projection-v1.md:252-262",
+    "plain_definition": "Child evidence for post-terminal activity was missing, so nothing is asserted. Missing evidence is never a clean bill.",
+    "confused_with": "None. 'None' is an observed zero with event_count 0; undetermined carries null and reads as attention.",
+    "slug": "undetermined",
+    "concern": {
+      "key": "states",
+      "title": "States you will meet first",
+      "blurb": "Specific values whose plain reading is usually wrong on first encounter."
+    }
+  },
+  {
+    "term": "hints only",
+    "surface_string": "SSE connected · hints only · coalesced",
+    "code_citation": "monitor/priv/static/app.js:414 (setStatus health pill), :2511-2518 (invalidation contract comment)",
+    "plain_definition": "The event stream carries only invalidation notices. It never ships data and never mutates the view; a refetch does that.",
+    "confused_with": "A live data feed. Nothing on screen ever comes from SSE; losing the stream costs freshness prompts, not correctness.",
+    "slug": "hints-only",
+    "concern": {
+      "key": "stream",
+      "title": "Stream and refresh",
+      "blurb": "The event stream is a doorbell, not a delivery. These terms describe how the page stays current."
+    }
+  },
+  {
+    "term": "coalesced",
+    "surface_string": "SSE connected · hints only · coalesced",
+    "code_citation": "monitor/priv/static/app.js:414 (setStatus), :2499-2510 (refreshSingleFlight)",
+    "plain_definition": "Bursts of invalidations collapse into one in-flight authoritative refetch; the last cause is replayed rather than dropped.",
+    "confused_with": "Debounced or dropped. No cause is lost, and the refetch is always a full authoritative fetch, not a partial patch.",
+    "slug": "coalesced",
+    "concern": {
+      "key": "stream",
+      "title": "Stream and refresh",
+      "blurb": "The event stream is a doorbell, not a delivery. These terms describe how the page stays current."
+    }
+  },
+  {
+    "term": "last successful authoritative refetch",
+    "surface_string": "last successful authoritative refetch <ts>",
+    "code_citation": "monitor/priv/static/app.js:413-415 (setStatus), :2480 / :2543 (lastAuthoritativeRefetchAt)",
+    "plain_definition": "When the browser last received a snapshot it could use. Client-held receipt state, not a server field.",
+    "confused_with": "projected_at. That is when the server built the projection; this is when this tab last successfully received one.",
+    "slug": "last-successful-authoritative-refetch",
+    "concern": {
+      "key": "stream",
+      "title": "Stream and refresh",
+      "blurb": "The event stream is a doorbell, not a delivery. These terms describe how the page stays current."
+    }
+  },
+  {
+    "term": "stale handle vs stale source snapshot",
+    "surface_string": "Stale source snapshot · received <ts> · refresh failure <kind>",
+    "code_citation": "monitor/priv/static/app.js:384-385 (replaceContent disclosure), :2110 (workspace overview); rule monitor/priv/presenter/workspace-set-v1.md:244-266",
+    "plain_definition": "A workspace source whose refresh is failing while an older snapshot is still held. Observational, never threshold-based.",
+    "confused_with": "Unavailable. Stale means data is held but not current; unavailable means nothing is held at all.",
+    "slug": "stale-handle-vs-stale-source-snapshot",
+    "concern": {
+      "key": "stream",
+      "title": "Stream and refresh",
+      "blurb": "The event stream is a doorbell, not a delivery. These terms describe how the page stays current."
+    }
+  },
+  {
+    "term": "logical unit",
+    "surface_string": "Logical unit · <id>",
+    "code_citation": "monitor/priv/static/app.js:2076 (unit view lede), :840 (resolution label); definition monitor/priv/presenter/projection-v1.md:344-371",
+    "plain_definition": "One planned piece of work: a Workflow step or a fan-out subagent. It owns attempts and is not a child Session.",
+    "confused_with": "A child Session. One unit may span several attempts across distinct or repeated child Session ids.",
+    "slug": "logical-unit",
+    "concern": {
+      "key": "structure",
+      "title": "Structure and navigation",
+      "blurb": "How work is decomposed, and how a large graph stays legible without hiding anything."
+    }
+  },
+  {
+    "term": "Attempt lineage",
+    "surface_string": "Attempt lineage",
+    "code_citation": "monitor/priv/static/app.js:2080 (unit view section), :1606 (fan-out attempt nav); fold rules monitor/priv/presenter/projection-v1.md:373-400",
+    "plain_definition": "The ordered attempts of one logical unit, including earlier failed ones. Identity is the unit id plus an ordinal.",
+    "confused_with": "A retry count. Lineage keeps every epoch visible, including resumes that reuse the same child Session id.",
+    "slug": "attempt-lineage",
+    "concern": {
+      "key": "structure",
+      "title": "Structure and navigation",
+      "blurb": "How work is decomposed, and how a large graph stays legible without hiding anything."
+    }
+  },
+  {
+    "term": "Provisional (attempt)",
+    "surface_string": "Provisional",
+    "code_citation": "monitor/priv/static/app.js:1610 and :1927 (ordinal null label); contract monitor/priv/presenter/projection-v1.md:413-427",
+    "plain_definition": "A volatile_only attempt with a null ordinal, seen only under source mode live. It vanishes when a durable Log appears.",
+    "confused_with": "Attempt 1. A provisional attempt is never persisted or renumbered, and its deep link must be treated as invalidatable.",
+    "slug": "provisional-attempt",
+    "concern": {
+      "key": "structure",
+      "title": "Structure and navigation",
+      "blurb": "How work is decomposed, and how a large graph stays legible without hiding anything."
+    }
+  },
+  {
+    "term": "semantic zoom",
+    "surface_string": "Dependency DAG · semantic zoom",
+    "code_citation": "monitor/priv/static/app.js:1424 (workflowGraph heading), :1281-1284 (bounds); contract monitor/priv/presenter/semantic-zoom-v1.md:7-19",
+    "plain_definition": "A bounded overview of a large dependency graph: at most six clusters plus one overflow at each zoom level.",
+    "confused_with": "A filter. Nothing is removed; every edge stays reachable through a finite sequence of activations.",
+    "slug": "semantic-zoom",
+    "concern": {
+      "key": "structure",
+      "title": "Structure and navigation",
+      "blurb": "How work is decomposed, and how a large graph stays legible without hiding anything."
+    }
+  },
+  {
+    "term": "Aggregate arc",
+    "surface_string": "Aggregate arc <from> → <to> · N observed edges",
+    "code_citation": "monitor/priv/static/app.js:1457 ('Aggregate dependency arcs'), :1462 (label); contract monitor/priv/presenter/semantic-zoom-v1.md:155-178",
+    "plain_definition": "A bundle of exact dependency edges between two clusters, carrying ready, blocked, and unknown counts.",
+    "confused_with": "A dependency. An arc is presentation structure; the real dependencies appear only in the exact-edge ledger.",
+    "slug": "aggregate-arc",
+    "concern": {
+      "key": "structure",
+      "title": "Structure and navigation",
+      "blurb": "How work is decomposed, and how a large graph stays legible without hiding anything."
+    }
+  },
+  {
+    "term": "Exact-edge ledger",
+    "surface_string": "Exact-edge ledger for selected aggregate arc",
+    "code_citation": "monitor/priv/static/app.js:1481-1482 ('These rows are exact projected dependencies; the selected overview arc is only an aggregate.')",
+    "plain_definition": "The complete list of real from/to dependency pairs behind one aggregate arc, paged 100 at a time.",
+    "confused_with": "The arc summary. The arc is the aggregate; only this ledger shows the actual projected dependency set.",
+    "slug": "exact-edge-ledger",
+    "concern": {
+      "key": "structure",
+      "title": "Structure and navigation",
+      "blurb": "How work is decomposed, and how a large graph stays legible without hiding anything."
+    }
+  },
+  {
+    "term": "Upstream boundary",
+    "surface_string": "Upstream boundary · Waves 1–N",
+    "code_citation": "monitor/priv/static/app.js:1335 (deriveSemanticZoom), :1453 ('Crosses the current zoom boundary.'); contract monitor/priv/presenter/semantic-zoom-v1.md:170-178",
+    "plain_definition": "At deeper zoom levels, the one entity holding every wave before the current window so no edge is silently dropped.",
+    "confused_with": "An overflow. Overflow holds waves after the window; the boundary holds the waves before it.",
+    "slug": "upstream-boundary",
+    "concern": {
+      "key": "structure",
+      "title": "Structure and navigation",
+      "blurb": "How work is decomposed, and how a large graph stays legible without hiding anything."
+    }
+  },
+  {
+    "term": "Follow",
+    "surface_string": "Follow this run / Following this run",
+    "code_citation": "monitor/priv/static/app.js:1728-1742 (followToggle), :1734 ('It never silently switches runs.')",
+    "plain_definition": "Explicit route state that keeps the same logical run selected across authoritative refetches, degrading rather than switching.",
+    "confused_with": "Auto-refresh. Follow is about identity stability; refetch happens either way, and follow never picks a different run for you.",
+    "slug": "follow",
+    "concern": {
+      "key": "structure",
+      "title": "Structure and navigation",
+      "blurb": "How work is decomposed, and how a large graph stays legible without hiding anything."
+    }
+  },
+  {
+    "term": "Parent-observed child Session",
+    "surface_string": "Parent-observed child Session",
+    "code_citation": "monitor/priv/static/app.js:833 (heading), :845 (basis line), :638-655 (resolveParentObservedChild)",
+    "plain_definition": "A child Session id that a parent run's Log already names, letting a dead-end id offer its owning parent run.",
+    "confused_with": "A projectable run. The child itself was never fetched or observed; only the parent's roster was scanned.",
+    "slug": "parent-observed-child-session",
+    "concern": {
+      "key": "structure",
+      "title": "Structure and navigation",
+      "blurb": "How work is decomposed, and how a large graph stays legible without hiding anything."
+    }
+  },
+  {
+    "term": "run_not_found",
+    "surface_string": "run_not_found (404)",
+    "code_citation": "monitor/lib/pixir_monitor/router.ex:75 and :128; client handling monitor/priv/static/app.js:2299 (identityLoss)",
+    "plain_definition": "The structured 404 saying this id is not a projectable run in this scope. The only failure that licenses the resolved-parent offer.",
+    "confused_with": "A transient fetch error. Only a structured run_not_found is treated as identity loss; every other 404 clears that licence.",
+    "slug": "run-not-found",
+    "concern": {
+      "key": "errors",
+      "title": "Error kinds an operator meets",
+      "blurb": "Server-side kinds that surface verbatim in the UI. Each is a specific confession, not a generic failure."
+    }
+  },
+  {
+    "term": "unscoped_route_unavailable",
+    "surface_string": "Use a workspace-scoped Runs route (404)",
+    "code_citation": "monitor/lib/pixir_monitor/router.ex:54 and :69; contract monitor/priv/presenter/workspace-set-v1.md:119-122",
+    "plain_definition": "In workspace-set mode the unscoped /api/runs routes refuse rather than guess a workspace. An explicit confession of scope.",
+    "confused_with": "A missing route. The route exists but is scope-inappropriate; it points at /api/workspaces/:key/… instead of inferring one.",
+    "slug": "unscoped-route-unavailable",
+    "concern": {
+      "key": "errors",
+      "title": "Error kinds an operator meets",
+      "blurb": "Server-side kinds that surface verbatim in the UI. Each is a specific confession, not a generic failure."
+    }
+  },
+  {
+    "term": "workspace_unavailable",
+    "surface_string": "Workspace projection is unavailable (503)",
+    "code_citation": "monitor/lib/pixir_monitor/router.ex:137-147 (unavailable_error); isolation rule monitor/priv/presenter/workspace-set-v1.md:206-233",
+    "plain_definition": "One declared source failed on its own scoped routes. There is no set-level 503; every other source is unaffected.",
+    "confused_with": "The monitor being down. Failure is isolated per source, and the failing source shows an error card, never a zero.",
+    "slug": "workspace-unavailable",
+    "concern": {
+      "key": "errors",
+      "title": "Error kinds an operator meets",
+      "blurb": "Server-side kinds that surface verbatim in the UI. Each is a specific confession, not a generic failure."
+    }
+  },
+  {
+    "term": "workspace_not_found",
+    "surface_string": "workspace_not_found (404)",
+    "code_citation": "monitor/lib/pixir_monitor/router.ex:127; contract monitor/priv/presenter/workspace-set-v1.md:123-126",
+    "plain_definition": "The workspace key is charset-valid but was never declared at serve time. Distinct from a malformed key.",
+    "confused_with": "invalid_workspace_key. That is a 400 for a key failing the safe-component rule, and it never echoes the key back.",
+    "slug": "workspace-not-found",
+    "concern": {
+      "key": "errors",
+      "title": "Error kinds an operator meets",
+      "blurb": "Server-side kinds that surface verbatim in the UI. Each is a specific confession, not a generic failure."
+    }
+  },
+  {
+    "term": "authentication_required",
+    "surface_string": "Same-origin monitor authentication is required (403)",
+    "code_citation": "monitor/lib/pixir_monitor/router.ex:186-192 (with_auth); host check monitor/lib/pixir_monitor/security.ex:22-26",
+    "plain_definition": "The request lacked the same-origin monitor session. The monitor answers only on its own loopback origin.",
+    "confused_with": "A login. There is no account; the session cookie is minted once from a single-use launch capability.",
+    "slug": "authentication-required",
+    "concern": {
+      "key": "errors",
+      "title": "Error kinds an operator meets",
+      "blurb": "Server-side kinds that surface verbatim in the UI. Each is a specific confession, not a generic failure."
+    }
+  },
+  {
+    "term": "invalid_launch",
+    "surface_string": "Launch capability is invalid, expired, or already used (401)",
+    "code_citation": "monitor/lib/pixir_monitor/router.ex:170 (consume_bootstrap); expiry copy monitor/lib/pixir_monitor/launch_surface.ex:287",
+    "plain_definition": "The one-shot launch token did not consume. Relaunching pixir-monitor serve arms a fresh launch surface.",
+    "confused_with": "A permissions problem. The token is single-use by design; a second tab using the same link legitimately fails.",
+    "slug": "invalid-launch",
+    "concern": {
+      "key": "errors",
+      "title": "Error kinds an operator meets",
+      "blurb": "Server-side kinds that surface verbatim in the UI. Each is a specific confession, not a generic failure."
+    }
+  },
+  {
+    "term": "shutting_down",
+    "surface_string": "Monitor is stopping (503)",
+    "code_citation": "monitor/lib/pixir_monitor/router.ex:178-184 (with_api drain carve-out)",
+    "plain_definition": "During the shutdown drain window API calls fail closed, so an open tab cannot keep painting a stale display as current.",
+    "confused_with": "A crash. This is the deliberate drain window; failing closed here is what keeps the display honest.",
+    "slug": "shutting-down",
+    "concern": {
+      "key": "errors",
+      "title": "Error kinds an operator meets",
+      "blurb": "Server-side kinds that surface verbatim in the UI. Each is a specific confession, not a generic failure."
+    }
+  },
+  {
+    "term": "next_actions",
+    "surface_string": "next: <command>",
+    "code_citation": "monitor/lib/pixir_monitor/cli.ex:526 (printer), :542 (normalize_error); registry monitor/priv/presenter/projection-v1.md:651-690",
+    "plain_definition": "The bounded operator steps attached to a structured error or projected safe action. Never composed from prose.",
+    "confused_with": "Automation. The monitor is read-only; it prints or offers a command to copy but never executes one.",
+    "slug": "next-actions",
+    "concern": {
+      "key": "errors",
+      "title": "Error kinds an operator meets",
+      "blurb": "Server-side kinds that surface verbatim in the UI. Each is a specific confession, not a generic failure."
+    }
+  },
+  {
+    "term": "read-only",
+    "surface_string": "Authoritative, recomputable projections. The monitor is read-only.",
+    "code_citation": "monitor/priv/static/app.js:1089 (Runs lede), :1131 / :1864 / :2093 (status lines)",
+    "plain_definition": "The monitor observes and never acts. Nothing it shows can be commanded from the page.",
+    "confused_with": "Static. The view updates constantly from authoritative refetches; it simply issues no writes.",
+    "slug": "read-only",
+    "concern": {
+      "key": "doctrine",
+      "title": "Read-only doctrine",
+      "blurb": "The monitor observes. These terms mark the boundary it never crosses."
+    }
+  },
+  {
+    "term": "Structured safe actions",
+    "surface_string": "Structured safe actions",
+    "code_citation": "monitor/priv/static/app.js:2050 (actionsPanel), :2055 ('Registered copy_only actions are the only executable affordance the monitor ever offers.'); registry monitor/priv/presenter/projection-v1.md:670-683",
+    "plain_definition": "Commands projected from a closed registry of structured runtime guidance, offered to copy and never run by the monitor.",
+    "confused_with": "Buttons that do the thing. Copying is the entire affordance; a mutating action is still only text to review and paste.",
+    "slug": "structured-safe-actions",
+    "concern": {
+      "key": "doctrine",
+      "title": "Read-only doctrine",
+      "blurb": "The monitor observes. These terms mark the boundary it never crosses."
+    }
+  },
+  {
+    "term": "Review to copy",
+    "surface_string": "Review command before copying",
+    "code_citation": "monitor/priv/static/app.js:2017 (reviewModal), :1972-1979 (classifyCommand)",
+    "plain_definition": "Copy gate for commands that mutate, carry shell syntax, or hide control or whitespace codepoints: bytes are shown first.",
+    "confused_with": "A confirmation dialog for running it. Nothing executes; the choice is only whether the text reaches your clipboard.",
+    "slug": "review-to-copy",
+    "concern": {
+      "key": "doctrine",
+      "title": "Read-only doctrine",
+      "blurb": "The monitor observes. These terms mark the boundary it never crosses."
+    }
+  },
+  {
+    "term": "escaped-only clipboard",
+    "surface_string": "Escaped-only clipboard is frozen for v1.x. No raw-byte copy exists.",
+    "code_citation": "monitor/priv/static/app.js:2023 and :2034 (dialog note), :1998-2004 (writeClipboard sink)",
+    "plain_definition": "Every copy passes one sink that escapes control and bidirectional codepoints. There is no raw-byte copy path.",
+    "confused_with": "Lossy copying. The escapes are reversible and visible; hostile bytes simply never arrive unannounced in your terminal.",
+    "slug": "escaped-only-clipboard",
+    "concern": {
+      "key": "doctrine",
+      "title": "Read-only doctrine",
+      "blurb": "The monitor observes. These terms mark the boundary it never crosses."
+    }
+  },
+  {
+    "term": "Limitations",
+    "surface_string": "Limitations",
+    "code_citation": "monitor/priv/static/app.js:1713 (limitationsPanel), :1233 / :1917 (inline limitation lines); closed registry monitor/priv/presenter/projection-v1.md:734-766",
+    "plain_definition": "Named, machine-readable admissions of missing or contradictory evidence. They are never hidden behind a successful aggregate.",
+    "confused_with": "Errors. A limitation is a confessed gap in evidence, not a failure of the run or of the monitor.",
+    "slug": "limitations",
+    "concern": {
+      "key": "doctrine",
+      "title": "Read-only doctrine",
+      "blurb": "The monitor observes. These terms mark the boundary it never crosses."
+    }
+  },
+  {
+    "term": "Evidence",
+    "surface_string": "Evidence (N)",
+    "code_citation": "monitor/priv/static/app.js:1698 (evidenceDrawer summary), :1703 (authority marker); authority vocabulary monitor/priv/presenter/projection-v1.md:692-700",
+    "plain_definition": "The cited rows behind a projection, each with an authority: canonical, derived, volatile, model_declared, or artifact.",
+    "confused_with": "Logs. Evidence rows are references into the Logs, carrying Session id and seq so a claim can be traced back.",
+    "slug": "evidence",
+    "concern": {
+      "key": "doctrine",
+      "title": "Read-only doctrine",
+      "blurb": "The monitor observes. These terms mark the boundary it never crosses."
+    }
+  },
+  {
+    "term": "Evidence-derived usage",
+    "surface_string": "Evidence-derived usage · N calls · Evidence complete",
+    "code_citation": "monitor/priv/static/app.js:1908 (usagePanel summary), :1903-1905 (usageCompletenessLabel); fold rules monitor/priv/presenter/projection-v1.md:524-560",
+    "plain_definition": "Token and call totals folded from durable provider_usage Events. 'Evidence complete' scopes the claim to that evidence.",
+    "confused_with": "The run being finished. Usage completeness is about evidence at the observed boundary, unrelated to execution state.",
+    "slug": "evidence-derived-usage",
+    "concern": {
+      "key": "doctrine",
+      "title": "Read-only doctrine",
+      "blurb": "The monitor observes. These terms mark the boundary it never crosses."
+    }
+  },
+  {
+    "term": "Write denials",
+    "surface_string": "Write denials (N)",
+    "code_citation": "monitor/priv/static/app.js:1242 (writeDenials heading), :1236-1237 (comment); rule monitor/priv/presenter/projection-v1.md:596-611",
+    "plain_definition": "Writes a policy refused, shown with the matched rule and deciding policy so the refusal is readable without opening the child Log.",
+    "confused_with": "A mutation. A denial is the opposite of a write and never moves mutation status toward partial or applied.",
+    "slug": "write-denials",
+    "concern": {
+      "key": "doctrine",
+      "title": "Read-only doctrine",
+      "blurb": "The monitor observes. These terms mark the boundary it never crosses."
+    }
+  },
+  {
+    "term": "Workspace Overview",
+    "surface_string": "Workspace Overview",
+    "code_citation": "monitor/priv/static/app.js:2097 (heading), :2098 ('no set-level total is calculated'); contract monitor/priv/presenter/workspace-set-v1.md:14-24",
+    "plain_definition": "The root view of a 2-to-8 workspace set: one section per declared source, in declaration order, with no cross-source sums.",
+    "confused_with": "Fleet. Fleet is reserved for a future multi-machine product; this is bounded, local, and explicitly declared.",
+    "slug": "workspace-overview",
+    "concern": {
+      "key": "doctrine",
+      "title": "Read-only doctrine",
+      "blurb": "The monitor observes. These terms mark the boundary it never crosses."
+    }
+  }
+]

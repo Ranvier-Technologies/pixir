@@ -8,15 +8,27 @@ defmodule Pixir.Provider.OutputTruncationIntegrationTest do
   setup do
     suffix = System.unique_integer([:positive])
     name = String.to_atom("truncation_auth_#{suffix}")
-    path = Path.join(System.tmp_dir!(), "pixir-truncation-auth-#{suffix}.json")
+    path = tmp_auth_store("pixir-truncation-auth-")
     {:ok, pid} = Auth.start_link(name: name, store_path: path, env_api_key: "fixture-token")
 
     on_exit(fn ->
       if Process.alive?(pid), do: GenServer.stop(pid)
-      File.rm_rf!(path)
     end)
 
     %{auth: name}
+  end
+
+  defp tmp_auth_store(prefix) do
+    directory =
+      Path.join(
+        System.tmp_dir!(),
+        prefix <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower)
+      )
+
+    File.rm_rf!(directory)
+    File.mkdir_p!(directory)
+    on_exit(fn -> File.rm_rf!(directory) end)
+    Path.join(directory, "auth.json")
   end
 
   test "Responses maps every accepted completed/incomplete terminal without cap inference", %{

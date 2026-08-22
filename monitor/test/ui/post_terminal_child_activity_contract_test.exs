@@ -28,9 +28,14 @@ defmodule PixirMonitor.UIPostTerminalChildActivityContractTest do
   end
 
   test "the run detail rail renders the dimension with basis and child-Log provenance", %{js: js} do
-    assert js =~ ~s|rail.append(postTerminalCard(run.post_terminal_child_activity));|
+    assert js =~ ~s|rail.append(postTerminalCard(run.post_terminal_child_activity, route));|
     assert js =~ ~s|card.dataset.truthDimension = "post_terminal_child_activity";|
-    assert js =~ ~s|card.append(heading(3, "Child activity after end"));|
+    # The heading is still an <h3> and still says exactly "Child activity after
+    # end"; it is now the dotted labelled-term affordance rather than a plain
+    # heading, so the reader can open the definition of the dimension. The
+    # shipped string is unchanged — the labelled-term table absorbs the fact
+    # that the list column calls the same dimension "Child after end".
+    assert js =~ ~s|card.append(labelledTerm("h3", "Child activity after end", route));|
 
     # Basis, parent-derived boundary, and the child Sessions that supplied the
     # evidence are all visible, not inferred by the reader.
@@ -73,7 +78,7 @@ defmodule PixirMonitor.UIPostTerminalChildActivityContractTest do
   end
 
   test "the surface stays read-only: it adds no action, button, or handler", %{js: js} do
-    card = between(js, "function postTerminalCard(activity) {", "\n  }\n")
+    card = between(js, "function postTerminalCard(activity, route) {", "\n  }\n")
     cell = between(js, "function postTerminalCell(activity) {", "\n  }\n")
 
     for source <- [card, cell] do

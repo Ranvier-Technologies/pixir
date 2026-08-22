@@ -78,11 +78,7 @@ defmodule PixirMonitor.EscriptLifecycleTest do
   # ExUnit timeout can never interrupt teardown.
   @tag timeout: 660_000
   test "one real browser fails closed across the complete lifecycle" do
-    root =
-      Path.join(
-        System.tmp_dir!(),
-        "pixir-monitor-escript-lifecycle-#{System.unique_integer([:positive])}"
-      )
+    root = PixirMonitor.TestRun.tmp("pixir-monitor-escript-lifecycle")
 
     workspace = Path.join(root, "workspace")
     File.mkdir_p!(workspace)

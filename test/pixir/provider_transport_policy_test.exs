@@ -8,9 +8,7 @@ defmodule Pixir.ProviderTransportPolicyTest do
 
   setup do
     name = :"auth_#{System.unique_integer([:positive])}"
-
-    path =
-      Path.join(System.tmp_dir!(), "pixir-transport-#{System.unique_integer([:positive])}.json")
+    path = tmp_auth_store("pixir-transport-auth-")
 
     {:ok, _} =
       Auth.start_link(
@@ -20,8 +18,20 @@ defmodule Pixir.ProviderTransportPolicyTest do
         oauth: __MODULE__.NoOAuth
       )
 
-    on_exit(fn -> File.rm_rf!(path) end)
     %{auth: name}
+  end
+
+  defp tmp_auth_store(prefix) do
+    directory =
+      Path.join(
+        System.tmp_dir!(),
+        prefix <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower)
+      )
+
+    File.rm_rf!(directory)
+    File.mkdir_p!(directory)
+    on_exit(fn -> File.rm_rf!(directory) end)
+    Path.join(directory, "auth.json")
   end
 
   defmodule NoOAuth do
@@ -1053,9 +1063,7 @@ defmodule Pixir.ProviderTransportPolicyTest do
 
   test "rotated bearer token preserves websocket continuation on the same socket", %{auth: auth} do
     second_auth = :"auth_#{System.unique_integer([:positive])}"
-
-    second_path =
-      Path.join(System.tmp_dir!(), "pixir-transport-#{System.unique_integer([:positive])}.json")
+    second_path = tmp_auth_store("pixir-transport-rotated-auth-")
 
     {:ok, _} =
       Auth.start_link(
@@ -1064,8 +1072,6 @@ defmodule Pixir.ProviderTransportPolicyTest do
         env_api_key: "sk-test-rotated",
         oauth: __MODULE__.NoOAuth
       )
-
-    on_exit(fn -> File.rm_rf!(second_path) end)
 
     {:ok, ids} = Agent.start_link(fn -> ["resp_1", "resp_2"] end)
     key = {:header_rotation, make_ref()}

@@ -66,7 +66,7 @@ defmodule PixirMonitor.WorkspaceSetCardinalityTest do
       active_port: Application.get_env(:pixir_monitor, :active_port)
     }
 
-    root = Path.join(System.tmp_dir!(), "pixir-workspace-cardinality-#{System.unique_integer([:positive])}")
+    root = PixirMonitor.TestRun.tmp("pixir-workspace-cardinality")
 
     roots =
       Map.new(1..(@max_sources + 1), fn index ->

@@ -27,19 +27,28 @@ defmodule Pixir.ACP.Server do
   auth through `pixir login`, and owns Credential storage outside the stdio channel),
   `session/set_mode` + `session/set_config_option` (modes, models, and reasoning effort,
   D.2), `session/set_model` (legacy Pixir/T3 compatibility), and `session/load` + `session/resume`
-  (lifecycle, A.6); emits `session/update` (incl. `current_mode_update` and
-  `plan`) and ORIGINATES `session/request_permission` (interactive permissions,
+  (lifecycle, A.6); emits `session/update` (incl. `current_mode_update`, `plan`, and the
+  additive runtime-driven `config_option_update`, #520) and ORIGINATES `session/request_permission` (interactive permissions,
   A.2 — correlating the client's response against `pending_requests`). Per-turn
-  knobs (model, reasoning effort, `permission_mode`) ride on `session/prompt`
-  `_meta`; sticky model and reasoning-effort selection are exposed through
-  `configOptions`; the legacy model catalog + auth status ride on `initialize._meta.pixir`.
+  knobs (model, reasoning effort, hosted Web Search, `permission_mode`) ride on
+  `session/prompt` `_meta`; sticky model, reasoning-effort, and Web Search
+  selections are exposed through `configOptions`; the legacy model catalog +
+  auth status ride on `initialize._meta.pixir`.
   Other methods get `-32601`. JSON-RPC errors are reserved for protocol faults; a
   failed Turn is reported as content with `stopReason:"end_turn"` (ADR 0009 §5), and
-  the prompt result additionally carries `_meta.pixir.turn_failure` (bounded facts:
-  `terminal_status`, `error_kind`) exactly when a `turn_failed` event was observed
-  during the prompt, so clients can distinguish failure from completion without
-  parsing chat text (#465, ADR 0009 §5 amendment). The signal is evidence-based: a
-  refused `session/prompt` (`:busy`) or a silent stall claims nothing.
+  the prompt result additionally carries `_meta.pixir.turn_failure` exactly when a
+  `turn_failed` event was observed during the prompt. Availability is owned jointly by
+  ACP's prompt table and the underlying Session: a terminal update normally remains behind
+  a bounded cleanup wait before its PromptResponse, and any residual `:busy` race is an
+  explicit `-32602` refusal rather than an empty successful Turn. A stalled Session probe
+  or a successor Turn can never hold the ACP Server or the completed request id indefinitely.
+  Failure facts are allowlisted: `terminal_status` is one of the current producer
+  statuses (`configuration_error`, `provider_error`, `tool_error`, or `interrupted`),
+  while `error_kind` is a lower-case ASCII identifier of at most 64 UTF-8 bytes. A
+  cleanup `interrupted` classification does not replace earlier non-empty facts from the
+  same prompt. Malformed facts are omitted, though an observed `turn_failed` still
+  projects an empty facts map so evidence presence is preserved. A refused prompt or
+  silent stall claims no failure evidence.
   Permission posture follows the session mode (`plan` → read-only) and
   `_meta.permission_mode "ask"` (→ interactive approval via the ACP asker).
 
@@ -58,11 +67,29 @@ defmodule Pixir.ACP.Server do
   require Logger
 
   alias Pixir.ACP.{Protocol, Translate}
-  alias Pixir.{Config, Conversation, SessionSupervisor, Subagents}
-  alias Pixir.Providers.Registry
+
+  alias Pixir.{
+    Compaction,
+    Config,
+    Conversation,
+    Event,
+    Paths,
+    SessionId,
+    SessionSupervisor,
+    Skills,
+    Subagents
+  }
+
+  alias Pixir.Providers.{Registry, ResolvedProviderRequest, ResponsesBackend}
 
   @protocol_version 1
   @idle_timeout 120_000
+  @prompt_admission_probe_timeout_ms 25
+  @prompt_cleanup_timeout_ms 1_000
+  @prompt_cleanup_poll_ms 5
+  @turn_failure_terminal_statuses ~w(configuration_error provider_error tool_error interrupted)
+  @max_turn_failure_error_kind_bytes 64
+  @turn_failure_error_kind_pattern ~r/\A[a-z][a-z0-9_]*\z/
 
   # Session modes (epic D.2). A `modeId` is a Pixir Agent ROLE (CONTEXT.md):
   # `build` = full access (execute tools), `plan` = read-only (produce a plan,
@@ -88,8 +115,10 @@ defmodule Pixir.ACP.Server do
   # choose". Both built-in providers omit the wire field when effort is unset;
   # neither supplies a Pixir-side effort default.
   @reasoning_effort_ids ~w(default low medium high xhigh)
+  @web_search_ids ~w(on off)
 
   defp meta_web_search(true), do: %{"enabled" => true}
+  defp meta_web_search(false), do: false
   defp meta_web_search(%{} = value), do: value
   defp meta_web_search(_value), do: nil
 
@@ -132,7 +161,12 @@ defmodule Pixir.ACP.Server do
 
     * `:io` — the stdio device (default `:stdio`; inject a `StringIO`/pipe in tests).
     * `:provider`, `:provider_opts` — passed through to each Turn (test seam).
-    * `:prompt_resolve_hook` — test callback at the terminal-status/reply boundary.
+    * `:prompt_resolve_hook` — test callback after the bounded Session Turn cleanup wait
+      and immediately before prompt resolution.
+    * `:prompt_before_cleanup_hook` — test callback after terminal status and before the
+      bounded Session cleanup wait.
+    * `:compaction_complete` — test seam for the runtime-owned structured compaction
+      completion; production uses `Pixir.Compaction.complete/2`.
     * `:name` — optional registered name.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -158,7 +192,40 @@ defmodule Pixir.ACP.Server do
   `handle_info({:line, _})` path the reader uses, without real stdio.
   """
   @spec feed(GenServer.server(), binary()) :: :ok
-  def feed(server, line) when is_binary(line), do: send(server, {:line, line}) && :ok
+  def feed(server, line) when is_binary(line) do
+    send(server, {:line, line})
+    :ok
+  end
+
+  @doc """
+  Apply a runtime-owned config change for one ACP session and push it to the
+  client without any client round-trip (#520). After validating and storing the
+  new sticky value(s), the Server emits ONE `session/update` carrying
+  `sessionUpdate: "config_option_update"` with the COMPLETE `configOptions`
+  list reflecting the new values (ACP: an update replaces the advertised set).
+  A runtime mode change additionally emits the existing additive
+  `current_mode_update`, mirroring the client-driven `session/set_mode` path.
+
+  `changes` maps any of `"mode"`, `"model"`, or `"reasoning_effort"` to its new
+  id. Invalid entries are dropped with a stderr warning; unknown sessions are
+  ignored (diagnostics to stderr; stdout stays JSON-RPC only). Returns
+  `{:ok, :queued}` when the change was handed to the Server, or a structured
+  `{:error, %{kind: :invalid_args}}` for malformed arguments. Presenter
+  plumbing only — the Log remains authoritative. The live plan→build producer
+  is `Pixir.ACP.RuntimeMode.leave_plan/1`, called from `update_plan`.
+  """
+  @spec runtime_config_change(GenServer.server(), binary(), map()) ::
+          {:ok, :queued} | {:error, %{kind: :invalid_args, details: map()}}
+  def runtime_config_change(server, acp_sid, changes)
+      when is_binary(acp_sid) and is_map(changes) do
+    GenServer.cast(server, {:runtime_config_change, acp_sid, changes})
+    {:ok, :queued}
+  end
+
+  def runtime_config_change(_server, _acp_sid, _changes),
+    do:
+      {:error,
+       %{kind: :invalid_args, details: %{"expected" => "binary session id and changes map"}}}
 
   @doc """
   Originate a `session/request_permission` request to the client and BLOCK until
@@ -216,6 +283,10 @@ defmodule Pixir.ACP.Server do
       # deliberately suppresses that config fallback so the provider omits its
       # reasoning-effort field.
       session_efforts: %{},
+      # acp_session_id => sticky hosted Web Search preference (`"on"` | `"off"`).
+      # This is Presenter-owned, in-memory Session state: it is projected into
+      # provider_opts only when a new Turn starts and is never written to History.
+      session_web_search: %{},
       # Stable Pixir subagent presentation items already created on the ACP wire.
       # Subsequent lifecycle events for the same subagent become updates, avoiding
       # duplicate items in clients that treat toolCallId creation as unique.
@@ -232,12 +303,26 @@ defmodule Pixir.ACP.Server do
       pending_requests: %{},
       request_timeout_ms: Keyword.get(opts, :request_timeout_ms, @idle_timeout),
       prompt_idle_timeout_ms: Keyword.get(opts, :prompt_idle_timeout_ms, @idle_timeout),
-      # Test seam at the terminal-status/reply boundary. The callback runs in the
-      # prompt Task immediately before the Server synchronizes the wire reply, so
-      # tests can drive both cancel/terminal orders without timing sleeps.
+      prompt_cleanup_timeout_ms:
+        Keyword.get(opts, :prompt_cleanup_timeout_ms, @prompt_cleanup_timeout_ms),
+      # Test seam after terminal status but before the bounded cleanup wait. It lets race
+      # tests install a successor Turn deterministically; production keeps it a no-op.
+      prompt_before_cleanup_hook: Keyword.get(opts, :prompt_before_cleanup_hook, fn -> :ok end),
+      # Test seam after a terminal status and the bounded Session cleanup wait, but
+      # immediately before the Server synchronizes the wire reply. Tests can drive both
+      # cancel/terminal orders without timing sleeps; the ordinary path observes the prior
+      # Turn as cleared, while the bounded wait cannot be wedged by a successor Turn.
       prompt_resolve_hook: Keyword.get(opts, :prompt_resolve_hook, fn _outcome -> :ok end),
+      compaction_complete: Keyword.get(opts, :compaction_complete, &Compaction.complete/2),
       provider: Keyword.get(opts, :provider),
-      provider_opts: Keyword.get(opts, :provider_opts, [])
+      provider_opts: Keyword.get(opts, :provider_opts, []),
+      tool_calls: %{},
+      deleted_sessions: MapSet.new(),
+      titles: %{},
+      # acp_session_id => fingerprint of the last available command list emitted.
+      # The command list is presenter state; Skills are rediscovered lazily at
+      # lifecycle and prompt boundaries rather than watched or polled.
+      command_fingerprints: %{}
     }
 
     # In tests, `reader: false` skips the stdin reader and lines are driven via `feed/2`.
@@ -275,6 +360,22 @@ defmodule Pixir.ACP.Server do
     end
   end
 
+  def handle_info(
+        {:deferred_available_commands, acp_sid, commands, fingerprint},
+        state
+      ) do
+    if Map.get(state.command_fingerprints, acp_sid) == fingerprint do
+      write_available_commands(state.out, acp_sid, commands)
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:deferred_title_update, acp_sid, title}, state) do
+    write_title_update(state.out, acp_sid, title)
+    {:noreply, state}
+  end
+
   def handle_info(_other, state), do: {:noreply, state}
 
   @impl true
@@ -291,6 +392,10 @@ defmodule Pixir.ACP.Server do
     end
 
     {:noreply, state}
+  end
+
+  def handle_cast({:runtime_config_change, acp_sid, changes}, state) do
+    {:noreply, apply_runtime_config_change(state, acp_sid, changes)}
   end
 
   # ── dispatch ────────────────────────────────────────────────────────────────
@@ -338,7 +443,10 @@ defmodule Pixir.ACP.Server do
           "embeddedContext" => false
         },
         "sessionCapabilities" => %{
-          "resume" => %{}
+          "resume" => %{},
+          "list" => %{},
+          "close" => %{},
+          "delete" => %{}
         }
       },
       "agentInfo" => %{"name" => "pixir", "version" => Pixir.version()},
@@ -375,9 +483,23 @@ defmodule Pixir.ACP.Server do
     end
   end
 
+  defp handle_request("session/list", params, id, state) do
+    list_sessions(params || %{}, id, state)
+  end
+
+  defp handle_request("session/delete", params, id, state) do
+    delete_session(params || %{}, id, state)
+  end
+
+  defp handle_request("session/close", params, id, state) do
+    close_session(params || %{}, id, state)
+  end
+
   defp handle_request("session/prompt", params, id, state) do
     with acp_sid when is_binary(acp_sid) <- Map.get(params, "sessionId"),
-         pixir_sid when is_binary(pixir_sid) <- Map.get(state.sessions, acp_sid) do
+         pixir_sid when is_binary(pixir_sid) <- Map.get(state.sessions, acp_sid),
+         cwd when is_binary(cwd) <- Map.get(state.workspaces, acp_sid) do
+      state = maybe_emit_available_commands(state, acp_sid, cwd)
       start_prompt(acp_sid, pixir_sid, params, id, state)
     else
       _ ->
@@ -406,6 +528,9 @@ defmodule Pixir.ACP.Server do
 
       "reasoning_effort" ->
         set_reasoning_effort(Map.get(params, "value"), params, id, state)
+
+      "web_search" ->
+        set_web_search(Map.get(params, "value"), params, id, state)
 
       other ->
         unknown_config_option(id, state, other)
@@ -513,7 +638,8 @@ defmodule Pixir.ACP.Server do
                   config_options(
                     mode_id,
                     current_model(state, acp_sid),
-                    current_effort(state, acp_sid)
+                    current_effort(state, acp_sid),
+                    current_web_search(state, acp_sid)
                   )
               }
           end
@@ -564,7 +690,8 @@ defmodule Pixir.ACP.Server do
                   config_options(
                     current_mode(state, params),
                     model_id,
-                    current_effort(state, acp_sid)
+                    current_effort(state, acp_sid),
+                    current_web_search(state, acp_sid, model: model_id)
                   )
               }
           end
@@ -602,7 +729,8 @@ defmodule Pixir.ACP.Server do
             config_options(
               current_mode(state, params),
               current_model(state, acp_sid),
-              effort_id
+              effort_id,
+              current_web_search(state, acp_sid)
             )
         }
 
@@ -610,6 +738,91 @@ defmodule Pixir.ACP.Server do
         %{state | session_efforts: Map.put(state.session_efforts, acp_sid, effort_id)}
     end
   end
+
+  # Validate and store a sticky hosted Web Search preference. `off` is always
+  # valid; `on` is accepted only when the currently selected Provider/backend
+  # can honor it. The runtime still owns request validation and shaping — ACP
+  # stores only the preference that will be threaded into the next Turn.
+  defp set_web_search(value, params, id, state) do
+    acp_sid = Map.get(params, "sessionId")
+
+    cond do
+      not (is_binary(acp_sid) and Map.has_key?(state.sessions, acp_sid)) ->
+        write(state.out, Protocol.error(id, Protocol.invalid_params(), "unknown session"))
+        state
+
+      value not in @web_search_ids ->
+        write(
+          state.out,
+          Protocol.error(id, Protocol.invalid_params(), "unknown config option value", %{
+            "configId" => "web_search",
+            "value" => value
+          })
+        )
+
+        state
+
+      value == "on" ->
+        case resolve_web_search_context(state, acp_sid) do
+          {:ok, resolved} ->
+            if web_search_supported?(resolved) do
+              write_web_search_config_result(state, acp_sid, id, value)
+            else
+              write_unsupported_web_search(state, id, resolved)
+            end
+
+          {:error, error} ->
+            write(
+              state.out,
+              Protocol.error(id, Protocol.invalid_params(), "web_search is unavailable", %{
+                "configId" => "web_search",
+                "value" => value,
+                "reason" => provider_selection_error_reason(error)
+              })
+            )
+
+            state
+        end
+
+      true ->
+        write_web_search_config_result(state, acp_sid, id, value)
+    end
+  end
+
+  defp write_web_search_config_result(state, acp_sid, id, value) do
+    result = %{
+      "configOptions" =>
+        config_options(
+          Map.get(state.modes, acp_sid, @default_mode),
+          current_model(state, acp_sid),
+          current_effort(state, acp_sid),
+          value
+        )
+    }
+
+    write(state.out, Protocol.result(id, result))
+    %{state | session_web_search: Map.put(state.session_web_search, acp_sid, value)}
+  end
+
+  defp write_unsupported_web_search(state, id, resolved) do
+    write(
+      state.out,
+      Protocol.error(id, Protocol.invalid_params(), "web_search is not supported", %{
+        "configId" => "web_search",
+        "value" => "on",
+        "reason" => "unsupported_backend",
+        "provider" => resolved_provider_name(resolved),
+        "backend" => resolved_backend_name(resolved)
+      })
+    )
+
+    state
+  end
+
+  defp provider_selection_error_reason(%{error: %{kind: kind}}) when is_atom(kind),
+    do: Atom.to_string(kind)
+
+  defp provider_selection_error_reason(_error), do: "invalid_provider_selection"
 
   defp unknown_config_option(id, state, config_id) do
     write(
@@ -620,6 +833,84 @@ defmodule Pixir.ACP.Server do
     )
 
     state
+  end
+
+  # ── runtime-owned config changes (#520) ──────────────────────────────────────
+
+  # The runtime (not the client) changed a knob. Validate + store each change,
+  # then emit ONE additive `config_option_update` carrying the complete
+  # `configOptions` list so presenters hear agent-initiated switches without a
+  # client round-trip. A mode change also emits `current_mode_update` for
+  # parity with the client-driven `session/set_mode` path. Invalid entries are
+  # dropped with a stderr warning; nothing invalid is ever advertised.
+  defp apply_runtime_config_change(state, acp_sid, changes) do
+    cond do
+      not Map.has_key?(state.sessions, acp_sid) ->
+        # Fixed messages only: caller-supplied ids/values never enter stderr.
+        Logger.warning("acp: runtime config change for unknown session")
+        state
+
+      true ->
+        {state, applied, mode_changed?} =
+          Enum.reduce(changes, {state, _applied = [], _mode_changed? = false}, fn
+            {"mode", mode_id}, {st, applied, mode_changed?} when mode_id in @mode_ids ->
+              if Map.get(st.modes, acp_sid, @default_mode) == mode_id do
+                {st, applied, mode_changed?}
+              else
+                {%{st | modes: Map.put(st.modes, acp_sid, mode_id)}, [:mode | applied], true}
+              end
+
+            {"model", model_id}, {st, applied, mode_changed?}
+            when is_binary(model_id) and model_id != "" ->
+              if Registry.model_supported?(model_id) do
+                {%{st | session_models: Map.put(st.session_models, acp_sid, model_id)},
+                 [:model | applied], mode_changed?}
+              else
+                Logger.warning("acp: runtime config change rejected unknown model")
+
+                {st, applied, mode_changed?}
+              end
+
+            {"reasoning_effort", effort}, {st, applied, mode_changed?}
+            when effort in @reasoning_effort_ids ->
+              {%{st | session_efforts: Map.put(st.session_efforts, acp_sid, effort)},
+               [:reasoning_effort | applied], mode_changed?}
+
+            {_key, _value}, acc ->
+              Logger.warning("acp: ignoring unsupported runtime config change")
+
+              acc
+          end)
+
+        if applied == [] do
+          state
+        else
+          if mode_changed? do
+            emit(self(), %{
+              "sessionId" => acp_sid,
+              "update" => %{
+                "sessionUpdate" => "current_mode_update",
+                "currentModeId" => Map.get(state.modes, acp_sid, @default_mode)
+              }
+            })
+          end
+
+          opts =
+            config_options(
+              Map.get(state.modes, acp_sid, @default_mode),
+              current_model(state, acp_sid),
+              current_effort(state, acp_sid),
+              current_web_search(state, acp_sid)
+            )
+
+          emit(self(), %{
+            "sessionId" => acp_sid,
+            "update" => %{"sessionUpdate" => "config_option_update", "configOptions" => opts}
+          })
+
+          state
+        end
+    end
   end
 
   # The current mode for the session named in `params` (default `@default_mode`).
@@ -637,15 +928,97 @@ defmodule Pixir.ACP.Server do
     end
   end
 
-  # The full `configOptions` list (D.2). Model and reasoning-effort selectors
-  # are the canonical ACP surfaces for their sticky per-session selections; the
-  # legacy `models` response field and `session/set_model` method remain model
-  # compatibility extensions.
-  defp config_options(current_mode, current_model, current_effort) do
+  # The displayed Web Search value is effective for the currently selected
+  # Provider/backend. A sticky `on` preference becomes `off` while an unsupported
+  # model/backend is selected, and becomes `on` again if the Session returns to a
+  # supported selection. With no sticky preference, the late-bound runtime
+  # default/config value from #523-B is projected through the same resolved seam.
+  defp current_web_search(state, acp_sid, opts \\ []) do
+    case resolve_web_search_context(state, acp_sid, opts) do
+      {:ok, resolved} ->
+        if web_search_supported?(resolved) do
+          state
+          |> effective_web_search_provider_opts(acp_sid, opts)
+          |> then(&ResolvedProviderRequest.attach_to_provider_opts(resolved, &1))
+          |> Keyword.get(:web_search)
+          |> web_search_enabled?()
+          |> on_off()
+        else
+          "off"
+        end
+
+      {:error, _error} ->
+        "off"
+    end
+  end
+
+  defp resolve_web_search_context(state, acp_sid, opts \\ []) do
+    model = Keyword.get(opts, :model, current_model(state, acp_sid))
+
+    selection = %{
+      provider_intent: if(state.provider, do: {:explicit, state.provider}, else: :auto),
+      request: %{},
+      provider_opts: state.provider_opts |> List.wrap() |> Keyword.put(:model, model)
+    }
+
+    Registry.resolve_request(selection)
+  end
+
+  defp effective_web_search_provider_opts(state, acp_sid, opts) do
+    model = Keyword.get(opts, :model, current_model(state, acp_sid))
+    provider_opts = state.provider_opts |> List.wrap() |> Keyword.put(:model, model)
+
+    case Map.get(state.session_web_search, acp_sid) do
+      "on" -> Keyword.put(provider_opts, :web_search, %{"enabled" => true})
+      "off" -> Keyword.put(provider_opts, :web_search, false)
+      nil -> provider_opts
+    end
+  end
+
+  defp web_search_supported?(resolved) do
+    case {
+      ResolvedProviderRequest.dialect(resolved),
+      ResolvedProviderRequest.responses_backend(resolved)
+    } do
+      {:responses, %ResponsesBackend{} = backend} ->
+        ResponsesBackend.mode(backend) == :chatgpt_codex
+
+      _other ->
+        false
+    end
+  end
+
+  defp web_search_enabled?(nil), do: false
+  defp web_search_enabled?(false), do: false
+  defp web_search_enabled?(%{"enabled" => false}), do: false
+  defp web_search_enabled?(%{enabled: false}), do: false
+  defp web_search_enabled?(_value), do: true
+
+  defp on_off(true), do: "on"
+  defp on_off(false), do: "off"
+
+  defp resolved_provider_name(resolved) do
+    resolved
+    |> ResolvedProviderRequest.dialect()
+    |> Atom.to_string()
+  end
+
+  defp resolved_backend_name(resolved) do
+    case ResolvedProviderRequest.responses_backend(resolved) do
+      %ResponsesBackend{} = backend -> backend |> ResponsesBackend.mode() |> Atom.to_string()
+      :not_applicable -> "not_applicable"
+    end
+  end
+
+  # The full `configOptions` list (D.2). Selectors are the canonical ACP
+  # surfaces for sticky per-session preferences; legacy compatibility fields and
+  # methods remain separate from this complete list.
+  defp config_options(current_mode, current_model, current_effort, current_web_search) do
     [
       mode_config_option(current_mode),
       model_config_option(current_model),
-      reasoning_effort_config_option(current_effort)
+      reasoning_effort_config_option(current_effort),
+      web_search_config_option(current_web_search)
     ]
   end
 
@@ -657,6 +1030,7 @@ defmodule Pixir.ACP.Server do
       "name" => "Mode",
       "type" => "select",
       "currentValue" => current,
+      "category" => "mode",
       # Each select option is `{name, value}` per ACP's SessionConfigSelectOption
       # (NOT `{id, name}` — `value` is the id echoed back on set_config_option).
       "options" =>
@@ -684,12 +1058,28 @@ defmodule Pixir.ACP.Server do
       "id" => "reasoning_effort",
       "name" => "Reasoning effort",
       "description" => "Reasoning effort for this session; default lets the provider choose.",
+      "category" => "thought_level",
       "type" => "select",
       "currentValue" => current,
       "options" =>
         Enum.map(@reasoning_effort_ids, fn effort ->
           %{"name" => effort, "value" => effort}
         end)
+    }
+  end
+
+  defp web_search_config_option(current) do
+    %{
+      "id" => "web_search",
+      "name" => "Web search",
+      "description" => "Provider-hosted web search for the next Turn.",
+      "category" => "capabilities",
+      "type" => "select",
+      "currentValue" => current,
+      "options" => [
+        %{"name" => "On", "value" => "on"},
+        %{"name" => "Off", "value" => "off"}
+      ]
     }
   end
 
@@ -765,19 +1155,24 @@ defmodule Pixir.ACP.Server do
         # 1:1 identity mapping: the ACP sessionId is the Pixir session id.
         acp_sid = pixir_sid
 
+        current_model = current_model(state, acp_sid)
+
         write(
           state.out,
           Protocol.result(
             id,
             session_setup_result(
               acp_sid,
-              default_model_id(),
-              current_effort(state, acp_sid)
+              current_model,
+              current_effort(state, acp_sid),
+              current_web_search(state, acp_sid, model: current_model)
             )
           )
         )
 
-        register_session(state, acp_sid, pixir_sid, cwd)
+        state
+        |> register_session(acp_sid, pixir_sid, cwd)
+        |> schedule_available_commands(acp_sid, cwd)
 
       {:error, error} ->
         write_start_error(state.out, id, error)
@@ -786,12 +1181,11 @@ defmodule Pixir.ACP.Server do
   end
 
   # The shared setup payload for session/new, session/load, and session/resume:
-  # the sessionId plus advertised modes and config options. `current_model` and
-  # `current_effort` are the effective setup values at session/new, load, or
-  # resume. Sticky selections are retained when the same server reattaches.
-  # The `models` field is a legacy Pixir/T3 compatibility extension; canonical
-  # ACP clients should read `configOptions`.
-  defp session_setup_result(acp_sid, current_model, current_effort) do
+  # the sessionId plus advertised modes and config options. The current values
+  # are effective at the setup boundary; sticky selections are retained when
+  # the same server reattaches. The `models` field is a legacy Pixir/T3
+  # compatibility extension; canonical ACP clients should read `configOptions`.
+  defp session_setup_result(acp_sid, current_model, current_effort, current_web_search) do
     %{
       "sessionId" => acp_sid,
       "modes" => %{
@@ -799,7 +1193,8 @@ defmodule Pixir.ACP.Server do
         "availableModes" => @available_modes
       },
       "models" => models_state(current_model),
-      "configOptions" => config_options(@default_mode, current_model, current_effort)
+      "configOptions" =>
+        config_options(@default_mode, current_model, current_effort, current_web_search)
     }
   end
 
@@ -816,12 +1211,13 @@ defmodule Pixir.ACP.Server do
     }
   end
 
-  # The current model to advertise for an existing session (load/resume): the
-  # sticky model if one was set on this server, else Pixir's default. (Sticky
-  # selections are in-memory and not persisted, so after a cold restart this is
-  # the default — the client can re-issue `session/set_model`.)
+  # The current model to advertise for an existing session: sticky selection
+  # first, then the server's injected/base Provider selection, then Pixir's
+  # default. Sticky selections are in-memory and are not persisted.
   defp current_model(state, acp_sid) do
-    Map.get(state.session_models, acp_sid) || default_model_id()
+    Map.get(state.session_models, acp_sid) ||
+      Keyword.get(List.wrap(state.provider_opts), :model) ||
+      default_model_id()
   end
 
   # Pixir's default model id, advertised as `currentModelId` at session/new.
@@ -837,7 +1233,8 @@ defmodule Pixir.ACP.Server do
       state
       | sessions: Map.put(state.sessions, acp_sid, pixir_sid),
         workspaces: Map.put(state.workspaces, acp_sid, cwd),
-        modes: Map.put(state.modes, acp_sid, @default_mode)
+        modes: Map.put(state.modes, acp_sid, @default_mode),
+        command_fingerprints: Map.delete(state.command_fingerprints, acp_sid)
     }
 
     if posture do
@@ -865,6 +1262,290 @@ defmodule Pixir.ACP.Server do
     )
   end
 
+  # ── session/list + close + delete helpers ───────────────────────────────────
+
+  defp list_sessions(params, id, state) do
+    cwd = Map.get(params, "cwd")
+    cursor = Map.get(params, "cursor")
+    limit = Map.get(params, "limit", 50)
+
+    cond do
+      is_binary(cwd) and Path.type(cwd) != :absolute ->
+        write(state.out, Protocol.error(id, Protocol.invalid_params(), "cwd must be absolute"))
+        state
+
+      not (is_nil(cursor) or (is_binary(cursor) and String.starts_with?(cursor, "offset:"))) ->
+        write(state.out, Protocol.error(id, Protocol.invalid_params(), "invalid cursor"))
+        state
+
+      true ->
+        offset = cursor_offset(cursor)
+
+        if offset < 0 do
+          write(state.out, Protocol.error(id, Protocol.invalid_params(), "invalid cursor"))
+          state
+        else
+          roots = if is_binary(cwd), do: [cwd], else: known_workspaces(state)
+
+          sessions =
+            roots
+            |> Enum.flat_map(&session_summaries(&1, state))
+            |> Enum.reject(&MapSet.member?(state.deleted_sessions, &1["sessionId"]))
+            |> Enum.sort_by(&(&1["updatedAt"] || ""), :desc)
+
+          limit = if is_integer(limit) and limit > 0, do: min(limit, 100), else: 50
+          page = Enum.slice(sessions, offset, limit)
+          next_offset = offset + length(page)
+          result = %{"sessions" => page}
+
+          result =
+            if next_offset < length(sessions),
+              do: Map.put(result, "cursor", "offset:#{next_offset}"),
+              else: result
+
+          write(state.out, Protocol.result(id, result))
+          state
+        end
+    end
+  end
+
+  defp close_session(params, id, state) do
+    acp_sid = Map.get(params, "sessionId")
+
+    case Map.get(state.sessions, acp_sid) do
+      nil ->
+        write(state.out, Protocol.error(id, Protocol.invalid_params(), "unknown session"))
+        state
+
+      pixir_sid ->
+        Conversation.interrupt(pixir_sid)
+        SessionSupervisor.stop_session(pixir_sid)
+        write(state.out, Protocol.result(id, %{}))
+        forget_session(state, acp_sid, pixir_sid)
+    end
+  end
+
+  defp forget_session(state, acp_sid, pixir_sid) do
+    %{
+      state
+      | sessions: Map.delete(state.sessions, acp_sid),
+        workspaces: Map.delete(state.workspaces, acp_sid),
+        modes: Map.delete(state.modes, acp_sid),
+        prompts: Map.delete(state.prompts, pixir_sid),
+        titles: Map.delete(state.titles, acp_sid),
+        session_models: Map.delete(state.session_models, acp_sid),
+        session_efforts: Map.delete(state.session_efforts, acp_sid),
+        session_web_search: Map.delete(state.session_web_search, acp_sid),
+        command_fingerprints: Map.delete(state.command_fingerprints, acp_sid),
+        presented_subagents:
+          MapSet.reject(state.presented_subagents, fn
+            {sid, _subagent_id} -> sid == acp_sid
+            _ -> false
+          end)
+    }
+  end
+
+  defp delete_session(params, id, state) do
+    sid = Map.get(params, "sessionId")
+
+    cond do
+      not is_binary(sid) or sid == "" ->
+        write(state.out, Protocol.error(id, Protocol.invalid_params(), "sessionId required"))
+        state
+
+      true ->
+        case SessionId.validate(sid) do
+          {:error, %{error: %{details: details}}} ->
+            write_invalid_session_id(state.out, id, details)
+            state
+
+          :ok ->
+            if Map.has_key?(state.sessions, sid) do
+              write(
+                state.out,
+                Protocol.error(id, Protocol.invalid_params(), "cannot delete active session")
+              )
+
+              state
+            else
+              write(state.out, Protocol.result(id, %{}))
+              %{state | deleted_sessions: MapSet.put(state.deleted_sessions, sid)}
+            end
+        end
+    end
+  end
+
+  defp cursor_offset(nil), do: 0
+
+  defp cursor_offset("offset:" <> value) do
+    case Integer.parse(value) do
+      {n, ""} when n >= 0 -> n
+      _ -> -1
+    end
+  end
+
+  defp known_workspaces(state), do: state.workspaces |> Map.values() |> Enum.uniq()
+
+  defp session_summaries(cwd, state) do
+    dir = Paths.sessions_dir(cwd)
+
+    case File.ls(dir) do
+      {:ok, files} ->
+        files
+        |> Enum.filter(&String.ends_with?(&1, ".ndjson"))
+        |> Enum.map(fn file -> session_summary(cwd, file, state) end)
+        |> Enum.reject(&is_nil/1)
+
+      _ ->
+        []
+    end
+  end
+
+  defp session_summary(cwd, file, state) do
+    sid = String.replace_suffix(file, ".ndjson", "")
+
+    # Soft-deleted ids still have a Log on disk. Skip them before title lookup so
+    # close/forget (which drops the in-memory title cache) cannot crash list on a
+    # dead Session. The deleted filter after summaries would be too late.
+    if MapSet.member?(state.deleted_sessions, sid) do
+      nil
+    else
+      path = Path.join(Paths.sessions_dir(cwd), file)
+
+      updated =
+        case File.stat(path) do
+          {:ok, stat} ->
+            stat.mtime
+            |> NaiveDateTime.from_erl!()
+            |> DateTime.from_naive!("Etc/UTC")
+            |> DateTime.to_iso8601()
+
+          _ ->
+            nil
+        end
+
+      title = Map.get(state.titles, sid) || title_from_history(sid, cwd)
+
+      %{"sessionId" => sid, "cwd" => cwd}
+      |> put_some("title", title)
+      |> put_some("updatedAt", updated)
+    end
+  end
+
+  defp title_from_history(sid, cwd) do
+    case Conversation.history(sid) do
+      {:ok, history} ->
+        title_from_events(history)
+
+      _ ->
+        case Pixir.Log.fold(sid, workspace: cwd) do
+          {:ok, history} -> title_from_events(history)
+          _ -> nil
+        end
+    end
+  end
+
+  defp title_from_events(history) do
+    history
+    |> Enum.find_value(fn
+      %{type: :user_message, data: %{"text" => text}} when is_binary(text) ->
+        String.slice(String.trim(text), 0, 80)
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp schedule_available_commands(state, acp_sid, cwd) do
+    {:ok, %{skills: skills}} = Skills.discover(cwd)
+    commands = available_commands(skills)
+    fingerprint = available_commands_fingerprint(commands)
+
+    Process.send_after(
+      self(),
+      {:deferred_available_commands, acp_sid, commands, fingerprint},
+      250
+    )
+
+    %{
+      state
+      | command_fingerprints: Map.put(state.command_fingerprints, acp_sid, fingerprint)
+    }
+  end
+
+  defp maybe_emit_available_commands(state, acp_sid, cwd) do
+    {:ok, %{skills: skills}} = Skills.discover(cwd)
+    commands = available_commands(skills)
+    fingerprint = available_commands_fingerprint(commands)
+
+    if Map.get(state.command_fingerprints, acp_sid) == fingerprint do
+      state
+    else
+      write_available_commands(state.out, acp_sid, commands)
+
+      %{
+        state
+        | command_fingerprints: Map.put(state.command_fingerprints, acp_sid, fingerprint)
+      }
+    end
+  end
+
+  defp write_available_commands(out, acp_sid, commands) do
+    write(
+      out,
+      Protocol.notification("session/update", %{
+        "sessionId" => acp_sid,
+        "update" => %{
+          "sessionUpdate" => "available_commands_update",
+          "availableCommands" => commands
+        }
+      })
+    )
+  end
+
+  defp write_title_update(out, acp_sid, title) do
+    write(
+      out,
+      Protocol.notification("session/update", %{
+        "sessionId" => acp_sid,
+        "update" => %{
+          "sessionUpdate" => "session_info_update",
+          "title" => title,
+          "_meta" => %{"pixir" => %{"schemaVersion" => 1}}
+        }
+      })
+    )
+  end
+
+  # Pure ACP projection of the current Skills index. `compact` is runtime-owned
+  # and always wins over a homonymous Skill; `plan` remains a mode, not a command.
+  defp available_commands(skills) when is_list(skills) do
+    compact = %{
+      "name" => "compact",
+      "description" => "Record a durable History compaction checkpoint"
+    }
+
+    skill_commands =
+      skills
+      |> Enum.reject(&Map.get(&1, :disable_model_invocation, false))
+      |> Enum.reject(&(&1.name in ["compact", "plan"]))
+      |> Enum.map(fn skill ->
+        %{
+          "name" => skill.name,
+          "description" => skill.description,
+          "input" => %{"hint" => skill.description}
+        }
+      end)
+
+    [compact | skill_commands]
+  end
+
+  defp available_commands_fingerprint(commands) do
+    commands
+    |> :erlang.term_to_binary([:deterministic])
+    |> then(&:crypto.hash(:sha256, &1))
+  end
+
   # ── session/load + resume helpers (A.6) ──────────────────────────────────────
 
   # session/load: reattach to a persisted session and REPLAY its History as
@@ -874,38 +1555,55 @@ defmodule Pixir.ACP.Server do
     # Existence check first: Conversation.start yields the :not_found -> -32602
     # contract for an unknown session. Restore the posture only after, so a
     # missing session never surfaces as an internal -32603 from the Log fold.
-    with {:ok, pixir_sid} <- Conversation.start(id: acp_sid, workspace: cwd),
-         {:ok, posture} <- restore_reattach_posture(acp_sid, cwd, pixir_sid) do
-      replayed_subagents = replay_history(state.out, acp_sid, pixir_sid, cwd)
-      current_model = current_model(state, acp_sid)
-
+    if MapSet.member?(state.deleted_sessions, acp_sid) do
       write(
         state.out,
-        Protocol.result(
-          id,
-          session_setup_result(acp_sid, current_model, current_effort(state, acp_sid))
-        )
+        Protocol.error(id, Protocol.invalid_params(), "session has been deleted", %{
+          "id" => acp_sid
+        })
       )
 
       state
-      |> register_session(acp_sid, pixir_sid, cwd, posture)
-      |> remember_presented_subagents(replayed_subagents)
     else
-      {:error, %{error: %{kind: :not_found, message: message}}} ->
+      with {:ok, pixir_sid} <- Conversation.start(id: acp_sid, workspace: cwd),
+           {:ok, posture} <- restore_reattach_posture(acp_sid, cwd, pixir_sid) do
+        replayed_subagents = replay_history(state.out, acp_sid, pixir_sid, cwd)
+        current_model = current_model(state, acp_sid)
+
         write(
           state.out,
-          Protocol.error(id, Protocol.invalid_params(), message, %{"id" => acp_sid})
+          Protocol.result(
+            id,
+            session_setup_result(
+              acp_sid,
+              current_model,
+              current_effort(state, acp_sid),
+              current_web_search(state, acp_sid, model: current_model)
+            )
+          )
         )
 
         state
+        |> register_session(acp_sid, pixir_sid, cwd, posture)
+        |> remember_presented_subagents(replayed_subagents)
+        |> schedule_available_commands(acp_sid, cwd)
+      else
+        {:error, %{error: %{kind: :not_found, message: message}}} ->
+          write(
+            state.out,
+            Protocol.error(id, Protocol.invalid_params(), message, %{"id" => acp_sid})
+          )
 
-      {:error, %{error: %{kind: :invalid_args, details: details}}} ->
-        write_invalid_session_id(state.out, id, details)
-        state
+          state
 
-      {:error, error} ->
-        write_start_error(state.out, id, error)
-        state
+        {:error, %{error: %{kind: :invalid_args, details: details}}} ->
+          write_invalid_session_id(state.out, id, details)
+          state
+
+        {:error, error} ->
+          write_start_error(state.out, id, error)
+          state
+      end
     end
   end
 
@@ -922,13 +1620,19 @@ defmodule Pixir.ACP.Server do
         state.out,
         Protocol.result(
           id,
-          session_setup_result(acp_sid, current_model, current_effort(state, acp_sid))
+          session_setup_result(
+            acp_sid,
+            current_model,
+            current_effort(state, acp_sid),
+            current_web_search(state, acp_sid, model: current_model)
+          )
         )
       )
 
       state
       |> register_session(acp_sid, pixir_sid, cwd, posture)
       |> remember_presented_subagents(historical_subagents)
+      |> schedule_available_commands(acp_sid, cwd)
     else
       {:error, %{error: %{kind: :not_found, message: message}}} ->
         write(
@@ -1037,6 +1741,9 @@ defmodule Pixir.ACP.Server do
   end
 
   defp translate_update(event, acp_sid, state) do
+    pixir_sid = Map.get(state.sessions, acp_sid)
+    prompt_ref = get_in(state.prompts, [pixir_sid, :id])
+
     opts =
       translate_opts(
         event,
@@ -1044,6 +1751,10 @@ defmodule Pixir.ACP.Server do
         state.presented_subagents,
         Map.get(state.workspaces, acp_sid)
       )
+      |> Keyword.put(:tool_call_args, tool_call_args_for(event, state))
+      |> Keyword.put(:tool_name, tool_name_for(event, state))
+      |> Keyword.put(:acp_sid, acp_sid)
+      |> maybe_put_prompt_ref(prompt_ref)
 
     {params, state} =
       case track_live_acp_warning(state, event) do
@@ -1064,10 +1775,13 @@ defmodule Pixir.ACP.Server do
           {Translate.update(event, acp_sid, opts), state}
       end
 
+    {params, state} = maybe_title_update(params, state, acp_sid, event)
+
     state = %{
       state
       | presented_subagents:
-          remember_presented_subagent(state.presented_subagents, event, acp_sid)
+          remember_presented_subagent(state.presented_subagents, event, acp_sid),
+        tool_calls: remember_tool_call(state.tool_calls, event)
     }
 
     {params, state}
@@ -1084,7 +1798,37 @@ defmodule Pixir.ACP.Server do
     event
     |> subagent_seen_opts(acp_sid, seen)
     |> Keyword.put(:workspace, workspace)
+    |> Keyword.put(:acp_sid, acp_sid)
   end
+
+  defp maybe_put_prompt_ref(opts, nil), do: opts
+  defp maybe_put_prompt_ref(opts, prompt_ref), do: Keyword.put(opts, :prompt_ref, prompt_ref)
+
+  defp tool_call_args_for(%{type: :tool_result, data: %{"call_id" => id}}, state) do
+    get_in(state.tool_calls, [id, :args]) || %{}
+  end
+
+  defp tool_call_args_for(_event, _state), do: %{}
+
+  defp tool_name_for(%{type: :tool_result, data: %{"call_id" => id}}, state) do
+    get_in(state.tool_calls, [id, :name])
+  end
+
+  defp tool_name_for(_event, _state), do: nil
+
+  defp maybe_title_update(nil, state, acp_sid, %{type: :user_message, data: %{"text" => text}})
+       when is_binary(text) do
+    title = String.slice(String.trim(text), 0, 80)
+
+    if title == "" or Map.has_key?(state.titles, acp_sid) do
+      {nil, state}
+    else
+      Process.send_after(self(), {:deferred_title_update, acp_sid, title}, 250)
+      {nil, %{state | titles: Map.put(state.titles, acp_sid, title)}}
+    end
+  end
+
+  defp maybe_title_update(params, state, _acp_sid, _event), do: {params, state}
 
   defp remember_presented_subagents(state, presented) do
     %{state | presented_subagents: MapSet.union(state.presented_subagents, presented)}
@@ -1101,6 +1845,16 @@ defmodule Pixir.ACP.Server do
 
   defp remember_presented_subagent(seen, _event, _acp_sid), do: seen
 
+  defp remember_tool_call(tool_calls, %{
+         type: :tool_call,
+         data: %{"call_id" => id, "name" => name, "args" => args}
+       })
+       when is_binary(id) and is_map(args) do
+    Map.put(tool_calls, id, %{name: name, args: args})
+  end
+
+  defp remember_tool_call(tool_calls, _event), do: tool_calls
+
   defp subagent_key(acp_sid, id), do: {acp_sid, id}
 
   # ── session/prompt helper ────────────────────────────────────────────────────
@@ -1109,9 +1863,10 @@ defmodule Pixir.ACP.Server do
     meta_opts = extract_meta_opts(params)
 
     cond do
-      Map.has_key?(state.prompts, pixir_sid) ->
-        # A concurrent prompt on a busy session is a client/state error, not an internal
-        # fault — report it as invalid params (per the CodeRabbit review).
+      prompt_running?(state, pixir_sid) ->
+        # Availability belongs to both presenter and runtime state. A terminal status can
+        # reach ACP just before Session handles the Turn Task result; checking only the
+        # prompt map would admit a Task that Conversation.send/3 then rejects as :busy.
         write(
           state.out,
           Protocol.error(id, Protocol.invalid_params(), "a turn is already running")
@@ -1136,28 +1891,203 @@ defmodule Pixir.ACP.Server do
       true ->
         prompt_blocks = Map.get(params, "prompt", [])
         prompt_text = extract_prompt_text(prompt_blocks)
-        attachments = extract_attachments(params, prompt_blocks)
-        server = self()
-        turn_opts = maybe_put(turn_opts(state, acp_sid, meta_opts), :attachments, attachments)
 
-        {:ok, task} =
-          Task.Supervisor.start_child(Pixir.TurnSupervisor, fn ->
-            run_prompt(
-              server,
-              acp_sid,
-              pixir_sid,
-              prompt_text,
-              turn_opts,
-              state.prompt_idle_timeout_ms,
-              state.prompt_resolve_hook
-            )
-          end)
+        if compact_prompt?(prompt_text) do
+          run_compact_prompt(acp_sid, pixir_sid, prompt_text, id, state)
+        else
+          attachments = extract_attachments(params, prompt_blocks)
+          server = self()
+          turn_opts = maybe_put(turn_opts(state, acp_sid, meta_opts), :attachments, attachments)
 
-        put_in(
-          state.prompts[pixir_sid],
-          Map.merge(%{id: id, task: task, cancel?: false}, new_warning_state())
-        )
+          {:ok, task} =
+            Task.Supervisor.start_child(Pixir.TurnSupervisor, fn ->
+              run_prompt(
+                server,
+                acp_sid,
+                pixir_sid,
+                prompt_text,
+                turn_opts,
+                state.prompt_idle_timeout_ms,
+                %{
+                  timeout_ms: state.prompt_cleanup_timeout_ms,
+                  before_wait: state.prompt_before_cleanup_hook
+                },
+                state.prompt_resolve_hook
+              )
+            end)
+
+          put_in(
+            state.prompts[pixir_sid],
+            Map.merge(%{id: id, task: task, cancel?: false}, new_warning_state())
+          )
+        end
     end
+  end
+
+  defp compact_prompt?(text) when is_binary(text),
+    do: String.match?(String.trim(text), ~r/^\/compact(?:\s.*)?$/)
+
+  defp compact_prompt?(_), do: false
+
+  defp run_compact_prompt(acp_sid, pixir_sid, prompt_text, id, state) do
+    workspace = Map.get(state.workspaces, acp_sid) || File.cwd!()
+
+    opts =
+      [workspace: workspace, trigger: "manual"]
+      |> maybe_tail_events(prompt_text)
+      |> Keyword.merge(compact_provider_opts(state, acp_sid))
+
+    server = self()
+    complete = state.compaction_complete
+
+    {:ok, task} =
+      Task.Supervisor.start_child(Pixir.TurnSupervisor, fn ->
+        completion = compact_completion(complete, pixir_sid, opts)
+
+        Pixir.ACP.Server.emit(
+          server,
+          Translate.message_chunk(compact_completion_text(completion), acp_sid)
+        )
+
+        maybe_emit_compact_usage(server, acp_sid, pixir_sid, completion)
+        GenServer.call(server, {:resolve_prompt, pixir_sid, :done, nil})
+      end)
+
+    put_in(
+      state.prompts[pixir_sid],
+      Map.merge(%{id: id, task: task, cancel?: false}, new_warning_state())
+    )
+  end
+
+  defp compact_provider_opts(state, acp_sid) do
+    opts =
+      state.provider_opts
+      |> List.wrap()
+      |> Keyword.take([
+        :transport,
+        :auth,
+        :model,
+        :responses_backend,
+        :config_path,
+        :raw_config,
+        :request_snapshot_loader,
+        :native,
+        :resolved_provider_request
+      ])
+      |> Keyword.put(:model, current_model(state, acp_sid))
+
+    case state.provider do
+      nil -> opts
+      provider -> Keyword.put(opts, :provider, provider)
+    end
+  end
+
+  defp compact_completion(complete, pixir_sid, opts) do
+    case complete.(pixir_sid, opts) do
+      {:ok, %{"status" => status} = completion}
+      when status in ["recorded", "no_op", "error"] ->
+        completion
+
+      other ->
+        %{
+          "status" => "error",
+          "range" => nil,
+          "checkpoint" => nil,
+          "error" => %{
+            ok: false,
+            error: %{
+              kind: :invalid_state,
+              message: "compaction completion returned an invalid result",
+              details: %{result: inspect(other)}
+            }
+          }
+        }
+    end
+  end
+
+  defp compact_completion_text(%{
+         "status" => "recorded",
+         "range" => range,
+         "checkpoint" => %{"seq" => seq}
+       })
+       when is_map(range) do
+    from_seq = range["from_seq"] || "?"
+    to_seq = range["to_seq"] || "?"
+    "Recorded compaction checkpoint at seq #{seq} for seq #{from_seq}..#{to_seq}."
+  end
+
+  defp compact_completion_text(%{"status" => "no_op"} = completion) do
+    "Nothing to compact: " <> to_string(completion["reason"] || "no compactable history")
+  end
+
+  defp compact_completion_text(%{"status" => "error", "error" => error}) do
+    kind = get_in(error, [:error, :kind]) || get_in(error, ["error", "kind"])
+    message = get_in(error, [:error, :message]) || get_in(error, ["error", "message"])
+    "Compaction failed: " <> compact_failure_text(kind, message)
+  end
+
+  defp compact_completion_text(_completion), do: "Compaction failed."
+
+  # A post-compaction gauge is emitted only when the runtime completion carries an
+  # actually measured snapshot. Deterministic local compaction currently carries none:
+  # it calls no Provider and Pixir owns no tokenizer, so reusing the prior usage would be
+  # stale and fabricating zero/estimating from Events would be dishonest.
+  defp maybe_emit_compact_usage(
+         server,
+         acp_sid,
+         pixir_sid,
+         %{"status" => "recorded", "pressure_snapshot" => snapshot}
+       )
+       when is_map(snapshot) do
+    case Translate.update(Event.context_pressure(pixir_sid, snapshot), acp_sid) do
+      nil -> :ok
+      update -> Pixir.ACP.Server.emit(server, update)
+    end
+  end
+
+  defp maybe_emit_compact_usage(_server, _acp_sid, _pixir_sid, _completion), do: :ok
+
+  defp compact_failure_text(kind, message) do
+    kind = if is_atom(kind), do: Atom.to_string(kind), else: kind
+
+    kind_text =
+      cond do
+        is_binary(kind) and byte_size(kind) <= @max_turn_failure_error_kind_bytes ->
+          kind
+
+        true ->
+          nil
+      end
+
+    message_text = if is_binary(message) and message != "", do: message, else: nil
+
+    cond do
+      kind_text && message_text -> kind_text <> ": " <> message_text
+      message_text -> message_text
+      kind_text -> kind_text
+      true -> "unknown error"
+    end
+  end
+
+  defp maybe_tail_events(opts, prompt_text) do
+    case prompt_text |> String.trim() |> String.split(~r/\s+/, parts: 2) do
+      [_cmd, tail] ->
+        case Integer.parse(String.trim(tail)) do
+          {tail_events, rest} when tail_events > 0 and rest == "" ->
+            Keyword.put(opts, :tail_events, tail_events)
+
+          _ ->
+            opts
+        end
+
+      _ ->
+        opts
+    end
+  end
+
+  defp prompt_running?(state, pixir_sid) do
+    Map.has_key?(state.prompts, pixir_sid) or
+      turn_running?(pixir_sid, @prompt_admission_probe_timeout_ms, false)
   end
 
   # A per-turn model knob is allowed when absent (use Pixir's own resolution) or
@@ -1319,7 +2249,8 @@ defmodule Pixir.ACP.Server do
       [
         mode: mode,
         permission_mode: permission_mode,
-        asker: build_asker(permission_mode, acp_sid)
+        asker: build_asker(permission_mode, acp_sid),
+        acp_runtime: %{server: self(), acp_sid: acp_sid}
       ]
       |> maybe_put(:write_policy, write_policy)
       |> maybe_put(:presenter_context, presenter_context)
@@ -1364,6 +2295,7 @@ defmodule Pixir.ACP.Server do
     meta_opts
     |> put_sticky(:model, Map.get(state.session_models, acp_sid))
     |> put_sticky(:reasoning_effort, Map.get(state.session_efforts, acp_sid))
+    |> put_sticky_web_search(state, acp_sid)
     |> normalize_provider_default_effort(state)
   end
 
@@ -1371,6 +2303,35 @@ defmodule Pixir.ACP.Server do
 
   defp put_sticky(opts, key, value) do
     if Keyword.has_key?(opts, key), do: opts, else: Keyword.put(opts, key, value)
+  end
+
+  defp put_sticky_web_search(opts, state, acp_sid) do
+    if Keyword.has_key?(opts, :web_search) do
+      opts
+    else
+      case Map.get(state.session_web_search, acp_sid) do
+        "on" ->
+          model_opts =
+            case Keyword.get(opts, :model) do
+              nil -> []
+              model -> [model: model]
+            end
+
+          effective = current_web_search(state, acp_sid, model_opts)
+
+          Keyword.put(
+            opts,
+            :web_search,
+            if(effective == "on", do: %{"enabled" => true}, else: false)
+          )
+
+        "off" ->
+          Keyword.put(opts, :web_search, false)
+
+        nil ->
+          opts
+      end
+    end
   end
 
   # `default` must suppress a configured effort, not become a provider value.
@@ -1448,6 +2409,7 @@ defmodule Pixir.ACP.Server do
          prompt_text,
          turn_opts,
          prompt_idle_timeout_ms,
+         prompt_cleanup,
          prompt_resolve_hook
        ) do
     Conversation.subscribe(pixir_sid)
@@ -1466,10 +2428,20 @@ defmodule Pixir.ACP.Server do
         maybe_fallback(server, acp_sid, saw_text?, fallback_text)
         # The Server resolves the request id and the cancel flag at this point, so a
         # cancel that raced a terminal status still wins (ADR 0009 §5 cancel race).
-        finish_prompt(server, pixir_sid, outcome, failure, prompt_resolve_hook)
+        finish_prompt(
+          server,
+          pixir_sid,
+          outcome,
+          failure,
+          prompt_cleanup,
+          prompt_resolve_hook
+        )
 
       {:error, :busy} ->
-        finish_prompt(server, pixir_sid, :error, nil, prompt_resolve_hook)
+        # The Session is the final admission authority. A non-ACP caller can start a Turn
+        # between the Server's availability check and this call, so keep this refusal
+        # explicit instead of resolving a request whose user text never ran as end_turn.
+        reject_busy_prompt(server, pixir_sid)
     end
   end
 
@@ -1503,9 +2475,46 @@ defmodule Pixir.ACP.Server do
     end
   end
 
-  defp finish_prompt(server, pixir_sid, outcome, failure, prompt_resolve_hook) do
+  defp finish_prompt(
+         server,
+         pixir_sid,
+         outcome,
+         failure,
+         prompt_cleanup,
+         prompt_resolve_hook
+       ) do
+    # Turn emits its terminal status before its supervised Task result reaches Session.
+    # Prefer to publish the PromptResponse only after the Session clears that Turn, but
+    # never let a successor Turn or a stalled state probe swallow the request id forever.
+    prompt_cleanup.before_wait.()
+    await_turn_cleanup(pixir_sid, prompt_cleanup.timeout_ms)
     prompt_resolve_hook.(outcome)
     :ok = GenServer.call(server, {:resolve_prompt, pixir_sid, outcome, failure})
+  end
+
+  defp reject_busy_prompt(server, pixir_sid) do
+    :ok = GenServer.call(server, {:reject_busy_prompt, pixir_sid})
+  end
+
+  defp await_turn_cleanup(pixir_sid, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + max(timeout_ms, 0)
+    do_await_turn_cleanup(pixir_sid, deadline)
+  end
+
+  defp do_await_turn_cleanup(pixir_sid, deadline) do
+    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    cond do
+      remaining_ms == 0 ->
+        :ok
+
+      not turn_running?(pixir_sid, remaining_ms, true) ->
+        :ok
+
+      true ->
+        Process.sleep(min(@prompt_cleanup_poll_ms, remaining_ms))
+        do_await_turn_cleanup(pixir_sid, deadline)
+    end
   end
 
   # Mirror of Conversation's terminal detection (conversation.ex:113-130), extended to
@@ -1536,28 +2545,58 @@ defmodule Pixir.ACP.Server do
 
   # #465: keep only the bounded classification facts — never the raw error message or
   # details, which already reach the user as chat content and may embed provider prose.
+  # Cancellation cleanup may append its own interruption failure after the Turn already
+  # emitted a more specific bounded failure. Keep those earlier facts for ACP instead of
+  # replacing `provider_error`/`tool_error` with the less specific cleanup outcome. A prior
+  # empty projection does not suppress a later valid interruption classification.
+  defp stash_turn_failure(
+         %{type: :turn_failed, data: %{"terminal_status" => "interrupted"}},
+         failure
+       )
+       when is_map(failure) and map_size(failure) > 0,
+       do: failure
+
   defp stash_turn_failure(%{type: :turn_failed, data: data}, _failure) when is_map(data),
     do: turn_failure_facts(data)
 
   defp stash_turn_failure(_event, failure), do: failure
 
   @doc false
-  # Bounded and type-guarded: a field only ships when the producer recorded a binary
-  # (Event.turn_failed/2 accepts any map, so a sloppy future producer must not be able
-  # to push a nested term or a JSON null onto the ACP wire through this channel). An
-  # empty map is still meaningful: the turn_failed event itself WAS observed.
+  # Event.turn_failed/2 accepts any map, so this presenter independently enforces the
+  # closed producer vocabulary and a conservative token grammar. An empty map remains
+  # meaningful: it says turn_failed evidence was observed but neither fact was safe to
+  # project. byte_size/1 makes the cap unambiguous for UTF-8 input.
   def turn_failure_facts(data) when is_map(data) do
-    for key <- ["terminal_status", "error_kind"],
-        value = data[key],
-        is_binary(value),
-        into: %{},
-        do: {key, value}
+    %{}
+    |> maybe_put_terminal_status(data["terminal_status"])
+    |> maybe_put_error_kind(data["error_kind"])
   end
 
-  defp turn_running?(pixir_sid) do
-    Pixir.Session.turn_running?(pixir_sid)
+  defp maybe_put_terminal_status(facts, status)
+       when status in @turn_failure_terminal_statuses,
+       do: Map.put(facts, "terminal_status", status)
+
+  defp maybe_put_terminal_status(facts, _status), do: facts
+
+  defp maybe_put_error_kind(facts, kind) when is_binary(kind) do
+    if byte_size(kind) <= @max_turn_failure_error_kind_bytes and
+         Regex.match?(@turn_failure_error_kind_pattern, kind) do
+      Map.put(facts, "error_kind", kind)
+    else
+      facts
+    end
+  end
+
+  defp maybe_put_error_kind(facts, _kind), do: facts
+
+  defp turn_running?(pixir_sid, timeout_ms \\ 5_000, fallback \\ false) do
+    case Pixir.Session.turn_running?(pixir_sid, timeout_ms) do
+      true -> true
+      false -> false
+      {:error, _error} -> fallback
+    end
   catch
-    :exit, _reason -> false
+    :exit, _reason -> fallback
   end
 
   # #465: the chat rendering of a failed Turn stays exactly as ADR 0009 §5 decided
@@ -1568,10 +2607,11 @@ defmodule Pixir.ACP.Server do
   # this prompt — the contract is evidence-based, never inferred from the terminal
   # shape (Grok round 1: inferring from `outcome == :error` falsely marked a
   # `Conversation.send` `:busy` refusal, where no Turn ran at all, as a failed Turn).
-  # Fields stay bounded (`terminal_status`, `error_kind`). A cancel that raced a
-  # failure keeps `stopReason:"cancelled"` AND carries the facts; the same holds for
-  # a prompt-idle `:timeout` whose Turn recorded `turn_failed` and then died without
-  # a terminal status.
+  # Fields stay bounded: `terminal_status` uses the current closed Turn producer
+  # vocabulary and `error_kind` is a lower-case ASCII identifier capped at 64 UTF-8
+  # bytes. A cancel that raced a failure keeps `stopReason:"cancelled"` AND carries the
+  # facts; the same holds for a prompt-idle `:timeout` whose Turn recorded `turn_failed`
+  # and then died without a terminal status.
   @doc false
   def prompt_result(stop_reason, failure) do
     base = %{"stopReason" => stop_reason}
@@ -1590,6 +2630,24 @@ defmodule Pixir.ACP.Server do
   defp terminal(%{type: :status, data: %{"status" => "error"}}), do: :error
   defp terminal(%{type: :status, data: %{"status" => "interrupted"}}), do: :interrupted
   defp terminal(_event), do: nil
+
+  @impl true
+  def handle_call({:reject_busy_prompt, pixir_sid}, _from, state) do
+    case Map.fetch(state.prompts, pixir_sid) do
+      {:ok, %{id: id}} ->
+        write(
+          state.out,
+          Protocol.error(id, Protocol.invalid_params(), "a turn is already running")
+        )
+
+        {:reply, :ok, %{state | prompts: Map.delete(state.prompts, pixir_sid)}}
+
+      :error ->
+        # Another terminal path already consumed the request id. Preserve the one-reply
+        # invariant rather than manufacturing an uncorrelated JSON-RPC response.
+        {:reply, :ok, state}
+    end
+  end
 
   # Read the request id + cancel flag at resolve time so a cancel that raced a terminal
   # status still wins.

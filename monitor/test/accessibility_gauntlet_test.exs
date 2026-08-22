@@ -76,7 +76,10 @@ defmodule PixirMonitor.AccessibilityGauntletTest do
       "fanout_group_expanded_by_enter",
       "unit_link_reachable_by_tab",
       "enter_changes_route_to_unit",
-      "escape_dispatched_without_navigation"
+      "escape_dispatched_without_navigation",
+      "manual_pane_opens_for_escape_contract",
+      "escape_closes_open_manual_pane",
+      "escape_close_preserves_underlying_route"
     ],
     "f2" => [
       "cluster_link_reachable_by_tab",
@@ -85,7 +88,10 @@ defmodule PixirMonitor.AccessibilityGauntletTest do
       "back_run_returns_to_first_member_page_with_target_absent",
       "members_next_advances_to_second_member_page",
       "member_link_returns_to_deep_link_with_second_page_state",
-      "escape_dispatched_without_navigation"
+      "escape_dispatched_without_navigation",
+      "manual_pane_opens_for_escape_contract",
+      "escape_closes_open_manual_pane",
+      "escape_close_preserves_underlying_route"
     ],
     "f3" => [
       "left_source_degradation_rendered_before_tab",
@@ -95,7 +101,10 @@ defmodule PixirMonitor.AccessibilityGauntletTest do
       "remaining_runs_expanded_by_enter",
       "overview_source_card_link_reachable_by_tab",
       "enter_changes_route_from_overview",
-      "escape_dispatched_without_navigation"
+      "escape_dispatched_without_navigation",
+      "manual_pane_opens_for_escape_contract",
+      "escape_closes_open_manual_pane",
+      "escape_close_preserves_underlying_route"
     ]
   }
 
@@ -142,7 +151,7 @@ defmodule PixirMonitor.AccessibilityGauntletTest do
   @tag timeout: 480_000
   test "records the complete accessibility matrix for F1, F2, and F3" do
     root = fixture_root!()
-    profiles_before = Path.wildcard(Path.join(System.tmp_dir!(), "pixir-monitor-a11y-*")) |> MapSet.new()
+    profiles_before = Path.wildcard(PixirMonitor.TestRun.profile_glob("pixir-monitor-a11y")) |> MapSet.new()
 
     on_exit(fn ->
       # A brutal ExUnit timeout cannot kill the System.cmd child tree, so reap
@@ -298,7 +307,7 @@ defmodule PixirMonitor.AccessibilityGauntletTest do
     end)
 
     assert Enum.map(evidence, & &1["frontier"]) == ["f1", "f2", "f3"]
-    assert Path.wildcard(Path.join(System.tmp_dir!(), "pixir-monitor-a11y-*")) |> MapSet.new() == profiles_before
+    assert Path.wildcard(PixirMonitor.TestRun.profile_glob("pixir-monitor-a11y")) |> MapSet.new() == profiles_before
   end
 
   defp run_harness!(frontier, options) do
@@ -340,11 +349,7 @@ defmodule PixirMonitor.AccessibilityGauntletTest do
   end
 
   defp fixture_root! do
-    path =
-      Path.join(
-        System.tmp_dir!(),
-        "pixir-monitor-accessibility-#{System.unique_integer([:positive])}"
-      )
+    path = PixirMonitor.TestRun.tmp("pixir-monitor-accessibility")
 
     File.mkdir_p!(path)
     path

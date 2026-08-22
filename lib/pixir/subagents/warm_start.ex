@@ -2,37 +2,37 @@ defmodule Pixir.Subagents.WarmStart do
   @moduledoc """
   Warm-start a Delegate child from a named prior Session in the same workspace (#435).
 
-  A warm-started child does not open on an empty Log. Its Log is created up front with:
+  A warm-started child does not open on an empty Log. Its Log is created atomically
+  up front with:
 
     1. a seq-0 `session_fork` lineage Event naming the seed Session and inheriting the
        seed's fork-tree root, so the child joins the seed's Provider cache family
        (ADR 0020) instead of deriving a fresh `s_` segment from its own id;
-    2. the seed Session's COMPLETE replayable conversational prefix, copied under the
+    2. the seed Session's complete replayable conversational prefix, copied under the
        existing `replay_v1` rules owned by `Pixir.Fork` (ADR 0024) — full, never a
        summary and never truncated, because the byte-stable shared prefix is exactly
        what earns the cache hit;
-    3. a runtime-authored lineage boundary marker appended after that prefix.
+    3. a runtime-authored lineage boundary marker after that prefix; and
+    4. the requested child's live `permission_posture` immediately after the boundary.
 
-  ## The boundary marker is a runtime artifact
+  ## The boundary and posture are runtime artifacts
 
-  The marker is authored here, by Pixir, never by the operator and never by the model.
-  No spec field can suppress it, reword it, or move it after the child's first new user
-  message: the child's first new user message is appended by the Turn *after* this Log
-  already ends with the marker. It is a `user_message` so it actually reaches the
-  Provider — a `subagent_event` would be dropped from the input array and the child
-  would inherit the transcript with no boundary at all.
+  Both Events are authored here by Pixir in the same `Log.create_session/3` event
+  list. No spec field can suppress or move the boundary after the child's first new
+  user message. The boundary is a `user_message` so it reaches the Provider — a
+  `subagent_event` would be dropped from the input array. The posture remains durable
+  authorization evidence rather than model conversation.
 
-  ## Seeding grants context, never scope
-
-  `replay_v1` copies `subagent_event` and `permission_decision` Events verbatim. Those
-  arrive in the child Log as inert historical transcript. The child's effective policy
-  is resolved from the NEW request only: the Subagents Manager writes the child's
-  own spawn-time `permission_posture` record with child lineage after this Log exists,
-  and no code path reads a replayed posture or permission decision as live policy input.
-  Restrict-never-widen is untouched.
+  The fold performed by `seed_child_log/3` owns the lineage used in the live posture;
+  an earlier validation snapshot is never authoritative. On cold resume, posture and
+  mutation evidence after the last valid runtime boundary are the live segment.
+  Copied `subagent_event` and `permission_decision` Events remain replay evidence, and
+  ordinary Fork replay keeps them, but historical posture never authorizes the new
+  warm child. A valid boundary with no following posture therefore fails closed.
   """
 
-  alias Pixir.{Event, Fork, Log, Paths, SessionId, SessionResources, Tool}
+  alias Pixir.{Event, Fork, Log, SessionId, SessionResources, Subagents, Tool}
+  alias Pixir.Permissions.WritePolicy
 
   @strategy "replay_v1"
 
@@ -72,8 +72,11 @@ defmodule Pixir.Subagents.WarmStart do
   @doc """
   Create the warm-started child Log for `child_session_id` from `seed_session_id`.
 
-  Fails before creating anything when the seed is unusable, so no partial child Log is
-  ever left behind. Returns the lineage evidence the envelope reports per child.
+  Fails before creating anything when the seed or requested posture is unusable,
+  so no partial child Log is ever left behind. Returns the lineage evidence the
+  envelope reports per child. The required `:permission_posture` option carries
+  the requested child identity and effective permission/workspace fields; this
+  module combines it with lineage from its own seed fold.
 
   Pass `:child_workspace` when the child's Log lives somewhere other than the seed's
   workspace — an isolated Subagent runs in a snapshot directory, and snapshots exclude
@@ -86,103 +89,116 @@ defmodule Pixir.Subagents.WarmStart do
     child_workspace = child_workspace(opts, seed_workspace)
 
     with :ok <- validate_child_id(child_session_id),
+         {:ok, posture_request} <- requested_posture(opts, child_workspace),
          {:ok, lineage, replayable} <- validate_with_prefix(seed_session_id, opts),
          {:ok, false} <- child_log_absent(child_session_id, child_workspace),
+         runtime_lineage =
+           runtime_lineage(lineage, child_session_id, child_workspace),
          {:ok, events} <-
            build_child_events(
              child_session_id,
              seed_session_id,
              replayable,
-             lineage,
-             child_workspace
+             runtime_lineage,
+             child_workspace,
+             posture_request
            ),
-         :ok <-
-           copy_resources(
+         {:ok, _written} <-
+           SessionResources.with_copied_resources(
              seed_session_id,
              child_session_id,
              events,
-             seed_workspace,
-             child_workspace
-           ),
-         {:ok, _written} <-
-           Log.create_session(child_session_id, events, workspace: child_workspace) do
-      {:ok,
-       lineage
-       |> Map.put("warm_started", true)
-       |> Map.put("child_session_id", child_session_id)
-       |> Map.put("child_workspace", child_workspace)
-       |> Map.put("child_log_path", Log.path(child_session_id, workspace: child_workspace))
-       |> Map.put("boundary_marker_kind", @boundary_marker_kind)}
+             resource_copy_opts(opts, seed_workspace, child_workspace),
+             fn -> create_child_session(child_session_id, events, child_workspace, opts) end
+           ) do
+      {:ok, runtime_lineage}
     else
       {:ok, true} -> {:error, child_log_exists(child_session_id, child_workspace)}
       {:error, _error} = error -> error
     end
   end
 
-  # Same-workspace copy is the ADR 0021 primitive. Across workspaces the payload has to
-  # be staged: copy into a same-workspace shadow under the seed's root, then move the
-  # child's resource directory into the child workspace, so an isolated child can still
-  # address every resource its replayed prefix references.
-  defp copy_resources(seed_sid, child_sid, events, workspace, workspace),
-    do:
-      SessionResources.copy_referenced_resources(seed_sid, child_sid, events,
-        workspace: workspace
-      )
+  defp resource_copy_opts(opts, seed_workspace, child_workspace) do
+    [parent_workspace: seed_workspace, child_workspace: child_workspace]
+    |> Keyword.merge(Keyword.take(opts, [:resource_copy_failpoint]))
+  end
 
-  defp copy_resources(seed_sid, child_sid, events, seed_workspace, child_workspace) do
-    with :ok <-
-           SessionResources.copy_referenced_resources(seed_sid, child_sid, events,
-             workspace: seed_workspace
-           ) do
-      staged = resources_dir(seed_workspace, child_sid)
-      final = resources_dir(child_workspace, child_sid)
+  # This seam covers only the atomic Log-create call used after resource finalization.
+  # It never changes or enters the durable Event list.
+  defp create_child_session(child_session_id, events, child_workspace, opts) do
+    case Keyword.get(opts, :log_create_fun, &Log.create_session/3) do
+      create when is_function(create, 3) ->
+        create.(child_session_id, events, workspace: child_workspace)
 
-      if File.dir?(staged) do
-        stage_into_child_workspace(staged, final, child_sid)
-      else
-        :ok
-      end
+      _other ->
+        {:error,
+         Tool.error(:invalid_args, "log_create_fun must be a three-arity function", %{
+           expected_arity: 3
+         })}
     end
   end
 
-  # This runs inside the Subagents Manager GenServer, so a bang call here would
-  # terminate the Manager and take its tracked agent state with it instead of failing
-  # closed with a structured error. Every filesystem failure stays inside the
-  # `:ok | {:error, map()}` contract (#435).
-  defp stage_into_child_workspace(staged, final, child_sid) do
-    parent = Path.dirname(final)
-
-    case File.mkdir_p(parent) do
-      :ok ->
-        _ = File.rm_rf(final)
-
-        case File.cp_r(staged, final) do
-          {:ok, _copied} ->
-            _ = File.rm_rf(staged)
-            :ok
-
-          {:error, reason, path} ->
-            _ = File.rm_rf(staged)
-            {:error, stage_failed(child_sid, path, reason)}
+  defp requested_posture(opts, child_workspace) do
+    case Keyword.fetch(opts, :permission_posture) do
+      {:ok, request} when is_map(request) ->
+        if valid_posture_request?(request) do
+          {:ok, Map.put(request, :workspace, child_workspace)}
+        else
+          {:error, invalid_posture_request(request)}
         end
 
-      {:error, reason} ->
-        _ = File.rm_rf(staged)
-        {:error, stage_failed(child_sid, parent, reason)}
+      {:ok, request} ->
+        {:error, invalid_posture_request(request)}
+
+      :error ->
+        {:error, invalid_posture_request(nil)}
     end
   end
 
-  defp stage_failed(child_sid, path, reason) do
-    Tool.error(:write_failed, "could not stage warm-start session resources", %{
-      "child_session_id" => child_sid,
-      "path" => path,
-      "filesystem_reason" => inspect(reason),
-      "next_actions" => ["inspect_child_workspace_permissions", "retry_delegate"]
+  defp valid_posture_request?(request) do
+    non_empty_binary?(Map.get(request, :subagent_id)) and
+      non_empty_binary?(Map.get(request, :parent_session_id)) and
+      Map.get(request, :permission_mode) in [:auto, :ask, :read_only, "auto", "ask", "read_only"] and
+      Map.has_key?(request, :write_policy) and
+      valid_write_policy?(Map.get(request, :write_policy)) and
+      Map.get(request, :workspace_mode) in ["shared", "isolated", "virtual_overlay"]
+  end
+
+  defp valid_write_policy?(nil), do: true
+
+  defp valid_write_policy?(policy) when is_map(policy) do
+    case policy |> WritePolicy.metadata() |> WritePolicy.from_metadata() do
+      {:ok, restored} when is_map(restored) -> true
+      _invalid -> false
+    end
+  end
+
+  defp valid_write_policy?(_policy), do: false
+
+  defp non_empty_binary?(value), do: is_binary(value) and String.trim(value) != ""
+
+  defp invalid_posture_request(_request) do
+    Tool.error(:invalid_args, "warm-start requires a complete child permission posture", %{
+      "field" => "permission_posture",
+      "required_fields" => [
+        "subagent_id",
+        "parent_session_id",
+        "permission_mode",
+        "write_policy",
+        "workspace_mode"
+      ],
+      "next_actions" => ["retry_delegate_with_the_runtime_child_permission_posture"]
     })
   end
 
-  defp resources_dir(workspace, session_id),
-    do: Paths.session_resources_dir(session_id, workspace)
+  defp runtime_lineage(lineage, child_session_id, child_workspace) do
+    lineage
+    |> Map.put("warm_started", true)
+    |> Map.put("child_session_id", child_session_id)
+    |> Map.put("child_workspace", child_workspace)
+    |> Map.put("child_log_path", Log.path(child_session_id, workspace: child_workspace))
+    |> Map.put("boundary_marker_kind", @boundary_marker_kind)
+  end
 
   @doc """
   The per-child envelope projection for warm-start lineage.
@@ -247,14 +263,15 @@ defmodule Pixir.Subagents.WarmStart do
   # ── child Log construction ───────────────────────────────────────────────
 
   # `replayable` is the exact prefix `validate_with_prefix/2` resolved, so the fork
-  # record, the replayed events, the marker, and the reported `replay_event_count`
+  # record, replayed events, marker, live posture, and reported `replay_event_count`
   # all describe ONE snapshot of the seed Log (#435).
   defp build_child_events(
          child_session_id,
          seed_session_id,
          replayable,
          lineage,
-         child_workspace
+         child_workspace,
+         posture_request
        ) do
     fork_event =
       Event.session_fork(child_session_id, %{
@@ -293,7 +310,12 @@ defmodule Pixir.Subagents.WarmStart do
       |> boundary_event(seed_session_id, lineage)
       |> Event.with_seq(length(replayed) + 1)
 
-    {:ok, [fork_event | replayed] ++ [marker]}
+    posture =
+      child_session_id
+      |> Event.subagent_event(Subagents.child_permission_posture(posture_request, lineage))
+      |> Event.with_seq(length(replayed) + 2)
+
+    {:ok, [fork_event | replayed] ++ [marker, posture]}
   end
 
   # The marker is a user_message on purpose: Provider input construction drops

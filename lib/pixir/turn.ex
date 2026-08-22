@@ -36,6 +36,7 @@ defmodule Pixir.Turn do
     Event,
     RecoveryCommands,
     Session,
+    SessionId,
     SessionResources,
     Skills,
     Tool
@@ -79,6 +80,16 @@ defmodule Pixir.Turn do
   # any real poisoning — the issue's own recipe is seven calls in ONE Turn — while still a
   # hard stop on an endless loop.
   @dangling_call_session_budget 32
+  @safe_session_record_event_types ~w(
+    assistant_message
+    history_compaction
+    provider_usage
+    reasoning
+    tool_call
+    tool_result
+    turn_failed
+  )
+  @safe_session_record_failure_classes ~w(noproc normal shutdown timeout)
 
   @doc false
   @spec dangling_call_recovery_budget() :: pos_integer()
@@ -92,11 +103,12 @@ defmodule Pixir.Turn do
           :session_id => String.t(),
           :workspace => String.t(),
           :role => atom(),
-          # Turn IDENTITY (#462 round 3). `Session.start_turn/2` always stamps it, and the
-          # declare path reads it to tag every committed-call declaration, so a killed
-          # Turn's surviving stream runner can never be mistaken for its successor. It is
-          # required: a ctx built without it declares under a nil generation and its
-          # declarations are drained as stale.
+          # Compound runtime Turn identity (#462 round 3, #471). `Session.start_turn/2`
+          # always stamps the opaque process-incarnation capability alongside the numeric
+          # generation. The declaration path pairs both values; a ctx built without the
+          # capability declares under `nil` and is classified as unstamped during a live
+          # Turn. The capability is never persisted or rendered.
+          :session_incarnation => reference(),
           :turn_generation => pos_integer(),
           # Fork family (ADR 0020): a fork passes its fork-tree ROOT session id so the
           # whole tree shares one prompt-cache family. No producer sets this yet (fork
@@ -217,6 +229,9 @@ defmodule Pixir.Turn do
         # is forced to `:read_only`, so mutating tools are denied (plan-and-wait,
         # D.3) — regardless of any caller-supplied permission_mode.
         mode: mode,
+        # Presenter binding for the plan→build producer (#520). ACP supplies
+        # `%{server, acp_sid}`; CLI and other callers omit it.
+        acp_runtime: Keyword.get(opts, :acp_runtime),
         cap:
           opts
           |> Keyword.get(:max_iterations, default_max_iterations())
@@ -228,7 +243,10 @@ defmodule Pixir.Turn do
           mode: permission_mode(mode, Keyword.get(opts, :permission_mode, :auto)),
           asker: Keyword.get(opts, :asker, fn _request -> :deny end),
           policy: Keyword.get(opts, :write_policy)
-        }
+        },
+        # #522-D: a 400 / unsupported-field rejection of compact_threshold must
+        # not retry the field every Turn on the same checkpoint range.
+        suppress_compact_threshold: false
       }
 
       loop(ctx, 0, state)
@@ -398,8 +416,9 @@ defmodule Pixir.Turn do
     commands like grep/ls) and produce a clear, step-by-step plan. Do NOT modify
     files or run mutating commands — write/edit and unsafe shell are disabled in
     this mode and will be refused. Call the `update_plan` tool to record the plan
-    as a checklist, then STOP and let the user review it. They will switch to
-    build mode and re-prompt to execute. All paths are relative to the workspace;
+    as a checklist, then STOP and let the user review it. Recording the plan
+    switches this session to build mode; the next prompt can execute. All paths
+    are relative to the workspace;
     a developer message in the conversation identifies the workspace root.
 
     #{@layer0_tail}
@@ -519,24 +538,106 @@ defmodule Pixir.Turn do
       |> maybe_put_cache_control_prompt_fields(state)
 
     {:ok, delta_acc} = Agent.start_link(fn -> [] end)
+    input_to_seq = Compaction.input_to_seq(history)
+    {:ok, threshold_gate} = Agent.start_link(fn -> new_threshold_gate(input_to_seq) end)
 
     try do
       provider_opts =
         state.provider_opts
         |> Keyword.put(:on_delta, delta_handler(sid, delta_acc))
-        |> Keyword.put(:on_committed_call, committed_call_handler(sid, ctx[:turn_generation]))
+        |> Keyword.put(
+          :on_committed_call,
+          threshold_committed_call_handler(sid, turn_identity(ctx), threshold_gate)
+        )
+        |> Keyword.put(
+          :on_compaction_item,
+          threshold_item_handler(sid, ctx, state, history, input_to_seq, threshold_gate)
+        )
         |> Keyword.put_new(:session_id, sid)
+        |> maybe_put_native_preference(state)
+        |> maybe_suppress_compact_threshold(state)
 
       case state.provider.stream(request, provider_opts) do
-        {:ok, %{finish_reason: :stop} = result} ->
+        {:ok, result} ->
+          threshold =
+            finalize_threshold_capture(
+              sid,
+              ctx,
+              state,
+              history,
+              input_to_seq,
+              result,
+              threshold_gate
+            )
+
+          handle_provider_success(
+            ctx,
+            iteration,
+            state,
+            result,
+            cache_metadata,
+            history,
+            threshold
+          )
+
+        {:error, error} ->
+          handle_provider_error(
+            ctx,
+            iteration,
+            state,
+            error,
+            history,
+            streamed_text(delta_acc),
+            threshold_gate,
+            cache_metadata
+          )
+      end
+    after
+      if Process.alive?(delta_acc), do: Agent.stop(delta_acc)
+      stop_threshold_gate(sid, turn_identity(ctx), threshold_gate)
+    end
+  end
+
+  defp handle_provider_success(ctx, iteration, state, result, cache_metadata, history, threshold) do
+    sid = ctx.session_id
+
+    if threshold_fired?(threshold) do
+      handle_threshold_success(
+        ctx,
+        iteration,
+        state,
+        result,
+        cache_metadata,
+        history,
+        threshold
+      )
+    else
+      case result do
+        %{finish_reason: :stop} ->
           with {:ok, _usage_event, final_evidence} <-
-                 record_provider_usage(sid, result, state, cache_metadata, iteration, history) do
+                 record_provider_usage(
+                   sid,
+                   result,
+                   state,
+                   cache_metadata,
+                   iteration,
+                   history,
+                   threshold
+                 ) do
             finish(sid, result.text, final_evidence)
           end
 
-        {:ok, %{finish_reason: :tool_calls, function_calls: calls} = result} ->
+        %{finish_reason: :tool_calls, function_calls: calls} ->
           with {:ok, _usage_event, _evidence} <-
-                 record_provider_usage(sid, result, state, cache_metadata, iteration, history) do
+                 record_provider_usage(
+                   sid,
+                   result,
+                   state,
+                   cache_metadata,
+                   iteration,
+                   history,
+                   threshold
+                 ) do
             continue_or_cap(
               ctx,
               iteration,
@@ -546,12 +647,104 @@ defmodule Pixir.Turn do
               result[:output_items] || []
             )
           end
-
-        {:error, error} ->
-          handle_provider_error(ctx, iteration, state, error, history, streamed_text(delta_acc))
       end
-    after
-      if Process.alive?(delta_acc), do: Agent.stop(delta_acc)
+    end
+  end
+
+  defp handle_threshold_success(ctx, iteration, state, result, cache_metadata, history, threshold) do
+    sid = ctx.session_id
+
+    case result do
+      %{finish_reason: :stop} ->
+        with {:ok, _usage_event, final_evidence} <-
+               record_provider_usage(
+                 sid,
+                 result,
+                 state,
+                 cache_metadata,
+                 iteration,
+                 history,
+                 threshold
+               ) do
+          finish(sid, result.text, final_evidence)
+        end
+
+      %{finish_reason: :tool_calls, function_calls: calls} ->
+        if capped?(iteration, state.cap) do
+          with {:ok, _usage_event, _evidence} <-
+                 record_provider_usage(
+                   sid,
+                   result,
+                   state,
+                   cache_metadata,
+                   iteration,
+                   history,
+                   threshold
+                 ) do
+            continue_or_cap(ctx, iteration, state, calls, result[:reasoning_items] || [])
+          end
+        else
+          case persist_threshold_tail(
+                 ctx,
+                 state,
+                 calls,
+                 result[:reasoning_items] || [],
+                 result[:output_items] || []
+               ) do
+            {:ok, state} ->
+              with {:ok, _usage_event, _evidence} <-
+                     record_provider_usage(
+                       sid,
+                       result,
+                       state,
+                       cache_metadata,
+                       iteration,
+                       history,
+                       threshold
+                     ) do
+                loop(ctx, iteration + 1, state)
+              end
+
+            {:terminal_tool_error, error} ->
+              finish_tool_error(sid, error)
+
+            {:error, error} ->
+              finish_tool_error(sid, error)
+          end
+        end
+    end
+  end
+
+  defp persist_threshold_tail(ctx, state, calls, reasoning_items, output_items) do
+    cond do
+      output_items == [] ->
+        with :ok <- record_reasoning(ctx.session_id, reasoning_items, state) do
+          run_calls(ctx, calls, state)
+        end
+
+      true ->
+        walk_output_items(ctx, state, output_items)
+    end
+  end
+
+  defp handle_provider_error(
+         ctx,
+         iteration,
+         state,
+         error,
+         history,
+         partial_text,
+         threshold_gate,
+         cache_metadata
+       ) do
+    flush_buffered_committed_calls(ctx.session_id, turn_identity(ctx), threshold_gate)
+
+    if threshold_field_rejected?(error) and not state.suppress_compact_threshold do
+      _ = record_threshold_rejection(ctx, state, error, history, cache_metadata, iteration)
+      emit_threshold_rejection_notice(ctx.session_id, error)
+      loop(ctx, iteration, %{state | suppress_compact_threshold: true})
+    else
+      handle_provider_error(ctx, iteration, state, error, history, partial_text)
     end
   end
 
@@ -695,13 +888,7 @@ defmodule Pixir.Turn do
         Logger.warning(
           "dangling tool call recovery could not be recorded; a synthesized tool_call " <>
             "may be left for orphan reconciliation to close",
-          session_id: sid,
-          call_id: call_id,
-          # #462 CR: the kind alone. `error` here comes from `safe_session_record/3`, whose
-          # `:session_record_unavailable` details carry an `inspect`ed `GenServer.call` exit
-          # reason — and that reason embeds the `{:record, event}` request term. Logging it
-          # whole would put the event's own payload on a log line.
-          failure_class: declare_failure_class(error)
+          safe_session_record_log_metadata(error)
         )
 
         :no_recovery
@@ -731,9 +918,9 @@ defmodule Pixir.Turn do
             :ok
 
           {:error, record_error} ->
-            Logger.warning("partial assistant text could not be recorded on a failed turn",
-              session_id: sid,
-              failure_class: get_in(record_error, [:error, :kind])
+            Logger.warning(
+              "partial assistant text could not be recorded on a failed turn",
+              safe_session_record_log_metadata(record_error)
             )
         end
 
@@ -763,10 +950,9 @@ defmodule Pixir.Turn do
         :ok
 
       {:error, record_error} ->
-        Logger.warning("terminal turn_failed could not be recorded",
-          session_id: sid,
-          terminal_status: failure_data["terminal_status"],
-          failure_class: get_in(record_error, [:error, :kind])
+        Logger.warning(
+          "terminal turn_failed could not be recorded",
+          safe_session_record_log_metadata(record_error)
         )
 
         :degraded
@@ -1223,7 +1409,15 @@ defmodule Pixir.Turn do
     end
   end
 
-  defp record_provider_usage(sid, result, state, cache_metadata, iteration, history) do
+  defp record_provider_usage(
+         sid,
+         result,
+         state,
+         cache_metadata,
+         iteration,
+         history,
+         threshold
+       ) do
     summary = provider_usage_summary(result, state.provider)
     {:ok, assessment} = ContextWindow.assess(summary, state.model)
     call_role = if result[:finish_reason] == :stop, do: "final_answer", else: "intermediate"
@@ -1244,6 +1438,7 @@ defmodule Pixir.Turn do
       |> Map.merge(stringify(result[:provider_metadata] || %{}))
       |> Map.merge(provider_hosted_tool_evidence(result))
       |> Map.merge(context_pressure_evidence(assessment))
+      |> Map.merge(threshold_usage_evidence(threshold, history))
 
     usage_event = Event.provider_usage(sid, data)
 
@@ -1262,47 +1457,95 @@ defmodule Pixir.Turn do
         {:ok, stamped_event, Map.put(evidence, "provider_usage_seq", stamped_event.seq)}
 
       {:error, error} ->
-        Logger.warning("provider_usage evidence could not be recorded",
-          session_id: sid,
-          error_kind: get_in(error, [:error, :kind])
+        Logger.warning(
+          "provider_usage evidence could not be recorded",
+          safe_session_record_log_metadata(error)
         )
 
         {:error, error}
     end
   end
 
-  defp safe_session_record(sid, event, event_type) do
+  # A `GenServer.call` exit embeds the full `{:record, event}` request. The event may
+  # contain model text, tool material, Provider metadata, paths, or credentials, so the
+  # exit term itself is never returned or logged. Only this closed projection crosses the
+  # safe-record boundary. Session ids are included only after canonical validation.
+  defp safe_session_record(sid, event, event_type)
+       when event_type in @safe_session_record_event_types do
     Session.record(sid, event)
   catch
     :exit, reason ->
-      if session_unavailable_exit?(reason) do
-        {:error,
-         Tool.error(
-           :session_record_unavailable,
-           "Session was unavailable while recording a canonical event.",
-           %{
-             session_id: sid,
-             event_type: event_type,
-             exit_reason: inspect(reason)
-           }
-         )}
-      else
-        exit(reason)
+      case session_unavailable_failure_class(reason) do
+        failure_class when failure_class in @safe_session_record_failure_classes ->
+          details =
+            %{event_type: event_type, failure_class: failure_class}
+            |> maybe_put_safe_session_id(sid)
+
+          {:error,
+           Tool.error(
+             :session_record_unavailable,
+             "Session was unavailable while recording a canonical event.",
+             details
+           )}
+
+        nil ->
+          # Do not turn an unexpected Session fault into ordinary unavailability. The
+          # original exit remains loud and preserves the pre-#489 propagation contract.
+          exit(reason)
       end
   end
 
-  defp session_unavailable_exit?(:noproc), do: true
-  defp session_unavailable_exit?(:normal), do: true
-  defp session_unavailable_exit?(:shutdown), do: true
-  defp session_unavailable_exit?({:noproc, _call}), do: true
-  defp session_unavailable_exit?({:normal, _call}), do: true
-  defp session_unavailable_exit?({:shutdown, _call}), do: true
-  defp session_unavailable_exit?({{:shutdown, _reason}, _call}), do: true
+  defp maybe_put_safe_session_id(details, sid) do
+    if SessionId.valid?(sid), do: Map.put(details, :session_id, sid), else: details
+  end
+
+  defp session_unavailable_failure_class(:noproc), do: "noproc"
+  defp session_unavailable_failure_class(:normal), do: "normal"
+  defp session_unavailable_failure_class(:shutdown), do: "shutdown"
+  defp session_unavailable_failure_class({:noproc, _call}), do: "noproc"
+  defp session_unavailable_failure_class({:normal, _call}), do: "normal"
+  defp session_unavailable_failure_class({:shutdown, _call}), do: "shutdown"
+  defp session_unavailable_failure_class({{:shutdown, _reason}, _call}), do: "shutdown"
+
   # #470: a record that cannot get an answer out of the Session is as undeliverable as
-  # one aimed at a dead Session. Classifying the call timeout here keeps every
-  # safe_session_record caller on the structured path instead of re-exiting.
-  defp session_unavailable_exit?({:timeout, {GenServer, :call, _call}}), do: true
-  defp session_unavailable_exit?(_reason), do: false
+  # one aimed at a dead Session. Keep the match narrow: only the `GenServer.call` timeout
+  # shape belongs to the safe-record projection; unrelated timeout exits still propagate.
+  defp session_unavailable_failure_class({:timeout, {GenServer, :call, _call}}), do: "timeout"
+  defp session_unavailable_failure_class(_reason), do: nil
+
+  defp session_unavailable_exit?(reason),
+    do: not is_nil(session_unavailable_failure_class(reason))
+
+  # Logger metadata is independently projected because `Session.record/2` may also
+  # return an arbitrary structured error without exiting. Do not trust such a return to
+  # carry the closed details produced above.
+  defp safe_session_record_log_metadata(error) do
+    details = get_in(error, [:error, :details])
+    details = if is_map(details), do: details, else: %{}
+
+    []
+    |> maybe_put_safe_log_session_id(detail(details, :session_id))
+    |> maybe_put_safe_log_event_type(detail(details, :event_type))
+    |> maybe_put_safe_log_failure_class(detail(details, :failure_class))
+  end
+
+  defp detail(details, key), do: Map.get(details, key, Map.get(details, Atom.to_string(key)))
+
+  defp maybe_put_safe_log_session_id(metadata, sid) do
+    if SessionId.valid?(sid), do: Keyword.put(metadata, :session_id, sid), else: metadata
+  end
+
+  defp maybe_put_safe_log_event_type(metadata, event_type)
+       when event_type in @safe_session_record_event_types,
+       do: Keyword.put(metadata, :event_type, event_type)
+
+  defp maybe_put_safe_log_event_type(metadata, _event_type), do: metadata
+
+  defp maybe_put_safe_log_failure_class(metadata, failure_class)
+       when failure_class in @safe_session_record_failure_classes,
+       do: Keyword.put(metadata, :failure_class, failure_class)
+
+  defp maybe_put_safe_log_failure_class(metadata, _failure_class), do: metadata
 
   # ADR 0020 pressure-gauge evidence on provider_usage. Namespace seam: this
   # module may only add `context_pressure_*` / `window_*` keys here —
@@ -1486,15 +1729,358 @@ defmodule Pixir.Turn do
   # the stream reads another chunk. A cast would reopen the very race this closes (the
   # kill could land while the message is still in flight). Losing a delta is cosmetic;
   # losing a committed call is the bug.
-  # The generation is captured HERE, at Turn start, and stamped on every declaration this
-  # Turn's stream makes (#462 round 3). That is what makes the Session able to tell this
-  # Turn's calls from a dead Turn's stragglers: the runner is unlinked on the default
-  # StreamIdle topology, so it can outlive the Turn Task and declare while a SUCCESSOR
-  # Turn is already alive. Without the stamp the Session sees only "some Turn is running"
-  # and files the straggler under the wrong Turn, which then drops it at its clean end.
-  defp committed_call_handler(sid, generation) do
-    fn call -> safe_declare_committed_call(sid, call, generation) end
+  # The compound runtime identity is captured HERE, at Turn start, and stamped on every
+  # declaration this Turn's stream makes (#462 round 3, #471). Pairing the process-local
+  # incarnation with the numeric generation lets the Session distinguish this Turn from
+  # a dead incarnation's straggler even after a transient restart resets generation to
+  # one. The incarnation capability never enters an Event or Pixir-authored Logger output.
+  defp committed_call_handler(sid, turn_identity) do
+    fn call -> safe_declare_committed_call(sid, call, turn_identity) end
   end
+
+  defp new_threshold_gate(input_to_seq) do
+    %{
+      input_to_seq: input_to_seq,
+      item: nil,
+      checkpoint_written: false,
+      buffered: [],
+      event_data: nil,
+      fallback_reason: nil
+    }
+  end
+
+  # A late `on_committed_call` after cancel/finalize is not in `buffered`: the
+  # first Turn's stream `after` already stopped the gate. Fall through to
+  # Session C6 (`stale_turn_generation`) instead of exiting `:noproc`.
+  defp threshold_committed_call_handler(sid, turn_identity, gate) do
+    fn call ->
+      if not Process.alive?(gate) do
+        committed_call_handler(sid, turn_identity).(call)
+      else
+        case threshold_gate_decision(gate, call) do
+          :buffer -> :ok
+          :declare -> committed_call_handler(sid, turn_identity).(call)
+        end
+      end
+    end
+  end
+
+  defp threshold_gate_decision(gate, call) do
+    Agent.get_and_update(gate, fn
+      %{item: item, checkpoint_written: false} = state when not is_nil(item) ->
+        {:buffer, %{state | buffered: state.buffered ++ [call]}}
+
+      state ->
+        {:declare, state}
+    end)
+  catch
+    :exit, reason ->
+      if dead_threshold_gate_exit?(reason) do
+        :declare
+      else
+        exit(reason)
+      end
+  end
+
+  defp dead_threshold_gate_exit?(:noproc), do: true
+  defp dead_threshold_gate_exit?({:noproc, _}), do: true
+  defp dead_threshold_gate_exit?(_reason), do: false
+
+  defp threshold_item_handler(sid, ctx, state, history, input_to_seq, gate) do
+    fn item ->
+      persist_threshold_once(sid, ctx, state, history, input_to_seq, item, gate)
+    end
+  end
+
+  defp finalize_threshold_capture(sid, ctx, state, history, input_to_seq, result, gate) do
+    item = Agent.get(gate, & &1.item) || result[:compaction_item]
+
+    if is_map(item) do
+      persist_threshold_once(sid, ctx, state, history, input_to_seq, item, gate)
+    else
+      flush_buffered_committed_calls(sid, turn_identity(ctx), gate)
+    end
+
+    gate_state = Agent.get(gate, & &1)
+
+    Map.merge(gate_state, %{
+      compact_threshold_sent: result[:compact_threshold_sent] == true,
+      result_item: result[:compaction_item]
+    })
+  end
+
+  # Claim the write before persisting so stream + finalize cannot both append
+  # a native_threshold Event for the same Turn (same range, two cmp_ ids).
+  defp persist_threshold_once(sid, ctx, state, history, input_to_seq, item, gate) do
+    case claim_threshold_write(gate, item) do
+      :write ->
+        case write_native_threshold(sid, ctx, state, history, input_to_seq, item, nil) do
+          {:ok, event_data} ->
+            Agent.update(gate, fn s -> %{s | event_data: event_data, item: item} end)
+            flush_buffered_committed_calls(sid, turn_identity(ctx), gate)
+            :ok
+
+          {:error, error} ->
+            Agent.update(gate, fn s ->
+              %{
+                s
+                | checkpoint_written: false,
+                  fallback_reason: threshold_write_reason(error),
+                  item: item
+              }
+            end)
+
+            flush_buffered_committed_calls(sid, turn_identity(ctx), gate)
+            :ok
+        end
+
+      :already_written ->
+        flush_buffered_committed_calls(sid, turn_identity(ctx), gate)
+        :ok
+    end
+  end
+
+  defp claim_threshold_write(gate, item) do
+    Agent.get_and_update(gate, fn
+      %{checkpoint_written: true} = state ->
+        {:already_written, %{state | item: item || state.item}}
+
+      state ->
+        {:write, %{state | checkpoint_written: true, item: item || state.item}}
+    end)
+  end
+
+  defp write_native_threshold(sid, _ctx, state, history, input_to_seq, item, reason) do
+    capturing = Compaction.capturing_current(state.resolved_provider_request)
+
+    opts =
+      [
+        provider: capturing["provider"],
+        backend: capturing["backend"],
+        dialect: capturing["dialect"],
+        model: capturing["model"]
+      ]
+      |> maybe_put_opt(:fallback_reason, reason)
+
+    case Compaction.native_threshold_event_data(history, input_to_seq, item, opts) do
+      {:ok, event_data} ->
+        case safe_session_record(
+               sid,
+               Event.history_compaction(sid, event_data),
+               "history_compaction"
+             ) do
+          {:ok, event} ->
+            emit_threshold_notice(sid, event_data, event)
+            {:ok, event_data}
+
+          {:error, _} = error ->
+            error
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp emit_threshold_notice(sid, event_data, event) do
+    range = event_data["range"] || %{}
+    replay = event_data["native_replay"] || %{}
+    usable? = replay["recorded_usable"] == true
+
+    Session.emit(
+      sid,
+      Event.context_pressure(sid, %{
+        "presentation" => "notice",
+        "tier" => "recovery",
+        "trigger" => "native_threshold",
+        "recovered" => usable?,
+        "message" =>
+          if usable? do
+            "Provider compact_threshold produced a native compaction item. Recorded a history_compaction checkpoint for seq #{range["from_seq"]}..#{range["to_seq"]}."
+          else
+            "Native compact_threshold capture was not usable (#{replay["fallback_reason"] || "unknown"}). Recorded a local history_compaction fallback for seq #{range["from_seq"]}..#{range["to_seq"]}."
+          end,
+        "range" => range,
+        "compaction_seq" => event.seq
+      })
+    )
+  end
+
+  defp emit_threshold_rejection_notice(sid, error) do
+    reason = threshold_rejection_reason(error)
+
+    Session.emit(
+      sid,
+      Event.context_pressure(sid, %{
+        "presentation" => "notice",
+        "tier" => "recovery",
+        "trigger" => "native_threshold",
+        "recovered" => false,
+        "fallback_reason" => reason,
+        "message" =>
+          "Provider rejected compact_threshold (#{reason}); staying on local History and not retrying the field on this checkpoint range."
+      })
+    )
+  end
+
+  defp record_threshold_rejection(ctx, state, error, history, cache_metadata, iteration) do
+    reason = threshold_rejection_reason(error)
+    input_to_seq = Compaction.input_to_seq(history)
+
+    threshold = %{
+      input_to_seq: input_to_seq,
+      item: nil,
+      checkpoint_written: false,
+      event_data: nil,
+      fallback_reason: reason,
+      compact_threshold_sent: true,
+      result_item: nil
+    }
+
+    result = %{
+      finish_reason: :error,
+      usage: nil,
+      provider_metadata: %{},
+      provider_hosted_tools: %{}
+    }
+
+    record_provider_usage(
+      ctx.session_id,
+      result,
+      state,
+      cache_metadata,
+      iteration,
+      history,
+      threshold
+    )
+  end
+
+  defp flush_buffered_committed_calls(sid, turn_identity, gate) do
+    calls =
+      Agent.get_and_update(gate, fn state ->
+        {state.buffered, %{state | buffered: []}}
+      end)
+
+    Enum.each(calls, fn call ->
+      safe_declare_committed_call(sid, call, turn_identity)
+    end)
+  catch
+    :exit, reason ->
+      if dead_threshold_gate_exit?(reason) do
+        :ok
+      else
+        exit(reason)
+      end
+  end
+
+  defp stop_threshold_gate(sid, turn_identity, gate) do
+    if Process.alive?(gate) do
+      flush_buffered_committed_calls(sid, turn_identity, gate)
+      if Process.alive?(gate), do: Agent.stop(gate)
+    end
+  end
+
+  defp threshold_fired?(threshold) when is_map(threshold) do
+    threshold.checkpoint_written == true or is_map(threshold[:event_data]) or
+      is_map(threshold[:item]) or is_map(threshold[:result_item])
+  end
+
+  defp threshold_fired?(_threshold), do: false
+
+  defp threshold_usage_evidence(threshold, history) when is_map(threshold) do
+    if threshold_evidence?(threshold) do
+      inspected = Compaction.inspect_native_replay(threshold[:event_data] || %{}) || %{}
+      ids = inspected["compaction_item_ids"] || compaction_item_ids(threshold)
+      reason = inspected["fallback_reason"] || threshold[:fallback_reason]
+      usable? = inspected["recorded_usable"] == true
+
+      native =
+        %{
+          "mode" => "threshold_item",
+          "threshold" => Compaction.compact_threshold(),
+          "recorded_usable" => usable?,
+          "compaction_item_ids" => ids,
+          "input_to_seq" => threshold[:input_to_seq],
+          "checkpoint_to_seq" => Compaction.latest_checkpoint_to_seq(history)
+        }
+        |> maybe_put_usage_reason(reason)
+
+      %{"native_compact" => native}
+    else
+      %{}
+    end
+  end
+
+  defp threshold_usage_evidence(_threshold, _history), do: %{}
+
+  defp threshold_evidence?(threshold) when is_map(threshold) do
+    threshold[:checkpoint_written] == true or is_map(threshold[:event_data]) or
+      is_map(threshold[:item]) or is_map(threshold[:result_item]) or
+      is_binary(threshold[:fallback_reason])
+  end
+
+  defp compaction_item_ids(threshold) do
+    item = threshold[:item] || threshold[:result_item]
+
+    case item do
+      %{"id" => id} when is_binary(id) -> [id]
+      %{id: id} when is_binary(id) -> [id]
+      _ -> []
+    end
+  end
+
+  defp maybe_put_usage_reason(payload, reason) when is_binary(reason) and reason != "",
+    do: Map.put(payload, "fallback_reason", reason)
+
+  defp maybe_put_usage_reason(payload, _reason), do: payload
+
+  defp maybe_put_opt(opts, _key, nil), do: opts
+  defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
+
+  defp maybe_put_native_preference(provider_opts, _state) do
+    if Keyword.has_key?(provider_opts, :native) do
+      provider_opts
+    else
+      Keyword.put(provider_opts, :native, Compaction.native_preference(provider_opts))
+    end
+  end
+
+  defp maybe_suppress_compact_threshold(provider_opts, %{suppress_compact_threshold: true}) do
+    Keyword.put(provider_opts, :suppress_compact_threshold, true)
+  end
+
+  defp maybe_suppress_compact_threshold(provider_opts, _state), do: provider_opts
+
+  defp threshold_field_rejected?(%{error: %{kind: :backend_rejected, details: details}})
+       when is_map(details) do
+    details[:compact_threshold_rejected] == true or
+      details["compact_threshold_rejected"] == true
+  end
+
+  defp threshold_field_rejected?(_error), do: false
+
+  defp threshold_rejection_reason(%{error: %{kind: :backend_rejected}}), do: "backend_rejected"
+
+  defp threshold_rejection_reason(%{error: %{kind: :native_unavailable}}),
+    do: "native_unavailable"
+
+  defp threshold_rejection_reason(_error), do: "backend_rejected"
+
+  defp threshold_write_reason(%{error: %{kind: kind}}) when is_atom(kind),
+    do: Atom.to_string(kind)
+
+  defp threshold_write_reason(_error), do: "malformed_native_replay"
+
+  defp turn_identity(%{
+         session_incarnation: session_incarnation,
+         turn_generation: turn_generation
+       })
+       when is_reference(session_incarnation) and is_integer(turn_generation) and
+              turn_generation > 0 do
+    {session_incarnation, turn_generation}
+  end
+
+  defp turn_identity(_ctx), do: nil
 
   # Swallowed on purpose, and the swallow is now TRUE (#462 round 3). The failure this
   # documents — a gone Session — arrives as an EXIT from `GenServer.call`, not as
@@ -1515,8 +2101,8 @@ defmodule Pixir.Turn do
   # amplifier for the duplicate-declare poison closed above. The structured return travels
   # the Provider's ordinary stream-error path, where `retryable?/1` does not match
   # `:session_record_unavailable`: the fault ends the stream once, named for what it is.
-  defp safe_declare_committed_call(sid, call, generation) do
-    case Session.declare_committed_calls(sid, [call], generation) do
+  defp safe_declare_committed_call(sid, call, turn_identity) do
+    case Session.declare_committed_calls(sid, [call], turn_identity) do
       :ok -> :ok
       {:error, error} -> warn_undeclared_call(sid, call, error)
     end
@@ -1566,7 +2152,7 @@ defmodule Pixir.Turn do
   end
 
   # #462 CR: the declare hand-off is a `GenServer.call`, and a `GenServer.call` exit
-  # reason EMBEDS THE REQUEST TERM — here `{:declare_committed_calls, [call], generation}`,
+  # reason EMBEDS THE REQUEST TERM — here `{:declare_committed_calls, [call], identity}`,
   # where `call` carries the tool's ARGUMENTS. `inspect(reason)` therefore leaked whatever
   # the model asked the tool to do (paths, secrets pasted into a command, credentials in a
   # URL) into a Logger metadata line and, on the unclassified path, into the durable
@@ -1631,6 +2217,9 @@ defmodule Pixir.Turn do
           {:error, error} -> {:halt, {:terminal_tool_error, error}}
         end
 
+      {:compaction, _item}, {:ok, state} ->
+        {:cont, {:ok, state}}
+
       {:provider_hosted_tool, _item}, {:ok, state} ->
         {:cont, {:ok, state}}
 
@@ -1676,6 +2265,8 @@ defmodule Pixir.Turn do
             workspace: ctx.workspace,
             call_id: id,
             dry_run: state.dry_run,
+            mode: state.mode,
+            acp_runtime: state.acp_runtime,
             bash_timeout_ms: state.bash_timeout_ms,
             bash_timeout_source: state.bash_timeout_source,
             virtual_overlay: state.virtual_overlay,

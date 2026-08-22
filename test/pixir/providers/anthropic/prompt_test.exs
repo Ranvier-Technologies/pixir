@@ -74,6 +74,10 @@ defmodule Pixir.Providers.Anthropic.PromptTest do
     assert String.contains?(build_layer0, @shared_tail)
     assert String.split(plan_layer0, @shared_tail) |> length() == 2
     assert String.split(build_layer0, @shared_tail) |> length() == 2
+
+    refute String.contains?(plan_layer0, "They will switch")
+    assert String.contains?(plan_layer0, "Recording the plan")
+    assert String.contains?(plan_layer0, "switches this session to build mode")
   end
 
   test "B1 lands on the last system block and is the only system breakpoint" do

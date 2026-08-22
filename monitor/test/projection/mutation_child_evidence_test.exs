@@ -96,6 +96,52 @@ defmodule PixirMonitor.ProjectionMutationChildEvidenceTest do
       assert unit["mutation"]["basis"] == "no_write_evidence"
     end
 
+    test "a missing call_id never correlates a write call with an ok result" do
+      assert {:ok, projection} =
+               Builder.build(
+                 input(
+                   child_logs: %{
+                     "child-writer" => [
+                       tool_call(1, nil, "write", %{"path" => "lib/nil.ex"})
+                       |> update_in(["data"], &Map.delete(&1, "call_id")),
+                       tool_result(2, nil, true)
+                       |> update_in(["data"], &Map.delete(&1, "call_id")),
+                       tool_call(3, "call-correlated", "write", %{"path" => "lib/correlated.ex"}),
+                       tool_result(4, "call-correlated", true)
+                     ]
+                   }
+                 )
+               )
+
+      [unit] = projection["units"]
+      assert unit["mutation"]["observed_paths"] == ["lib/correlated.ex"]
+      assert projection["mutation"]["observed_paths"] == ["lib/correlated.ex"]
+    end
+
+    # Pins is_binary/1 specifically, not just presence: a matching NON-binary id on
+    # both sides (the shape a `!= nil` relaxation would let through) must not correlate.
+    test "a matching non-binary call_id on both sides never correlates" do
+      assert {:ok, projection} =
+               Builder.build(
+                 input(
+                   child_logs: %{
+                     "child-writer" => [
+                       tool_call(1, nil, "write", %{"path" => "lib/integer_id.ex"})
+                       |> put_in(["data", "call_id"], 123),
+                       tool_result(2, nil, true)
+                       |> put_in(["data", "call_id"], 123),
+                       tool_call(3, "call-correlated", "write", %{"path" => "lib/correlated.ex"}),
+                       tool_result(4, "call-correlated", true)
+                     ]
+                   }
+                 )
+               )
+
+      [unit] = projection["units"]
+      assert unit["mutation"]["observed_paths"] == ["lib/correlated.ex"]
+      assert projection["mutation"]["observed_paths"] == ["lib/correlated.ex"]
+    end
+
     test "envelope-supplied writes take precedence and are never double-counted" do
       assert {:ok, projection} =
                Builder.build(

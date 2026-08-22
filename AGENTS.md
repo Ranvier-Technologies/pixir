@@ -63,6 +63,11 @@ is grounded enough:
    - `0038` Pixir Monitor is an experimental sibling source-checkout SPA using
      authoritative snapshots and bounded SSE invalidation hints.
    - `0039` Provider-output truncation is neutral, durable success evidence.
+   - `0040` Native OpenAI compaction is a replay window on
+     `history_compaction`. Overlay amendment (2026-08-16): default-on after
+     OpenAI Responses resolve; recovery stays local.
+     Implementation plan for #522-B/C/D:
+     `docs/design/0004-native-openai-compaction-implementation.md`.
 5. **Nearest local instructions:** read the closest subtree `AGENTS.md` before editing
    code, docs, tests, benchmarks, or ADRs.
 
@@ -107,7 +112,8 @@ Pixir Harness is public as an early source-install developer preview:
 - Supported: source build, CLI, ACP stdio, OpenAI Responses provider, ChatGPT
   subscription OAuth/API-key fallback, core tools, Skills, Subagents, Workflows,
   Workflow Templates, Session Resources/Image Attachments/resource links, Provider
-  usage, opt-in Provider-hosted Web Search, and local diagnostics.
+  usage, Provider-hosted Web Search (default-on for `chatgpt_codex`), and local
+  diagnostics.
 - Experimental: the source-only `monitor/` Pixir Monitor sibling app, long-running
   non-blocking Subagent UX, Workflow Templates as product surface, PATCHMD customization
   operations, benchmark drivers, and client-specific projection behavior. Pixir Monitor

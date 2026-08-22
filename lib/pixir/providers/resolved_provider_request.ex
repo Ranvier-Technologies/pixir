@@ -103,12 +103,18 @@ defmodule Pixir.Providers.ResolvedProviderRequest do
 
   def source_evidence_valid?(_resolved), do: false
 
-  @doc "Attach only the selection fields the chosen Provider is allowed to consume."
+  @doc """
+  Attach only the selection fields the chosen Provider is allowed to consume.
+
+  Hosted `web_search` is decided here, after Provider and Responses backend are
+  known. An existing opts/config value wins; `false` stays off; absence enables
+  only for `chatgpt_codex`.
+  """
   @spec attach_to_provider_opts(t(), keyword()) :: keyword()
   def attach_to_provider_opts(%__MODULE__{provider: Pixir.Provider} = resolved, opts) do
     opts
     |> strip_config_ingress()
-    |> attach_provider_defaults(resolved.provider_defaults)
+    |> attach_provider_defaults(resolved)
     |> Keyword.put(:model, resolved.model)
     |> Keyword.put(:responses_backend, resolved.responses_backend)
     |> Keyword.put(:resolved_provider_request, resolved)
@@ -118,7 +124,7 @@ defmodule Pixir.Providers.ResolvedProviderRequest do
     do:
       opts
       |> strip_config_ingress()
-      |> attach_provider_defaults(resolved.provider_defaults)
+      |> attach_provider_defaults(resolved)
       |> Keyword.put(:model, resolved.model)
 
   def attach_to_provider_opts(
@@ -128,12 +134,12 @@ defmodule Pixir.Providers.ResolvedProviderRequest do
       do:
         opts
         |> strip_config_ingress()
-        |> attach_provider_defaults(resolved.provider_defaults)
+        |> attach_provider_defaults(resolved)
 
   def attach_to_provider_opts(%__MODULE__{dialect: :custom} = resolved, opts) do
     opts
     |> strip_config_ingress()
-    |> attach_provider_defaults(resolved.provider_defaults)
+    |> attach_provider_defaults(resolved)
     |> Keyword.put(:model, resolved.model)
     |> Keyword.put(:responses_backend, resolved.responses_backend)
     |> Keyword.put(:resolved_provider_request, resolved)
@@ -158,17 +164,44 @@ defmodule Pixir.Providers.ResolvedProviderRequest do
     }
   end
 
-  defp attach_provider_defaults(opts, defaults) do
+  defp attach_provider_defaults(opts, %__MODULE__{provider_defaults: defaults} = resolved) do
     opts
     |> Keyword.put_new(:max_retries, defaults.max_retries)
     |> Keyword.put_new(:stream_idle_timeout_ms, defaults.stream_idle_timeout_ms)
     |> put_optional(:reasoning_effort, defaults.reasoning_effort)
     |> put_optional(:text_verbosity, defaults.text_verbosity)
-    |> put_optional(:web_search, defaults.web_search)
+    |> put_web_search(resolved)
   end
 
   defp put_optional(opts, _key, nil), do: opts
   defp put_optional(opts, key, value), do: Keyword.put_new(opts, key, value)
+
+  # Precedence: turn/presenter or sticky opts, then explicit config (including
+  # `false`), then the backend-derived default. Config `nil` is "no preference."
+  defp put_web_search(opts, resolved) do
+    case Keyword.fetch(opts, :web_search) do
+      {:ok, _override} ->
+        opts
+
+      :error ->
+        case resolved.provider_defaults.web_search do
+          nil -> put_optional(opts, :web_search, backend_web_search_default(resolved))
+          value -> Keyword.put(opts, :web_search, value)
+        end
+    end
+  end
+
+  defp backend_web_search_default(%__MODULE__{
+         dialect: :responses,
+         responses_backend: %ResponsesBackend{} = backend
+       }) do
+    case ResponsesBackend.mode(backend) do
+      :chatgpt_codex -> %{"enabled" => true}
+      _mode -> nil
+    end
+  end
+
+  defp backend_web_search_default(_resolved), do: nil
 
   defp strip_config_ingress(opts), do: Keyword.drop(opts, @config_ingress_keys)
 
@@ -207,6 +240,7 @@ defmodule Pixir.Providers.ResolvedProviderRequest do
   defp safe_dialect(_dialect), do: :invalid
 
   defp valid_web_search_default?(nil), do: true
+  defp valid_web_search_default?(false), do: true
 
   defp valid_web_search_default?(web_search) when is_map(web_search) do
     allowed = HostedTools.web_search_config_fields()

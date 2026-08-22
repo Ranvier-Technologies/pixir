@@ -4,7 +4,7 @@ defmodule Pixir.CLITest do
   import ExUnit.CaptureIO
   import Pixir.Test.RawLogHelpers
 
-  alias Pixir.{CLI, Event, Log, Paths, Subagents}
+  alias Pixir.{CLI, Compaction, Event, Log, Paths, Subagents}
   alias Pixir.Delegate.Evidence
 
   defmodule StubProvider do
@@ -338,6 +338,225 @@ defmodule Pixir.CLITest do
   test "--attach reports structured errors for missing values and unsupported commands" do
     assert {:error, 2} = CLI.route(["--attach"])
     assert {:error, 2} = CLI.route(["--attach", "note.txt", "doctor"])
+  end
+
+  test "subcommand-shaped argv is refused before any Session starts (#546)" do
+    in_tmp_workspace("pixir-cli-unknown-subcommand", fn ws ->
+      output =
+        capture_io(:stderr, fn ->
+          assert {:error, 2} = CLI.route(["serve", "--launch-mode", "help"])
+        end)
+
+      assert output =~ "unknown subcommand: serve"
+      assert output =~ "pixir-monitor serve"
+
+      # Single-dash tokens count as option-shaped too, and unknown heads get the
+      # generic hint instead of the monitor pointer.
+      generic =
+        capture_io(:stderr, fn ->
+          assert {:error, 2} = CLI.route(["deploy", "-v"])
+        end)
+
+      assert generic =~ "unknown subcommand: deploy"
+      assert generic =~ "pixir help"
+
+      # The refusal wins over trailing help flags: the contract promises the
+      # refusal for the shape, and the serve hint beats generic usage.
+      helped =
+        capture_io(:stderr, fn ->
+          assert {:error, 2} = CLI.route(["serve", "--help"])
+        end)
+
+      assert helped =~ "pixir-monitor serve"
+
+      # The refusal is pre-Session: nothing was appended to the store.
+      assert Path.wildcard(Path.join([ws, ".pixir", "sessions", "*.ndjson"])) == []
+    end)
+  end
+
+  test "mode flags count as the subcommand shape on the escript path (#546)" do
+    # extract_mode/1 strips --ask/--read-only/--yolo before routing, so the
+    # guard must see them via main/1's trailing-mode-flag signal: `pixir serve
+    # --ask` is the incident gesture even though route/2 never sees the flag.
+    in_tmp_workspace("pixir-cli-mode-flag-shape", fn ws ->
+      with_cli_halt(fn ->
+        output =
+          capture_io(:stderr, fn ->
+            assert {:pixir_cli_halt, 2} = catch_throw(CLI.main(["serve", "--ask"]))
+          end)
+
+        assert output =~ "unknown subcommand: serve"
+
+        assert {:pixir_cli_halt, 2} =
+                 catch_throw(capture_io(:stderr, fn -> CLI.main(["hello", "--read-only"]) end))
+      end)
+
+      assert Path.wildcard(Path.join([ws, ".pixir", "sessions", "*.ndjson"])) == []
+
+      # A mode flag BEFORE the prompt stays a prompt signal: `pixir --read-only
+      # hello` still one-shots.
+      with_cli_halt(fn ->
+        with_cli_provider([stop("leading ok")], fn ->
+          capture_io(fn ->
+            assert {:pixir_cli_halt, 0} = catch_throw(CLI.main(["--read-only", "hello"]))
+          end)
+        end)
+      end)
+
+      sid = only_session_id!(ws)
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+      assert %{data: %{"text" => "hello"}} = Enum.find(history, &(&1.type == :user_message))
+    end)
+
+    # A value-taking runtime flag's value is not the first positional token:
+    # the mode flag here still PRECEDES the prompt, so it stays a prompt.
+    in_tmp_workspace("pixir-cli-mode-flag-value", fn ws ->
+      with_cli_halt(fn ->
+        with_cli_provider([stop("value ok")], fn ->
+          capture_io(fn ->
+            assert {:pixir_cli_halt, 0} =
+                     catch_throw(CLI.main(["--bash-timeout-ms", "500", "--read-only", "hello"]))
+          end)
+        end)
+      end)
+
+      sid = only_session_id!(ws)
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+      assert %{data: %{"text" => "hello"}} = Enum.find(history, &(&1.type == :user_message))
+    end)
+  end
+
+  test "the trailing detector's arity list stays in parity with extract_runtime_options (#546)" do
+    # @value_taking_runtime_flags is a second copy of the extract walk's arity
+    # knowledge; this source pin fails the moment a value-taking flag is added
+    # to one walk and not the other (the drift class 5361897 fixed by hand).
+    source = File.read!(Path.expand("../../lib/pixir/cli.ex", __DIR__))
+
+    extract_clause_flags =
+      Regex.scan(~r/defp extract_runtime_options\(\["(--[a-z-]+)", [a-z_]+ \| rest\]/, source)
+      |> Enum.map(fn [_, flag] -> flag end)
+      |> MapSet.new()
+
+    [_, attribute_body] = Regex.run(~r/@value_taking_runtime_flags \[([^\]]+)\]/, source)
+
+    attribute_flags =
+      Regex.scan(~r/"(--[a-z-]+)"/, attribute_body)
+      |> Enum.map(fn [_, flag] -> flag end)
+      |> MapSet.new()
+
+    assert MapSet.size(extract_clause_flags) > 0
+    assert extract_clause_flags == attribute_flags
+  end
+
+  test "a value-taking --attach before the prompt keeps a trailing-free prompt shape (#546)" do
+    in_tmp_workspace("pixir-cli-attach-mode-value", fn ws ->
+      File.write!(Path.join(ws, "note.txt"), "ctx")
+
+      with_cli_halt(fn ->
+        with_cli_provider([stop("attach ok")], fn ->
+          capture_io(fn ->
+            assert {:pixir_cli_halt, 0} =
+                     catch_throw(CLI.main(["--attach", "note.txt", "--read-only", "hello"]))
+          end)
+        end)
+      end)
+
+      sid = only_session_id!(ws)
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+      assert %{data: %{"text" => "hello"}} = Enum.find(history, &(&1.type == :user_message))
+    end)
+  end
+
+  test "negative numbers and a bare hyphen are not option-shaped (#546)" do
+    in_tmp_workspace("pixir-cli-not-option-shaped", fn ws ->
+      with_cli_provider([stop("minus"), stop("dash")], fn ->
+        assert :ok = CLI.route(["compute", "-3", "plus", "5"])
+        assert :ok = CLI.route(["diff", "before", "-", "after"])
+      end)
+
+      prompts =
+        for path <- Path.wildcard(Path.join([ws, ".pixir", "sessions", "*.ndjson"])) do
+          {:ok, history} = Log.fold(Path.basename(path, ".ndjson"), workspace: ws)
+
+          Enum.find_value(history, fn event ->
+            if event.type == :user_message, do: event.data["text"]
+          end)
+        end
+
+      assert Enum.sort(prompts) == ["compute -3 plus 5", "diff before - after"]
+
+      # Real flag tokens inside unquoted prose still refuse: quote the prompt.
+      capture_io(:stderr, fn ->
+        assert {:error, 2} = CLI.route(["run", "mix", "test", "--stale"])
+      end)
+    end)
+  end
+
+  test "stdin prompt path is unchanged by the refusal guard (#546)" do
+    in_tmp_workspace("pixir-cli-stdin-unchanged", fn ws ->
+      with_cli_provider([stop("stdin ok")], fn ->
+        capture_io("summarize stdin", fn -> assert :ok = CLI.route(["-"]) end)
+      end)
+
+      sid = only_session_id!(ws)
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+      assert %{data: %{"text" => "summarize stdin"}} =
+               Enum.find(history, &(&1.type == :user_message))
+    end)
+  end
+
+  test "quoted and bare prose prompts still reach one-shot unchanged (#546)" do
+    in_tmp_workspace("pixir-cli-prompt-unchanged", fn ws ->
+      with_cli_provider([stop("quoted"), stop("prose")], fn ->
+        # A quoted prompt arrives as ONE argument; its spaces fail the bare-word
+        # shape, so the incident string still runs when explicitly quoted.
+        assert :ok = CLI.route(["serve --launch-mode help"])
+        # Bare multi-word prose without option-shaped tokens is untouched.
+        assert :ok = CLI.route(["tell", "me", "about", "serve"])
+      end)
+
+      prompts =
+        for sid <- Path.wildcard(Path.join([ws, ".pixir", "sessions", "*.ndjson"])) do
+          {:ok, history} = Log.fold(Path.basename(sid, ".ndjson"), workspace: ws)
+
+          Enum.find_value(history, fn event ->
+            if event.type == :user_message, do: event.data["text"]
+          end)
+        end
+
+      assert Enum.sort(prompts) == ["serve --launch-mode help", "tell me about serve"]
+    end)
+  end
+
+  test "every known subcommand still routes to its own handler, never the refusal (#546)" do
+    # Smoke half of the clause-order pin: each known command still answers with
+    # its own handler. `acp` is deliberately absent because its clause takes
+    # over stdio and blocks.
+    for command <-
+          ~w(login doctor models gc diagnose tree compact fork inspect-replay delegate resume) do
+      output = capture_io(fn -> assert :ok = CLI.route([command, "--help"]) end)
+      refute output =~ "unknown subcommand"
+    end
+  end
+
+  test "the prompt fall-through stays the last route_command clause (#546)" do
+    # Structural half of the clause-order pin. The refusal assumes every known
+    # command matched an earlier clause, so the guarded [prompt | rest] clause
+    # must stay terminal; the smoke test above cannot see a reorder because
+    # help?/1 answers `<cmd> --help` with usage() from the fall-through too.
+    source = File.read!(Path.expand("../../lib/pixir/cli.ex", __DIR__))
+
+    heads =
+      Regex.scan(~r/defp route_command\((.*)/, source)
+      |> Enum.map(fn [_, head] -> head end)
+
+    assert heads != []
+    assert List.last(heads) =~ "[prompt | rest]"
+
+    # The order pin alone survives a body rewrite; pin the guard call too so
+    # the fall-through cannot silently stop consulting the shape check.
+    assert source =~ "subcommand_shaped?(prompt, rest, runtime)"
   end
 
   test "--web-search is accepted for one-shot and resume but rejected for other commands" do
@@ -1007,6 +1226,8 @@ defmodule Pixir.CLITest do
     assert out =~ "history_compaction"
     assert out =~ "--dry-run"
     assert out =~ "--tail-events"
+    assert out =~ "chatgpt_codex"
+    assert out =~ "native replay"
   end
 
   test "inspect-replay --help is self-describing without network" do
@@ -1091,6 +1312,65 @@ defmodule Pixir.CLITest do
     end)
   end
 
+  test "inspect-replay --json never prints native_replay ciphertext" do
+    ws =
+      Path.join(
+        System.tmp_dir!(),
+        "pixir-cli-inspect-native-#{System.unique_integer([:positive])}"
+      )
+
+    sid = "inspect-native-cli"
+    File.mkdir_p!(ws)
+
+    assert {:ok, data} =
+             Compaction.persist_threshold_item(
+               %{
+                 "range" => %{"from_seq" => 0, "to_seq" => 0},
+                 "strategy" => "deterministic_operational_summary_v1",
+                 "summary" => "cli inspect checkpoint",
+                 "limitations" => ["full Log remains authoritative"]
+               },
+               %{
+                 "type" => "compaction",
+                 "id" => "cmp_cli_inspect",
+                 "encrypted_content" => "CIPHERTEXT_CLI_INSPECT"
+               },
+               backend: "chatgpt_codex",
+               dialect: "chatgpt_codex",
+               model: "gpt-5.5"
+             )
+
+    events = [
+      Event.user_message(sid, "old"),
+      Event.history_compaction(sid, data),
+      Event.user_message(sid, "recent")
+    ]
+
+    events
+    |> Enum.with_index()
+    |> Enum.each(fn {event, seq} ->
+      assert {:ok, _} = Log.append(Event.with_seq(event, seq), workspace: ws)
+    end)
+
+    on_exit(fn -> File.rm_rf!(ws) end)
+
+    File.cd!(ws, fn ->
+      out =
+        capture_io(fn ->
+          assert :ok = CLI.route(["inspect-replay", sid, "--json"])
+        end)
+
+      assert {:ok, decoded} = Jason.decode(out)
+      assert decoded["history_compaction"]["native_replay"]["mode"] == "threshold_item"
+
+      assert decoded["history_compaction"]["native_replay"]["compaction_item_ids"] ==
+               ["cmp_cli_inspect"]
+
+      refute out =~ "encrypted_content"
+      refute out =~ "CIPHERTEXT_CLI_INSPECT"
+    end)
+  end
+
   test "compact --dry-run --json prints a machine-readable plan" do
     ws = Path.join(System.tmp_dir!(), "pixir-cli-compact-#{System.unique_integer([:positive])}")
     sid = "compact-cli"
@@ -1123,8 +1403,113 @@ defmodule Pixir.CLITest do
                 "compactable" => true,
                 "recorded" => false,
                 "would_compact_events" => 2,
-                "event" => %{"range" => %{"from_seq" => 0, "to_seq" => 1}}
+                "event" => %{"range" => %{"from_seq" => 0, "to_seq" => 1}},
+                "native_replay_usable" => false,
+                "native_replay_reason" => reason
               }} = Jason.decode(out)
+
+      assert reason in ["native_unavailable", "overlay_off"]
+    end)
+  end
+
+  test "compact --json with compaction.native false stays local" do
+    home =
+      Path.join(System.tmp_dir!(), "pixir-cli-native-off-#{System.unique_integer([:positive])}")
+
+    ws =
+      Path.join(System.tmp_dir!(), "pixir-cli-compact-off-#{System.unique_integer([:positive])}")
+
+    sid = "compact-cli-overlay-off"
+    previous_home = System.get_env("PIXIR_HOME")
+    File.mkdir_p!(home)
+    File.mkdir_p!(ws)
+
+    File.write!(
+      Path.join(home, "config.json"),
+      Jason.encode!(%{"compaction" => %{"native" => false}})
+    )
+
+    events = [
+      Event.user_message(sid, "one"),
+      Event.assistant_message(sid, "two"),
+      Event.user_message(sid, "three")
+    ]
+
+    events
+    |> Enum.with_index()
+    |> Enum.each(fn {event, seq} ->
+      assert {:ok, _path} = Log.append(Event.with_seq(event, seq), workspace: ws)
+    end)
+
+    on_exit(fn ->
+      File.rm_rf!(ws)
+      File.rm_rf!(home)
+    end)
+
+    try do
+      System.put_env("PIXIR_HOME", home)
+
+      File.cd!(ws, fn ->
+        out =
+          capture_io(fn ->
+            assert :ok = CLI.route(["compact", sid, "--json", "--tail-events", "1"])
+          end)
+
+        assert {:ok, decoded} = Jason.decode(out)
+        assert decoded["recorded"] == true
+        refute Map.has_key?(decoded["event"], "native_replay")
+        assert decoded["native_replay_usable"] == false
+        assert decoded["native_replay_reason"] == "overlay_off"
+        refute out =~ "encrypted_content"
+      end)
+    after
+      if previous_home,
+        do: System.put_env("PIXIR_HOME", previous_home),
+        else: System.delete_env("PIXIR_HOME")
+    end
+  end
+
+  test "compact prints native replay unused on chatgpt_codex" do
+    ws =
+      Path.join(
+        System.tmp_dir!(),
+        "pixir-cli-compact-codex-#{System.unique_integer([:positive])}"
+      )
+
+    sid = "compact-cli-codex"
+    File.mkdir_p!(ws)
+
+    events = [
+      Event.user_message(sid, "one"),
+      Event.assistant_message(sid, "two"),
+      Event.user_message(sid, "three")
+    ]
+
+    events
+    |> Enum.with_index()
+    |> Enum.each(fn {event, seq} ->
+      assert {:ok, _path} = Log.append(Event.with_seq(event, seq), workspace: ws)
+    end)
+
+    on_exit(fn -> File.rm_rf!(ws) end)
+
+    File.cd!(ws, fn ->
+      human =
+        capture_io(fn ->
+          assert :ok = CLI.route(["compact", sid, "--tail-events", "1"])
+        end)
+
+      assert human =~ "Recorded compaction checkpoint"
+      assert human =~ "Native replay: unused (native_unavailable)"
+
+      out =
+        capture_io(fn ->
+          assert :ok = CLI.route(["compact", sid, "--dry-run", "--json", "--tail-events", "1"])
+        end)
+
+      assert {:ok, decoded} = Jason.decode(out)
+      assert decoded["native_replay_usable"] == false
+      assert decoded["native_replay_reason"] == "native_unavailable"
     end)
   end
 

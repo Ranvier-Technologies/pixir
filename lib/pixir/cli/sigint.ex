@@ -66,8 +66,19 @@ defmodule Pixir.CLI.Sigint do
     Code.ensure_loaded?(Mix) and function_exported?(Mix, :env, 0) and Mix.env() == :test
   end
 
-  defp start_sigint_forwarder(beam_pid) do
-    script = ~s(trap 'kill -USR1 #{beam_pid}' INT; while sleep 3600; do :; done)
+  @doc false
+  @spec start_sigint_forwarder(charlist() | String.t() | integer()) :: {:ok, port()}
+  def start_sigint_forwarder(beam_pid) do
+    # Block on stdin so Port.close / BEAM death delivers EOF and this helper
+    # exits. A `sleep` wait is never reaped and holds inherited fds, which
+    # hangs pipelines that consume pixir output (#541).
+    #
+    # INT still forwards USR1. The trap flag distinguishes a signal-interrupted
+    # `read` from real EOF: on dash both cases return status 1.
+    script =
+      "interrupted=0; trap 'kill -USR1 #{beam_pid}; interrupted=1' INT; " <>
+        "while :; do interrupted=0; IFS= read -r _ && continue; " <>
+        "if [ \"$interrupted\" -eq 1 ]; then continue; fi; break; done"
 
     port =
       Port.open({:spawn_executable, System.find_executable("sh")}, [

@@ -6,11 +6,13 @@ defmodule Pixir.Tools.UpdatePlan do
   the session bus, which the ACP front-end renders as a live checklist. It mutates
   no files and runs no commands, so it is permitted even in `:read_only`/plan mode
   (the architect tool). The model calls it in plan mode to present its plan, then
-  stops (plan-and-wait).
+  stops. Recording that plan is the live plan→build producer (#520): ACP sessions
+  advertise `build` so the presenter picker moves without a client round-trip.
   """
 
   use Pixir.Tool
 
+  alias Pixir.ACP.RuntimeMode
   alias Pixir.{Event, Session, Tool}
 
   @priorities ~w(high medium low)
@@ -23,7 +25,8 @@ defmodule Pixir.Tools.UpdatePlan do
       description:
         "Record or update the step-by-step plan as a checklist. Send the COMPLETE " <>
           "current plan each time (it replaces the previous one). Use this in plan " <>
-          "mode to present your plan, then stop.",
+          "mode to present your plan, then stop. Recording the plan switches the " <>
+          "session to build mode.",
       parameters: %{
         "type" => "object",
         "properties" => %{
@@ -59,6 +62,7 @@ defmodule Pixir.Tools.UpdatePlan do
     if Enum.all?(entries, &is_map/1) do
       normalized = Enum.map(entries, &normalize_entry/1)
       Session.emit(context.session_id, Event.plan(context.session_id, normalized))
+      _ = RuntimeMode.leave_plan(context)
       {:ok, %{"output" => "Recorded a plan with #{length(normalized)} step(s)."}}
     else
       {:error, Tool.error(:invalid_args, "entries must be a list of objects", %{})}

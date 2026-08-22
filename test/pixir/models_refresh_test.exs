@@ -280,25 +280,28 @@ defmodule Pixir.ModelsRefreshTest do
     # It landed in the prior run's dir, and nowhere else.
     assert File.exists?(auth_store_path(prior, prior_auth_name))
 
-    # Plant that exact leftover, BEFORE start_auth/3 runs, under the name the current
-    # run is about to take. `prior` stands in for the process-wide tmp root the
-    # pre-fix helper resolved against, so the shipped test writes only under `dir`
-    # while still reproducing the collision.
+    # Keep the leftover under `prior`, then prove both halves of resolution: that file is
+    # not read by the current Auth, while a second leftover planted under `current` is.
+    # Pixir.Auth intentionally gives a stored subscription precedence over env_api_key,
+    # so planting under `current` and expecting :api_key would assert the wrong product
+    # semantics. The two-name probe below instead fails against the pre-fix shared-root
+    # helper and cannot pass merely because both planted files were ignored.
     leftover = File.read!(auth_store_path(prior, prior_auth_name))
     File.write!(auth_store_path(prior, name), leftover)
 
-    # Now the current run starts an Auth under the colliding name WITH a real API key,
-    # exactly as every err_body test in this file does. Post-fix the store resolves
-    # under `current`, which is empty, so the planted subscription does not load and
-    # env_api_key stands: kind is :api_key. Pre-fix the store resolved against a root
-    # shared with `prior`, the stale subscription loaded and WON over env_api_key in
-    # Pixir.Auth, so refresh_openai/2 took the "unsupported auth kind" skip branch and
-    # emitted no err_body at all: the nil-err_body failure filed in #464.
     auth = start_auth(current, name, "sk-openai")
 
     status = Auth.status(auth)
     assert status.authenticated?
     assert status.kind == :api_key
+
+    resolved_probe_name = auth_name()
+    File.write!(auth_store_path(current, resolved_probe_name), leftover)
+    resolved_probe_auth = start_auth(current, resolved_probe_name, "sk-probe")
+
+    resolved_probe_status = Auth.status(resolved_probe_auth)
+    assert resolved_probe_status.authenticated?
+    assert resolved_probe_status.kind == :subscription
 
     # Drive one real refresh down the 503 path. Under the bug this provider entry is a
     # "skipped" map and err_body is nil; the assertion below is the exact field #464

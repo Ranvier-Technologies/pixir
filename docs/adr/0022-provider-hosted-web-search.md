@@ -2,7 +2,12 @@
 
 Date: 2026-06-12
 Status: Accepted
-Implementation status: deterministic slice implemented; live smoke is opt-in
+Implementation status: deterministic slice implemented; runtime default-on
+for `chatgpt_codex` is implemented (#523-B); ACP `web_search` `configOption`
+is implemented (#523-C); live smoke is opt-in.
+Amended 2026-08-16 (issue #523-A): the absence-of-override default is now
+backend-scoped — enabled only for `chatgpt_codex` — see
+"Amendment (2026-08-16, issue #523-A): backend-scoped default-on" below.
 
 ## Context
 
@@ -54,6 +59,61 @@ The smoke is agent-useful under ADR 0005: `--help`, `--dry-run`, JSON output, bo
 evidence, and structured errors with next actions. The dry-run path does not require
 auth, does not call the Provider, and does not write files.
 
+## Amendment (2026-08-16, issue #523-A): backend-scoped default-on
+
+The original Decision above still stands for what Web Search *is*: a
+Provider-hosted Tool, serialized only through Pixir's Provider request
+config, recorded in `provider_usage`, never a local `tool_call`. What
+changes is the **absence-of-override default**.
+
+#521 left hosted `web_search` opt-in. That matched the original
+consequence that usage should stay opt-in until there was an explicit
+policy for which Turns may use current web evidence by default. That
+policy is now accepted. It does **not** make search ambient, add a local
+web-search Tool, or change Hex defaults in this amendment.
+
+When no presenter, config, CLI flag, `_meta`, or spawn-arg override is
+present, the default is decided **after** Provider and backend are
+resolved — not globally in `Pixir.Config.load/1`:
+
+| Resolved Provider / backend | Absence of override |
+| --- | --- |
+| OpenAI Responses, `chatgpt_codex` | enabled |
+| OpenAI Responses, `open_responses` | disabled |
+| Anthropic | disabled |
+
+`Pixir.Config.load/1` may still surface an operator preference from
+`~/.pixir/config.json` or the application env. Absent or `nil` means "no
+preference," not "off for every backend." Baking `chatgpt_codex`
+default-on into Config would enable search before the request has a
+Provider or backend, and would misfire on Anthropic and `open_responses`,
+both of which reject Provider-hosted tools.
+
+Precedence after that late-bound default:
+
+- An explicit `false` always wins. Config, CLI, ACP preference, `_meta`,
+  and spawn-agent args that say `false` disable hosted Web Search even
+  on `chatgpt_codex`.
+- An explicit `true` or enabled config object still *requests* enablement.
+  The runtime validates the request against the resolved Provider and
+  backend. Anthropic and `open_responses` continue to reject hosted
+  tools with a structured error; this amendment does not invent a local
+  search fallback for those paths.
+
+Presenters stay Presenters (ADR 0017 / ADR 0009). ACP may later advertise
+a `web_search` `configOption` and may already pass `_meta.web_search`,
+but those are preferences only. The runtime validates the preference and
+builds the Provider request. CLI `--web-search` and ACP share that same
+runtime policy; neither presenter assembles `%{"type" => "web_search"}`
+itself.
+
+The runtime default (#523-B) is implemented at Provider/backend resolution
+(`ResolvedProviderRequest.attach_to_provider_opts/2`). ACP's `web_search`
+`configOption` (#523-C) now exposes that policy as an `on`/`off` Session-sticky
+preference; it still passes only `provider_opts` and never assembles a hosted
+Provider tool. Presenters also continue to share the runtime policy through
+existing knobs (`--web-search`, `_meta.web_search`, config).
+
 ## Consequences
 
 - Pixir can use current web evidence through the same OpenAI Responses backend without
@@ -62,8 +122,11 @@ auth, does not call the Provider, and does not write files.
   evidence, not Session state.
 - Presenters remain Presenters. They can expose settings later, but Pixir owns the Provider
   request shape.
-- Hosted Web Search queries cross the Leakage Boundary. The product should keep usage
-  opt-in until there is an explicit policy for ambient search.
+- Hosted Web Search queries still cross the Leakage Boundary. The product
+  policy is no longer "opt-in until a default exists": after Provider and
+  backend resolution, absence of override enables hosted search only for
+  `chatgpt_codex`. That is a scoped default, not ambient search. An
+  explicit `false` always wins. See the 2026-08-16 amendment.
 - Provider-hosted tool evidence increases `provider_usage` size slightly, so the parser
   keeps the evidence bounded and normalized.
 - Citations depend on backend stream shape and include support. Pixir preserves
@@ -73,7 +136,9 @@ auth, does not call the Provider, and does not write files.
 
 - Do not implement MCP.
 - Do not add local browser automation as part of Web Search.
-- Do not make Web Search ambient for every Turn.
+- Do not make Web Search ambient for every Turn. Default-on for
+  `chatgpt_codex` after backend resolution is not ambient: other backends
+  stay off, and an explicit `false` still disables it.
 - Do not make OpenAI search output Pixir's source of truth.
 - Do not treat hosted Web Search as a local `Tool`.
 - Do not change client adapter behavior in this slice.
@@ -105,13 +170,28 @@ Regression coverage should prove:
 Representative live probes should use the configured default OpenAI model with low
 reasoning effort when supported, unless the user explicitly asks otherwise.
 
+Later runtime slices of #523, not this amendment, must additionally prove:
+
+- absence of override enables `%{"type" => "web_search"}` only after the
+  request resolves to `chatgpt_codex`;
+- the same absence leaves Anthropic and `open_responses` without hosted
+  search, and does not change `Pixir.Config.load/1` into a global default-on;
+- an explicit `false` from config, CLI, ACP preference, `_meta`, or spawn
+  args beats the `chatgpt_codex` default;
+- CLI and ACP produce the same request shape for the same resolved
+  preference.
+
 ## References
 
 - ADR 0004: unified Event envelope and canonical vs ephemeral events.
 - ADR 0005: agent ergonomics and structured script errors.
+- ADR 0009: ACP transport; Presenters request preferences, they do not
+  assemble Provider tools.
 - ADR 0017: minimal Harness core and Presenter boundary.
 - ADR 0019: Provider usage, prompt-cache observability, and WebSocket continuation.
 - ADR 0021: Session Resources and Image Attachments, which use the same "Provider
   projection, local truth" principle.
+- ADR 0037: Anthropic provider seam; `hosted_tools: false`, no hosted
+  `web_search`.
 - OpenAI Web Search guide:
   https://developers.openai.com/api/docs/guides/tools-web-search

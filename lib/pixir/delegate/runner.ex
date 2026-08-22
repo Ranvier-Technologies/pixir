@@ -66,6 +66,10 @@ defmodule Pixir.Delegate.Runner do
     service_unavailable_error server_is_overloaded overloaded server_error
   )
   @root_limit_keys ~w(child_timeout_ms delegate_timeout_ms timeout_ms wait_horizon_ms)
+  @required_horizon_evidence_fields ~w(
+    effective_timeout_ms estimated_critical_path_ms waves suggested_timeout_ms
+  )
+  @horizon_arithmetic_evidence_fields ~w(per_wave_budget_ms wave_budgets_ms)
   # Shared with Pixir.Delegate.CLIContract so dry-run rejects exactly the tasks[]
   # entries the real run rejects. `seed_session_id` names a prior Session to
   # warm-start this child from (#435); omitting it keeps the cold child behavior.
@@ -172,21 +176,167 @@ defmodule Pixir.Delegate.Runner do
     end
   end
 
-  @doc false
-  @spec admit_horizon(map(), map(), map(), keyword()) :: {:ok, map() | nil} | {:error, map()}
-  def admit_horizon(request, spec, spec_meta, opts \\ []) do
-    with {:ok, details} <- critical_path(request, spec, spec_meta, opts) do
+  @doc "Validate the facts used by Delegate horizon admission."
+  @spec validate_horizon_evidence(term()) :: :ok | {:error, map()}
+  def validate_horizon_evidence(details) when is_map(details) do
+    missing_fields =
+      Enum.reject(@required_horizon_evidence_fields, &Map.has_key?(details, &1))
+
+    malformed_fields =
+      Enum.filter(@required_horizon_evidence_fields, fn field ->
+        Map.has_key?(details, field) and not positive_integer?(details[field])
+      end)
+
+    {arithmetic_missing, arithmetic_malformed, arithmetic_contradictions} =
+      validate_horizon_arithmetic_evidence(details)
+
+    contradictions =
+      details
+      |> horizon_value_contradictions()
+      |> Kernel.++(arithmetic_contradictions)
+
+    evidence_errors = %{
+      "missing_fields" => missing_fields ++ arithmetic_missing,
+      "malformed_fields" => malformed_fields ++ arithmetic_malformed,
+      "contradictions" => contradictions
+    }
+
+    if Enum.all?(evidence_errors, fn {_kind, entries} -> entries == [] end) do
+      :ok
+    else
+      {:error, invalid_horizon_evidence(evidence_errors)}
+    end
+  end
+
+  def validate_horizon_evidence(_details) do
+    {:error,
+     invalid_horizon_evidence(%{
+       "missing_fields" => [],
+       "malformed_fields" => ["critical_path"],
+       "contradictions" => []
+     })}
+  end
+
+  @doc "Apply the fail-closed Delegate horizon verdict to precomputed evidence."
+  @spec admit_horizon_details(map(), term()) :: {:ok, map() | nil} | {:error, map()}
+  def admit_horizon_details(request, details) when is_map(request) do
+    with :ok <- validate_horizon_evidence(details) do
       cond do
         details["effective_timeout_ms"] >= details["estimated_critical_path_ms"] ->
           {:ok, nil}
 
-        Map.get(request, :allow_short_horizon?, false) ->
+        Map.get(request, :allow_short_horizon?, false) === true ->
           {:ok, CriticalPath.horizon_values(details)}
 
         true ->
           {:error, CriticalPath.rejection(details)}
       end
     end
+  end
+
+  def admit_horizon_details(_request, _details) do
+    {:error,
+     invalid_horizon_evidence(%{
+       "missing_fields" => [],
+       "malformed_fields" => ["request"],
+       "contradictions" => []
+     })}
+  end
+
+  @doc false
+  @spec admit_horizon(map(), map(), map(), keyword()) :: {:ok, map() | nil} | {:error, map()}
+  def admit_horizon(request, spec, spec_meta, opts \\ []) do
+    with {:ok, details} <- critical_path(request, spec, spec_meta, opts) do
+      admit_horizon_details(request, details)
+    end
+  end
+
+  defp validate_horizon_arithmetic_evidence(details) do
+    present_fields =
+      Enum.filter(@horizon_arithmetic_evidence_fields, &Map.has_key?(details, &1))
+
+    missing_fields =
+      if present_fields == [], do: ["per_wave_budget_ms|wave_budgets_ms"], else: []
+
+    malformed_fields =
+      Enum.filter(present_fields, fn
+        "per_wave_budget_ms" -> not positive_integer?(details["per_wave_budget_ms"])
+        "wave_budgets_ms" -> not positive_integer_list?(details["wave_budgets_ms"])
+      end)
+
+    contradictions =
+      if malformed_fields == [] do
+        horizon_arithmetic_contradictions(details, present_fields)
+      else
+        []
+      end
+
+    {missing_fields, malformed_fields, contradictions}
+  end
+
+  defp horizon_arithmetic_contradictions(details, present_fields) do
+    waves = details["waves"]
+    estimate = details["estimated_critical_path_ms"]
+
+    if positive_integer?(waves) and positive_integer?(estimate) do
+      Enum.flat_map(present_fields, fn
+        "per_wave_budget_ms" ->
+          if waves * details["per_wave_budget_ms"] == estimate do
+            []
+          else
+            ["waves_times_per_wave_budget_ms_must_equal_estimated_critical_path_ms"]
+          end
+
+        "wave_budgets_ms" ->
+          budgets = details["wave_budgets_ms"]
+
+          []
+          |> maybe_add_contradiction(
+            length(budgets) != waves,
+            "wave_budgets_ms_length_must_equal_waves"
+          )
+          |> maybe_add_contradiction(
+            Enum.sum(budgets) != estimate,
+            "wave_budgets_ms_sum_must_equal_estimated_critical_path_ms"
+          )
+      end)
+    else
+      []
+    end
+  end
+
+  defp horizon_value_contradictions(details) do
+    estimate = details["estimated_critical_path_ms"]
+    suggested = details["suggested_timeout_ms"]
+
+    if positive_integer?(estimate) and positive_integer?(suggested) and suggested < estimate do
+      ["suggested_timeout_ms_must_cover_estimated_critical_path_ms"]
+    else
+      []
+    end
+  end
+
+  defp maybe_add_contradiction(entries, true, contradiction), do: entries ++ [contradiction]
+  defp maybe_add_contradiction(entries, false, _contradiction), do: entries
+
+  defp positive_integer?(value), do: is_integer(value) and value > 0
+
+  defp positive_integer_list?(values) when is_list(values) and values != [],
+    do: Enum.all?(values, &positive_integer?/1)
+
+  defp positive_integer_list?(_values), do: false
+
+  defp invalid_horizon_evidence(evidence_errors) do
+    error_payload(
+      "invalid_horizon_evidence",
+      "Delegate horizon admission requires complete, positive, internally consistent integer evidence",
+      evidence_errors
+      |> Map.put("required_fields", @required_horizon_evidence_fields)
+      |> Map.put("next_actions", [
+        "rerun_delegate_spec_validation",
+        "upgrade_pixir_client_and_daemon_together"
+      ])
+    )
   end
 
   defp stringify_estimate(estimate, effective_timeout_ms \\ nil) do

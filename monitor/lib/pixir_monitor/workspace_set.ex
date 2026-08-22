@@ -137,8 +137,12 @@ defmodule PixirMonitor.WorkspaceSet do
     |> Keyword.put(:workspace, path)
   end
 
-  defp scope_error(%{kind: "run_not_found"} = error, key),
-    do: %{kind: "run_not_found", message: error.message, details: %{workspace: key, run_id: run_id(error)}}
+  defp scope_error(%{kind: "run_not_found"} = error, key) do
+    details = %{workspace: key, run_id: run_id(error)}
+    details = put_optional_session_id(details, :parent_session_id, parent_session_id(error))
+    details = put_optional_reason(details, :parent_unprojected_reason, parent_unprojected_reason(error))
+    %{kind: "run_not_found", message: error.message, details: details}
+  end
 
   defp scope_error(%{kind: "invalid_run_id"} = error, key),
     do: %{kind: "invalid_run_id", message: error.message, details: invalid_id_details(error, key)}
@@ -160,6 +164,22 @@ defmodule PixirMonitor.WorkspaceSet do
     do: %{kind: "workspace_unavailable", message: "Workspace projection is unavailable", details: %{workspace: key}}
 
   defp run_id(error), do: get_in(error, [:details, :run_id]) || get_in(error, [:details, "run_id"]) || "unknown"
+
+  defp parent_session_id(error),
+    do: get_in(error, [:details, :parent_session_id]) || get_in(error, [:details, "parent_session_id"])
+
+  defp parent_unprojected_reason(error),
+    do: get_in(error, [:details, :parent_unprojected_reason]) || get_in(error, [:details, "parent_unprojected_reason"])
+
+  defp put_optional_session_id(details, key, value) do
+    if is_binary(value) and Pixir.SessionId.valid?(value), do: Map.put(details, key, value), else: details
+  end
+
+  defp put_optional_reason(details, key, value) do
+    if is_binary(value) and Regex.match?(~r/\A[a-z][a-z0-9_]{0,63}\z/, value),
+      do: Map.put(details, key, value),
+      else: details
+  end
 
   defp invalid_id_details(error, key) do
     max_bytes = get_in(error, [:details, :max_bytes]) || get_in(error, [:details, "max_bytes"])

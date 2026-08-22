@@ -139,11 +139,18 @@ defmodule PixirMonitor.UIRunCardCopyContractTest do
     end
 
     test "the run truth rail card passes the shared alias map", %{js: js} do
+      # The BASIS is a shared constant too, for the same reason the alias map
+      # is: the manual's ON THIS RUN part attributes its advisory fold to the
+      # same provenance word this card prints, and two literals is a parallel
+      # copy table that lets one surface be renamed while the other goes on
+      # attributing the old word to a live reading.
       assert js =~
-               ~s|distributionCard("Model advisory", "advisory", advisoryCounts, ADVISORY_BUCKET_ORDER, ADVISORY_DISPLAY_ALIASES, "model declared"|
+               ~s|distributionCard(route, "Model advisory", "advisory", advisoryCounts, ADVISORY_BUCKET_ORDER, ADVISORY_DISPLAY_ALIASES, ADVISORY_FOLD_BASIS|
+
+      assert js =~ ~s|const ADVISORY_FOLD_BASIS = "model declared";|
 
       refute js =~
-               ~s|distributionCard("Model advisory", "advisory", advisoryCounts, ["stop", "needs_review", "pass", "unknown", "invalid"], null|
+               ~s|distributionCard(route, "Model advisory", "advisory", advisoryCounts, ["stop", "needs_review", "pass", "unknown", "invalid"], null|
     end
 
     test "the semantic-zoom cluster summary row uses the same alias map", %{js: js} do
@@ -183,11 +190,15 @@ defmodule PixirMonitor.UIRunCardCopyContractTest do
     end
 
     test "marker tone is still driven by the raw token, never by the label", %{js: js} do
-      # distributionMarkers passes `name` (the raw token) as the tone argument
-      # and the aliased string only as the visible label.
+      # distributionBuckets carries the raw token beside the aliased phrase, and
+      # distributionMarkers passes that token as the tone argument while the
+      # aliased string is only ever the visible label. Pinned on the shared fold
+      # because the manual pane reads the SAME fold: a bucket whose tone came
+      # from its label would now be wrong in two surfaces at once.
       assert js =~
-               ~s|wrap.append(labeledMarker(count + " " + distributionValueLabel(name, aliases), name, dimension, basis))|
+               ~s|buckets.push({token: name, phrase: count + " " + pluralizeDistributionLabel(distributionValueLabel(name, aliases), count)})|
 
+      assert js =~ ~s|wrap.append(labeledMarker(bucket.phrase, bucket.token, dimension, basis))|
       assert js =~ ~s|function labeledMarker(label, tone, dimension, basis)|
       assert js =~ ~s|"marker marker-" + markerTone(tone)|
     end

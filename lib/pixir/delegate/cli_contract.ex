@@ -182,18 +182,17 @@ defmodule Pixir.Delegate.CLIContract do
 
         case load_and_validate_spec(request, read_stdin, runtime_opts) do
           {:ok, spec, spec_meta} ->
-            spec_meta = maybe_put_horizon_override(spec_meta, request)
+            if request.dry_run? do
+              dry_run_result(request, spec, spec_meta)
+              |> maybe_put_dry_run_counts(spec)
+            else
+              case admit_horizon_spec_meta(request, spec_meta) do
+                {:ok, admitted_spec_meta} ->
+                  runtime_result(runner, request, spec, admitted_spec_meta, runtime_opts)
 
-            cond do
-              request.dry_run? ->
-                dry_run_result(request, spec, spec_meta)
-                |> maybe_put_dry_run_counts(spec)
-
-              horizon_reject?(spec_meta, request) ->
-                error_result(CriticalPath.rejection(spec_meta["critical_path"]), request.json?)
-
-              true ->
-                runtime_result(runner, request, spec, spec_meta, runtime_opts)
+                {:error, error} ->
+                  error_result(error, request.json?)
+              end
             end
 
           {:error, error} ->
@@ -1764,26 +1763,28 @@ defmodule Pixir.Delegate.CLIContract do
        ) do
     case load_and_validate_spec(request, read_stdin, Keyword.get(async_opts, :runtime_opts, [])) do
       {:ok, spec, spec_meta} ->
-        spec_meta = maybe_put_horizon_override(spec_meta, request)
+        case admit_horizon_spec_meta(request, spec_meta) do
+          {:ok, admitted_spec_meta} ->
+            local_start = fn ->
+              apply(async, :start, [request, spec, admitted_spec_meta, async_opts])
+            end
 
-        if horizon_reject?(spec_meta, request) do
-          error_result(CriticalPath.rejection(spec_meta["critical_path"]), request.json?)
-        else
-          local_start = fn -> apply(async, :start, [request, spec, spec_meta, async_opts]) end
+            dispatch_daemon_start_or_local(
+              daemon_client,
+              request,
+              async_opts,
+              %{
+                "request" => request_to_wire(request),
+                "spec" => spec,
+                "spec_meta" => admitted_spec_meta,
+                "runtime_opts" => []
+              },
+              local_start
+            )
+            |> render_async_dispatch(request)
 
-          dispatch_daemon_start_or_local(
-            daemon_client,
-            request,
-            async_opts,
-            %{
-              "request" => request_to_wire(request),
-              "spec" => spec,
-              "spec_meta" => spec_meta,
-              "runtime_opts" => []
-            },
-            local_start
-          )
-          |> render_async_dispatch(request)
+          {:error, error} ->
+            error_result(error, request.json?)
         end
 
       {:error, error} ->
@@ -2119,7 +2120,8 @@ defmodule Pixir.Delegate.CLIContract do
          {:ok, spec} <- decode_spec(raw),
          :ok <- validate_strict_spec_keys(spec, request.workspace, runtime_opts),
          {:ok, spec_meta} <- validate_spec(spec, request.workspace, runtime_opts),
-         {:ok, critical_path} <- Runner.critical_path(request, spec, spec_meta, runtime_opts) do
+         {:ok, critical_path} <- Runner.critical_path(request, spec, spec_meta, runtime_opts),
+         :ok <- Runner.validate_horizon_evidence(critical_path) do
       {:ok, spec, Map.merge(source_meta, Map.put(spec_meta, "critical_path", critical_path))}
     end
   end
@@ -2796,21 +2798,13 @@ defmodule Pixir.Delegate.CLIContract do
     end
   end
 
-  defp horizon_reject?(spec_meta, request) do
-    details = spec_meta["critical_path"] || %{}
+  defp admit_horizon_spec_meta(request, spec_meta) do
+    spec_meta = Map.delete(spec_meta, "horizon_override")
 
-    details["effective_timeout_ms"] < details["estimated_critical_path_ms"] and
-      not request.allow_short_horizon?
-  end
-
-  defp maybe_put_horizon_override(spec_meta, request) do
-    details = spec_meta["critical_path"] || %{}
-
-    if request.allow_short_horizon? and
-         details["effective_timeout_ms"] < details["estimated_critical_path_ms"] do
-      Map.put(spec_meta, "horizon_override", CriticalPath.horizon_values(details))
-    else
-      spec_meta
+    case Runner.admit_horizon_details(request, spec_meta["critical_path"]) do
+      {:ok, nil} -> {:ok, spec_meta}
+      {:ok, horizon_override} -> {:ok, Map.put(spec_meta, "horizon_override", horizon_override)}
+      {:error, error} -> {:error, error}
     end
   end
 
@@ -3431,6 +3425,7 @@ defmodule Pixir.Delegate.CLIContract do
               "invalid_args",
               "invalid_json",
               "invalid_spec",
+              "invalid_horizon_evidence",
               "horizon_shorter_than_critical_path"
             ],
        do: 2
@@ -3456,6 +3451,7 @@ defmodule Pixir.Delegate.CLIContract do
               "invalid_args",
               "invalid_json",
               "invalid_spec",
+              "invalid_horizon_evidence",
               "unsupported_mode",
               "horizon_shorter_than_critical_path"
             ],

@@ -364,6 +364,53 @@ defmodule Pixir.Providers.ResolvedProviderRequestTest do
     refute projection =~ "45000"
   end
 
+  test "absent web_search defaults on only after chatgpt_codex resolution" do
+    assert {:ok, chatgpt} = resolve(%{})
+    attached = ResolvedProviderRequest.attach_to_provider_opts(chatgpt, [])
+    assert attached[:web_search] == %{"enabled" => true}
+
+    assert {:ok, open} =
+             Registry.resolve_request(
+               selection(%{provider_opts: [responses_backend: open_profile()]}),
+               raw_config: %{}
+             )
+
+    open_attached = ResolvedProviderRequest.attach_to_provider_opts(open, [])
+    refute Keyword.has_key?(open_attached, :web_search)
+
+    assert {:ok, anthropic} = resolve(%{"model" => "claude-fable-5"})
+    anthropic_attached = ResolvedProviderRequest.attach_to_provider_opts(anthropic, [])
+    refute Keyword.has_key?(anthropic_attached, :web_search)
+  end
+
+  test "explicit web_search false beats the chatgpt_codex default" do
+    assert {:ok, resolved} = resolve(%{"web_search" => false})
+    assert resolved.provider_defaults.web_search == false
+
+    attached = ResolvedProviderRequest.attach_to_provider_opts(resolved, [])
+    assert attached[:web_search] == false
+
+    presenter =
+      ResolvedProviderRequest.attach_to_provider_opts(resolved, web_search: %{"enabled" => true})
+
+    assert presenter[:web_search] == %{"enabled" => true}
+
+    assert {:ok, enabled_config} = resolve(%{})
+
+    disabled =
+      ResolvedProviderRequest.attach_to_provider_opts(enabled_config, web_search: false)
+
+    assert disabled[:web_search] == false
+  end
+
+  test "invalid web_search config does not default-on for chatgpt_codex" do
+    assert {:ok, resolved} = resolve(%{"web_search" => %{"enabled" => true, "unknown" => true}})
+    assert resolved.provider_defaults.web_search == false
+
+    attached = ResolvedProviderRequest.attach_to_provider_opts(resolved, [])
+    assert attached[:web_search] == false
+  end
+
   test "certified custom providers accept only open profiles" do
     assert {:ok, resolved} =
              Registry.resolve_request(

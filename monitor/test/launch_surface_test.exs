@@ -394,32 +394,87 @@ defmodule PixirMonitor.LaunchSurfaceTest do
       LaunchSurface.stop(surface)
     end
 
-    test "a launcher that raises with the capability URL never leaks it into diagnostics" do
-      test_pid = self()
+    for {callback_mode, classification} <- [
+          raise: ":launcher_raised",
+          throw: ":launcher_threw",
+          exit: ":launcher_exited"
+        ] do
+      test "a launcher #{callback_mode} is fixed-classified, secretless, and re-enterable" do
+        callback_mode = unquote(callback_mode)
+        classification = unquote(classification)
+        test_pid = self()
 
-      # The launcher receives the real capability URL and raises with it in the
-      # message — exactly the shape that Exception.message/1 would leak.
-      Application.put_env(
-        :pixir_monitor,
-        :browser_launcher,
-        fn url -> raise "spawn failed for #{url}" end,
-        persistent: false
-      )
+        sentinels = %{
+          secret: "SECRET_SENTINEL_#{callback_mode}",
+          capability: "CAPABILITY_SENTINEL_#{callback_mode}",
+          raw_reason: "RAW_REASON_SENTINEL_#{callback_mode}"
+        }
 
-      {:ok, surface} =
-        LaunchSurface.start_link(launch_mode: "darwin", port: 45_931, platform: {:unix, :darwin}, emit: &send(test_pid, {:frame, &1}))
+        Application.put_env(
+          :pixir_monitor,
+          :browser_launcher,
+          fn url ->
+            send(test_pid, {:launcher_input, callback_mode, url})
+            fail_launcher(callback_mode, url, sentinels)
+          end,
+          persistent: false
+        )
 
-      outcome = LaunchSurface.outcome(surface, 5_000)
-      assert outcome.status == "failed"
-      assert outcome.kind == "browser_open_failed"
-      assert outcome.details.reason == ":launcher_raised"
+        {{first_outcome, second_outcome, frames, urls}, logs} =
+          ExUnit.CaptureLog.with_log(fn ->
+            {:ok, surface} =
+              LaunchSurface.start_unlinked(
+                launch_mode: "darwin",
+                port: 45_931,
+                platform: {:unix, :darwin},
+                emit: &send(test_pid, {:frame, &1})
+              )
 
-      frames = drain_frames(200)
-      assert Enum.any?(frames, &(&1[:kind] == "browser_open_failed"))
-      encoded = inspect({outcome, frames})
-      refute encoded =~ "launch="
-      refute encoded =~ "127.0.0.1"
-      refute encoded =~ "spawn failed"
+            on_exit(fn ->
+              if Process.alive?(surface), do: LaunchSurface.stop(surface)
+            end)
+
+            first_outcome = LaunchSurface.outcome(surface, 5_000)
+            assert_receive {:launcher_input, ^callback_mode, first_url}, 5_000
+            assert Process.alive?(surface)
+
+            second_outcome = LaunchSurface.reenter(surface, 5_000)
+            assert_receive {:launcher_input, ^callback_mode, second_url}, 5_000
+            assert Process.alive?(surface)
+
+            frames = drain_frames(200)
+            LaunchSurface.stop(surface)
+
+            {first_outcome, second_outcome, frames, [first_url, second_url]}
+          end)
+
+        for outcome <- [first_outcome, second_outcome] do
+          assert outcome.status == "failed"
+          assert outcome.kind == "browser_open_failed"
+          assert outcome.details.reason == classification
+        end
+
+        assert Enum.count(frames, &(&1[:kind] == "browser_open_failed")) == 2
+        assert length(Enum.uniq(urls)) == 2
+
+        capabilities = Enum.map(urls, &capability_of/1)
+
+        for capability <- capabilities do
+          assert {:ok, _session} = PixirMonitor.Vault.consume_launch(capability)
+          assert {:error, :invalid_or_expired} = PixirMonitor.Vault.consume_launch(capability)
+        end
+
+        diagnostics = inspect({first_outcome, second_outcome, frames})
+
+        forbidden =
+          [sentinels.secret, sentinels.capability, sentinels.raw_reason] ++
+            urls ++ capabilities
+
+        for bytes <- forbidden do
+          refute diagnostics =~ bytes
+          refute logs =~ bytes
+        end
+      end
     end
 
     test "a launcher returning outside its contract is a fixed-atom failure, never an inspected term" do
@@ -477,6 +532,29 @@ defmodule PixirMonitor.LaunchSurfaceTest do
       assert {:ok, expired} = PixirMonitor.Vault.issue_launch_for_test(0)
       assert {:error, :invalid_or_expired} = PixirMonitor.Vault.consume_launch(expired)
     end
+  end
+
+  defp fail_launcher(:raise, url, sentinels) do
+    raise "#{sentinels.secret} #{sentinels.capability} #{sentinels.raw_reason} #{url}"
+  end
+
+  defp fail_launcher(:throw, url, sentinels) do
+    throw(%{
+      secret: sentinels.secret,
+      capability: sentinels.capability,
+      raw_reason: sentinels.raw_reason,
+      url: url
+    })
+  end
+
+  defp fail_launcher(:exit, url, sentinels) do
+    exit({
+      :launcher_exit,
+      sentinels.secret,
+      sentinels.capability,
+      sentinels.raw_reason,
+      url
+    })
   end
 
   defp assert_readiness! do

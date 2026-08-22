@@ -45,7 +45,7 @@ defmodule PixirMonitor.WorkspaceSetDegradationTest do
       active_port: Application.get_env(:pixir_monitor, :active_port)
     }
 
-    root = Path.join(System.tmp_dir!(), "pixir-workspace-degradation-#{System.unique_integer([:positive])}")
+    root = PixirMonitor.TestRun.tmp("pixir-workspace-degradation")
     left = Path.join(root, "left-root")
     right = Path.join(root, "right-root")
     File.mkdir_p!(left)

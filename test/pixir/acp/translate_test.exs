@@ -7,24 +7,54 @@ defmodule Pixir.ACP.TranslateTest do
 
   describe "update/2 streaming" do
     test "text_delta -> agent_message_chunk" do
-      e = Event.text_delta("pix", "hello")
+      first = Event.text_delta("pix", "hello")
+      second = Event.text_delta("pix", " world")
+      opts = [prompt_ref: "prompt-7"]
 
       assert %{
                "sessionId" => @sid,
                "update" => %{
                  "sessionUpdate" => "agent_message_chunk",
+                 "messageId" => message_id,
                  "content" => %{"type" => "text", "text" => "hello"}
                }
-             } = Translate.update(e, @sid)
+             } = Translate.update(first, @sid, opts)
+
+      assert %{
+               "update" => %{
+                 "sessionUpdate" => "agent_message_chunk",
+                 "messageId" => ^message_id,
+                 "content" => %{"type" => "text", "text" => " world"}
+               }
+             } = Translate.update(second, @sid, opts)
+
+      assert is_binary(message_id)
+      refute message_id =~ first.id
+      refute message_id =~ second.id
     end
 
     test "reasoning_delta -> agent_thought_chunk" do
-      e = Event.reasoning_delta("pix", "thinking")
+      first = Event.reasoning_delta("pix", "think")
+      second = Event.reasoning_delta("pix", "ing")
+      opts = [prompt_ref: "prompt-7"]
 
       assert %{"update" => %{"sessionUpdate" => "agent_thought_chunk"} = u} =
-               Translate.update(e, @sid)
+               Translate.update(first, @sid, opts)
 
-      assert u["content"] == %{"type" => "text", "text" => "thinking"}
+      assert u["content"] == %{"type" => "text", "text" => "think"}
+      assert is_binary(u["messageId"])
+
+      assert %{"update" => %{"messageId" => message_id, "content" => content}} =
+               Translate.update(second, @sid, opts)
+
+      assert message_id == u["messageId"]
+      assert content == %{"type" => "text", "text" => "ing"}
+
+      refute message_id ==
+               get_in(Translate.update(Event.text_delta("pix", "hi"), @sid, opts), [
+                 "update",
+                 "messageId"
+               ])
     end
   end
 
@@ -142,6 +172,46 @@ defmodule Pixir.ACP.TranslateTest do
                Translate.update(e, @sid)
 
       assert [%{"content" => %{"text" => "io_error: no such file"}}] = content
+    end
+
+    test "write result can render bounded new-file diff content" do
+      e = Event.tool_result("pix", "c-write", %{"ok" => true, "output" => "wrote"})
+
+      assert %{"update" => %{"content" => [diff]}} =
+               Translate.update(e, @sid,
+                 workspace: "/workspace",
+                 tool_name: "write",
+                 tool_call_args: %{"path" => "new.txt", "content" => "new body"}
+               )
+
+      assert diff == %{
+               "type" => "diff",
+               "path" => "/workspace/new.txt",
+               "oldText" => nil,
+               "newText" => "new body"
+             }
+    end
+
+    test "edit result can render bounded old/new diff content" do
+      e = Event.tool_result("pix", "c-edit", %{"ok" => true, "output" => "edited"})
+
+      assert %{"update" => %{"content" => [diff]}} =
+               Translate.update(e, @sid,
+                 workspace: "/workspace",
+                 tool_name: "edit",
+                 tool_call_args: %{
+                   "path" => "lib/a.ex",
+                   "old_string" => "old",
+                   "new_string" => "new"
+                 }
+               )
+
+      assert diff == %{
+               "type" => "diff",
+               "path" => "/workspace/lib/a.ex",
+               "oldText" => "old",
+               "newText" => "new"
+             }
     end
 
     test "adds Pixir semantic metadata for subagent and workflow results" do
@@ -308,18 +378,24 @@ defmodule Pixir.ACP.TranslateTest do
       assert %{"sessionId" => @sid, "update" => user_update} =
                Translate.replay(Event.user_message("pix", "hello"), @sid)
 
-      assert user_update == %{
-               "sessionUpdate" => "user_message_chunk",
-               "content" => %{"type" => "text", "text" => "hello"}
-             }
+      assert user_update["sessionUpdate"] == "user_message_chunk"
+      assert user_update["content"] == %{"type" => "text", "text" => "hello"}
+      assert is_binary(user_update["messageId"])
 
       assert %{"update" => assistant_update} =
                Translate.replay(Event.assistant_message("pix", "hi back"), @sid)
 
-      assert assistant_update == %{
-               "sessionUpdate" => "agent_message_chunk",
-               "content" => %{"type" => "text", "text" => "hi back"}
-             }
+      assert assistant_update["sessionUpdate"] == "agent_message_chunk"
+      assert assistant_update["content"] == %{"type" => "text", "text" => "hi back"}
+      assert is_binary(assistant_update["messageId"])
+    end
+
+    test "replay messageId is stable for the same history event" do
+      event = Event.user_message("pix", "hello")
+      first = Translate.replay(event, @sid)
+      second = Translate.replay(event, @sid)
+
+      assert get_in(first, ["update", "messageId"]) == get_in(second, ["update", "messageId"])
     end
 
     test "omits partial assistant evidence from clean transcript replay" do
@@ -372,9 +448,12 @@ defmodule Pixir.ACP.TranslateTest do
                "sessionId" => @sid,
                "update" => %{
                  "sessionUpdate" => "agent_message_chunk",
+                 "messageId" => message_id,
                  "content" => %{"type" => "text", "text" => "capped"}
                }
              } = Translate.message_chunk("capped", @sid)
+
+      assert is_binary(message_id)
     end
   end
 

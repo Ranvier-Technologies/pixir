@@ -94,7 +94,7 @@ defmodule Pixir.ConfigTest do
              "max_retries" => 2,
              "stream_idle_timeout_ms" => 180_000,
              "web_search" => nil,
-             "compaction" => %{"tail_events" => 40, "model_assisted" => false},
+             "compaction" => %{"tail_events" => 40, "model_assisted" => false, "native" => nil},
              "model" => "gpt-5.5",
              "models" => nil,
              "anthropic_models" => nil,
@@ -159,9 +159,27 @@ defmodule Pixir.ConfigTest do
 
     assert result["effective"]["compaction"]["tail_events"] == 12
     assert result["effective"]["compaction"]["model_assisted"] == true
+    assert result["effective"]["compaction"]["native"] == nil
     assert result["effective"]["model"] == "gpt-5.3-codex"
     assert result["effective"]["models"] == ["gpt-5.3-codex"]
     assert result["effective"]["context_windows"] == %{"gpt-5.3-codex" => 64_000}
+  end
+
+  test "compaction.native is nil, true, or false and invalid stays nil", %{
+    config_path: config_path
+  } do
+    assert Config.compaction_native(config_path: config_path) == nil
+
+    File.write!(config_path, Jason.encode!(%{"compaction" => %{"native" => true}}))
+    assert Config.compaction_native(config_path: config_path) == true
+
+    File.write!(config_path, Jason.encode!(%{"compaction" => %{"native" => false}}))
+    assert Config.compaction_native(config_path: config_path) == false
+
+    File.write!(config_path, Jason.encode!(%{"compaction" => %{"native" => "on"}}))
+    loaded = Config.load(config_path: config_path)
+    assert loaded["effective"]["compaction"]["native"] == nil
+    assert Enum.any?(loaded["warnings"], &(&1["field"] == "compaction.native"))
   end
 
   test "web_search explicit disable stays unwarned and malformed lists warn without crashing",
@@ -170,13 +188,34 @@ defmodule Pixir.ConfigTest do
 
     result = Config.load(config_path: config_path)
     assert result["warnings"] == []
-    assert result["effective"]["web_search"] == nil
+    assert result["effective"]["web_search"] == false
 
     File.write!(config_path, Jason.encode!(%{"web_search" => [1, 2, 3]}))
 
     result = Config.load(config_path: config_path)
     assert Enum.any?(result["warnings"], &(&1["field"] == "web_search"))
-    assert result["effective"]["web_search"] == nil
+    assert result["effective"]["web_search"] == false
+  end
+
+  test "web_search distinguishes absent, explicit enable, and explicit disable",
+       %{config_path: config_path} do
+    assert Config.load(config_path: config_path)["effective"]["web_search"] == nil
+    assert {:ok, absent} = Config.request_snapshot(config_path: config_path)
+    assert absent.provider_defaults.web_search == nil
+
+    File.write!(config_path, Jason.encode!(%{"web_search" => true}))
+
+    assert Config.load(config_path: config_path)["effective"]["web_search"] == %{
+             "enabled" => true
+           }
+
+    assert {:ok, enabled} = Config.request_snapshot(config_path: config_path)
+    assert enabled.provider_defaults.web_search == %{"enabled" => true}
+
+    File.write!(config_path, Jason.encode!(%{"web_search" => false}))
+    assert Config.load(config_path: config_path)["effective"]["web_search"] == false
+    assert {:ok, disabled} = Config.request_snapshot(config_path: config_path)
+    assert disabled.provider_defaults.web_search == false
   end
 
   test "keeps bash timeout max at least as large as an explicit timeout and warns", %{
@@ -217,7 +256,7 @@ defmodule Pixir.ConfigTest do
         "max_retries" => -1,
         "stream_idle_timeout_ms" => "forever",
         "web_search" => %{"enabled" => true, "unknown" => true},
-        "compaction" => %{"tail_events" => 0, "model_assisted" => "yes"},
+        "compaction" => %{"tail_events" => 0, "model_assisted" => "yes", "native" => "yes"},
         "model" => 42,
         "models" => ["ok", 7],
         "context_windows" => %{"bad" => "nope"}
@@ -240,6 +279,7 @@ defmodule Pixir.ConfigTest do
     assert MapSet.member?(fields, "web_search")
     assert MapSet.member?(fields, "compaction.tail_events")
     assert MapSet.member?(fields, "compaction.model_assisted")
+    assert MapSet.member?(fields, "compaction.native")
     assert MapSet.member?(fields, "model")
     assert MapSet.member?(fields, "models")
     assert MapSet.member?(fields, "context_windows")
@@ -258,9 +298,10 @@ defmodule Pixir.ConfigTest do
 
     assert result["effective"]["max_retries"] == 2
     assert result["effective"]["stream_idle_timeout_ms"] == 180_000
-    assert result["effective"]["web_search"] == nil
+    assert result["effective"]["web_search"] == false
     assert result["effective"]["compaction"]["tail_events"] == 40
     assert result["effective"]["compaction"]["model_assisted"] == false
+    assert result["effective"]["compaction"]["native"] == nil
     assert result["effective"]["model"] == "gpt-5.5"
     assert result["effective"]["models"] == nil
     assert result["effective"]["context_windows"] == %{}
@@ -544,10 +585,10 @@ defmodule Pixir.ConfigTest do
     for value <- [uri, DateTime.utc_now(), MapSet.new([:enabled])] do
       loaded = Config.load(raw_config: %{"web_search" => value})
       assert Enum.any?(loaded["warnings"], &(&1["field"] == "web_search"))
-      assert loaded["effective"]["web_search"] == nil
+      assert loaded["effective"]["web_search"] == false
       refute inspect(loaded) =~ sentinel
       assert {:ok, snapshot} = Config.request_snapshot(raw_config: %{"web_search" => value})
-      assert snapshot.provider_defaults.web_search == nil
+      assert snapshot.provider_defaults.web_search == false
     end
 
     loaded = Config.load(raw_config: %{"context_windows" => uri})
@@ -584,7 +625,12 @@ defmodule Pixir.ConfigTest do
     assert MapSet.member?(warnings, "host_commands")
     assert loaded["effective"]["reasoning"]["effort"] == nil
     assert loaded["effective"]["text"]["verbosity"] == nil
-    assert loaded["effective"]["compaction"] == %{"tail_events" => 40, "model_assisted" => false}
+
+    assert loaded["effective"]["compaction"] == %{
+             "tail_events" => 40,
+             "model_assisted" => false,
+             "native" => nil
+           }
 
     assert loaded["effective"]["host_commands"] == %{
              "max_concurrent" => 4,
@@ -655,7 +701,7 @@ defmodule Pixir.ConfigTest do
     Application.put_env(:pixir, :web_search, improper_web_search)
 
     assert {:ok, app_snapshot} = Config.request_snapshot(raw_config: %{})
-    assert app_snapshot.provider_defaults.web_search == nil
+    assert app_snapshot.provider_defaults.web_search == false
 
     Application.delete_env(:pixir, :web_search)
 
@@ -667,7 +713,7 @@ defmodule Pixir.ConfigTest do
                }
              )
 
-    assert raw_snapshot.provider_defaults.web_search == nil
+    assert raw_snapshot.provider_defaults.web_search == false
     assert raw_snapshot.model == "gpt-5.5"
 
     loaded = Config.load(raw_config: %{"models" => improper_models})
@@ -756,18 +802,18 @@ defmodule Pixir.ConfigTest do
     unsafe = %{"filters" => Date.utc_today()}
 
     loaded = Config.load(raw_config: %{"web_search" => unsafe})
-    assert loaded["effective"]["web_search"] == nil
+    assert loaded["effective"]["web_search"] == false
     assert Enum.any?(loaded["warnings"], &(&1["field"] == "web_search"))
 
     assert {:ok, raw_snapshot} =
              Config.request_snapshot(raw_config: %{"web_search" => unsafe})
 
-    assert raw_snapshot.provider_defaults.web_search == nil
+    assert raw_snapshot.provider_defaults.web_search == false
 
     Application.put_env(:pixir, :web_search, unsafe)
-    assert Config.load(raw_config: %{})["effective"]["web_search"] == nil
+    assert Config.load(raw_config: %{})["effective"]["web_search"] == false
     assert {:ok, app_snapshot} = Config.request_snapshot(raw_config: %{})
-    assert app_snapshot.provider_defaults.web_search == nil
+    assert app_snapshot.provider_defaults.web_search == false
   end
 
   test "rejected web_search warnings never inspect or echo hostile values" do
@@ -775,7 +821,7 @@ defmodule Pixir.ConfigTest do
     hostile = %{"filters" => %HostileWebSearchValue{secret: sentinel}}
 
     loaded = Config.load(raw_config: %{"web_search" => hostile})
-    assert loaded["effective"]["web_search"] == nil
+    assert loaded["effective"]["web_search"] == false
 
     assert [%{"field" => "web_search", "message" => "invalid value; ignoring"}] =
              loaded["warnings"]
@@ -783,7 +829,7 @@ defmodule Pixir.ConfigTest do
     refute inspect(loaded) =~ sentinel
 
     Application.put_env(:pixir, :web_search, hostile)
-    assert Config.load(raw_config: %{})["effective"]["web_search"] == nil
+    assert Config.load(raw_config: %{})["effective"]["web_search"] == false
   end
 
   test "invalid web_search map keys never enter errors or warnings" do
@@ -792,7 +838,7 @@ defmodule Pixir.ConfigTest do
     unsafe = %{hostile_key => "value"}
 
     loaded = Config.load(raw_config: %{"web_search" => unsafe})
-    assert loaded["effective"]["web_search"] == nil
+    assert loaded["effective"]["web_search"] == false
 
     assert [%{"field" => "web_search", "message" => "invalid value; ignoring"}] =
              loaded["warnings"]
@@ -802,7 +848,7 @@ defmodule Pixir.ConfigTest do
     assert {:ok, snapshot} =
              Config.request_snapshot(raw_config: %{"web_search" => unsafe})
 
-    assert snapshot.provider_defaults.web_search == nil
+    assert snapshot.provider_defaults.web_search == false
   end
 
   test "web_search normalized key collisions fail closed instead of last-write-win" do
@@ -811,13 +857,13 @@ defmodule Pixir.ConfigTest do
           %{:filters => %{"first" => true}, "filters" => %{"second" => true}}
         ] do
       loaded = Config.load(raw_config: %{"web_search" => web_search})
-      assert loaded["effective"]["web_search"] == nil
+      assert loaded["effective"]["web_search"] == false
       assert Enum.any?(loaded["warnings"], &(&1["field"] == "web_search"))
 
       assert {:ok, snapshot} =
                Config.request_snapshot(raw_config: %{"web_search" => web_search})
 
-      assert snapshot.provider_defaults.web_search == nil
+      assert snapshot.provider_defaults.web_search == false
     end
   end
 

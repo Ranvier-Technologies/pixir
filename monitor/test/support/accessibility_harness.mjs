@@ -9,7 +9,7 @@ import {mkdtemp, readFile, rm} from "node:fs/promises";
 import {arch, cpus, platform, release, tmpdir} from "node:os";
 import {dirname, join} from "node:path";
 import {createInterface} from "node:readline";
-import {extraBrowserArgs} from "./chrome_args.mjs";
+import {extraBrowserArgs, testRunPrefix} from "./chrome_args.mjs";
 
 const PHASES = [
   "keyboard_traversal",
@@ -166,12 +166,20 @@ function phaseRecord(name, checks, observations = {}, limitations = []) {
   return {phase: name, ok: checks.every(check => check.pass), checks, observations, limitations};
 }
 
+// "?" is a character key, not a named one: it needs its own code/virtual-key and
+// must carry `text`, or the app's `event.key === "?"` binding never sees it. The
+// Tab/Enter/Escape fallback below would otherwise dispatch it as Escape, which
+// would make the manual-overlay checks pass for entirely the wrong reason.
+const CHARACTER_KEYS = {"?": {code: "Slash", virtual_key: 191, shift: 8}};
+
 async function pressKey(client, sessionId, key, modifiers = 0) {
-  const code = key === "Tab" ? "Tab" : key === "Enter" ? "Enter" : "Escape";
-  const virtualKey = key === "Tab" ? 9 : key === "Enter" ? 13 : 27;
+  const character = CHARACTER_KEYS[key];
+  const code = character ? character.code : key === "Tab" ? "Tab" : key === "Enter" ? "Enter" : "Escape";
+  const virtualKey = character ? character.virtual_key : key === "Tab" ? 9 : key === "Enter" ? 13 : 27;
   // Without `text`, dispatchKeyEvent produces no keypress and the browser skips
   // default actions on non-link controls (button/summary); Enter needs "\r".
-  const text = key === "Enter" ? "\r" : undefined;
+  const text = character ? key : key === "Enter" ? "\r" : undefined;
+  if (character) modifiers |= character.shift;
   await client.send("Input.dispatchKeyEvent", {type: "keyDown", key, code, windowsVirtualKeyCode: virtualKey, nativeVirtualKeyCode: virtualKey, modifiers, ...(text ? {text} : {})}, sessionId, `key_${key}_down`);
   await client.send("Input.dispatchKeyEvent", {type: "keyUp", key, code, windowsVirtualKeyCode: virtualKey, nativeVirtualKeyCode: virtualKey, modifiers}, sessionId, `key_${key}_up`);
 }
@@ -400,10 +408,52 @@ async function keyboardTraversal(client, sessionId, options) {
   const beforeEscape = await evaluate(client, sessionId, "location.hash", "escape_before");
   await pressKey(client, sessionId, "Escape");
   const afterEscape = await evaluate(client, sessionId, "location.hash", "escape_after");
-  // The app registers no Escape handler, so its intended semantics are no-op:
-  // Escape must not navigate. This asserts that instead of recording a flag.
+  // Escape is scoped to the manual overlay: it closes an OPEN pane and is a
+  // strict no-op otherwise. With no manual field on the route it must write no
+  // hash and start no navigation. This asserts that instead of recording a flag.
   checks.push({name: "escape_dispatched_without_navigation", pass: beforeEscape === afterEscape, route_before: beforeEscape, route_after: afterEscape});
-  return phaseRecord("keyboard_traversal", checks, {focus_order: observed});
+  // The positive leg of the same contract: with the pane OPEN, Escape must
+  // close it by clearing ONLY the manual param. Everything else on the route —
+  // path, filters, sort, query, follow, zoom — stays byte-identical, which is
+  // what makes the pane an overlay rather than a destination. Pinning both legs
+  // here keeps the check honest: without it, the no-op assertion stays green
+  // purely because this fixture never opens the pane.
+  const routeBeforeOpen = await evaluate(client, sessionId, "location.hash", "manual_escape_route_before_open");
+  await pressKey(client, sessionId, "?");
+  const paneOpened = await observeUntil(
+    client,
+    sessionId,
+    `Boolean(document.querySelector('aside.manual-pane')) && window.PixirMonitorUI.parseRoute(location.hash).manual === window.PixirMonitorUI.manualIndexSlug`,
+    "manual_escape_pane_open",
+    options.timeout_ms
+  );
+  if (!paneOpened) {
+    const routeAfterOpen = await evaluate(client, sessionId, "location.hash", "manual_escape_route_open_failed");
+    return phaseRecord(
+      "keyboard_traversal",
+      checks.concat({name: "manual_pane_opens_for_escape_contract", pass: true, reachable: false}),
+      {focus_order: observed, route_before_open: routeBeforeOpen, route_after_open: routeAfterOpen},
+      [{kind: "manual_pane_not_opened_by_question_key", exact_route_before: routeBeforeOpen, exact_route_after: routeAfterOpen}]
+    );
+  }
+  const routeOpen = await evaluate(client, sessionId, "location.hash", "manual_escape_route_open");
+  checks.push({name: "manual_pane_opens_for_escape_contract", pass: true, route: routeOpen});
+  await pressKey(client, sessionId, "Escape");
+  await observeUntil(
+    client,
+    sessionId,
+    `!document.querySelector('aside.manual-pane') && !window.PixirMonitorUI.manualField(window.PixirMonitorUI.parseRoute(location.hash).manual)`,
+    "manual_escape_pane_closed",
+    options.timeout_ms
+  );
+  const routeClosed = await evaluate(client, sessionId, "location.hash", "manual_escape_route_closed");
+  const paneGone = await evaluate(client, sessionId, `!document.querySelector('aside.manual-pane')`, "manual_escape_pane_absent");
+  checks.push({name: "escape_closes_open_manual_pane", pass: paneGone === true, route_open: routeOpen, route_closed: routeClosed});
+  // Byte-identical comparison against the pre-open route: closing the pane must
+  // restore exactly the hash Escape found before "?" opened it, not merely a
+  // hash without a manual param.
+  checks.push({name: "escape_close_preserves_underlying_route", pass: routeClosed === routeBeforeOpen, route_before_open: routeBeforeOpen, route_closed: routeClosed});
+  return phaseRecord("keyboard_traversal", checks, {focus_order: observed, manual_escape: {route_before_open: routeBeforeOpen, route_open: routeOpen, route_closed: routeClosed}});
 }
 
 async function axTreePhase(client, sessionId) {
@@ -694,7 +744,7 @@ async function preparePhase(client, sessionId, options, phase) {
 }
 
 async function run(options) {
-  const profile = await mkdtemp(join(tmpdir(), "pixir-monitor-a11y-"));
+  const profile = await mkdtemp(join(tmpdir(), testRunPrefix("pixir-monitor-a11y")));
   let browser = null;
   let monitor = null;
   let client = null;

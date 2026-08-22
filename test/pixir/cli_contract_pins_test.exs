@@ -205,6 +205,20 @@ defmodule Pixir.CLIContractPinsTest do
     assert_field(structured, "details", &is_map/1)
   end
 
+  test "unknown-subcommand refusal pins the pre-session structured error shape (#546)" do
+    refusal =
+      capture_io(fn ->
+        assert {:error, 2} = CLI.route(["--json", "serve", "--launch-mode", "help"])
+      end)
+      |> decode_json!()
+
+    assert refusal["ok"] == false
+    structured = assert_field(refusal, "error", &is_map/1)
+    assert structured["kind"] == "invalid_args"
+    details = assert_field(structured, "details", &is_map/1)
+    assert details["command"] == "serve"
+  end
+
   test "timeout envelope pins fail-closed recovery fields" do
     in_tmp_workspace("pixir-cli-contract-timeout", fn _workspace ->
       with_cli_provider(

@@ -6,6 +6,8 @@ copyable examples.
 - `CONTEXT.md` is the glossary only. Do not put implementation specs or scratch plans
   there.
 - ADRs live in `docs/adr/`; add one only for a hard-to-reverse, surprising trade-off.
+- Design notes live in `docs/design/`. The #522-B/C/D native compact implementation
+  plan is `docs/design/0004-native-openai-compaction-implementation.md`.
 - `docs/benchmarks/AGENTS.md` owns benchmark specs and reports.
 - `docs/examples/AGENTS.md` owns copyable examples; examples should be deterministic and
   offline unless explicitly named otherwise.

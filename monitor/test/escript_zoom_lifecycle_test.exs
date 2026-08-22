@@ -77,11 +77,7 @@ defmodule PixirMonitor.EscriptZoomLifecycleTest do
   @tag skip: @browser_skip
   @tag timeout: 240_000
   test "authoritative SSE refetch preserves then honestly clamps semantic zoom state" do
-    root =
-      Path.join(
-        System.tmp_dir!(),
-        "pixir-monitor-escript-zoom-lifecycle-#{System.unique_integer([:positive])}"
-      )
+    root = PixirMonitor.TestRun.tmp("pixir-monitor-escript-zoom-lifecycle")
 
     workspace = Path.join(root, "workspace")
     File.mkdir_p!(workspace)

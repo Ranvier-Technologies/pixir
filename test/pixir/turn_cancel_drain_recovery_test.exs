@@ -146,20 +146,25 @@ defmodule Pixir.TurnCancelDrainRecoveryTest do
      }}
   end
 
-  # The turn generation a Session really hands out, read from a GENUINELY started Turn's
-  # own ctx rather than written as a literal (#462 CR). A literal keeps passing if
-  # `start_turn/2` ever numbers differently, and the whole point of the stamp is that it
-  # is the identity the Session itself issues. The probe Turn is a no-op that returns at
-  # once, so the Session is idle again before this returns.
-  defp started_turn_generation(sid) do
+  # The compound identity a Session really hands out, read from a GENUINELY started
+  # Turn's own ctx rather than assembled from literals (#462 CR, #471). The probe Turn is
+  # a no-op that returns at once, so the Session is idle again before this returns.
+  defp started_turn_identity(sid) do
     test_pid = self()
     {:ok, _ref} = Session.start_turn(sid, fn ctx -> send(test_pid, {:probe_ctx, ctx}) end)
-    assert_receive {:probe_ctx, %{turn_generation: generation}}, 5_000
+
+    assert_receive {:probe_ctx,
+                    %{
+                      session_incarnation: session_incarnation,
+                      turn_generation: generation
+                    }},
+                   5_000
+
     # The Task ref `start_turn/2` returns belongs to the SESSION, which is the process that
     # awaits the Turn — the test never receives on it. So the wait for the probe Turn to be
     # released is on the Session's own observable state instead.
     wait_until_idle(sid)
-    generation
+    {session_incarnation, generation}
   end
 
   defp wait_until_idle(sid, attempts \\ 100) do
@@ -194,6 +199,7 @@ defmodule Pixir.TurnCancelDrainRecoveryTest do
   test "cancelling while the stream is still open persists the call committed on the wire",
        %{sid: sid, ws: ws} do
     auth = start_auth()
+    test_pid = self()
     # Built HERE, in the test process: the transport closure captures `self()` so it can
     # announce each committed call back to the test. Building it inside the Turn closure
     # would capture the Turn Task instead and the announcements would go nowhere.
@@ -201,6 +207,11 @@ defmodule Pixir.TurnCancelDrainRecoveryTest do
 
     {:ok, _ref} =
       Session.start_turn(sid, fn turn_ctx ->
+        send(
+          test_pid,
+          {:turn_runtime_identity, turn_ctx.session_incarnation, turn_ctx.turn_generation}
+        )
+
         Turn.run(turn_ctx, "run a command",
           provider: Pixir.Provider,
           provider_opts: [
@@ -214,6 +225,9 @@ defmodule Pixir.TurnCancelDrainRecoveryTest do
           ]
         )
       end)
+
+    assert_receive {:turn_runtime_identity, session_incarnation, 1}, 5_000
+    assert is_reference(session_incarnation)
 
     # The call is on the wire and the stream has NOT returned. This is the kill window.
     assert_receive {:call_committed_on_the_wire, "call_midstream"}, 5_000
@@ -239,12 +253,12 @@ defmodule Pixir.TurnCancelDrainRecoveryTest do
 
     # `"interrupt"` is load-bearing, not incidental (#462 CR). It is the reason written by
     # the ACCUMULATE-then-interrupt-drain path — the production one: the declaration
-    # matched the live Turn's generation, was held in `committed_calls`, and was drained
-    # when `interrupt/1` killed the Turn. The Session's *straggler* clause writes
-    # `"declared_without_turn"` (no Turn) or `"stale_turn_generation"` (wrong Turn)
-    # instead, so seeing either here would mean this test had stopped exercising the path
-    # it claims to — which is exactly what a ctx built without `turn_generation` produces,
-    # since `nil` is always routed to that clause.
+    # matched the live Turn's compound runtime identity, was held in `committed_calls`,
+    # and was drained when `interrupt/1` killed the Turn. The Session's *straggler* clause
+    # writes `"declared_without_turn"` (no Turn), `"stale_turn_generation"` (wrong runtime
+    # identity), or `"unstamped_declaration"` (no identity during a live Turn) instead.
+    # Seeing one here would mean Turn stopped transporting the process incarnation paired
+    # with the numeric generation.
     assert drained.data["drained"]["reason"] == "interrupt"
     assert drained.data["name"] == "bash"
 
@@ -253,6 +267,29 @@ defmodule Pixir.TurnCancelDrainRecoveryTest do
 
     assert result.data["ok"] == false
     assert result.data["error"]["kind"] == "orphan_tool_call"
+
+    assert [failure] = Enum.filter(history, &(&1.type == :turn_failed))
+    assert failure.data["terminal_status"] == "interrupted"
+    assert failure.data["error_kind"] == "interrupted"
+    assert failure.data["details"] == %{"scope" => "turn"}
+
+    raw = File.read!(Log.path(sid, workspace: ws))
+    decoded = raw |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+
+    assert Enum.map(decoded, & &1["type"]) == [
+             "user_message",
+             "tool_call",
+             "tool_result",
+             "turn_failed"
+           ]
+
+    assert Enum.count(decoded, &(&1["type"] == "turn_failed")) == 1
+    assert Enum.at(decoded, 3)["data"]["terminal_status"] == "interrupted"
+
+    refute raw =~ inspect(session_incarnation)
+    refute raw =~ "session_incarnation"
+    refute raw =~ "turn_identity"
+    refute raw =~ "#Reference"
   end
 
   # #462 round 3: the declare hand-off is a synchronous `GenServer.call`, and against a
@@ -271,29 +308,31 @@ defmodule Pixir.TurnCancelDrainRecoveryTest do
     # Session already gone — the exact `:noproc` window.
     transport = commit_on_cue("call_orphaned")
 
-    # #462 CR: the ctx carries a REAL `turn_generation`, taken from the ctx
-    # `Session.start_turn/2` builds, not `nil` and not a literal. `nil` means "no identity
-    # claimed" and is always routed to the Session's straggler clause, so a ctx without it
-    # never exercises the production hand-off shape at all.
-    #
-    # The Turn cannot itself run *under* `start_turn/2` here, and the reason is worth
-    # stating so nobody "fixes" it back: `Session.terminate/2` calls
-    # `terminate_active_turn/1`, so the `GenServer.stop` below would kill the Turn Task,
-    # and with `stream_idle_timeout_ms: :infinity` `StreamIdle.run/3` streams IN-PROCESS
-    # (no `spawn_monitor`) — the open stream would die with the Task before the cue could
-    # be consumed. That watchdog-free in-process stream is the very window being
-    # reproduced. What this test measures is unaffected either way: the Session is
-    # provably GONE when the declare runs, so the declare exits `:noproc` before any
-    # generation comparison can happen. The stamp is here so the ctx is production-shaped,
-    # not because the outcome turns on its value.
-    generation = started_turn_generation(sid)
+    # #462 CR / #471: the ctx carries the REAL compound runtime identity taken from a ctx
+    # `Session.start_turn/2` built, not `nil` and not literals. The Turn cannot itself run
+    # *under* `start_turn/2` here, and the reason is worth stating so nobody "fixes" it
+    # back: `Session.terminate/2` calls `terminate_active_turn/1`, so the `GenServer.stop`
+    # below would kill the Turn Task, and with `stream_idle_timeout_ms: :infinity`
+    # `StreamIdle.run/3` streams IN-PROCESS (no `spawn_monitor`) — the open stream would
+    # die with the Task before the cue could be consumed. That watchdog-free in-process
+    # stream is the very window being reproduced. What this test measures is unaffected
+    # either way: the Session is provably GONE when the declare runs, so the declare exits
+    # `:noproc` before any identity comparison can happen. The stamp is here so the ctx is
+    # production-shaped, not because the outcome turns on its value.
+    {session_incarnation, generation} = started_turn_identity(sid)
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
         turn =
           Task.async(fn ->
             Turn.run(
-              %{session_id: sid, workspace: ws, role: :build, turn_generation: generation},
+              %{
+                session_id: sid,
+                workspace: ws,
+                role: :build,
+                session_incarnation: session_incarnation,
+                turn_generation: generation
+              },
               "run it",
               provider: Pixir.Provider,
               provider_opts: [
@@ -435,14 +474,19 @@ defmodule Pixir.TurnCancelDrainRecoveryTest do
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        # #462 CR: `turn_generation` stamped, matching the ctx `Session.start_turn/2`
-        # builds for a first Turn. This Session is a stub that cannot serve `start_turn`,
-        # so the generation is supplied by hand rather than derived — but it must be
-        # PRESENT: without it every declaration arrives `nil` and takes the straggler
-        # clause, and this test would be measuring a path it does not claim to.
+        # #462 CR / #471: a complete compound runtime identity is stamped. This Session
+        # is a stub that cannot serve `start_turn`, so the opaque reference and generation
+        # are supplied here; omitting either would make Turn declare under `nil`, and this
+        # test would no longer exercise the production hand-off shape it claims to.
         result =
           Turn.run(
-            %{session_id: sid, workspace: ws, role: :build, turn_generation: 1},
+            %{
+              session_id: sid,
+              workspace: ws,
+              role: :build,
+              session_incarnation: make_ref(),
+              turn_generation: 1
+            },
             "run it",
             provider: Pixir.Provider,
             provider_opts: [
@@ -572,7 +616,13 @@ defmodule Pixir.TurnCancelDrainRecoveryTest do
     {result, log} =
       ExUnit.CaptureLog.with_log(fn ->
         Turn.run(
-          %{session_id: sid, workspace: ws, role: :build, turn_generation: 1},
+          %{
+            session_id: sid,
+            workspace: ws,
+            role: :build,
+            session_incarnation: make_ref(),
+            turn_generation: 1
+          },
           "run it",
           provider: Pixir.Provider,
           provider_opts: [
@@ -1512,7 +1562,7 @@ defmodule Pixir.TurnCancelDrainRecoveryTest do
   # Auth server is linked to its caller.
   defp start_auth do
     auth = :"auth_462_#{System.unique_integer([:positive])}"
-    store = Path.join(System.tmp_dir!(), "pixir-462-auth-#{System.unique_integer([:positive])}")
+    store = tmp_auth_store("pixir-462-auth-")
 
     {:ok, _} =
       Pixir.Auth.start_link(
@@ -1522,8 +1572,20 @@ defmodule Pixir.TurnCancelDrainRecoveryTest do
         oauth: __MODULE__.NoOAuth
       )
 
-    on_exit(fn -> File.rm_rf!(store) end)
     auth
+  end
+
+  defp tmp_auth_store(prefix) do
+    directory =
+      Path.join(
+        System.tmp_dir!(),
+        prefix <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower)
+      )
+
+    File.rm_rf!(directory)
+    File.mkdir_p!(directory)
+    on_exit(fn -> File.rm_rf!(directory) end)
+    Path.join(directory, "auth.json")
   end
 
   defp canned_attempts(attempts) do

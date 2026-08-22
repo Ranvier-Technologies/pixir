@@ -503,6 +503,132 @@ defmodule Pixir.Delegate.RunnerTest do
     end)
   end
 
+  test "precomputed horizon evidence fails closed when facts are absent malformed or contradictory" do
+    valid = %{
+      "strategy" => "subagents",
+      "effective_timeout_ms" => 100_000,
+      "estimated_critical_path_ms" => 120_000,
+      "waves" => 2,
+      "suggested_timeout_ms" => 120_000,
+      "per_wave_budget_ms" => 60_000,
+      "wave_budgets_ms" => [60_000, 60_000]
+    }
+
+    invalid_cases = [
+      {"missing critical path", nil},
+      {"missing required fact", Map.delete(valid, "effective_timeout_ms")},
+      {"nil effective horizon", Map.put(valid, "effective_timeout_ms", nil)},
+      {"nil estimate", Map.put(valid, "estimated_critical_path_ms", nil)},
+      {"non-numeric estimate", Map.put(valid, "estimated_critical_path_ms", "120000")},
+      {"zero horizon", Map.put(valid, "effective_timeout_ms", 0)},
+      {"negative wave count", Map.put(valid, "waves", -1)},
+      {"missing arithmetic", Map.drop(valid, ["per_wave_budget_ms", "wave_budgets_ms"])},
+      {"malformed wave budgets", Map.put(valid, "wave_budgets_ms", [60_000, nil])},
+      {"suggestion below estimate", Map.put(valid, "suggested_timeout_ms", 119_999)},
+      {"per-wave arithmetic mismatch", Map.put(valid, "per_wave_budget_ms", 59_999)},
+      {"wave count mismatch", Map.put(valid, "wave_budgets_ms", [120_000])},
+      {"wave sum mismatch", Map.put(valid, "wave_budgets_ms", [60_000, 59_999])}
+    ]
+
+    for {label, details} <- invalid_cases do
+      assert {:error,
+              %{
+                "ok" => false,
+                "status" => "rejected",
+                "kind" => "invalid_horizon_evidence",
+                "details" => evidence_errors
+              }} = Runner.admit_horizon_details(%{allow_short_horizon?: true}, details),
+             label
+
+      assert evidence_errors["missing_fields"] != [] or
+               evidence_errors["malformed_fields"] != [] or
+               evidence_errors["contradictions"] != [],
+             label
+    end
+
+    secret = "operator-secret-/private/worktree"
+
+    assert {:error, secret_safe_error} =
+             Runner.admit_horizon_details(
+               %{allow_short_horizon?: true},
+               Map.put(valid, "effective_timeout_ms", secret)
+             )
+
+    refute inspect(secret_safe_error) =~ secret
+  end
+
+  test "runner rejects inconsistent planned child counts before Session or spawn" do
+    spec = %{
+      "contract_version" => 1,
+      "strategy" => "subagents",
+      "task" => "must not spawn",
+      "subagents" => %{"max_threads" => 1, "timeout_ms" => 60_000}
+    }
+
+    for planned_child_count <- [nil, "1", 0] do
+      ws = tmp_workspace("pixir-delegate-invalid-horizon-input")
+      test_pid = self()
+
+      spawn_agent = fn _parent_session_id, _args, _opts ->
+        send(test_pid, {:unexpected_horizon_spawn, planned_child_count})
+        {:error, :must_not_spawn}
+      end
+
+      assert {:error, %{"kind" => "invalid_spec"}} =
+               Runner.run(
+                 %{workspace: ws, timeout_ms: 100_000},
+                 spec,
+                 %{
+                   "strategy" => "subagents",
+                   "planned_child_count" => planned_child_count
+                 },
+                 spawn_agent: spawn_agent
+               )
+
+      refute_received {:unexpected_horizon_spawn, ^planned_child_count}
+      refute File.exists?(Path.join([ws, ".pixir", "sessions"]))
+    end
+  end
+
+  test "short-horizon override requires exact boolean true" do
+    ws = tmp_workspace("pixir-delegate-exact-horizon-override")
+
+    spec = %{
+      "contract_version" => 1,
+      "strategy" => "subagents",
+      "tasks" => ["first", "second"],
+      "subagents" => %{"max_threads" => 1, "timeout_ms" => 60_000}
+    }
+
+    spec_meta = %{"strategy" => "subagents", "planned_child_count" => 2}
+
+    for hostile_truthy <- ["true", :yes, 1, [true], %{value: true}] do
+      assert {:error, %{"kind" => "horizon_shorter_than_critical_path"}} =
+               Runner.admit_horizon(
+                 %{
+                   workspace: ws,
+                   timeout_ms: 100_000,
+                   allow_short_horizon?: hostile_truthy
+                 },
+                 spec,
+                 spec_meta
+               )
+    end
+
+    assert {:ok,
+            %{
+              "effective_timeout_ms" => 100_000,
+              "estimated_critical_path_ms" => 120_000,
+              "waves" => 2,
+              "suggested_timeout_ms" => 120_000
+            }} =
+             Runner.admit_horizon(
+               %{workspace: ws, timeout_ms: 100_000, allow_short_horizon?: true},
+               spec,
+               spec_meta
+             )
+  end
+
   test "explicit wait horizons from request and limits are independently repairable" do
     ws = tmp_workspace("pixir-delegate-explicit-wait-recovery")
 

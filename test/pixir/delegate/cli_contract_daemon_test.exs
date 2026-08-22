@@ -3,7 +3,7 @@ defmodule Pixir.Delegate.CLIContractDaemonTest do
 
   import ExUnit.CaptureIO
 
-  alias Pixir.Delegate.CLIContract
+  alias Pixir.Delegate.{CLIContract, DaemonServer}
 
   defmodule UnavailableDaemonClient do
     def call(_action, _body, _opts) do
@@ -220,6 +220,25 @@ defmodule Pixir.Delegate.CLIContractDaemonTest do
     end
   end
 
+  defmodule HorizonAdmissionAsync do
+    def start(request, _spec, spec_meta, opts) do
+      test_pid = opts |> Keyword.fetch!(:runtime_opts) |> Keyword.fetch!(:test_pid)
+      send(test_pid, {:horizon_admission_async_start, request, spec_meta})
+
+      {:ok,
+       %{
+         "ok" => true,
+         "status" => "running",
+         "kind" => "delegate_start",
+         "delegate_id" => "dlg1_horizon_admission",
+         "parent_session_id" => "parent-horizon-admission",
+         "owner" => %{"state" => "live_delegate_owner"},
+         "runtime_residency" => %{"model" => "current_beam_runtime"},
+         "summary" => "horizon admission callback entered"
+       }}
+    end
+  end
+
   defmodule FakeDaemonCommand do
     def run("foreground", _opts) do
       {:ok,
@@ -244,6 +263,170 @@ defmodule Pixir.Delegate.CLIContractDaemonTest do
     File.mkdir_p!(ws)
     on_exit(fn -> File.rm_rf!(ws) end)
     %{ws: ws}
+  end
+
+  defp horizon_details do
+    %{
+      "strategy" => "subagents",
+      "effective_timeout_ms" => 100_000,
+      "estimated_critical_path_ms" => 120_000,
+      "waves" => 2,
+      "suggested_timeout_ms" => 120_000,
+      "per_wave_budget_ms" => 60_000,
+      "wave_budgets_ms" => [60_000, 60_000]
+    }
+  end
+
+  defp start_horizon_admission_daemon(ws) do
+    token = "horizon-admission-token-#{System.unique_integer([:positive])}"
+
+    assert {:ok, pid} =
+             DaemonServer.start_link(
+               workspace: ws,
+               async: HorizonAdmissionAsync,
+               token: token
+             )
+
+    Process.unlink(pid)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        try do
+          GenServer.stop(pid)
+        catch
+          :exit, _reason -> :ok
+        end
+      end
+    end)
+
+    {pid, token}
+  end
+
+  defp daemon_horizon_start(pid, token, ws, override, critical_path, strategy \\ "subagents") do
+    spec = %{
+      "contract_version" => 1,
+      "tasks" => ["first", "second"],
+      "subagents" => %{"max_threads" => 1, "timeout_ms" => 60_000}
+    }
+
+    spec_meta = %{
+      "planned_child_count" => 2,
+      "critical_path" => critical_path
+    }
+
+    {spec, spec_meta} =
+      if is_nil(strategy) do
+        {spec, spec_meta}
+      else
+        {Map.put(spec, "strategy", strategy), Map.put(spec_meta, "strategy", strategy)}
+      end
+
+    GenServer.call(
+      pid,
+      {:ipc_request,
+       %{
+         "token" => token,
+         "workspace" => ws,
+         "action" => "delegate_start",
+         "body" => %{
+           "request" => %{
+             "json?" => true,
+             "contract_version" => 1,
+             "timeout_ms" => 100_000,
+             "allow_short_horizon?" => override
+           },
+           "spec" => spec,
+           "spec_meta" => spec_meta,
+           "runtime_opts" => [test_pid: self()]
+         }
+       }}
+    )
+  end
+
+  test "daemon wire ingress rejects hostile truthy overrides before async dispatch", %{ws: ws} do
+    {pid, token} = start_horizon_admission_daemon(ws)
+
+    for hostile_truthy <- ["true", :yes, 1, [true], %{"value" => true}] do
+      assert %{
+               "ipc_ok" => false,
+               "error" => %{
+                 "kind" => "horizon_shorter_than_critical_path",
+                 "status" => "rejected"
+               }
+             } = daemon_horizon_start(pid, token, ws, hostile_truthy, horizon_details())
+
+      refute_received {:horizon_admission_async_start, _, _}
+    end
+
+    assert %{"ipc_ok" => true} =
+             daemon_horizon_start(pid, token, ws, true, horizon_details())
+
+    assert_receive {:horizon_admission_async_start, %{allow_short_horizon?: true},
+                    %{
+                      "horizon_override" => %{
+                        "effective_timeout_ms" => 100_000,
+                        "estimated_critical_path_ms" => 120_000,
+                        "waves" => 2,
+                        "suggested_timeout_ms" => 120_000
+                      }
+                    }}
+  end
+
+  test "daemon wire ingress rejects absent malformed and contradictory evidence with no dispatch",
+       %{ws: ws} do
+    {pid, token} = start_horizon_admission_daemon(ws)
+    valid = horizon_details()
+
+    invalid_cases = [
+      nil,
+      Map.delete(valid, "effective_timeout_ms"),
+      Map.put(valid, "effective_timeout_ms", nil),
+      Map.put(valid, "estimated_critical_path_ms", "120000"),
+      Map.put(valid, "waves", 0),
+      Map.put(valid, "suggested_timeout_ms", 119_999),
+      Map.put(valid, "wave_budgets_ms", [60_000, 59_999])
+    ]
+
+    for critical_path <- invalid_cases do
+      assert %{
+               "ipc_ok" => false,
+               "error" => %{
+                 "kind" => "invalid_horizon_evidence",
+                 "status" => "rejected"
+               }
+             } = daemon_horizon_start(pid, token, ws, true, critical_path)
+
+      refute_received {:horizon_admission_async_start, _, _}
+    end
+  end
+
+  test "daemon wire ingress rejects missing or unsupported strategy before dispatch", %{ws: ws} do
+    {pid, token} = start_horizon_admission_daemon(ws)
+    hostile_strategy = "unsupported-/private/operator-secret"
+
+    for {strategy, observed_class} <- [{nil, "missing"}, {hostile_strategy, "unsupported"}] do
+      reply = daemon_horizon_start(pid, token, ws, true, horizon_details(), strategy)
+
+      assert %{
+               "ipc_ok" => false,
+               "error" => %{
+                 "kind" => "invalid_spec",
+                 "status" => "rejected",
+                 "details" => %{
+                   "observed_strategy_class" => ^observed_class,
+                   "accepted_values" => ["subagents", "workflow"],
+                   "fallback_allowed" => false,
+                   "next_actions" => [
+                     "send_a_supported_delegate_strategy",
+                     "upgrade_pixir_client_and_daemon_together"
+                   ]
+                 }
+               }
+             } = reply
+
+      if strategy, do: refute(inspect(reply) =~ strategy)
+      refute_received {:horizon_admission_async_start, _, _}
+    end
   end
 
   test "start requires a resident daemon when daemon is unavailable", %{ws: ws} do

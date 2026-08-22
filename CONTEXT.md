@@ -337,7 +337,10 @@ Compaction is not deletion and not a Presenter convenience: any compacted summar
 affects future model input must be derivable from, or recorded as, durable Log-backed
 state. Pixir's first concrete form is a canonical `history_compaction` Event: Provider
 replay sees the latest checkpoint plus the recent uncompressed tail, while the full Log
-remains authoritative for audit, repair, and deeper reconstruction.
+remains authoritative for audit, repair, and deeper reconstruction. A later accepted
+form (ADR 0040) may attach a Provider-native replay window to that same Event. The
+window is a replay aid for the capturing model and dialect; it is not a second Log
+and never deletes the compacted Events.
 
 ### Summary
 A lossy, human- or model-readable synthesis of prior context. A summary may be produced

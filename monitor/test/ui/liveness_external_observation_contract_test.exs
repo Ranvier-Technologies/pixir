@@ -23,7 +23,7 @@ defmodule PixirMonitor.UILivenessExternalObservationContractTest do
   test "the liveness truth card copy is state-specific and never asserts a fault", %{js: js} do
     assert js =~ "function livenessCardNote("
     assert js =~ "Owner is another process; activity confirmed from durable Log evidence."
-    assert js =~ ~s|truthCard("Liveness", "liveness", livenessState(run), livenessBasis(run), livenessCardNote(run))|
+    assert js =~ ~s|truthCard(route, "Liveness", "liveness", livenessState(run), livenessBasis(run), livenessCardNote(run))|
     # "Not currently reachable" must no longer be the blanket else-branch for
     # every non-reachable state: externally_owned is not a reachability fault.
     refute js =~ ~s|run.liveness.reachable === true ? "Reachable now" : "Not currently reachable"|

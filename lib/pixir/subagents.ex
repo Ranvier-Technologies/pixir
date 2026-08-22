@@ -7,6 +7,12 @@ defmodule Pixir.Subagents do
   detached restored children must remain explicit so parents and diagnostics can
   tell "finished cleanly" apart from "needs operator attention".
 
+  A warm child keeps its copied replay Events as historical evidence. Its live
+  authorization posture is the session-scoped posture written immediately after
+  the most recent valid runtime lineage boundary; cold resume evaluates posture
+  and mutation evidence only in that boundary's current segment. Logs without a
+  valid boundary retain the legacy root/child/Fork fold rules.
+
   `max_depth` is an absolute delegation-depth cap from the root Session. A child
   spawned by the root runs at depth `1`; that child may only spawn another child
   when the configured cap is at least `2`.
@@ -14,10 +20,21 @@ defmodule Pixir.Subagents do
 
   alias Pixir.{Log, Permissions, SessionId, Tool}
   alias Pixir.Permissions.WritePolicy
-  alias Pixir.Subagents.Manager
+  alias Pixir.Subagents.{Manager, WarmStart}
 
   @statuses ~w(queued running completed failed timed_out cancelled detached closed)
   @terminal_statuses ~w(completed failed cancelled timed_out closed detached)
+
+  @cancellation_steps [
+    {:session_interrupt_evidence, "session_interrupt_evidence"},
+    {:child_cancellation_event, "child_cancellation_event"}
+  ]
+  @cancellation_failed_steps Enum.map(@cancellation_steps, &elem(&1, 1))
+  @cancellation_next_actions [
+    "inspect_parent_session_log",
+    "inspect_child_session_log",
+    "rerun_subagent_if_still_needed"
+  ]
 
   @allowed_transitions %{
     "queued" => ~w(running failed detached closed),
@@ -77,14 +94,63 @@ defmodule Pixir.Subagents do
   @doc """
   Cancel a running Subagent, or close a queued/terminal Subagent as cleanup.
 
-  Cancelling a running Subagent also appends a terminal `cancelled_by_parent`
-  `:subagent_event` to the **child's** own Log, so the child Log alone is evidence
-  of its cancellation. Callers that cancel on behalf of a Workflow may name the
-  canceller with `:workflow_id`, `:workflow_step_id`, and `:workflow_close_outcome`;
-  those fields are simply absent from the child event for a plain parent close. The
-  return contract (`status`, `reason`, `elapsed_ms`, `next_actions`) is unchanged.
+  Cancelling a running Subagent fences its active logical Turn without stopping the
+  reusable child Session. It then appends a `cancelled_by_parent` `:subagent_event`
+  with `scope: "turn"` to the child's own Log. The event follows the synchronous
+  interrupt result, but a C6-classified late declaration may append after it, so it is
+  not promised physically list-last. Callers that cancel on behalf of a Workflow may
+  name the canceller with `:workflow_id`, `:workflow_step_id`, and
+  `:workflow_close_outcome`; those fields are simply absent from the child event for a
+  plain parent close. Running-close results include bounded `cancellation_evidence`;
+  the ordinary path is `complete`, while missing durable Session/child evidence is
+  `partial` without raw errors or exits. The existing lifecycle return fields remain.
   """
   def close(parent_session_id, id, opts \\ []), do: Manager.close(parent_session_id, id, opts)
+
+  @doc false
+  def cancellation_evidence(true, true), do: %{"status" => "complete"}
+
+  def cancellation_evidence(interrupt_complete?, child_event_complete?)
+      when is_boolean(interrupt_complete?) and is_boolean(child_event_complete?) do
+    completed = %{
+      session_interrupt_evidence: interrupt_complete?,
+      child_cancellation_event: child_event_complete?
+    }
+
+    failed_steps =
+      for {key, step} <- @cancellation_steps,
+          not Map.fetch!(completed, key),
+          do: step
+
+    %{
+      "status" => "partial",
+      "failed_steps" => failed_steps,
+      "next_actions" => @cancellation_next_actions
+    }
+  end
+
+  @doc false
+  def normalize_cancellation_evidence(%{"status" => "complete"}),
+    do: %{"status" => "complete"}
+
+  def normalize_cancellation_evidence(%{"status" => "partial"} = evidence) do
+    declared_steps = Map.get(evidence, "failed_steps", [])
+
+    failed_steps =
+      if is_list(declared_steps) do
+        Enum.filter(@cancellation_failed_steps, &(&1 in declared_steps))
+      else
+        []
+      end
+
+    %{
+      "status" => "partial",
+      "failed_steps" => failed_steps,
+      "next_actions" => @cancellation_next_actions
+    }
+  end
+
+  def normalize_cancellation_evidence(_evidence), do: nil
 
   @doc "List Subagents for a parent Session."
   def list(parent_session_id, opts \\ []), do: Manager.list(parent_session_id, opts)
@@ -113,18 +179,46 @@ defmodule Pixir.Subagents do
   def summarize_wait_outcome(%{"summary" => summary}) when is_binary(summary), do: summary
   def summarize_wait_outcome(_outcome), do: "wait_agent outcome unavailable."
 
+  @doc false
+  @spec child_permission_posture(map(), map() | nil) :: map()
+  def child_permission_posture(request, warm_lineage) when is_map(request) do
+    %{
+      "event" => "permission_posture",
+      "scope" => "session",
+      "lineage" => "child",
+      "source" => "subagent_spawn",
+      "subagent_id" => Map.fetch!(request, :subagent_id),
+      "parent_session_id" => Map.fetch!(request, :parent_session_id),
+      "permission_mode" => posture_permission_mode(Map.fetch!(request, :permission_mode)),
+      "write_policy" => WritePolicy.metadata(Map.get(request, :write_policy)),
+      "workspace_mode" => Map.fetch!(request, :workspace_mode),
+      "workspace" => Map.fetch!(request, :workspace),
+      "warm_start" => WarmStart.envelope_projection(warm_lineage)
+    }
+  end
+
+  defp posture_permission_mode(nil), do: nil
+  defp posture_permission_mode(mode) when is_atom(mode), do: Atom.to_string(mode)
+  defp posture_permission_mode(mode) when is_binary(mode), do: mode
+
   @doc """
   Rehydrate a Session's durable permission posture for a cold resume.
 
   Root Sessions record their posture at creation (`Pixir.Conversation.start/1`,
   lineage `root`, trusted only in root position: first non-`session_fork` event,
   runtime-authored source) and restore the recorded capability ceiling —
-  including unbounded auto when the marker declared it. Spawned
-  children record theirs in the Subagent Manager (lineage `child`) and keep the
-  stricter contract: write-capable history restores only with a bounded policy.
-  Legacy Logs without posture evidence remain resumable only when they contain
-  no write-capable evidence, and then restore an explicit read-only ceiling;
-  otherwise they fail closed with reason `missing`, which is the one
+  including unbounded auto when the marker declared it. Spawned children record
+  theirs with lineage `child` and keep the stricter contract: write-capable
+  history restores only with a bounded policy.
+
+  Warm-start Logs add a runtime-authored `lineage_boundary_v1` marker. Only the
+  permission posture and mutation evidence physically appended after the last
+  valid marker govern that live warm segment; copied posture remains replay
+  evidence. A valid boundary without current posture fails closed. Without a
+  valid boundary, the existing full-history root/child/Fork behavior is
+  preserved. Legacy Logs without posture evidence remain resumable only when
+  they contain no write-capable evidence, and then restore an explicit read-only
+  ceiling; otherwise they fail closed with reason `missing`, which is the one
   classification the operator may override via the CLI's explicit legacy-root
   attestation (never as unbounded auto).
   """
@@ -135,30 +229,105 @@ defmodule Pixir.Subagents do
     with :ok <- SessionId.validate(session_id),
          {:ok, workspace} <- canonical_resume_workspace(session_id, workspace),
          {:ok, history} <- fold_resume_history(session_id, workspace) do
-      evidence? = write_capable_evidence?(history)
-
-      case posture_events(history) do
-        [] ->
-          if evidence? do
-            {:error, resume_posture_error(session_id, "missing")}
-          else
-            {:ok,
-             %{
-               permission_mode: :read_only,
-               write_policy: nil,
-               workspace_mode: "shared",
-               workspace: workspace,
-               lineage: :legacy_unknown
-             }}
+      case current_lineage_segment(history) do
+        {:warm, boundary, current_history, posture_proof} ->
+          with :ok <-
+                 validate_current_segment_posture(
+                   session_id,
+                   boundary.data,
+                   current_history,
+                   posture_proof
+                 ) do
+            restore_resume_posture(
+              session_id,
+              current_history,
+              history,
+              workspace,
+              "missing_current_posture"
+            )
           end
 
-        events ->
-          with {:ok, posture} <- restore_posture_events(session_id, events, history),
-               :ok <- validate_restored_workspace(session_id, posture, workspace),
-               :ok <- validate_restored_policy(session_id, posture, evidence?) do
-            {:ok, posture}
-          end
+        :full_history ->
+          restore_resume_posture(session_id, history, history, workspace, "missing")
       end
+    end
+  end
+
+  @doc false
+  @spec warm_lineage_proof(String.t(), keyword()) :: {:ok, map()} | :none | {:error, map()}
+  def warm_lineage_proof(session_id, opts \\ []) do
+    workspace = Keyword.get(opts, :workspace, File.cwd!())
+
+    with :ok <- SessionId.validate(session_id),
+         {:ok, workspace} <- canonical_resume_workspace(session_id, workspace),
+         {:ok, history} <- fold_resume_history(session_id, workspace) do
+      case current_lineage_segment(history) do
+        {:warm, boundary, current_history, posture_proof} ->
+          posture_event =
+            case current_history do
+              [posture | _rest] ->
+                case validate_current_segment_posture(
+                       session_id,
+                       boundary.data,
+                       current_history,
+                       posture_proof
+                     ) do
+                  :ok -> posture
+                  {:error, _error} -> nil
+                end
+
+              [] ->
+                nil
+            end
+
+          {:ok,
+           %{
+             boundary_event: boundary.event,
+             posture_event: posture_event,
+             seed_session_id: boundary.data["seed_session_id"],
+             fork_root_session_id: boundary.data["fork_root_session_id"],
+             replay_event_count: boundary.data["replay_event_count"]
+           }}
+
+        :full_history ->
+          :none
+      end
+    end
+  end
+
+  defp restore_resume_posture(
+         session_id,
+         posture_history,
+         lineage_history,
+         workspace,
+         missing_reason
+       ) do
+    evidence? = write_capable_evidence?(posture_history)
+
+    case posture_events(posture_history) do
+      [] when missing_reason == "missing_current_posture" ->
+        {:error, resume_posture_error(session_id, missing_reason)}
+
+      [] ->
+        if evidence? do
+          {:error, resume_posture_error(session_id, missing_reason)}
+        else
+          {:ok,
+           %{
+             permission_mode: :read_only,
+             write_policy: nil,
+             workspace_mode: "shared",
+             workspace: workspace,
+             lineage: :legacy_unknown
+           }}
+        end
+
+      events ->
+        with {:ok, posture} <- restore_posture_events(session_id, events, lineage_history),
+             :ok <- validate_restored_workspace(session_id, posture, workspace),
+             :ok <- validate_restored_policy(session_id, posture, evidence?) do
+          {:ok, posture}
+        end
     end
   end
 
@@ -216,6 +385,223 @@ defmodule Pixir.Subagents do
       "log_error" => error
     })
   end
+
+  # A lineage marker may reset authorization interpretation only when its physical
+  # position is covered by an atomic runtime-created `session_fork` prefix. The direct
+  # warm-start marker occupies the one position immediately after the fork's replayed
+  # prefix; a marker inherited by an ordinary Fork must already be inside that Fork's
+  # declared replay prefix. This keeps an append-only writer from manufacturing a later
+  # marker and hiding earlier posture or mutation evidence. Full same-UID Log rewriting
+  # remains the documented local NDJSON threat-model residue, matching root posture.
+  defp current_lineage_segment(history) do
+    with {:ok, fork} <- lineage_container(history) do
+      boundary =
+        history
+        |> Enum.with_index()
+        |> Enum.reduce(nil, fn {event, index}, last_boundary ->
+          case lineage_boundary_origin(event, index, fork) do
+            {:ok, origin, data} ->
+              %{data: data, event: event, index: index, origin: origin}
+
+            :error ->
+              last_boundary
+          end
+        end)
+
+      case boundary do
+        nil ->
+          :full_history
+
+        %{index: index, origin: origin} = boundary ->
+          {:warm, boundary, Enum.drop(history, index + 1), origin}
+      end
+    else
+      :error -> :full_history
+    end
+  end
+
+  defp lineage_container([
+         %{
+           type: :session_fork,
+           data:
+             %{
+               "fork_root_session_id" => fork_root_session_id,
+               "replay_event_count" => replay_event_count,
+               "strategy" => "replay_v1"
+             } = data
+         }
+         | _rest
+       ])
+       when is_integer(replay_event_count) and replay_event_count >= 0 do
+    parent_session_id = Map.get(data, "parent_session_id")
+
+    if SessionId.valid?(fork_root_session_id) and SessionId.valid?(parent_session_id) do
+      {:ok,
+       %{
+         fork_root_session_id: fork_root_session_id,
+         parent_session_id: parent_session_id,
+         replay_event_count: replay_event_count,
+         source: Map.get(data, "source"),
+         warm_lineage: Map.get(data, "warm_lineage")
+       }}
+    else
+      :error
+    end
+  end
+
+  defp lineage_container(_history), do: :error
+
+  defp lineage_boundary_origin(
+         %{
+           type: :user_message,
+           data:
+             %{
+               "lineage_boundary" => true,
+               "author" => "runtime",
+               "marker_kind" => marker_kind,
+               "seed_session_id" => seed_session_id,
+               "fork_root_session_id" => fork_root_session_id,
+               "replay_event_count" => replay_event_count,
+               "text" => text
+             } = data
+         } = event,
+         index,
+         fork
+       )
+       when is_integer(replay_event_count) and replay_event_count > 0 do
+    coherent_shape? =
+      marker_kind == WarmStart.boundary_marker_kind() and
+        SessionId.valid?(seed_session_id) and
+        SessionId.valid?(fork_root_session_id) and
+        fork_root_session_id == fork.fork_root_session_id and
+        index == replay_event_count + 1 and
+        text == WarmStart.boundary_text(seed_session_id)
+
+    cond do
+      coherent_shape? and fork.source == "delegate_warm_start" and
+        fork.parent_session_id == seed_session_id and
+          replay_event_count == fork.replay_event_count ->
+        {:ok, :direct, data}
+
+      coherent_shape? and
+          inherited_boundary_proof?(
+            fork.warm_lineage,
+            data,
+            event.id,
+            index,
+            fork.replay_event_count
+          ) ->
+        {:ok, {:inherited, fork.warm_lineage}, data}
+
+      true ->
+        :error
+    end
+  end
+
+  defp lineage_boundary_origin(_event, _index, _fork), do: :error
+
+  defp inherited_boundary_proof?(
+         %{
+           "version" => 1,
+           "boundary_event_id" => boundary_event_id,
+           "posture_event_id" => posture_event_id,
+           "boundary_index" => boundary_index,
+           "posture_index" => posture_index,
+           "seed_session_id" => seed_session_id,
+           "fork_root_session_id" => fork_root_session_id,
+           "replay_event_count" => replay_event_count
+         },
+         boundary,
+         event_id,
+         index,
+         outer_replay_event_count
+       ) do
+    boundary_event_id == event_id and
+      (is_nil(posture_event_id) or non_empty_binary?(posture_event_id)) and
+      boundary_index == index and
+      boundary_index <= outer_replay_event_count and
+      posture_index == index + 1 and
+      seed_session_id == boundary["seed_session_id"] and
+      fork_root_session_id == boundary["fork_root_session_id"] and
+      replay_event_count == boundary["replay_event_count"]
+  end
+
+  defp inherited_boundary_proof?(
+         _proof,
+         _boundary,
+         _event_id,
+         _index,
+         _outer_replay_event_count
+       ),
+       do: false
+
+  defp validate_current_segment_posture(
+         session_id,
+         boundary,
+         [posture | _rest],
+         :direct
+       ) do
+    if current_posture_matches_boundary?(posture, boundary) do
+      :ok
+    else
+      {:error, resume_posture_error(session_id, "missing_current_posture")}
+    end
+  end
+
+  defp validate_current_segment_posture(
+         session_id,
+         boundary,
+         [posture | _rest],
+         {:inherited, %{"posture_event_id" => posture_event_id}}
+       )
+       when is_binary(posture_event_id) and posture_event_id != "" do
+    if posture.id == posture_event_id and current_posture_matches_boundary?(posture, boundary) do
+      :ok
+    else
+      {:error, resume_posture_error(session_id, "missing_current_posture")}
+    end
+  end
+
+  defp validate_current_segment_posture(session_id, _boundary, _history, _proof) do
+    {:error, resume_posture_error(session_id, "missing_current_posture")}
+  end
+
+  defp current_posture_matches_boundary?(
+         %{
+           type: :subagent_event,
+           data: %{
+             "event" => "permission_posture",
+             "scope" => "session",
+             "lineage" => "child",
+             "source" => "subagent_spawn",
+             "subagent_id" => subagent_id,
+             "parent_session_id" => parent_session_id,
+             "permission_mode" => permission_mode,
+             "write_policy" => _write_policy,
+             "workspace_mode" => workspace_mode,
+             "workspace" => workspace,
+             "warm_start" => warm_start
+           }
+         },
+         boundary
+       )
+       when is_map(warm_start) do
+    non_empty_binary?(subagent_id) and
+      non_empty_binary?(parent_session_id) and
+      permission_mode in ["auto", "ask", "read_only"] and
+      workspace_mode in ["shared", "isolated", "virtual_overlay"] and
+      non_empty_binary?(workspace) and
+      warm_start["warm_started"] == true and
+      warm_start["seed_session_id"] == boundary["seed_session_id"] and
+      warm_start["fork_root_session_id"] == boundary["fork_root_session_id"] and
+      warm_start["replay_event_count"] == boundary["replay_event_count"] and
+      warm_start["strategy"] == "replay_v1" and
+      warm_start["boundary_marker_kind"] == boundary["marker_kind"]
+  end
+
+  defp current_posture_matches_boundary?(_posture, _boundary), do: false
+
+  defp non_empty_binary?(value), do: is_binary(value) and value != ""
 
   defp posture_events(history) do
     Enum.filter(history, fn
@@ -382,7 +768,10 @@ defmodule Pixir.Subagents do
   defp mutating_by_name?(%{"name" => name}) when is_binary(name),
     do: Permissions.mutating?(name, %{})
 
-  defp mutating_by_name?(_data), do: false
+  # A tool_call whose data carries no binary `name` is unclassifiable. This module's
+  # posture is fail-closed, so ordinary unclassifiable calls count as write-capable;
+  # only the separate synthesized/drained marker clauses above retain their exemption.
+  defp mutating_by_name?(_data), do: true
 
   defp write_policy_decision?(history) do
     Enum.any?(history, fn
@@ -703,12 +1092,19 @@ defmodule Pixir.Subagents do
   def reconstruct(history) when is_list(history) do
     history
     |> Enum.filter(&(&1.type == :subagent_event))
-    # Session-scoped evidence a Session writes about ITSELF (permission posture at
-    # spawn, the terminal `cancelled_by_parent` statement) is not a child lifecycle
-    # event: folding it here would fabricate a phantom child — a nil-id one for
-    # posture, or a self-referential entry for cancellation — and flip delegate
-    # snapshots to incomplete. Only the parent-side records describe children.
+    # Evidence a Session writes about ITSELF (permission posture, the Turn-scoped
+    # `cancelled_by_parent` statement, and a delegate `horizon_override`) is not a child
+    # lifecycle event: folding it here would fabricate a phantom child — a
+    # nil-id one for posture or horizon override, or a self-referential entry for
+    # cancellation — and flip delegate snapshots to incomplete. Only the parent-side
+    # records describe children.
     |> Enum.reject(&self_scoped_event?/1)
+    # Structural gate: the fold's identity key is meaningless without a real child id,
+    # so any record lacking one is dropped here even if a future session-scoped event
+    # is not yet named above. `self_scoped_event?/1` stays as documentation and
+    # defense-in-depth for the known producers; this predicate closes the class.
+    # Same identity predicate as `Pixir.SessionTree` uses for subagent records.
+    |> Enum.filter(fn %{data: data} -> child_identity?(data["subagent_id"]) end)
     |> Enum.reduce(%{}, fn %{data: data}, acc ->
       id = data["subagent_id"]
 
@@ -721,18 +1117,39 @@ defmodule Pixir.Subagents do
       updated =
         current
         |> Map.merge(Map.take(data, subagent_fields()))
+        |> maybe_clear_reconstructed_cancellation_evidence(data)
+        |> normalize_reconstructed_cancellation_evidence()
         |> Map.put("events", current["events"] ++ [data["event"]])
 
       Map.put(acc, id, updated)
     end)
   end
 
+  # A successful `input` event is the durable boundary of a fresh logical Turn. The live
+  # Manager clears the prior Turn's cancellation evidence before writing this event; the
+  # fold must perform the same clear even though absent fields ordinarily carry forward.
+  defp maybe_clear_reconstructed_cancellation_evidence(agent, %{"event" => "input"}),
+    do: Map.delete(agent, "cancellation_evidence")
+
+  defp maybe_clear_reconstructed_cancellation_evidence(agent, _data), do: agent
+
+  defp normalize_reconstructed_cancellation_evidence(agent) do
+    case normalize_cancellation_evidence(agent["cancellation_evidence"]) do
+      nil -> Map.delete(agent, "cancellation_evidence")
+      evidence -> Map.put(agent, "cancellation_evidence", evidence)
+    end
+  end
+
   defp self_scoped_event?(%{data: %{"event" => "permission_posture"}}), do: true
+
+  defp self_scoped_event?(%{data: %{"event" => "horizon_override"}}), do: true
 
   defp self_scoped_event?(%{data: %{"event" => "cancelled_by_parent", "lineage" => "child"}}),
     do: true
 
   defp self_scoped_event?(_event), do: false
+
+  defp child_identity?(id), do: is_binary(id) and String.trim(id) != ""
 
   defp subagent_fields do
     [
@@ -758,6 +1175,7 @@ defmodule Pixir.Subagents do
       "elapsed_ms",
       "reason",
       "next_actions",
+      "cancellation_evidence",
       "retry_attempts",
       "retry_max_attempts",
       "current_attempt_index",

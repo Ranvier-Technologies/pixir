@@ -56,6 +56,51 @@ defmodule Pixir.SubagentsTest do
     end
   end
 
+  defmodule LateDeclarationProvider do
+    def stream(_request, opts) do
+      test_pid = Keyword.fetch!(opts, :test_pid)
+      counter = Keyword.fetch!(opts, :counter)
+      attempt = Agent.get_and_update(counter, fn current -> {current + 1, current + 1} end)
+
+      case attempt do
+        1 ->
+          declare = Keyword.fetch!(opts, :on_committed_call)
+
+          producer =
+            spawn(fn ->
+              send(test_pid, {:late_declaration_producer_ready, self()})
+
+              receive do
+                :release_late_declaration ->
+                  result =
+                    declare.(%{
+                      call_id: "call_after_child_cancellation",
+                      name: "bash",
+                      args: %{"command" => "echo late"}
+                    })
+
+                  send(test_pid, {:late_declaration_producer_finished, result})
+              after
+                10_000 -> send(test_pid, :late_declaration_producer_watchdog)
+              end
+            end)
+
+          send(test_pid, {:late_provider_turn_started, 1, self(), producer})
+
+        successor ->
+          send(test_pid, {:late_provider_turn_started, successor, self(), nil})
+      end
+
+      receive do
+        :finish_provider ->
+          {:ok, %{text: "done", reasoning: "", function_calls: [], finish_reason: :stop}}
+      after
+        10_000 ->
+          {:ok, %{text: "watchdog", reasoning: "", function_calls: [], finish_reason: :stop}}
+      end
+    end
+  end
+
   defmodule FailingAfterToolProvider do
     def stream(%{history: history}, _opts) do
       if Enum.any?(history, &(&1.type == :tool_result)) do
@@ -134,11 +179,18 @@ defmodule Pixir.SubagentsTest do
           pid,
           {:provider_knobs, request[:model] || Keyword.get(opts, :model),
            request[:reasoning_effort] || Keyword.get(opts, :reasoning_effort),
-           request[:web_search] || Keyword.get(opts, :web_search)}
+           fetch_web_search(request, opts)}
         )
       end
 
       {:ok, %{text: "done", reasoning: "", function_calls: [], finish_reason: :stop}}
+    end
+
+    defp fetch_web_search(request, opts) do
+      case Map.fetch(request, :web_search) do
+        {:ok, value} -> value
+        :error -> Keyword.get(opts, :web_search)
+      end
     end
   end
 
@@ -581,7 +633,7 @@ defmodule Pixir.SubagentsTest do
 
     assert {:ok, [_completed]} = Subagents.wait(sid, [agent["id"]], 10_000, workspace: ws)
     assert_received {:provider_knobs, _model, _effort, web_search}
-    assert web_search == nil
+    assert web_search == false
   end
 
   test "spawn_agent tool strips caller-authored provider knobs", %{sid: sid, ws: ws} do
@@ -1870,6 +1922,7 @@ defmodule Pixir.SubagentsTest do
     assert {:ok, cancelled} = Subagents.close(sid, agent["id"])
     assert cancelled["status"] == "cancelled"
     assert cancelled["reason"] == "cancelled_by_parent"
+    assert cancelled["cancellation_evidence"] == %{"status" => "complete"}
     assert is_integer(cancelled["elapsed_ms"])
     assert "inspect_child_session_log" in cancelled["next_actions"]
     assert "rerun_subagent_if_still_needed" in cancelled["next_actions"]
@@ -1885,6 +1938,7 @@ defmodule Pixir.SubagentsTest do
     assert event.data["subagent_id"] == agent["id"]
     assert event.data["status"] == "cancelled"
     assert event.data["reason"] == "cancelled_by_parent"
+    assert event.data["cancellation_evidence"] == %{"status" => "complete"}
     assert is_integer(event.data["elapsed_ms"])
     assert "rerun_subagent_if_still_needed" in event.data["next_actions"]
 
@@ -1894,6 +1948,15 @@ defmodule Pixir.SubagentsTest do
     assert [%{"id" => id, "status" => "cancelled"}] = outcome["cancelled"]
     assert id == agent["id"]
     assert "rerun_subagent_if_still_needed" in outcome["next_actions"]
+
+    assert {:ok, parent_history} = Log.fold(sid, workspace: ws)
+    reconstructed = Subagents.reconstruct(parent_history)[agent["id"]]
+    assert reconstructed["cancellation_evidence"] == %{"status" => "complete"}
+
+    restart_subagents_manager()
+    assert {:ok, [restored]} = Subagents.list(sid, workspace: ws)
+    assert restored["status"] == "cancelled"
+    assert restored["cancellation_evidence"] == %{"status" => "complete"}
   end
 
   test "close cleans up a queued subagent before runtime start", %{sid: sid, ws: ws} do
@@ -1974,6 +2037,7 @@ defmodule Pixir.SubagentsTest do
 
     # The child Log alone is sufficient evidence of a parent cancellation.
     assert event.data["reason"] == "cancelled_by_parent"
+    assert event.data["scope"] == "turn"
     assert event.data["lineage"] == "child"
     assert event.data["subagent_id"] == agent["id"]
     assert event.data["parent_session_id"] == sid
@@ -1982,8 +2046,10 @@ defmodule Pixir.SubagentsTest do
     refute Map.has_key?(event.data, "workflow_id")
     refute Map.has_key?(event.data, "workflow_close_outcome")
 
-    # Terminal: it is the last canonical event in the child Log.
-    assert List.last(child_history).seq == event.seq
+    # The cancellation statement follows the synchronous interrupt result. A surviving
+    # C6-classified declaration producer may append a bounded straggler later, so physical
+    # list-last ordering is deliberately not part of the contract.
+    assert is_integer(event.seq)
 
     # No sibling spelling is invented anywhere on this path.
     parent_reasons = cancellation_reasons(sid, ws, agent["id"])
@@ -1994,6 +2060,263 @@ defmodule Pixir.SubagentsTest do
              child_history,
              &(&1.data["reason"] in ["parent_cancelled", "cancelled_by_workflow"])
            )
+  end
+
+  test "close deterministically resolves completion timeout cancellation and repeated-close races",
+       %{sid: sid, ws: ws} do
+    {:ok, completing} =
+      Subagents.spawn_agent(
+        sid,
+        %{"task" => "complete before close", "timeout_ms" => 15_000},
+        workspace: ws,
+        provider: KnobCaptureProvider,
+        permission_mode: :read_only
+      )
+
+    completing_sid = completing["child_session_id"]
+    on_exit(fn -> cleanup_session(completing_sid) end)
+
+    assert {:ok, [completed]} = Subagents.wait(sid, [completing["id"]], 5_000, workspace: ws)
+    assert completed["status"] == "completed"
+    assert {:ok, completed_close} = Subagents.close(sid, completing["id"], workspace: ws)
+    assert completed_close["status"] == "closed"
+    assert completed_close["reason"] == "closed_by_parent"
+    refute Map.has_key?(completed_close, "cancellation_evidence")
+
+    {:ok, timing_out} =
+      Subagents.spawn_agent(
+        sid,
+        %{"task" => "timeout before close", "timeout_ms" => 15_000},
+        workspace: ws,
+        provider: BlockingProvider,
+        permission_mode: :read_only
+      )
+
+    timing_out_sid = timing_out["child_session_id"]
+    on_exit(fn -> cleanup_session(timing_out_sid) end)
+    wait_until_started(sid, ws, timing_out)
+
+    # Drive the Manager's real timeout message directly; 15s remains only a bounded
+    # watchdog and never serves as correctness synchronization.
+    send(Process.whereis(Pixir.Subagents.Manager), {:subagent_timeout, sid, timing_out["id"]})
+
+    assert {:ok, [timed_out]} =
+             Subagents.wait(sid, [timing_out["id"]], 5_000, workspace: ws)
+
+    assert timed_out["status"] == "timed_out"
+    assert timed_out["reason"] == "timeout"
+    assert {:ok, timed_out_close} = Subagents.close(sid, timing_out["id"], workspace: ws)
+    assert timed_out_close["status"] == "closed"
+    assert timed_out_close["reason"] == "timeout"
+    refute Map.has_key?(timed_out_close, "cancellation_evidence")
+
+    {:ok, cancelling} =
+      Subagents.spawn_agent(
+        sid,
+        %{"task" => "cancel then close repeatedly", "timeout_ms" => 15_000},
+        workspace: ws,
+        provider: BlockingProvider,
+        permission_mode: :read_only
+      )
+
+    cancelling_sid = cancelling["child_session_id"]
+    on_exit(fn -> cleanup_session(cancelling_sid) end)
+    wait_until_started(sid, ws, cancelling)
+
+    assert {:ok, cancelled} = Subagents.close(sid, cancelling["id"], workspace: ws)
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["reason"] == "cancelled_by_parent"
+    assert cancelled["cancellation_evidence"] == %{"status" => "complete"}
+
+    assert {:ok, closed_once} = Subagents.close(sid, cancelling["id"], workspace: ws)
+    assert closed_once["status"] == "closed"
+    assert closed_once["reason"] == "cancelled_by_parent"
+    assert closed_once["cancellation_evidence"] == %{"status" => "complete"}
+
+    assert {:ok, closed_twice} = Subagents.close(sid, cancelling["id"], workspace: ws)
+    assert closed_twice["status"] == "closed"
+    assert closed_twice["reason"] == "cancelled_by_parent"
+    assert closed_twice["cancellation_evidence"] == %{"status" => "complete"}
+    assert is_pid(GenServer.whereis(Session.via(cancelling_sid)))
+  end
+
+  test "cancelled child Session stays alive and send_input starts a fresh compound Turn identity",
+       %{sid: sid, ws: ws} do
+    {:ok, agent} =
+      Subagents.spawn_agent(
+        sid,
+        %{"task" => "first blocking turn", "timeout_ms" => 15_000},
+        workspace: ws,
+        provider: BlockingProvider,
+        permission_mode: :auto
+      )
+
+    child_sid = agent["child_session_id"]
+    on_exit(fn -> cleanup_session(child_sid) end)
+
+    wait_until(fn ->
+      case Registry.lookup(Pixir.Sessions.Registry, child_sid) do
+        [{pid, _}] ->
+          match?(%{turn: %{identity: {_incarnation, _generation}}}, :sys.get_state(pid))
+
+        _ ->
+          false
+      end
+    end)
+
+    assert [{child_pid, _}] = Registry.lookup(Pixir.Sessions.Registry, child_sid)
+    assert %{turn: %{identity: first_identity}} = :sys.get_state(child_pid)
+    assert {first_incarnation, first_generation} = first_identity
+    assert is_reference(first_incarnation)
+    assert is_integer(first_generation)
+
+    assert {:ok, cancelled} = Subagents.close(sid, agent["id"], workspace: ws)
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["cancellation_evidence"] == %{"status" => "complete"}
+    assert [{^child_pid, _}] = Registry.lookup(Pixir.Sessions.Registry, child_sid)
+    assert Process.alive?(child_pid)
+    assert %{turn: nil} = :sys.get_state(child_pid)
+
+    assert {:ok, resumed} =
+             Subagents.send_input(sid, agent["id"], "second blocking turn", workspace: ws)
+
+    assert resumed["status"] == "running"
+    refute Map.has_key?(resumed, "cancellation_evidence")
+
+    wait_until(fn ->
+      case :sys.get_state(child_pid) do
+        %{turn: %{identity: identity}} -> identity != first_identity
+        _ -> false
+      end
+    end)
+
+    assert %{turn: %{identity: second_identity}} = :sys.get_state(child_pid)
+
+    assert {^first_incarnation, second_generation} = second_identity
+    assert second_generation > first_generation
+    refute second_identity == first_identity
+
+    restart_subagents_manager()
+    assert {:ok, [restored]} = Subagents.list(sid, workspace: ws)
+    assert restored["status"] == "running"
+    refute Map.has_key?(restored, "cancellation_evidence")
+
+    assert {:ok, cancelled_again} = Subagents.close(sid, agent["id"], workspace: ws)
+    assert cancelled_again["status"] == "cancelled"
+    assert Process.alive?(child_pid)
+  end
+
+  test "a late real declaration producer is C6-classified after child cancellation and cannot attach to the successor",
+       %{sid: sid, ws: ws} do
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+    on_exit(fn -> if Process.alive?(counter), do: Agent.stop(counter) end)
+
+    {:ok, agent} =
+      Subagents.spawn_agent(
+        sid,
+        %{"task" => "hold a declaration producer", "timeout_ms" => 15_000},
+        workspace: ws,
+        provider: LateDeclarationProvider,
+        provider_opts: [test_pid: self(), counter: counter],
+        permission_mode: :auto
+      )
+
+    child_sid = agent["child_session_id"]
+    child_pid = GenServer.whereis(Session.via(child_sid))
+    on_exit(fn -> cleanup_session(child_sid) end)
+
+    assert_receive {:late_declaration_producer_ready, producer}, 2_000
+    assert_receive {:late_provider_turn_started, 1, _first_turn_pid, ^producer}, 2_000
+
+    wait_until(fn ->
+      match?(%{turn: %{identity: {_incarnation, _generation}}}, :sys.get_state(child_pid))
+    end)
+
+    assert %{turn: %{identity: first_identity}} = :sys.get_state(child_pid)
+
+    assert {:ok, first_cancelled} = Subagents.close(sid, agent["id"], workspace: ws)
+    assert first_cancelled["cancellation_evidence"] == %{"status" => "complete"}
+
+    child_after_cancel = child_history!(first_cancelled)
+    assert [first_failure] = Enum.filter(child_after_cancel, &(&1.type == :turn_failed))
+    assert [first_child_cancel] = child_cancellation_events(child_after_cancel)
+    assert first_failure.seq < first_child_cancel.seq
+    assert first_child_cancel.data["scope"] == "turn"
+
+    assert {:ok, resumed} =
+             Subagents.send_input(sid, agent["id"], "hold the successor", workspace: ws)
+
+    assert resumed["status"] == "running"
+    assert_receive {:late_provider_turn_started, 2, _successor_turn_pid, nil}, 2_000
+
+    wait_until(fn ->
+      case :sys.get_state(child_pid) do
+        %{turn: %{identity: identity}} -> identity != first_identity
+        _ -> false
+      end
+    end)
+
+    assert %{turn: %{identity: second_identity}} = :sys.get_state(child_pid)
+
+    refute second_identity == first_identity
+
+    # Release only after both the interrupt failure record and child cancellation record
+    # are durable and a fresh successor Turn has acknowledged that it is active.
+    send(producer, :release_late_declaration)
+    assert_receive {:late_declaration_producer_finished, :ok}, 2_000
+    refute_received :late_declaration_producer_watchdog
+
+    wait_until(fn ->
+      case Log.fold(child_sid, workspace: agent["workspace"]) do
+        {:ok, history} ->
+          Enum.any?(
+            history,
+            &(&1.type == :tool_call and
+                &1.data["call_id"] == "call_after_child_cancellation")
+          )
+
+        _ ->
+          false
+      end
+    end)
+
+    assert {:ok, child_with_late} = Log.fold(child_sid, workspace: agent["workspace"])
+
+    assert late =
+             Enum.find(
+               child_with_late,
+               &(&1.type == :tool_call and
+                   &1.data["call_id"] == "call_after_child_cancellation")
+             )
+
+    assert late.data["drained"]["reason"] == "stale_turn_generation"
+    assert late.seq > first_child_cancel.seq
+
+    # This pins the inherited C6 identity-classification path for two Turns in one Session
+    # incarnation. The real transient-restart regression in `SessionTest` is the separate
+    # anti-vacuity pin for the incarnation component when numeric generations collide.
+    assert %{turn: %{identity: ^second_identity}, committed_calls: committed_calls} =
+             :sys.get_state(child_pid)
+
+    refute Enum.any?(committed_calls, &(&1.call_id == "call_after_child_cancellation"))
+
+    assert {:ok, second_cancelled} = Subagents.close(sid, agent["id"], workspace: ws)
+    assert second_cancelled["status"] == "cancelled"
+    assert Process.alive?(child_pid)
+
+    final_child_history = child_history!(second_cancelled)
+
+    assert Enum.count(
+             final_child_history,
+             &(&1.type == :tool_call and
+                 &1.data["call_id"] == "call_after_child_cancellation")
+           ) == 1
+
+    assert Enum.count(
+             final_child_history,
+             &(&1.type == :tool_result and
+                 &1.data["call_id"] == "call_after_child_cancellation")
+           ) == 1
   end
 
   test "cancelling a subagent mid-tool-call orders the terminal event after orphan repair", %{
@@ -2038,7 +2361,7 @@ defmodule Pixir.SubagentsTest do
 
     assert [terminal] = child_cancellation_events(child_history)
     assert orphan.seq < terminal.seq
-    assert List.last(child_history).seq == terminal.seq
+    assert terminal.data["scope"] == "turn"
   end
 
   test "cancelling a child that is alive but idle still writes the terminal child event", %{
@@ -2079,7 +2402,7 @@ defmodule Pixir.SubagentsTest do
     assert [terminal] = child_cancellation_events(child_history)
     assert terminal.data["parent_session_id"] == sid
     assert terminal.data["subagent_id"] == agent["id"]
-    assert List.last(child_history).seq == terminal.seq
+    assert terminal.data["scope"] == "turn"
 
     assert [orphan] =
              Enum.filter(child_history, fn event ->
@@ -2115,9 +2438,43 @@ defmodule Pixir.SubagentsTest do
     assert {:ok, cancelled} = Subagents.close(sid, agent["id"], workspace: ws)
     assert cancelled["status"] == "cancelled"
     assert cancelled["reason"] == "cancelled_by_parent"
+
+    expected_evidence = %{
+      "status" => "partial",
+      "failed_steps" => ["session_interrupt_evidence", "child_cancellation_event"],
+      "next_actions" => [
+        "inspect_parent_session_log",
+        "inspect_child_session_log",
+        "rerun_subagent_if_still_needed"
+      ]
+    }
+
+    assert cancelled["cancellation_evidence"] == expected_evidence
+    refute inspect(cancelled["cancellation_evidence"]) =~ "noproc"
+    refute inspect(cancelled["cancellation_evidence"]) =~ "EXIT"
     assert Process.alive?(Process.whereis(Pixir.Subagents.Manager))
 
-    # Parent-side evidence is unchanged and authoritative.
+    assert {:ok, parent_history} = Log.fold(sid, workspace: ws)
+
+    assert [parent_cancelled] =
+             Enum.filter(
+               parent_history,
+               &(&1.type == :subagent_event and &1.data["subagent_id"] == agent["id"] and
+                   &1.data["event"] == "cancelled")
+             )
+
+    assert parent_cancelled.data["cancellation_evidence"] == expected_evidence
+    refute inspect(parent_cancelled.data["cancellation_evidence"]) =~ "noproc"
+
+    reconstructed = Subagents.reconstruct(parent_history)[agent["id"]]
+    assert reconstructed["cancellation_evidence"] == expected_evidence
+
+    restart_subagents_manager()
+    assert {:ok, [restored]} = Subagents.list(sid, workspace: ws)
+    assert restored["status"] == "cancelled"
+    assert restored["cancellation_evidence"] == expected_evidence
+
+    # Parent-side evidence remains authoritative when child persistence is impossible.
     assert cancellation_reasons(sid, ws, agent["id"]) == ["cancelled_by_parent"]
   end
 
@@ -2162,7 +2519,7 @@ defmodule Pixir.SubagentsTest do
         "type" => "subagent_event",
         "data" => %{
           "event" => "cancelled_by_parent",
-          "scope" => "session",
+          "scope" => "turn",
           "lineage" => "child",
           "status" => "cancelled",
           "reason" => "cancelled_by_parent",
@@ -2175,6 +2532,59 @@ defmodule Pixir.SubagentsTest do
 
     assert {:ok, history} = Log.fold(cold_sid, workspace: ws)
     assert Subagents.reconstruct(history) == %{}
+  end
+
+  test "a delegate horizon override never reconstructs as a phantom child" do
+    real_id = "sub_real_479"
+
+    history = [
+      %{
+        type: :subagent_event,
+        data: %{
+          "event" => "finished",
+          "subagent_id" => real_id,
+          "child_session_id" => "s_child_479",
+          "status" => "completed"
+        }
+      },
+      %{
+        type: :subagent_event,
+        data: %{
+          "event" => "horizon_override",
+          "source" => "allow_short_horizon",
+          "scope" => "delegate",
+          "horizon_override" => %{"declared_timeout_ms" => 100}
+        }
+      }
+    ]
+
+    assert %{^real_id => %{"id" => ^real_id}} = reconstructed = Subagents.reconstruct(history)
+    assert map_size(reconstructed) == 1
+    refute Map.has_key?(reconstructed, nil)
+  end
+
+  # The structural gate, not the named-event allowlist: an id-less subagent_event the
+  # allowlist has never heard of must still be unable to fold into a phantom child.
+  test "an unnamed id-less subagent_event never reconstructs as a phantom child" do
+    real_id = "sub_real_structural"
+
+    history = [
+      %{
+        type: :subagent_event,
+        data: %{
+          "event" => "finished",
+          "subagent_id" => real_id,
+          "child_session_id" => "s_child_structural",
+          "status" => "completed"
+        }
+      },
+      %{type: :subagent_event, data: %{"event" => "delegate_meta", "scope" => "delegate"}},
+      %{type: :subagent_event, data: %{"event" => "delegate_meta", "subagent_id" => "  "}}
+    ]
+
+    reconstructed = Subagents.reconstruct(history)
+    assert map_size(reconstructed) == 1
+    assert Map.has_key?(reconstructed, real_id)
   end
 
   test "a detached subagent refuses close and writes no child event", %{sid: sid, ws: ws} do
@@ -2447,6 +2857,35 @@ defmodule Pixir.SubagentsTest do
     assert details["reason"] == "missing"
   end
 
+  test "a tool_call without a binary name is mutation evidence", %{ws: ws} do
+    cold_sid = unique_session_id("legacy-unclassifiable-name")
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "tool_call",
+        "data" => %{"call_id" => "call_unclassifiable", "name" => 123, "args" => %{}}
+      }
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(cold_sid, workspace: ws)
+
+    assert details["reason"] == "missing"
+  end
+
+  test "a tool_call with no name key at all is mutation evidence", %{ws: ws} do
+    cold_sid = unique_session_id("legacy-absent-name")
+
+    write_raw_history!(cold_sid, ws, [
+      %{"type" => "tool_call", "data" => %{"call_id" => "call_nameless"}}
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(cold_sid, workspace: ws)
+
+    assert details["reason"] == "missing"
+  end
+
   test "cold resume rejects a shared posture whose recorded workspace is absent", %{ws: ws} do
     cold_sid = unique_session_id("shared-workspace-absent")
 
@@ -2581,6 +3020,340 @@ defmodule Pixir.SubagentsTest do
              Subagents.resume_posture(cold_sid, workspace: ws)
 
     assert details["reason"] == "missing"
+  end
+
+  test "a valid warm boundary without current posture cannot restore copied root authority", %{
+    ws: ws
+  } do
+    cold_sid = unique_session_id("warm-missing-current-posture")
+    seed_sid = "seed-root-auto"
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "session_fork",
+        "data" => %{
+          "parent_session_id" => seed_sid,
+          "fork_root_session_id" => seed_sid,
+          "replay_event_count" => 2,
+          "strategy" => "replay_v1",
+          "source" => "delegate_warm_start"
+        }
+      },
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "lineage" => "root",
+          "source" => "root_session_start",
+          "permission_mode" => "auto",
+          "write_policy" => nil,
+          "workspace_mode" => "shared",
+          "workspace" => ws
+        }
+      },
+      %{"type" => "user_message", "data" => %{"text" => "copied root history"}},
+      %{
+        "type" => "user_message",
+        "data" => %{
+          "text" => Pixir.Subagents.WarmStart.boundary_text(seed_sid),
+          "lineage_boundary" => true,
+          "author" => "runtime",
+          "marker_kind" => Pixir.Subagents.WarmStart.boundary_marker_kind(),
+          "seed_session_id" => seed_sid,
+          "fork_root_session_id" => seed_sid,
+          "replay_event_count" => 2
+        }
+      }
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(cold_sid, workspace: ws)
+
+    assert details["reason"] == "missing_current_posture"
+  end
+
+  test "a malformed warm marker preserves full-history root and Fork behavior", %{ws: ws} do
+    cold_sid = unique_session_id("malformed-warm-boundary")
+    seed_sid = "seed-malformed-boundary"
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "session_fork",
+        "data" => %{"parent_session_id" => seed_sid, "fork_root_session_id" => seed_sid}
+      },
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "lineage" => "root",
+          "source" => "root_session_start",
+          "permission_mode" => "auto",
+          "write_policy" => nil,
+          "workspace_mode" => "shared",
+          "workspace" => ws
+        }
+      },
+      %{
+        "type" => "user_message",
+        "data" => warm_boundary(seed_sid, seed_sid, 1, %{"marker_kind" => "lineage_boundary_v0"})
+      }
+    ])
+
+    assert {:ok, posture} = Subagents.resume_posture(cold_sid, workspace: ws)
+    assert posture.lineage == :root
+    assert posture.permission_mode == :auto
+    assert posture.write_policy == nil
+  end
+
+  test "semantically incoherent warm markers preserve legacy Fork posture", %{ws: ws} do
+    seed_sid = "seed-incoherent-boundary"
+
+    variants = [
+      %{
+        "seed_session_id" => "../invalid",
+        "text" => Pixir.Subagents.WarmStart.boundary_text("../invalid")
+      },
+      %{"fork_root_session_id" => "other-root"},
+      %{"fork_root_session_id" => "../invalid-root"},
+      %{"replay_event_count" => 99},
+      %{"author" => "operator"},
+      %{"text" => "forged boundary text"}
+    ]
+
+    Enum.with_index(variants, fn overrides, index ->
+      cold_sid = unique_session_id("incoherent-warm-boundary-#{index}")
+
+      write_raw_history!(cold_sid, ws, [
+        %{
+          "type" => "session_fork",
+          "data" => %{
+            "parent_session_id" => seed_sid,
+            "fork_root_session_id" => seed_sid,
+            "replay_event_count" => 1,
+            "strategy" => "replay_v1",
+            "source" => "delegate_warm_start"
+          }
+        },
+        %{
+          "type" => "subagent_event",
+          "data" => %{
+            "event" => "permission_posture",
+            "scope" => "session",
+            "lineage" => "root",
+            "source" => "root_session_start",
+            "permission_mode" => "auto",
+            "write_policy" => nil,
+            "workspace_mode" => "shared",
+            "workspace" => ws
+          }
+        },
+        %{
+          "type" => "user_message",
+          "data" => warm_boundary(seed_sid, seed_sid, 1, overrides)
+        }
+      ])
+
+      assert {:ok, posture} = Subagents.resume_posture(cold_sid, workspace: ws)
+      assert posture.lineage == :root
+      assert posture.permission_mode == :auto
+    end)
+  end
+
+  test "warm resume ignores posture and mutation evidence before the last valid boundary", %{
+    ws: ws
+  } do
+    cold_sid = unique_session_id("warm-current-segment")
+    seed_sid = "seed-current-segment"
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "session_fork",
+        "data" => %{
+          "parent_session_id" => seed_sid,
+          "fork_root_session_id" => seed_sid,
+          "replay_event_count" => 3,
+          "strategy" => "replay_v1",
+          "source" => "delegate_warm_start"
+        }
+      },
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "lineage" => "root",
+          "source" => "root_session_start",
+          "permission_mode" => "auto",
+          "write_policy" => nil,
+          "workspace_mode" => "shared",
+          "workspace" => ws
+        }
+      },
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "historical-write",
+          "name" => "write",
+          "args" => %{"path" => "old.txt", "content" => "old"}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{"call_id" => "historical-write", "ok" => true, "output" => "written"}
+      },
+      %{"type" => "user_message", "data" => warm_boundary(seed_sid, seed_sid, 3)},
+      %{
+        "type" => "subagent_event",
+        "data" =>
+          warm_child_posture(ws, seed_sid, seed_sid, 3, %{
+            "subagent_id" => "sub_current",
+            "parent_session_id" => "parent_current",
+            "permission_mode" => "ask"
+          })
+      }
+    ])
+
+    assert {:ok, posture} = Subagents.resume_posture(cold_sid, workspace: ws)
+    assert posture.lineage == :child
+    assert posture.permission_mode == :ask
+    assert posture.write_policy == nil
+  end
+
+  test "a current posture separated from its warm boundary fails closed", %{ws: ws} do
+    cold_sid = unique_session_id("nonadjacent-warm-posture")
+    seed_sid = "seed-nonadjacent-warm-posture"
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "session_fork",
+        "data" => %{
+          "parent_session_id" => seed_sid,
+          "fork_root_session_id" => seed_sid,
+          "replay_event_count" => 1,
+          "strategy" => "replay_v1",
+          "source" => "delegate_warm_start"
+        }
+      },
+      %{"type" => "user_message", "data" => %{"text" => "copied history"}},
+      %{"type" => "user_message", "data" => warm_boundary(seed_sid, seed_sid, 1)},
+      %{"type" => "user_message", "data" => %{"text" => "unexpected gap"}},
+      %{
+        "type" => "subagent_event",
+        "data" => warm_child_posture(ws, seed_sid, seed_sid, 1, %{})
+      }
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(cold_sid, workspace: ws)
+
+    assert details["reason"] == "missing_current_posture"
+  end
+
+  test "an exact boundary appended after a normal Fork cannot reset authorization", %{ws: ws} do
+    cold_sid = unique_session_id("forged-warm-boundary")
+    seed_sid = "seed-forged-warm-boundary"
+    broad_policy = policy_fixture(["**/*"])
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "session_fork",
+        "data" => %{
+          "parent_session_id" => seed_sid,
+          "fork_root_session_id" => seed_sid,
+          "replay_event_count" => 1,
+          "strategy" => "replay_v1"
+        }
+      },
+      %{
+        "type" => "subagent_event",
+        "data" => %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "lineage" => "child",
+          "source" => "subagent_spawn",
+          "subagent_id" => "sub_original",
+          "parent_session_id" => "parent_original",
+          "permission_mode" => "read_only",
+          "write_policy" => nil,
+          "workspace_mode" => "shared",
+          "workspace" => ws
+        }
+      },
+      %{"type" => "user_message", "data" => warm_boundary(seed_sid, seed_sid, 1)},
+      %{
+        "type" => "subagent_event",
+        "data" =>
+          warm_child_posture(ws, seed_sid, seed_sid, 1, %{
+            "subagent_id" => "sub_forged",
+            "parent_session_id" => "parent_forged",
+            "permission_mode" => "auto",
+            "write_policy" => WritePolicy.metadata(broad_policy)
+          })
+      }
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(cold_sid, workspace: ws)
+
+    assert details["reason"] == "ambiguous"
+
+    forked_sid = unique_session_id("forked-forged-warm-boundary")
+    assert {:ok, _} = Pixir.Fork.fork(cold_sid, workspace: ws, child_session_id: forked_sid)
+    assert {:ok, forked_history} = Log.fold(forked_sid, workspace: ws)
+    refute List.first(forked_history).data["warm_lineage"]
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: forked_details}}} =
+             Subagents.resume_posture(forked_sid, workspace: ws)
+
+    assert forked_details["reason"] == "ambiguous"
+  end
+
+  test "current warm-segment mutation evidence still constrains an unbounded posture", %{ws: ws} do
+    cold_sid = unique_session_id("warm-current-mutation")
+    seed_sid = "seed-current-mutation"
+
+    write_raw_history!(cold_sid, ws, [
+      %{
+        "type" => "session_fork",
+        "data" => %{
+          "parent_session_id" => seed_sid,
+          "fork_root_session_id" => seed_sid,
+          "replay_event_count" => 1,
+          "strategy" => "replay_v1",
+          "source" => "delegate_warm_start"
+        }
+      },
+      %{"type" => "user_message", "data" => %{"text" => "copied history"}},
+      %{"type" => "user_message", "data" => warm_boundary(seed_sid, seed_sid, 1)},
+      %{
+        "type" => "subagent_event",
+        "data" =>
+          warm_child_posture(ws, seed_sid, seed_sid, 1, %{
+            "subagent_id" => "sub_current_mutation",
+            "parent_session_id" => "parent_current_mutation",
+            "permission_mode" => "ask"
+          })
+      },
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "current-write",
+          "name" => "write",
+          "args" => %{"path" => "current.txt", "content" => "current"}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{"call_id" => "current-write", "ok" => true, "output" => "written"}
+      }
+    ])
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(cold_sid, workspace: ws)
+
+    assert details["reason"] == "unbounded_write_policy"
   end
 
   test "a seq-0 root marker restores unbounded auto despite write evidence", %{ws: ws} do
@@ -3344,6 +4117,53 @@ defmodule Pixir.SubagentsTest do
       assert {:ok, restricted} = Subagents.restrict_resume_posture(posture, :auto, requested)
       assert restricted.write_policy["bash"] == "disabled"
     end
+  end
+
+  defp warm_boundary(seed_session_id, fork_root_session_id, replay_event_count, overrides \\ %{}) do
+    Map.merge(
+      %{
+        "text" => Pixir.Subagents.WarmStart.boundary_text(seed_session_id),
+        "lineage_boundary" => true,
+        "author" => "runtime",
+        "marker_kind" => Pixir.Subagents.WarmStart.boundary_marker_kind(),
+        "seed_session_id" => seed_session_id,
+        "fork_root_session_id" => fork_root_session_id,
+        "replay_event_count" => replay_event_count
+      },
+      overrides
+    )
+  end
+
+  defp warm_child_posture(
+         ws,
+         seed_session_id,
+         fork_root_session_id,
+         replay_event_count,
+         overrides
+       ) do
+    Map.merge(
+      %{
+        "event" => "permission_posture",
+        "scope" => "session",
+        "lineage" => "child",
+        "source" => "subagent_spawn",
+        "subagent_id" => "sub_current",
+        "parent_session_id" => "parent_current",
+        "permission_mode" => "read_only",
+        "write_policy" => nil,
+        "workspace_mode" => "shared",
+        "workspace" => ws,
+        "warm_start" => %{
+          "warm_started" => true,
+          "seed_session_id" => seed_session_id,
+          "fork_root_session_id" => fork_root_session_id,
+          "replay_event_count" => replay_event_count,
+          "strategy" => "replay_v1",
+          "boundary_marker_kind" => Pixir.Subagents.WarmStart.boundary_marker_kind()
+        }
+      },
+      overrides
+    )
   end
 
   defp posture_fixture(mode, write_policy) do

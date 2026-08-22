@@ -75,13 +75,10 @@ defmodule PixirMonitor.EscriptMalformedScaleTest do
   @tag skip: @browser_skip
   @tag timeout: 300_000
   test "malformed fields remain bounded, inert, confessed, and outside semantic ordering" do
-    workspace =
-      Path.join(
-        System.tmp_dir!(),
-        "pixir-monitor-escript-malformed-scale-#{System.unique_integer([:positive])}"
-      )
+    workspace = PixirMonitor.TestRun.tmp("pixir-monitor-escript-malformed-scale")
+    profile_base = Path.join(workspace, "chrome-profiles")
 
-    File.mkdir_p!(workspace)
+    File.mkdir_p!(profile_base)
     on_exit(fn -> File.rm_rf!(workspace) end)
 
     input = SemanticZoomFixture.malformed_input_500()
@@ -113,7 +110,7 @@ defmodule PixirMonitor.EscriptMalformedScaleTest do
           "--browser",
           @browser,
           "--profile-base",
-          System.tmp_dir!(),
+          profile_base,
           "--run-id",
           run_id,
           "--oracle-file",

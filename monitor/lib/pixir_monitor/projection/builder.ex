@@ -1801,16 +1801,27 @@ defmodule PixirMonitor.Projection.Builder do
   @write_tools ~w(write edit apply_virtual_diff)
 
   # Applied writes reconstructed from the unit's child Log: a write-class tool call
-  # correlated by call_id to an ok result. Lower-bound evidence only.
+  # correlated to an ok result by a binary call_id present on both sides.
+  # Lower-bound evidence only.
   defp child_derived_write_paths(unit, ctx) do
     events = unit_child_events(unit, ctx)
-    ok_calls = for e <- events, e["type"] == "tool_result", get_in(e, ["data", "ok"]) == true, into: MapSet.new(), do: get_in(e, ["data", "call_id"])
+
+    ok_calls =
+      for e <- events,
+          e["type"] == "tool_result",
+          get_in(e, ["data", "ok"]) == true,
+          call_id = get_in(e, ["data", "call_id"]),
+          is_binary(call_id),
+          into: MapSet.new(),
+          do: call_id
 
     paths =
       for event <- events,
           event["type"] == "tool_call",
           get_in(event, ["data", "name"]) in @write_tools,
-          MapSet.member?(ok_calls, get_in(event, ["data", "call_id"])),
+          call_id = get_in(event, ["data", "call_id"]),
+          is_binary(call_id),
+          MapSet.member?(ok_calls, call_id),
           path = workspace_relative_path(get_in(event, ["data", "args", "path"])),
           path != nil,
           do: path

@@ -98,8 +98,56 @@ defmodule Pixir.ACP.ServerTest do
     end
   end
 
+  defmodule TurnBoundaryProvider do
+    def stream(_request, opts) do
+      sink = Keyword.fetch!(opts, :sink)
+      test = Keyword.fetch!(opts, :test)
+      turn = Agent.get_and_update(sink, fn count -> {count, count + 1} end)
+      send(test, {:turn_provider_opts, turn, opts})
+
+      if turn == 0 do
+        Process.sleep(10_000)
+      end
+
+      {:ok, %{text: "", reasoning: "", function_calls: [], finish_reason: :stop}}
+    end
+  end
+
+  defmodule StaticHeaderAuth do
+    use GenServer
+
+    def start_link(headers), do: GenServer.start_link(__MODULE__, headers)
+    def init(headers), do: {:ok, headers}
+    def handle_call(:request_headers, _from, headers), do: {:reply, {:ok, headers}, headers}
+  end
+
   defp stop(text),
     do: {:ok, %{text: text, reasoning: "", function_calls: [], finish_reason: :stop}}
+
+  defp responses_transport_attempts(test, attempts) do
+    {:ok, queue} = Agent.start_link(fn -> :queue.from_list(attempts) end)
+
+    fn http_request, acc, fun ->
+      send(test, {:responses_body, Jason.decode!(http_request.body)})
+
+      chunks =
+        Agent.get_and_update(queue, fn pending ->
+          case :queue.out(pending) do
+            {{:value, chunks}, rest} -> {chunks, rest}
+            {:empty, empty} -> raise "no canned Responses attempt left: #{inspect(empty)}"
+          end
+        end)
+
+      acc = fun.({:status, 200}, acc)
+
+      acc =
+        Enum.reduce(chunks, acc, fn chunk, current ->
+          fun.({:data, "data: " <> Jason.encode!(chunk) <> "\n\n"}, current)
+        end)
+
+      {:ok, acc}
+    end
+  end
 
   defp tool_calls(calls),
     do: {:ok, %{text: "", reasoning: "", function_calls: calls, finish_reason: :tool_calls}}
@@ -147,6 +195,10 @@ defmodule Pixir.ACP.ServerTest do
   end
 
   setup do
+    # #563: isolate PIXIR_HOME only. Do not redirect HOME here — the real-escript
+    # describe calls `mix escript.build`, which needs the operator Mix/Hex home.
+    Pixir.Test.OperatorState.isolate_pixir_home!()
+
     ws =
       Path.join(
         System.tmp_dir!(),
@@ -162,6 +214,14 @@ defmodule Pixir.ACP.ServerTest do
   # Start a Server with a capture output device and no stdin reader (lines via feed/2).
   # A unique `:id` lets a single test start more than one Server (e.g. load/resume,
   # which needs a fresh second server).
+  defp official_responses_backend do
+    %{
+      "mode" => "open_responses",
+      "responses_url" => "https://api.openai.com/v1/responses",
+      "auth" => %{"policy" => "none"}
+    }
+  end
+
   defp start_server(out, opts \\ []) do
     {id, opts} = Keyword.pop(opts, :id, Server)
 
@@ -182,6 +242,21 @@ defmodule Pixir.ACP.ServerTest do
   defp await_method(out, method, timeout \\ 2_000) do
     deadline = System.monotonic_time(:millisecond) + timeout
     poll_method(out, method, deadline)
+  end
+
+  defp await_available_commands(out, session_id, timeout \\ 2_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    poll_find(
+      out,
+      fn line ->
+        line["method"] == "session/update" and line["params"]["sessionId"] == session_id and
+          get_in(line, ["params", "update", "sessionUpdate"]) ==
+            "available_commands_update"
+      end,
+      "available commands for #{session_id}",
+      deadline
+    )
   end
 
   defp poll_method(out, method, deadline),
@@ -243,6 +318,25 @@ defmodule Pixir.ACP.ServerTest do
     end
   end
 
+  defp await_turn_idle(session_id, timeout \\ 1_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    poll_turn_idle(session_id, deadline)
+  end
+
+  defp poll_turn_idle(session_id, deadline) do
+    cond do
+      Pixir.Session.turn_running?(session_id) == false ->
+        :ok
+
+      System.monotonic_time(:millisecond) > deadline ->
+        flunk("timed out waiting for Session Turn cleanup")
+
+      true ->
+        Process.sleep(10)
+        poll_turn_idle(session_id, deadline)
+    end
+  end
+
   test "initialize returns the agent capabilities", %{out: out} do
     server = start_server(out)
     Server.feed(server, request(1, "initialize", %{"protocolVersion" => 1}))
@@ -253,6 +347,9 @@ defmodule Pixir.ACP.ServerTest do
     assert resp["result"]["agentCapabilities"]["loadSession"] == true
     assert resp["result"]["agentCapabilities"]["promptCapabilities"]["image"] == true
     assert resp["result"]["agentCapabilities"]["sessionCapabilities"]["resume"] == %{}
+    assert resp["result"]["agentCapabilities"]["sessionCapabilities"]["list"] == %{}
+    assert resp["result"]["agentCapabilities"]["sessionCapabilities"]["close"] == %{}
+    assert resp["result"]["agentCapabilities"]["sessionCapabilities"]["delete"] == %{}
     assert resp["result"]["agentInfo"]["name"] == "pixir"
 
     assert [
@@ -342,6 +439,546 @@ defmodule Pixir.ACP.ServerTest do
     refute Map.has_key?(logout, "error")
   end
 
+  test "session/list returns empty matches", %{out: out, ws: ws} do
+    server = start_server(out)
+
+    Server.feed(server, request(10, "session/list", %{"cwd" => ws}))
+
+    assert %{"result" => %{"sessions" => []}} = await_id(out, 10)
+  end
+
+  test "session/close stops an active ACP session and unknown close errors", %{out: out, ws: ws} do
+    server = start_server(out)
+    Server.feed(server, request(11, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 11)["result"]["sessionId"]
+
+    Server.feed(server, request(12, "session/close", %{"sessionId" => sid}))
+    assert await_id(out, 12)["result"] == %{}
+
+    Server.feed(server, request(13, "session/close", %{"sessionId" => sid}))
+    assert await_id(out, 13)["error"]["code"] == -32_602
+  end
+
+  test "session/delete soft-hides a closed session but leaves the log", %{out: out, ws: ws} do
+    {:ok, agent} = Agent.start_link(fn -> [stop("hello")] end)
+    server = start_server(out, provider: StubProvider, provider_opts: [agent: agent])
+
+    Server.feed(server, request(14, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 14)["result"]["sessionId"]
+
+    Server.feed(
+      server,
+      request(15, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "make a log"}]
+      })
+    )
+
+    assert await_id(out, 15)["result"]["stopReason"] == "end_turn"
+    log_path = Pixir.Log.path(sid, workspace: ws)
+    assert File.exists?(log_path)
+
+    Server.feed(server, request(16, "session/close", %{"sessionId" => sid}))
+    assert await_id(out, 16)["result"] == %{}
+
+    Server.feed(server, request(17, "session/delete", %{"sessionId" => sid}))
+    assert await_id(out, 17)["result"] == %{}
+
+    Server.feed(server, request(18, "session/list", %{"cwd" => ws}))
+    assert await_id(out, 18)["result"]["sessions"] == []
+    assert File.exists?(log_path)
+  end
+
+  test "session/load of a deleted session is invalid params and leaves the server alive", %{
+    out: out,
+    ws: ws
+  } do
+    server = start_server(out)
+
+    Server.feed(server, request(500, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 500)["result"]["sessionId"]
+
+    Server.feed(server, request(501, "session/close", %{"sessionId" => sid}))
+    assert await_id(out, 501)["result"] == %{}
+
+    Server.feed(server, request(502, "session/delete", %{"sessionId" => sid}))
+    assert await_id(out, 502)["result"] == %{}
+
+    Server.feed(server, request(503, "session/load", %{"sessionId" => sid, "cwd" => ws}))
+    resp = await_id(out, 503)
+    assert resp["error"]["code"] == -32_602
+    assert resp["error"]["message"] == "session has been deleted"
+
+    Server.feed(server, request(504, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    assert is_binary(await_id(out, 504)["result"]["sessionId"])
+  end
+
+  test "session/delete maps malformed Session ids to -32602 without killing ACP", %{
+    out: out,
+    ws: ws
+  } do
+    server = start_server(out)
+    hostile = "???"
+
+    Server.feed(server, request(1, "session/delete", %{"sessionId" => hostile}))
+    response = await_id(out, 1)
+
+    assert response["error"]["code"] == -32602
+    assert response["error"]["message"] == "invalid session id"
+    assert response["error"]["data"]["field"] == "sessionId"
+    assert is_binary(response["error"]["data"]["reason"])
+    refute inspect(response) =~ hostile
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    assert is_binary(await_id(out, 2)["result"]["sessionId"])
+  end
+
+  test "/compact N records exactly one CLI-equivalent checkpoint outside the model path", %{
+    out: out,
+    ws: ws
+  } do
+    write_acp_skill(ws, "compact", "Must never activate for the runtime command")
+    {:ok, agent} = Agent.start_link(fn -> [stop("one"), stop("two")] end)
+    server = start_server(out, provider: StubProvider, provider_opts: [agent: agent])
+
+    Server.feed(server, request(19, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 19)["result"]["sessionId"]
+
+    for {id, text} <- [{20, "first"}, {21, "second"}] do
+      Server.feed(
+        server,
+        request(id, "session/prompt", %{
+          "sessionId" => sid,
+          "prompt" => [%{"type" => "text", "text" => text}]
+        })
+      )
+
+      assert await_id(out, id)["result"]["stopReason"] == "end_turn"
+    end
+
+    StringIO.flush(out)
+
+    assert {:ok, %{"event" => expected_checkpoint}} =
+             Pixir.Compaction.dry_run(sid, workspace: ws, trigger: "manual", tail_events: 1)
+
+    Server.feed(
+      server,
+      request(22, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "/compact 1"}]
+      })
+    )
+
+    assert await_id(out, 22)["result"]["stopReason"] == "end_turn"
+
+    updates =
+      out
+      |> written_lines()
+      |> Enum.filter(&(&1["method"] == "session/update"))
+      |> Enum.map(&get_in(&1, ["params", "update"]))
+
+    assert [chunk] = Enum.filter(updates, &(&1["sessionUpdate"] == "agent_message_chunk"))
+    assert chunk["content"]["text"] =~ "Recorded compaction checkpoint"
+    refute Enum.any?(updates, &(&1["sessionUpdate"] == "usage_update"))
+    assert Agent.get(agent, & &1) == []
+
+    {:ok, history} = Pixir.Log.fold(sid, workspace: ws)
+    assert [checkpoint] = Enum.filter(history, &(&1.type == :history_compaction))
+    assert checkpoint.data == expected_checkpoint
+    assert checkpoint.data["trigger"] == "manual"
+    assert checkpoint.data["tail_event_count"] == 1
+    refute Enum.any?(history, &(&1.type == :skill_activation and &1.data["name"] == "compact"))
+  end
+
+  test "/compact no-op emits only an honest short result", %{out: out, ws: ws} do
+    server = start_server(out)
+    Server.feed(server, request(23, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 23)["result"]["sessionId"]
+    StringIO.flush(out)
+
+    Server.feed(
+      server,
+      request(24, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "/compact"}]
+      })
+    )
+
+    assert await_id(out, 24)["result"]["stopReason"] == "end_turn"
+    updates = compact_prompt_updates(out)
+    assert [chunk] = Enum.filter(updates, &(&1["sessionUpdate"] == "agent_message_chunk"))
+    assert chunk["content"]["text"] =~ "Nothing to compact"
+    refute Enum.any?(updates, &(&1["sessionUpdate"] == "usage_update"))
+
+    {:ok, history} = Pixir.Log.fold(sid, workspace: ws)
+    refute Enum.any?(history, &(&1.type == :history_compaction))
+  end
+
+  test "/compact error emits only an honest short result", %{out: out, ws: ws} do
+    test_pid = self()
+
+    failure = %{
+      ok: false,
+      error: %{kind: :invalid_state, message: "forced compaction failure", details: %{}}
+    }
+
+    complete = fn _sid, _opts ->
+      send(test_pid, {:compaction_process, self()})
+
+      {:ok,
+       %{
+         "status" => "error",
+         "range" => nil,
+         "checkpoint" => nil,
+         "error" => failure
+       }}
+    end
+
+    server = start_server(out, compaction_complete: complete)
+    Server.feed(server, request(25, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 25)["result"]["sessionId"]
+    StringIO.flush(out)
+
+    Server.feed(
+      server,
+      request(26, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "/compact 3"}]
+      })
+    )
+
+    assert await_id(out, 26)["result"]["stopReason"] == "end_turn"
+    assert_receive {:compaction_process, compaction_pid}
+    refute compaction_pid == server
+
+    updates = compact_prompt_updates(out)
+    assert [chunk] = Enum.filter(updates, &(&1["sessionUpdate"] == "agent_message_chunk"))
+    assert chunk["content"]["text"] =~ "Compaction failed: invalid_state"
+    refute Enum.any?(updates, &(&1["sessionUpdate"] == "usage_update"))
+  end
+
+  test "/compact emits chunk then usage_update only from a supplied runtime snapshot", %{
+    out: out,
+    ws: ws
+  } do
+    sid = "compact-runtime-snapshot-#{System.unique_integer([:positive])}"
+
+    events = [
+      Event.user_message(sid, "one"),
+      Event.assistant_message(sid, "two"),
+      Event.assistant_message(sid, "three")
+    ]
+
+    events
+    |> Enum.with_index()
+    |> Enum.each(fn {event, seq} ->
+      assert {:ok, _} = Pixir.Log.append(Event.with_seq(event, seq), workspace: ws)
+    end)
+
+    complete = fn compact_sid, opts ->
+      with {:ok, completion} <- Pixir.Compaction.complete(compact_sid, opts) do
+        {:ok,
+         Map.put(completion, "pressure_snapshot", %{
+           "presentation" => "snapshot",
+           "tier" => "none",
+           "model" => "measured-model",
+           "input_tokens" => 321,
+           "window_tokens" => 1_000,
+           "ratio" => 0.321,
+           "checkpoint_to_seq" => 1
+         })}
+      end
+    end
+
+    server = start_server(out, compaction_complete: complete)
+    Server.feed(server, request(27, "session/resume", %{"sessionId" => sid, "cwd" => ws}))
+    assert await_id(out, 27)["result"]["sessionId"] == sid
+    StringIO.flush(out)
+
+    Server.feed(
+      server,
+      request(28, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "/compact 1"}]
+      })
+    )
+
+    assert await_id(out, 28)["result"]["stopReason"] == "end_turn"
+
+    assert [chunk, usage] = compact_prompt_updates(out)
+    assert chunk["sessionUpdate"] == "agent_message_chunk"
+    assert usage["sessionUpdate"] == "usage_update"
+    assert usage["used"] == 321
+    assert usage["size"] == 1_000
+    assert get_in(usage, ["_meta", "pixir", "checkpointToSeq"]) == 1
+  end
+
+  test "overlay-on /compact persists standalone_window via the compact client", %{
+    out: out,
+    ws: ws
+  } do
+    test = self()
+    {:ok, auth} = StaticHeaderAuth.start_link([{"authorization", "Bearer sk-acp-compact"}])
+
+    output = [
+      %{"type" => "message", "role" => "user", "content" => "kept prefix"},
+      %{
+        "type" => "compaction",
+        "id" => "cmp_acp_standalone",
+        "encrypted_content" => "CIPHERTEXT_ACP"
+      }
+    ]
+
+    transport = fn http_request, acc, fun ->
+      send(test, {:compact_request, http_request})
+      acc = fun.({:status, 200}, acc)
+
+      acc =
+        fun.(
+          {:data, Jason.encode!(%{"output" => output, "usage" => %{"input_tokens" => 4}})},
+          acc
+        )
+
+      {:ok, acc}
+    end
+
+    {:ok, agent} = Agent.start_link(fn -> [stop("one"), stop("two")] end)
+
+    server =
+      start_server(out,
+        provider: StubProvider,
+        provider_opts: [
+          agent: agent,
+          auth: auth,
+          transport: transport,
+          responses_backend: official_responses_backend()
+        ]
+      )
+
+    Server.feed(server, request(40, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 40)["result"]["sessionId"]
+
+    for {id, text} <- [{41, "first"}, {42, "second"}] do
+      Server.feed(
+        server,
+        request(id, "session/prompt", %{
+          "sessionId" => sid,
+          "prompt" => [%{"type" => "text", "text" => text}]
+        })
+      )
+
+      assert await_id(out, id)["result"]["stopReason"] == "end_turn"
+    end
+
+    StringIO.flush(out)
+
+    Server.feed(
+      server,
+      request(43, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "/compact 1"}]
+      })
+    )
+
+    assert await_id(out, 43)["result"]["stopReason"] == "end_turn"
+    assert_received {:compact_request, request}
+    assert String.ends_with?(request.url, "/compact")
+    body = Jason.decode!(request.body)
+    assert body["store"] == false
+    refute Map.has_key?(body, "compact_threshold")
+    refute Map.has_key?(body, "context_management")
+
+    {:ok, history} = Pixir.Log.fold(sid, workspace: ws)
+    checkpoint = Enum.find(history, &(&1.type == :history_compaction))
+    replay = checkpoint.data["native_replay"]
+    assert replay["mode"] == "standalone_window"
+    assert replay["recorded_usable"] == true
+    assert replay["items"] == output
+    refute inspect(Pixir.Compaction.inspect_native_replay(checkpoint.data)) =~ "CIPHERTEXT"
+  end
+
+  test "ACP /compact passes the session-sticky model into compact provider opts", %{
+    out: out,
+    ws: ws
+  } do
+    test = self()
+    {:ok, auth} = StaticHeaderAuth.start_link([{"authorization", "Bearer sk-acp-sticky"}])
+
+    output = [
+      %{"type" => "message", "role" => "user", "content" => "kept prefix"},
+      %{
+        "type" => "compaction",
+        "id" => "cmp_acp_sticky",
+        "encrypted_content" => "CIPHERTEXT_STICKY"
+      }
+    ]
+
+    transport = fn http_request, acc, fun ->
+      send(test, {:compact_request, http_request})
+      acc = fun.({:status, 200}, acc)
+
+      acc =
+        fun.(
+          {:data, Jason.encode!(%{"output" => output, "usage" => %{"input_tokens" => 2}})},
+          acc
+        )
+
+      {:ok, acc}
+    end
+
+    {:ok, agent} = Agent.start_link(fn -> [stop("one"), stop("two")] end)
+    sticky = Enum.find(Pixir.Providers.Registry.models(), &(not &1["default"]))["id"]
+
+    server =
+      start_server(out,
+        provider: StubProvider,
+        provider_opts: [
+          agent: agent,
+          auth: auth,
+          transport: transport,
+          responses_backend: official_responses_backend()
+        ]
+      )
+
+    Server.feed(server, request(50, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 50)["result"]["sessionId"]
+
+    Server.feed(
+      server,
+      request(51, "session/set_model", %{"sessionId" => sid, "modelId" => sticky})
+    )
+
+    assert await_id(out, 51)["result"] == %{}
+
+    for {id, text} <- [{52, "first"}, {53, "second"}] do
+      Server.feed(
+        server,
+        request(id, "session/prompt", %{
+          "sessionId" => sid,
+          "prompt" => [%{"type" => "text", "text" => text}]
+        })
+      )
+
+      assert await_id(out, id)["result"]["stopReason"] == "end_turn"
+    end
+
+    Server.feed(
+      server,
+      request(54, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "/compact 1"}]
+      })
+    )
+
+    assert await_id(out, 54)["result"]["stopReason"] == "end_turn"
+    assert_received {:compact_request, request}
+    body = Jason.decode!(request.body)
+    assert body["model"] == sticky
+    refute Map.has_key?(body, "compact_threshold")
+  end
+
+  test "overlay-off /compact stays local and does not call the compact client", %{
+    out: out,
+    ws: ws
+  } do
+    {:ok, agent} = Agent.start_link(fn -> [stop("one"), stop("two")] end)
+
+    server =
+      start_server(out,
+        provider: StubProvider,
+        provider_opts: [
+          agent: agent,
+          native: false,
+          transport: fn _request, _acc, _fun ->
+            flunk("standalone compact client must not run")
+          end
+        ]
+      )
+
+    Server.feed(server, request(44, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 44)["result"]["sessionId"]
+
+    for {id, text} <- [{45, "first"}, {46, "second"}] do
+      Server.feed(
+        server,
+        request(id, "session/prompt", %{
+          "sessionId" => sid,
+          "prompt" => [%{"type" => "text", "text" => text}]
+        })
+      )
+
+      assert await_id(out, id)["result"]["stopReason"] == "end_turn"
+    end
+
+    StringIO.flush(out)
+
+    assert {:ok, %{"event" => expected_checkpoint}} =
+             Pixir.Compaction.dry_run(sid, workspace: ws, trigger: "manual", tail_events: 1)
+
+    Server.feed(
+      server,
+      request(47, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "/compact 1"}]
+      })
+    )
+
+    assert await_id(out, 47)["result"]["stopReason"] == "end_turn"
+
+    {:ok, history} = Pixir.Log.fold(sid, workspace: ws)
+    assert [checkpoint] = Enum.filter(history, &(&1.type == :history_compaction))
+    assert checkpoint.data == expected_checkpoint
+    refute Map.has_key?(checkpoint.data, "native_replay")
+  end
+
+  test "chatgpt_codex /compact stays local and does not POST /compact", %{
+    out: out,
+    ws: ws
+  } do
+    {:ok, agent} = Agent.start_link(fn -> [stop("one"), stop("two")] end)
+
+    server =
+      start_server(out,
+        provider: StubProvider,
+        provider_opts: [
+          agent: agent,
+          transport: fn _request, _acc, _fun ->
+            flunk("chatgpt_codex standalone compact must not POST /compact")
+          end
+        ]
+      )
+
+    Server.feed(server, request(48, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 48)["result"]["sessionId"]
+
+    for {id, text} <- [{49, "first"}, {50, "second"}] do
+      Server.feed(
+        server,
+        request(id, "session/prompt", %{
+          "sessionId" => sid,
+          "prompt" => [%{"type" => "text", "text" => text}]
+        })
+      )
+
+      assert await_id(out, id)["result"]["stopReason"] == "end_turn"
+    end
+
+    Server.feed(
+      server,
+      request(51, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "/compact 1"}]
+      })
+    )
+
+    assert await_id(out, 51)["result"]["stopReason"] == "end_turn"
+
+    {:ok, history} = Pixir.Log.fold(sid, workspace: ws)
+    assert [checkpoint] = Enum.filter(history, &(&1.type == :history_compaction))
+    assert checkpoint.data["trigger"] == "manual"
+    refute Map.has_key?(checkpoint.data, "native_replay")
+  end
+
   test "session/new starts a conversation and returns a sessionId", %{out: out, ws: ws} do
     server = start_server(out)
     Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
@@ -349,6 +986,152 @@ defmodule Pixir.ACP.ServerTest do
 
     assert resp["id"] == 2
     assert is_binary(resp["result"]["sessionId"])
+  end
+
+  describe "visible Skills index" do
+    setup do
+      # HOME isolation is scoped to the exact-index pins. Leaving it on the
+      # module setup hung `mix escript.build` under a scratch HOME (#564 CI).
+      Pixir.Test.OperatorState.isolate_discovery_roots!()
+      :ok
+    end
+
+    test "session/new advertises compact and the visible Skills index", %{out: out, ws: ws} do
+      write_acp_skill(ws, "alpha", "Use Alpha for focused review")
+      write_acp_skill(ws, "plan", "Must remain a mode")
+      write_acp_skill(ws, "compact", "Must not shadow runtime compaction")
+      write_acp_skill(ws, "hidden", "Disabled for model invocation", disable?: true)
+
+      server = start_server(out)
+      Server.feed(server, request(102, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+      sid = await_id(out, 102)["result"]["sessionId"]
+
+      commands =
+        out
+        |> await_available_commands(sid)
+        |> get_in(["params", "update", "availableCommands"])
+
+      assert Enum.map(commands, & &1["name"]) == ["compact", "alpha"]
+      assert Enum.count(commands, &(&1["name"] == "compact")) == 1
+
+      assert Enum.find(commands, &(&1["name"] == "compact"))["description"] ==
+               "Record a durable History compaction checkpoint"
+
+      alpha = Enum.find(commands, &(&1["name"] == "alpha"))
+      assert alpha["description"] == "Use Alpha for focused review"
+      assert alpha["input"]["hint"] == "Use Alpha for focused review"
+    end
+
+    test "session/load and session/resume advertise available commands", %{ws: ws} do
+      write_acp_skill(ws, "alpha", "Use Alpha after reattaching")
+
+      for {method, sid, request_id} <- [
+            {"session/load", "commands-load", 103},
+            {"session/resume", "commands-resume", 104}
+          ] do
+        event = Event.user_message(sid, "persisted") |> Event.with_seq(0)
+        assert {:ok, [_]} = Pixir.Log.create_session(sid, [event], workspace: ws)
+
+        {:ok, capture} = StringIO.open("")
+        server = start_server(capture, id: {__MODULE__, method})
+        Server.feed(server, request(request_id, method, %{"sessionId" => sid, "cwd" => ws}))
+
+        assert await_id(capture, request_id)["result"]["sessionId"] == sid
+
+        commands =
+          capture
+          |> await_available_commands(sid)
+          |> get_in(["params", "update", "availableCommands"])
+
+        assert Enum.map(commands, & &1["name"]) == ["compact", "alpha"]
+      end
+    end
+
+    test "session/prompt re-emits commands only when the Skills fingerprint changes", %{
+      out: out,
+      ws: ws
+    } do
+      skill_path = write_acp_skill(ws, "alpha", "Alpha v1")
+      {:ok, sink} = Agent.start_link(fn -> nil end)
+      server = start_server(out, provider: CapturingProvider, provider_opts: [sink: sink])
+
+      Server.feed(server, request(105, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+      sid = await_id(out, 105)["result"]["sessionId"]
+      _initial = await_available_commands(out, sid)
+      StringIO.flush(out)
+
+      prompt = fn id ->
+        Server.feed(
+          server,
+          request(id, "session/prompt", %{
+            "sessionId" => sid,
+            "prompt" => [%{"type" => "text", "text" => "continue"}]
+          })
+        )
+
+        assert await_id(out, id)["result"]["stopReason"] == "end_turn"
+      end
+
+      prompt.(106)
+      assert available_command_updates(out) == []
+      StringIO.flush(out)
+
+      File.write!(skill_path, skill_markdown("alpha", "Alpha v2"))
+      prompt.(107)
+      assert [changed] = available_command_updates(out)
+
+      assert get_in(changed, ["params", "update", "availableCommands"]) |> Enum.map(& &1["name"]) ==
+               ["compact", "alpha"]
+
+      assert get_in(changed, ["params", "update", "availableCommands"])
+             |> Enum.find(&(&1["name"] == "alpha"))
+             |> Map.fetch!("description") == "Alpha v2"
+
+      StringIO.flush(out)
+      prompt.(108)
+      assert available_command_updates(out) == []
+      StringIO.flush(out)
+
+      File.rm_rf!(Path.dirname(skill_path))
+      prompt.(109)
+      assert [removed] = available_command_updates(out)
+
+      assert get_in(removed, ["params", "update", "availableCommands"]) |> Enum.map(& &1["name"]) ==
+               ["compact"]
+    end
+  end
+
+  test "ACP slash and dollar Skill invocations record the same activation", %{out: out, ws: ws} do
+    write_acp_skill(ws, "alpha", "Use Alpha for activation parity")
+    {:ok, sink} = Agent.start_link(fn -> nil end)
+    server = start_server(out, provider: CapturingProvider, provider_opts: [sink: sink])
+
+    Server.feed(server, request(110, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 110)["result"]["sessionId"]
+
+    for {id, text} <- [{111, "/alpha inspect"}, {112, "$alpha inspect"}] do
+      Server.feed(
+        server,
+        request(id, "session/prompt", %{
+          "sessionId" => sid,
+          "prompt" => [%{"type" => "text", "text" => text}]
+        })
+      )
+
+      assert await_id(out, id)["result"]["stopReason"] == "end_turn"
+    end
+
+    assert {:ok, history} = Pixir.Log.fold(sid, workspace: ws)
+
+    activations =
+      history
+      |> Enum.filter(&(&1.type == :skill_activation))
+      |> Enum.map(& &1.data)
+
+    assert [slash_activation, dollar_activation] = activations
+    assert slash_activation == dollar_activation
+    assert slash_activation["name"] == "alpha"
+    assert slash_activation["activated_by"] == "user"
   end
 
   test "session/new advertises build/plan modes with build as default (D.2)", %{out: out, ws: ws} do
@@ -365,6 +1148,7 @@ defmodule Pixir.ACP.ServerTest do
     # option is {name, value} per ACP SessionConfigSelectOption (not {id, name}).
     mode_opt = Enum.find(resp["result"]["configOptions"], &(&1["id"] == "mode"))
     assert mode_opt["type"] == "select"
+    assert mode_opt["category"] == "mode"
     assert mode_opt["currentValue"] == "build"
     assert Enum.all?(mode_opt["options"], &match?(%{"name" => _, "value" => _}, &1))
     assert Enum.map(mode_opt["options"], & &1["value"]) == ["build", "plan"]
@@ -385,10 +1169,11 @@ defmodule Pixir.ACP.ServerTest do
       Enum.find(resp["result"]["configOptions"], &(&1["id"] == "reasoning_effort"))
 
     assert Enum.map(resp["result"]["configOptions"], & &1["id"]) ==
-             ["mode", "model", "reasoning_effort"]
+             ["mode", "model", "reasoning_effort", "web_search"]
 
     assert reasoning_opt["name"] == "Reasoning effort"
     assert reasoning_opt["type"] == "select"
+    assert reasoning_opt["category"] == "thought_level"
     assert reasoning_opt["currentValue"] == (Pixir.Config.reasoning_effort() || "default")
 
     assert Enum.map(reasoning_opt["options"], & &1["value"]) ==
@@ -397,6 +1182,13 @@ defmodule Pixir.ACP.ServerTest do
     assert Enum.all?(reasoning_opt["options"], fn option ->
              option["name"] == option["value"]
            end)
+
+    web_search_opt = Enum.find(resp["result"]["configOptions"], &(&1["id"] == "web_search"))
+    assert web_search_opt["name"] == "Web search"
+    assert web_search_opt["type"] == "select"
+    assert web_search_opt["currentValue"] == "on"
+    assert Enum.map(web_search_opt["options"], & &1["value"]) == ["on", "off"]
+    assert Enum.all?(web_search_opt["options"], &match?(%{"name" => _, "value" => _}, &1))
   end
 
   test "session/set_mode switches mode and emits current_mode_update (D.2)", %{out: out, ws: ws} do
@@ -414,6 +1206,9 @@ defmodule Pixir.ACP.ServerTest do
     update = Enum.find(lines, &(&1["method"] == "session/update"))
     assert update["params"]["update"]["sessionUpdate"] == "current_mode_update"
     assert update["params"]["update"]["currentModeId"] == "plan"
+
+    # Client-driven set_mode stays on the existing wire: no config_option_update.
+    refute Enum.any?(lines, &config_update?/1)
   end
 
   test "session/set_config_option {configId: mode} switches mode (D.2)", %{out: out, ws: ws} do
@@ -437,7 +1232,7 @@ defmodule Pixir.ACP.ServerTest do
     result = Enum.find(lines, &(&1["id"] == 6))["result"]
 
     assert Enum.map(result["configOptions"], & &1["id"]) ==
-             ["mode", "model", "reasoning_effort"]
+             ["mode", "model", "reasoning_effort", "web_search"]
 
     mode_opt = Enum.find(result["configOptions"], &(&1["id"] == "mode"))
     assert mode_opt["currentValue"] == "plan"
@@ -447,6 +1242,357 @@ defmodule Pixir.ACP.ServerTest do
 
     update = Enum.find(lines, &(&1["method"] == "session/update"))
     assert update["params"]["update"]["currentModeId"] == "plan"
+  end
+
+  # ── runtime-owned config changes (#520) ──────────────────────────────────────
+
+  defp config_update?(line) do
+    line["method"] == "session/update" and
+      get_in(line, ["params", "update", "sessionUpdate"]) == "config_option_update"
+  end
+
+  # Poll until at least `n` runtime `config_option_update` notifications are on
+  # the wire (or the deadline passes), then return ALL currently written ones.
+  defp await_config_updates(out, n, timeout \\ 2_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_await_config_updates(out, n, deadline)
+  end
+
+  defp do_await_config_updates(out, n, deadline) do
+    updates = Enum.filter(written_lines(out), &config_update?/1)
+
+    if length(updates) >= n or System.monotonic_time(:millisecond) > deadline do
+      updates
+    else
+      Process.sleep(10)
+      do_await_config_updates(out, n, deadline)
+    end
+  end
+
+  test "runtime plan→build emits one additive config_option_update with the full list (#520)", %{
+    out: out,
+    ws: ws
+  } do
+    server = start_server(out)
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    [new_resp] = await_lines(out, 1)
+    sid = new_resp["result"]["sessionId"]
+
+    # Client drives plan through the existing response path first…
+    Server.feed(
+      server,
+      request(6, "session/set_config_option", %{
+        "sessionId" => sid,
+        "configId" => "mode",
+        "value" => "plan"
+      })
+    )
+
+    lines = await_lines(out, 2)
+    assert Enum.find(lines, &(&1["id"] == 6))["result"]["configOptions"]
+
+    # …then Pixir ITSELF flips plan→build with no client call in between.
+    assert {:ok, :queued} = Server.runtime_config_change(server, sid, %{"mode" => "build"})
+    [update] = await_config_updates(out, 1)
+
+    assert update["params"]["sessionId"] == sid
+
+    opts = update["params"]["update"]["configOptions"]
+
+    assert Enum.map(opts, & &1["id"]) == ["mode", "model", "reasoning_effort", "web_search"]
+    assert Enum.find(opts, &(&1["id"] == "mode"))["currentValue"] == "build"
+
+    # Other options are unchanged by a mode flip.
+    assert Enum.find(opts, &(&1["id"] == "model"))["currentValue"] == default_model_id()
+
+    assert Enum.find(opts, &(&1["id"] == "reasoning_effort"))["currentValue"] ==
+             (Pixir.Config.reasoning_effort() || "default")
+
+    # Exactly ONE config_option_update so far: the client-driven
+    # set_config_option reply is a response, never an update notification.
+    assert Enum.count(written_lines(out), &config_update?/1) == 1
+
+    # Additive parity with set_mode: current_mode_update still rides along.
+    mode_update =
+      Enum.find(written_lines(out), fn l ->
+        l["method"] == "session/update" and
+          get_in(l, ["params", "update", "sessionUpdate"]) == "current_mode_update"
+      end)
+
+    assert mode_update["params"]["sessionId"] == sid
+    assert mode_update["params"]["update"]["currentModeId"] == "build"
+  end
+
+  test "runtime model change advertises the new model and stores it sticky (#520)", %{
+    out: out,
+    ws: ws
+  } do
+    server = start_server(out)
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    [new_resp] = await_lines(out, 1)
+    sid = new_resp["result"]["sessionId"]
+
+    other_model = Enum.find(Pixir.Providers.Registry.models(), &(!&1["default"]))["id"]
+
+    assert {:ok, :queued} = Server.runtime_config_change(server, sid, %{"model" => other_model})
+    [update] = await_config_updates(out, 1)
+
+    opts = update["params"]["update"]["configOptions"]
+    assert Enum.find(opts, &(&1["id"] == "model"))["currentValue"] == other_model
+    assert Enum.find(opts, &(&1["id"] == "mode"))["currentValue"] == "build"
+
+    # The stored value is sticky, not just wire cosmetics: a later
+    # client-driven reply projects it back.
+    Server.feed(
+      server,
+      request(6, "session/set_config_option", %{
+        "sessionId" => sid,
+        "configId" => "reasoning_effort",
+        "value" => "high"
+      })
+    )
+
+    result = await_id(out, 6)["result"]
+
+    assert Enum.find(result["configOptions"], &(&1["id"] == "model"))["currentValue"] ==
+             other_model
+  end
+
+  test "runtime reasoning_effort change emits config_option_update and stays sticky (#520)", %{
+    out: out,
+    ws: ws
+  } do
+    server = start_server(out)
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    [new_resp] = await_lines(out, 1)
+    sid = new_resp["result"]["sessionId"]
+
+    assert {:ok, :queued} =
+             Server.runtime_config_change(server, sid, %{"reasoning_effort" => "high"})
+
+    [update] = await_config_updates(out, 1)
+
+    opts = update["params"]["update"]["configOptions"]
+
+    assert Enum.find(opts, &(&1["id"] == "reasoning_effort"))["currentValue"] == "high"
+
+    # Sticky: a later client-driven change to ANOTHER knob reflects the
+    # runtime-stored effort.
+    Server.feed(
+      server,
+      request(6, "session/set_config_option", %{
+        "sessionId" => sid,
+        "configId" => "model",
+        "value" => default_model_id()
+      })
+    )
+
+    result = await_id(out, 6)["result"]
+
+    assert Enum.find(result["configOptions"], &(&1["id"] == "reasoning_effort"))["currentValue"] ==
+             "high"
+  end
+
+  test "runtime config changes ignore invalid values and unknown sessions (#520)", %{
+    out: out,
+    ws: ws
+  } do
+    server = start_server(out)
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    [new_resp] = await_lines(out, 1)
+    sid = new_resp["result"]["sessionId"]
+
+    assert {:ok, :queued} =
+             Server.runtime_config_change(server, "no-such-session", %{"mode" => "build"})
+
+    assert {:ok, :queued} = Server.runtime_config_change(server, sid, %{"mode" => "bogus"})
+    assert {:ok, :queued} = Server.runtime_config_change(server, sid, %{"model" => "not-a-model"})
+
+    assert {:ok, :queued} =
+             Server.runtime_config_change(server, sid, %{"reasoning_effort" => "ultrathink"})
+
+    assert {:error, %{kind: :invalid_args}} = Server.runtime_config_change(server, 42, "nope")
+
+    # Deterministic sync: casts sent before this line are processed before the
+    # request is handled (FIFO mailbox), so awaiting the response proves the
+    # invalid changes were evaluated and dropped.
+    Server.feed(server, request(3, "initialize", %{}))
+    assert %{"protocolVersion" => 1} = await_id(out, 3)["result"]
+
+    refute Enum.any?(written_lines(out), &config_update?/1)
+
+    refute Enum.any?(written_lines(out), fn l ->
+             l["method"] == "session/update" and l["params"]["sessionId"] == sid and
+               get_in(l, ["params", "update", "sessionUpdate"]) == "current_mode_update"
+           end)
+  end
+
+  test "update_plan in plan mode is the live plan→build producer (#520)", %{
+    out: out,
+    ws: ws
+  } do
+    script = [
+      tool_calls([
+        %{
+          call_id: "c1",
+          name: "update_plan",
+          args: %{
+            "entries" => [
+              %{"content" => "inspect mix.exs", "priority" => "high", "status" => "pending"}
+            ]
+          }
+        }
+      ]),
+      stop("Plan recorded.")
+    ]
+
+    {:ok, agent} = Agent.start_link(fn -> script end)
+    server = start_server(out, provider: StubProvider, provider_opts: [agent: agent])
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    [new_resp] = await_lines(out, 1)
+    sid = new_resp["result"]["sessionId"]
+
+    Server.feed(
+      server,
+      request(6, "session/set_config_option", %{
+        "sessionId" => sid,
+        "configId" => "mode",
+        "value" => "plan"
+      })
+    )
+
+    lines = await_lines(out, 2)
+    assert Enum.find(lines, &(&1["id"] == 6))["result"]["configOptions"]
+    refute Enum.any?(lines, &config_update?/1)
+
+    Server.feed(
+      server,
+      request(7, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "make a plan"}]
+      })
+    )
+
+    assert await_id(out, 7)["result"]["stopReason"] == "end_turn"
+    [update] = await_config_updates(out, 1)
+
+    assert update["params"]["sessionId"] == sid
+    opts = update["params"]["update"]["configOptions"]
+    assert Enum.map(opts, & &1["id"]) == ["mode", "model", "reasoning_effort", "web_search"]
+    assert Enum.find(opts, &(&1["id"] == "mode"))["currentValue"] == "build"
+
+    assert Enum.find(opts, &(&1["id"] == "model"))["currentValue"] == default_model_id()
+
+    assert Enum.find(opts, &(&1["id"] == "reasoning_effort"))["currentValue"] ==
+             (Pixir.Config.reasoning_effort() || "default")
+
+    assert Enum.count(written_lines(out), &config_update?/1) == 1
+
+    mode_updates =
+      Enum.filter(written_lines(out), fn l ->
+        l["method"] == "session/update" and
+          get_in(l, ["params", "update", "sessionUpdate"]) == "current_mode_update"
+      end)
+
+    build_mode =
+      Enum.find(mode_updates, &(get_in(&1, ["params", "update", "currentModeId"]) == "build"))
+
+    assert build_mode["params"]["sessionId"] == sid
+  end
+
+  test "update_plan in build mode does not emit a no-op mode flip (#520)", %{
+    out: out,
+    ws: ws
+  } do
+    script = [
+      tool_calls([
+        %{
+          call_id: "c1",
+          name: "update_plan",
+          args: %{
+            "entries" => [
+              %{"content" => "add a comment", "priority" => "low", "status" => "pending"}
+            ]
+          }
+        }
+      ]),
+      stop("Noted the plan in build mode.")
+    ]
+
+    {:ok, agent} = Agent.start_link(fn -> script end)
+    server = start_server(out, provider: StubProvider, provider_opts: [agent: agent])
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    [new_resp] = await_lines(out, 1)
+    sid = new_resp["result"]["sessionId"]
+
+    Server.feed(
+      server,
+      request(7, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "plan then implement"}]
+      })
+    )
+
+    assert await_id(out, 7)["result"]["stopReason"] == "end_turn"
+
+    refute Enum.any?(written_lines(out), &config_update?/1)
+
+    refute Enum.any?(written_lines(out), fn l ->
+             l["method"] == "session/update" and
+               get_in(l, ["params", "update", "sessionUpdate"]) == "current_mode_update"
+           end)
+  end
+
+  test "a second update_plan in the same plan-mode turn does not duplicate the flip (#520)", %{
+    out: out,
+    ws: ws
+  } do
+    script = [
+      tool_calls([
+        %{
+          call_id: "c1",
+          name: "update_plan",
+          args: %{"entries" => [%{"content" => "first draft", "status" => "pending"}]}
+        }
+      ]),
+      tool_calls([
+        %{
+          call_id: "c2",
+          name: "update_plan",
+          args: %{"entries" => [%{"content" => "refined draft", "status" => "pending"}]}
+        }
+      ]),
+      stop("Plan refined.")
+    ]
+
+    {:ok, agent} = Agent.start_link(fn -> script end)
+    server = start_server(out, provider: StubProvider, provider_opts: [agent: agent])
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    [new_resp] = await_lines(out, 1)
+    sid = new_resp["result"]["sessionId"]
+
+    Server.feed(
+      server,
+      request(6, "session/set_mode", %{"sessionId" => sid, "modeId" => "plan"})
+    )
+
+    _ = await_lines(out, 2)
+
+    Server.feed(
+      server,
+      request(7, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "refine the plan"}]
+      })
+    )
+
+    assert await_id(out, 7)["result"]["stopReason"] == "end_turn"
+    updates = await_config_updates(out, 1)
+    assert length(updates) == 1
+
+    assert hd(updates)["params"]["update"]["configOptions"]
+           |> Enum.find(&(&1["id"] == "mode"))
+           |> Map.fetch!("currentValue") == "build"
   end
 
   test "session/set_config_option {configId: model} stores a sticky model (ACP v1)", %{
@@ -473,7 +1619,7 @@ defmodule Pixir.ACP.ServerTest do
     [set_resp] = await_lines(out, 1)
 
     assert Enum.map(set_resp["result"]["configOptions"], & &1["id"]) ==
-             ["mode", "model", "reasoning_effort"]
+             ["mode", "model", "reasoning_effort", "web_search"]
 
     model_opt = Enum.find(set_resp["result"]["configOptions"], &(&1["id"] == "model"))
     assert model_opt["currentValue"] == sticky
@@ -489,6 +1635,296 @@ defmodule Pixir.ACP.ServerTest do
     prompt_resp = await_id(out, 7)
     assert prompt_resp["result"]["stopReason"] == "end_turn"
     assert Agent.get(sink, & &1)[:model] == sticky
+  end
+
+  test "session/set_config_option web_search is sticky, false wins, and stays Provider-hosted", %{
+    out: out,
+    ws: ws
+  } do
+    test = self()
+
+    chunks = [
+      %{
+        type: "response.output_item.done",
+        item: %{
+          type: "web_search_call",
+          id: "ws_acp_1",
+          status: "completed",
+          action: %{type: "search", sources: []}
+        }
+      },
+      %{type: "response.completed"}
+    ]
+
+    {:ok, auth} = StaticHeaderAuth.start_link([{"authorization", "Bearer sk-acp-test"}])
+
+    server =
+      start_server(out,
+        provider_opts: [
+          auth: auth,
+          provider_transport: :http_sse,
+          transport:
+            responses_transport_attempts(test, [
+              [%{type: "response.completed"}],
+              chunks
+            ])
+        ]
+      )
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    [new_resp] = await_lines(out, 1)
+    sid = new_resp["result"]["sessionId"]
+
+    initial = Enum.find(new_resp["result"]["configOptions"], &(&1["id"] == "web_search"))
+    assert initial["currentValue"] == "on"
+
+    assert {:ok, history_before} = Pixir.Conversation.history(sid)
+
+    Server.feed(
+      server,
+      request(3, "session/set_config_option", %{
+        "sessionId" => sid,
+        "configId" => "web_search",
+        "value" => "off"
+      })
+    )
+
+    off_resp = await_id(out, 3)
+
+    assert Enum.map(off_resp["result"]["configOptions"], & &1["id"]) ==
+             ["mode", "model", "reasoning_effort", "web_search"]
+
+    assert Enum.find(off_resp["result"]["configOptions"], &(&1["id"] == "web_search"))[
+             "currentValue"
+           ] == "off"
+
+    assert {:ok, ^history_before} = Pixir.Conversation.history(sid)
+
+    Server.feed(
+      server,
+      request(4, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "stay offline"}]
+      })
+    )
+
+    assert await_id(out, 4)["result"]["stopReason"] == "end_turn"
+    assert_receive {:responses_body, off_body}, 2_000
+    refute Enum.any?(off_body["tools"] || [], &(&1["type"] == "web_search"))
+
+    Server.feed(
+      server,
+      request(5, "session/set_config_option", %{
+        "sessionId" => sid,
+        "configId" => "web_search",
+        "value" => "on"
+      })
+    )
+
+    on_resp = await_id(out, 5)
+
+    assert Enum.find(on_resp["result"]["configOptions"], &(&1["id"] == "web_search"))[
+             "currentValue"
+           ] == "on"
+
+    Server.feed(
+      server,
+      request(6, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "search now"}]
+      })
+    )
+
+    assert await_id(out, 6)["result"]["stopReason"] == "end_turn"
+    assert_receive {:responses_body, on_body}, 2_000
+    assert Enum.any?(on_body["tools"] || [], &(&1["type"] == "web_search"))
+
+    assert {:ok, history_after} = Pixir.Conversation.history(sid)
+    refute Enum.any?(history_after, &(&1.type in [:tool_call, :tool_result]))
+
+    assert Enum.any?(history_after, fn event ->
+             event.type == :provider_usage and
+               is_map(get_in(event.data, ["provider_hosted_tools", "web_search"]))
+           end)
+  end
+
+  test "web_search on rejects Anthropic and open_responses before a Provider call", %{
+    out: out,
+    ws: ws
+  } do
+    anthropic =
+      start_server(out, id: :anthropic_web_search, provider_opts: [model: "claude-fable-5"])
+
+    Server.feed(anthropic, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    anthropic_new = await_id(out, 2)
+    anthropic_sid = anthropic_new["result"]["sessionId"]
+
+    assert Enum.find(
+             anthropic_new["result"]["configOptions"],
+             &(&1["id"] == "web_search")
+           )["currentValue"] == "off"
+
+    Server.feed(
+      anthropic,
+      request(30, "session/set_config_option", %{
+        "sessionId" => anthropic_sid,
+        "configId" => "web_search",
+        "value" => "off"
+      })
+    )
+
+    anthropic_off = await_id(out, 30)["result"]["configOptions"]
+    assert Enum.find(anthropic_off, &(&1["id"] == "web_search"))["currentValue"] == "off"
+
+    Server.feed(
+      anthropic,
+      request(3, "session/set_config_option", %{
+        "sessionId" => anthropic_sid,
+        "configId" => "web_search",
+        "value" => "on"
+      })
+    )
+
+    anthropic_error = await_id(out, 3)["error"]
+    assert anthropic_error["code"] == Protocol.invalid_params()
+    assert anthropic_error["data"]["reason"] == "unsupported_backend"
+    assert anthropic_error["data"]["provider"] == "anthropic"
+    assert anthropic_error["data"]["backend"] == "not_applicable"
+
+    {:ok, open_out} = StringIO.open("")
+
+    open_backend = %{
+      "mode" => "open_responses",
+      "base_url" => "https://vendor.example",
+      "auth" => %{"policy" => "none"}
+    }
+
+    open =
+      start_server(open_out,
+        id: :open_responses_web_search,
+        provider_opts: [responses_backend: open_backend]
+      )
+
+    Server.feed(open, request(4, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    open_new = await_id(open_out, 4)
+    open_sid = open_new["result"]["sessionId"]
+
+    assert Enum.find(open_new["result"]["configOptions"], &(&1["id"] == "web_search"))[
+             "currentValue"
+           ] == "off"
+
+    Server.feed(
+      open,
+      request(5, "session/set_config_option", %{
+        "sessionId" => open_sid,
+        "configId" => "web_search",
+        "value" => "on"
+      })
+    )
+
+    open_error = await_id(open_out, 5)["error"]
+    assert open_error["code"] == Protocol.invalid_params()
+    assert open_error["data"]["reason"] == "unsupported_backend"
+    assert open_error["data"]["provider"] == "responses"
+    assert open_error["data"]["backend"] == "open_responses"
+  end
+
+  test "web_search effective value follows model changes without losing the sticky preference", %{
+    out: out,
+    ws: ws
+  } do
+    server = start_server(out)
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    new_resp = await_id(out, 2)
+    sid = new_resp["result"]["sessionId"]
+
+    Server.feed(
+      server,
+      request(3, "session/set_config_option", %{
+        "sessionId" => sid,
+        "configId" => "web_search",
+        "value" => "on"
+      })
+    )
+
+    assert await_id(out, 3)["result"]
+
+    Server.feed(
+      server,
+      request(4, "session/set_config_option", %{
+        "sessionId" => sid,
+        "configId" => "model",
+        "value" => "claude-fable-5"
+      })
+    )
+
+    anthropic_options = await_id(out, 4)["result"]["configOptions"]
+    assert Enum.find(anthropic_options, &(&1["id"] == "web_search"))["currentValue"] == "off"
+
+    Server.feed(
+      server,
+      request(5, "session/set_config_option", %{
+        "sessionId" => sid,
+        "configId" => "model",
+        "value" => default_model_id()
+      })
+    )
+
+    responses_options = await_id(out, 5)["result"]["configOptions"]
+    assert Enum.find(responses_options, &(&1["id"] == "web_search"))["currentValue"] == "on"
+  end
+
+  test "web_search changes apply to the next Turn, not the Turn already started", %{
+    out: out,
+    ws: ws
+  } do
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+    server =
+      start_server(out,
+        provider: TurnBoundaryProvider,
+        provider_opts: [sink: counter, test: self()]
+      )
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 2)["result"]["sessionId"]
+
+    Server.feed(
+      server,
+      request(3, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "first"}],
+        "_meta" => %{"web_search" => true}
+      })
+    )
+
+    assert_receive {:turn_provider_opts, 0, first_opts}, 2_000
+    assert first_opts[:web_search] == %{"enabled" => true}
+
+    Server.feed(
+      server,
+      request(4, "session/set_config_option", %{
+        "sessionId" => sid,
+        "configId" => "web_search",
+        "value" => "off"
+      })
+    )
+
+    assert await_id(out, 4)["result"]
+    Server.feed(server, notification("session/cancel", %{"sessionId" => sid}))
+    assert await_id(out, 3)["result"]["stopReason"] == "cancelled"
+
+    Server.feed(
+      server,
+      request(5, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "second"}]
+      })
+    )
+
+    assert_receive {:turn_provider_opts, 1, second_opts}, 2_000
+    assert second_opts[:web_search] == false
+    assert await_id(out, 5)["result"]["stopReason"] == "end_turn"
   end
 
   test "default sentinel suppresses configured effort on the anthropic path resolved from base opts",
@@ -634,7 +2070,13 @@ defmodule Pixir.ACP.ServerTest do
     set_resp = await_id(out, 6)
     config_options = set_resp["result"]["configOptions"]
 
-    assert Enum.map(config_options, & &1["id"]) == ["mode", "model", "reasoning_effort"]
+    assert Enum.map(config_options, & &1["id"]) == [
+             "mode",
+             "model",
+             "reasoning_effort",
+             "web_search"
+           ]
+
     assert Enum.find(config_options, &(&1["id"] == "mode"))["currentValue"] == "build"
 
     assert Enum.find(config_options, &(&1["id"] == "model"))["currentValue"] ==
@@ -762,7 +2204,7 @@ defmodule Pixir.ACP.ServerTest do
     [set_resp] = await_lines(out, 1)
 
     assert Enum.map(set_resp["result"]["configOptions"], & &1["id"]) ==
-             ["mode", "model", "reasoning_effort"]
+             ["mode", "model", "reasoning_effort", "web_search"]
 
     model_opt = Enum.find(set_resp["result"]["configOptions"], &(&1["id"] == "model"))
     assert model_opt["currentValue"] == sticky
@@ -812,6 +2254,19 @@ defmodule Pixir.ACP.ServerTest do
     prompt_off = await_id(out, 8)
     assert prompt_off["result"]["stopReason"] == "end_turn"
     assert Agent.get(sink, & &1).request[:web_search] == nil
+
+    Server.feed(
+      server,
+      request(9, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "disable search"}],
+        "_meta" => %{"web_search" => false}
+      })
+    )
+
+    prompt_false = await_id(out, 9)
+    assert prompt_false["result"]["stopReason"] == "end_turn"
+    assert Agent.get(sink, & &1).request.web_search == false
   end
 
   test "session/set_config_option with an unknown config id is invalid params", %{
@@ -2041,16 +3496,124 @@ defmodule Pixir.ACP.ServerTest do
                "stopReason" => "cancelled",
                "_meta" => %{"pixir" => %{"turn_failure" => facts}}
              }
+
+      interrupted =
+        Server.turn_failure_facts(%{
+          "terminal_status" => "interrupted",
+          "error_kind" => "interrupted"
+        })
+
+      assert interrupted == %{
+               "terminal_status" => "interrupted",
+               "error_kind" => "interrupted"
+             }
+
+      assert Server.prompt_result("cancelled", interrupted) == %{
+               "stopReason" => "cancelled",
+               "_meta" => %{"pixir" => %{"turn_failure" => interrupted}}
+             }
     end
 
-    test "facts are type-guarded: non-binary fields drop, evidence presence survives as {}" do
+    test "facts are closed and bounded while observed evidence survives as {}" do
+      sixty_four_bytes = "a" <> String.duplicate("b", 63)
+      sixty_five_bytes = sixty_four_bytes <> "c"
+
       assert Server.turn_failure_facts(%{
                "terminal_status" => %{"nested" => "term"},
                "error_kind" => nil
              }) == %{}
 
+      assert Server.turn_failure_facts(%{
+               "terminal_status" => "provider_error",
+               "error_kind" => sixty_four_bytes
+             }) == %{
+               "terminal_status" => "provider_error",
+               "error_kind" => sixty_four_bytes
+             }
+
+      for hostile <- [
+            sixty_five_bytes,
+            "UpperCase",
+            "contains-hyphen",
+            "contains\ncontrol",
+            "unicode_λ",
+            "9starts_with_digit"
+          ] do
+        assert Server.turn_failure_facts(%{
+                 "terminal_status" => "provider_error",
+                 "error_kind" => hostile
+               }) == %{"terminal_status" => "provider_error"}
+
+        assert Server.turn_failure_facts(%{
+                 "terminal_status" => "invented_status",
+                 "error_kind" => hostile
+               }) == %{}
+      end
+
       assert Server.turn_failure_facts(%{"terminal_status" => "tool_error"}) ==
                %{"terminal_status" => "tool_error"}
+
+      assert Server.turn_failure_facts(%{"terminal_status" => "configuration_error"}) ==
+               %{"terminal_status" => "configuration_error"}
+    end
+  end
+
+  test "hostile safe-record details never reach ACP stdout", %{out: out, ws: ws} do
+    test_pid = self()
+    sentinel = "ACP_FAILURE_SECRET_SENTINEL"
+
+    server =
+      start_server(out,
+        provider: SignallingBlockingProvider,
+        provider_opts: [sink: test_pid]
+      )
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 2)["result"]["sessionId"]
+
+    Server.feed(
+      server,
+      request(3, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "wait"}]
+      })
+    )
+
+    assert_receive :provider_started, 1_000
+
+    Pixir.Session.emit(
+      sid,
+      Event.turn_failed(sid, %{
+        "terminal_status" => "provider_error",
+        "error_kind" => "session_record_unavailable",
+        "error_message" => sentinel,
+        "details" => %{
+          "session_id" => sid,
+          "event_type" => "provider_usage",
+          "failure_class" => "noproc",
+          "exit_reason_#{sentinel}" => %{"hostile_value" => sentinel}
+        }
+      })
+    )
+
+    # Same-sender GenServer ordering acknowledges that Session published the hostile
+    # Event before cancellation produces the terminal status.
+    assert {:ok, _history} = Pixir.Session.history(sid)
+    Server.feed(server, notification("session/cancel", %{"sessionId" => sid}))
+
+    response = await_id(out, 3)
+    assert response["result"]["stopReason"] == "cancelled"
+
+    assert get_in(response, ["result", "_meta", "pixir", "turn_failure"]) == %{
+             "terminal_status" => "provider_error",
+             "error_kind" => "session_record_unavailable"
+           }
+
+    {_input, stdout} = StringIO.contents(out)
+    refute stdout =~ sentinel
+
+    for line <- String.split(stdout, "\n", trim: true) do
+      assert {:ok, %{"jsonrpc" => "2.0"}} = Jason.decode(line)
     end
   end
 
@@ -2265,6 +3828,127 @@ defmodule Pixir.ACP.ServerTest do
     assert Enum.at(lines, prompt_response_index)["result"]["stopReason"] == "end_turn"
   end
 
+  test "PromptResponse follows Session cleanup and a back-to-back prompt runs once", %{
+    out: out,
+    ws: ws
+  } do
+    test_pid = self()
+    {:ok, script} = Agent.start_link(fn -> [stop("first done"), stop("second done")] end)
+    {:ok, sid_holder} = Agent.start_link(fn -> nil end)
+
+    resolve_hook = fn outcome ->
+      sid = Agent.get(sid_holder, & &1)
+      send(test_pid, {:prompt_ready, outcome, Pixir.Session.turn_running?(sid), self()})
+
+      receive do
+        :release_prompt_response -> :ok
+      end
+    end
+
+    server =
+      start_server(out,
+        provider: StubProvider,
+        provider_opts: [agent: script],
+        prompt_resolve_hook: resolve_hook
+      )
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 2)["result"]["sessionId"]
+    Agent.update(sid_holder, fn _ -> sid end)
+
+    prompt = fn id, text ->
+      Server.feed(
+        server,
+        request(id, "session/prompt", %{
+          "sessionId" => sid,
+          "prompt" => [%{"type" => "text", "text" => text}]
+        })
+      )
+    end
+
+    prompt.(3, "first prompt")
+    assert_receive {:prompt_ready, :done, false, first_task}, 1_000
+    refute Enum.any?(written_lines(out), &(&1["id"] == 3))
+    send(first_task, :release_prompt_response)
+    assert await_id(out, 3)["result"]["stopReason"] == "end_turn"
+
+    prompt.(4, "second prompt")
+    assert_receive {:prompt_ready, :done, false, second_task}, 1_000
+    send(second_task, :release_prompt_response)
+    assert await_id(out, 4)["result"]["stopReason"] == "end_turn"
+
+    responses = written_lines(out)
+    assert Enum.count(responses, &(&1["id"] == 3)) == 1
+    assert Enum.count(responses, &(&1["id"] == 4)) == 1
+
+    assert {:ok, history} = Pixir.Session.history(sid)
+
+    assert Enum.count(history, fn
+             %{type: :user_message, data: %{"text" => "second prompt"}} -> true
+             _event -> false
+           end) == 1
+  end
+
+  test "a successor Turn cannot swallow a completed prompt response during cleanup", %{
+    out: out,
+    ws: ws
+  } do
+    test_pid = self()
+    {:ok, script} = Agent.start_link(fn -> [stop("first done")] end)
+    {:ok, sid_holder} = Agent.start_link(fn -> nil end)
+
+    before_cleanup_hook = fn ->
+      sid = Agent.get(sid_holder, & &1)
+      await_turn_idle(sid)
+
+      result =
+        Pixir.Session.start_turn(sid, fn _ctx ->
+          send(test_pid, {:successor_turn_started, self()})
+
+          receive do
+            :release_successor_turn -> :ok
+          end
+        end)
+
+      send(test_pid, {:successor_turn_result, result})
+    end
+
+    resolve_hook = fn outcome ->
+      sid = Agent.get(sid_holder, & &1)
+      send(test_pid, {:successor_prompt_ready, outcome, Pixir.Session.turn_running?(sid)})
+    end
+
+    server =
+      start_server(out,
+        provider: StubProvider,
+        provider_opts: [agent: script],
+        prompt_cleanup_timeout_ms: 30,
+        prompt_before_cleanup_hook: before_cleanup_hook,
+        prompt_resolve_hook: resolve_hook
+      )
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 2)["result"]["sessionId"]
+    Agent.update(sid_holder, fn _ -> sid end)
+
+    Server.feed(
+      server,
+      request(3, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "finish before successor"}]
+      })
+    )
+
+    assert_receive {:successor_turn_result, {:ok, _turn_ref}}, 1_000
+    assert_receive {:successor_turn_started, successor_pid}, 1_000
+    assert_receive {:successor_prompt_ready, :done, true}, 1_000
+    assert await_id(out, 3)["result"]["stopReason"] == "end_turn"
+    assert Pixir.Session.turn_running?(sid) == true
+
+    send(successor_pid, :release_successor_turn)
+    await_turn_idle(sid)
+  end
+
   test "cancel ordered before terminal status resolves the prompt with cancelled", %{
     out: out,
     ws: ws
@@ -2410,6 +4094,79 @@ defmodule Pixir.ACP.ServerTest do
     lines = await_lines(out, 1)
     prompt_resp = Enum.find(lines, &(&1["id"] == 3))
     assert prompt_resp["result"]["stopReason"] == "cancelled"
+  end
+
+  test "a stalled Session admission probe does not block the ACP Server", %{out: out, ws: ws} do
+    {:ok, script} = Agent.start_link(fn -> [stop("eventually runs")] end)
+    server = start_server(out, provider: StubProvider, provider_opts: [agent: script])
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 2)["result"]["sessionId"]
+    [{session_pid, _value}] = Registry.lookup(Pixir.Sessions.Registry, sid)
+
+    :ok = :sys.suspend(session_pid)
+
+    on_exit(fn ->
+      if Process.alive?(session_pid) do
+        try do
+          :sys.resume(session_pid)
+        catch
+          :exit, _reason -> :ok
+        end
+      end
+    end)
+
+    Server.feed(
+      server,
+      request(3, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "wait for Session"}]
+      })
+    )
+
+    Server.feed(server, request(91, "initialize", %{"protocolVersion" => 1}))
+    assert await_id(out, 91, 1_000)["result"]["protocolVersion"] == 1
+
+    :ok = :sys.resume(session_pid)
+    assert await_id(out, 3, 5_000)["result"]["stopReason"] == "end_turn"
+  end
+
+  test "session/prompt refuses when the Session still owns a Turn outside ACP state", %{
+    out: out,
+    ws: ws
+  } do
+    test_pid = self()
+    server = start_server(out, provider: NoDeltaProvider)
+
+    Server.feed(server, request(2, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+    sid = await_id(out, 2)["result"]["sessionId"]
+
+    assert {:ok, _turn_ref} =
+             Pixir.Session.start_turn(sid, fn _ctx ->
+               send(test_pid, {:external_turn_started, self()})
+
+               receive do
+                 :release_external_turn -> :ok
+               end
+             end)
+
+    assert_receive {:external_turn_started, turn_pid}, 1_000
+
+    Server.feed(
+      server,
+      request(3, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "must not be dropped"}]
+      })
+    )
+
+    rejected = await_id(out, 3)
+    assert rejected["error"]["code"] == -32_602
+    assert rejected["error"]["message"] =~ "already running"
+    refute Map.has_key?(rejected, "result")
+
+    send(turn_pid, :release_external_turn)
+    await_turn_idle(sid)
   end
 
   test "a second prompt on a busy session is invalid params (not internal error)", %{
@@ -2820,6 +4577,43 @@ defmodule Pixir.ACP.ServerTest do
   end
 
   # ── helpers ──────────────────────────────────────────────────────────────────
+
+  defp compact_prompt_updates(out) do
+    out
+    |> written_lines()
+    |> Enum.filter(&(&1["method"] == "session/update"))
+    |> Enum.map(&get_in(&1, ["params", "update"]))
+  end
+
+  defp available_command_updates(out) do
+    out
+    |> written_lines()
+    |> Enum.filter(
+      &(get_in(&1, ["params", "update", "sessionUpdate"]) ==
+          "available_commands_update")
+    )
+  end
+
+  defp write_acp_skill(workspace, name, description, opts \\ []) do
+    dir = Path.join([workspace, ".agents", "skills", name])
+    path = Path.join(dir, "SKILL.md")
+    File.mkdir_p!(dir)
+    File.write!(path, skill_markdown(name, description, Keyword.get(opts, :disable?, false)))
+    path
+  end
+
+  defp skill_markdown(name, description, disable? \\ false) do
+    disabled = if disable?, do: "disable-model-invocation: true\n", else: ""
+
+    """
+    ---
+    name: #{name}
+    description: #{description}
+    #{disabled}---
+
+    # #{description}
+    """
+  end
 
   defp presentation_type(line) do
     case get_in(line, ["params", "update", "_meta", "pixir", "presentation"]) do

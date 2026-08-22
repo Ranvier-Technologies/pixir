@@ -408,7 +408,7 @@ defmodule PixirMonitor.EscriptWorkspaceSetTest do
   end
 
   defp fixture_workspaces!(mode) do
-    root = Path.join(System.tmp_dir!(), "pixir-monitor-set-browser-#{System.unique_integer([:positive])}")
+    root = PixirMonitor.TestRun.tmp("pixir-monitor-set-browser")
     left = Path.join(root, "left")
     right = Path.join(root, "right")
     left_sessions = Path.join([left, ".pixir", "sessions"])

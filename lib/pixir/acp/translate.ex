@@ -34,16 +34,18 @@ defmodule Pixir.ACP.Translate do
   @spec update(Event.t(), acp_sid(), keyword()) :: map() | nil
   def update(event, acp_sid, opts \\ [])
 
-  def update(%{type: :text_delta, data: %{"chunk" => chunk}}, acp_sid, _opts) do
+  def update(%{type: :text_delta, data: %{"chunk" => chunk}} = event, acp_sid, opts) do
     wrap(acp_sid, %{
       "sessionUpdate" => "agent_message_chunk",
+      "messageId" => message_id(event, "assistant", Keyword.put(opts, :acp_sid, acp_sid)),
       "content" => text_block(chunk)
     })
   end
 
-  def update(%{type: :reasoning_delta, data: %{"chunk" => chunk}}, acp_sid, _opts) do
+  def update(%{type: :reasoning_delta, data: %{"chunk" => chunk}} = event, acp_sid, opts) do
     wrap(acp_sid, %{
       "sessionUpdate" => "agent_thought_chunk",
+      "messageId" => message_id(event, "thought", Keyword.put(opts, :acp_sid, acp_sid)),
       "content" => text_block(chunk)
     })
   end
@@ -65,14 +67,16 @@ defmodule Pixir.ACP.Translate do
     )
   end
 
-  def update(%{type: :tool_result, data: %{"call_id" => id, "ok" => ok} = data}, acp_sid, _opts) do
+  def update(%{type: :tool_result, data: %{"call_id" => id, "ok" => ok} = data}, acp_sid, opts) do
+    call_args = Keyword.get(opts, :tool_call_args, %{})
+
     wrap(
       acp_sid,
       %{
         "sessionUpdate" => "tool_call_update",
         "toolCallId" => id,
         "status" => if(ok, do: "completed", else: "failed"),
-        "content" => [%{"type" => "content", "content" => text_block(result_text(ok, data))}]
+        "content" => tool_result_content(ok, data, call_args, opts)
       }
       |> put_optional("rawOutput", semantic_tool_output(data))
     )
@@ -163,8 +167,12 @@ defmodule Pixir.ACP.Translate do
   @spec replay(Event.t(), acp_sid(), keyword()) :: map() | nil
   def replay(event, acp_sid, opts \\ [])
 
-  def replay(%{type: :user_message, data: %{"text" => text}}, acp_sid, _opts) do
-    wrap(acp_sid, %{"sessionUpdate" => "user_message_chunk", "content" => text_block(text)})
+  def replay(%{type: :user_message, data: %{"text" => text}} = event, acp_sid, opts) do
+    wrap(acp_sid, %{
+      "sessionUpdate" => "user_message_chunk",
+      "messageId" => message_id(event, "user", Keyword.put(opts, :acp_sid, acp_sid)),
+      "content" => text_block(text)
+    })
   end
 
   def replay(
@@ -174,8 +182,12 @@ defmodule Pixir.ACP.Translate do
       ),
       do: nil
 
-  def replay(%{type: :assistant_message, data: %{"text" => text}}, acp_sid, _opts) do
-    wrap(acp_sid, %{"sessionUpdate" => "agent_message_chunk", "content" => text_block(text)})
+  def replay(%{type: :assistant_message, data: %{"text" => text}} = event, acp_sid, opts) do
+    wrap(acp_sid, %{
+      "sessionUpdate" => "agent_message_chunk",
+      "messageId" => message_id(event, "assistant", Keyword.put(opts, :acp_sid, acp_sid)),
+      "content" => text_block(text)
+    })
   end
 
   def replay(%{type: :provider_usage} = event, acp_sid, opts), do: update(event, acp_sid, opts)
@@ -199,7 +211,11 @@ defmodule Pixir.ACP.Translate do
   """
   @spec message_chunk(String.t(), acp_sid()) :: map()
   def message_chunk(text, acp_sid) when is_binary(text) do
-    wrap(acp_sid, %{"sessionUpdate" => "agent_message_chunk", "content" => text_block(text)})
+    wrap(acp_sid, %{
+      "sessionUpdate" => "agent_message_chunk",
+      "messageId" => "pixir:" <> acp_sid <> ":assistant:fallback",
+      "content" => text_block(text)
+    })
   end
 
   @doc "Build the pinned schema-valid, non-transcript ACP warning update."
@@ -330,6 +346,28 @@ defmodule Pixir.ACP.Translate do
 
   defp wrap(acp_sid, update), do: %{"sessionId" => acp_sid, "update" => update}
 
+  defp message_id(%{session_id: session_id, seq: seq}, role, opts) do
+    stable =
+      cond do
+        is_integer(seq) ->
+          "seq:" <> Integer.to_string(seq)
+
+        true ->
+          case Keyword.get(opts, :prompt_ref) do
+            ref when not is_nil(ref) -> "prompt:" <> to_text(ref)
+            _ -> "live"
+          end
+      end
+
+    "pixir:" <> to_text(session_id) <> ":" <> role <> ":" <> stable
+  end
+
+  defp message_id(_event, role, opts) do
+    sid = Keyword.get(opts, :acp_sid) || Keyword.get(opts, :session_id)
+    scope = if is_binary(sid) and sid != "", do: sid, else: "unknown"
+    "pixir:unknown:" <> scope <> ":" <> role
+  end
+
   defp put_optional(map, _key, nil), do: map
   defp put_optional(map, key, value), do: Map.put(map, key, value)
 
@@ -398,6 +436,60 @@ defmodule Pixir.ACP.Translate do
   end
 
   defp semantic_tool_output(_data), do: nil
+
+  @max_diff_text_bytes 1_000_000
+
+  defp tool_result_content(true, data, call_args, opts) do
+    case tool_diff_content(data, call_args, opts) do
+      nil -> [%{"type" => "content", "content" => text_block(result_text(true, data))}]
+      diff -> [diff]
+    end
+  end
+
+  defp tool_result_content(false, data, _call_args, _opts),
+    do: [%{"type" => "content", "content" => text_block(result_text(false, data))}]
+
+  defp tool_diff_content(data, call_args, opts) when is_map(call_args) do
+    name = Keyword.get(opts, :tool_name) || data["name"]
+    path = call_args["path"] || data["path"]
+
+    with true <- name in ["write", "edit"],
+         true <- is_binary(path) and path != "",
+         {:ok, location} <- location_path(path, Keyword.get(opts, :workspace)),
+         {:ok, old_text, new_text} <- diff_sides(name, data, call_args),
+         true <- bounded_diff_text?(old_text),
+         true <- bounded_diff_text?(new_text) do
+      %{"type" => "diff", "path" => location, "oldText" => old_text, "newText" => new_text}
+    else
+      _ -> nil
+    end
+  end
+
+  defp tool_diff_content(_data, _call_args, _opts), do: nil
+
+  defp diff_sides("write", data, args) do
+    new_text = args["content"] || data["newText"] || data["new_text"]
+    old_text = data["oldText"] || data["old_text"]
+
+    if is_binary(new_text) do
+      {:ok, old_text, new_text}
+    else
+      :error
+    end
+  end
+
+  defp diff_sides("edit", data, args) do
+    old = data["oldText"] || data["old_text"] || args["old_string"]
+    new = data["newText"] || data["new_text"] || args["new_string"]
+
+    if is_binary(old) and is_binary(new), do: {:ok, old, new}, else: :error
+  end
+
+  defp diff_sides(_name, _data, _args), do: :error
+
+  defp bounded_diff_text?(nil), do: true
+  defp bounded_diff_text?(text) when is_binary(text), do: byte_size(text) <= @max_diff_text_bytes
+  defp bounded_diff_text?(_), do: false
 
   defp semantic_output(type, data) do
     Map.put(data, "_meta", %{

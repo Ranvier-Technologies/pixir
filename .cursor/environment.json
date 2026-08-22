@@ -1,0 +1,8 @@
+{
+  "name": "Pixir Harness",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "user": "ubuntu",
+  "install": "bin/cloud-agent-install.sh"
+}

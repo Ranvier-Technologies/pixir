@@ -37,8 +37,22 @@ defmodule PixirMonitor.ProjectionFailureContractTest do
     assert @app_js =~ "function renderProjectionFailure(error)"
     assert @app_js =~ "function renderCurrentGuarded()"
     assert @app_js =~ "function renderProjectionFailureSafely(error)"
-    assert @app_js =~ "catch (error) { renderProjectionFailureSafely(error); }"
-    assert @app_js =~ "refresh(currentReason).catch(renderProjectionFailureSafely)"
+
+    # The render catch sites go through the CLASSIFIER, which routes a Monitor
+    # authoring defect away from this path before it can be normalized. A defect
+    # reaching `normalizeProjectionFailure` is repainted as
+    # `projection_render_failed` — "The fetched projection could not be
+    # displayed." — which turns our own bug into an accusation against the
+    # operator's Log, and on a followed run can additionally masquerade as a
+    # run-identity or follow-degradation problem.
+    assert @app_js =~ "function renderRenderErrorSafely(error)"
+    assert @app_js =~ "if (isMonitorDefect(error)) return renderMonitorDefectSafely(error);"
+    assert @app_js =~ "catch (error) { renderRenderErrorSafely(error); }"
+    assert @app_js =~ "refresh(currentReason).catch(renderRenderErrorSafely)"
+
+    # The classifier still DELEGATES every genuine projection failure here, so
+    # the classified failure path itself is unchanged for the cases it owns.
+    assert @app_js =~ "renderProjectionFailureSafely(error);\n  }"
     assert @app_js =~ ~s|app.dataset.errorKind = "projection_failure_renderer_failed";|
     assert @app_js =~ ~s|app.dataset.errorPhase = primaryFailure.phase;|
     assert @app_js =~ ~s|app.textContent = "Projection unavailable. " + projectionFailureMessage(primaryFailure);|

@@ -2,7 +2,7 @@ defmodule Pixir.Providers.Anthropic.Prompt do
   @moduledoc """
   Provider-private pa1 prompt builder for Anthropic Messages requests.
 
-  pa1 mirrors the px3 prompt contract in doctrine, not bytes. Layer 0 is a
+  pa1 mirrors the px4 prompt contract in doctrine, not bytes. Layer 0 is a
   byte-stable system text block selected by mode, Layer 1 is the deterministic
   Skills index when present, and volatile late context is inserted as the leading
   text content block of the latest user message because Anthropic has no developer
@@ -64,8 +64,9 @@ defmodule Pixir.Providers.Anthropic.Prompt do
                commands like grep/ls) and produce a clear, step-by-step plan. Do NOT modify
                files or run mutating commands; write/edit and unsafe shell are disabled in
                this mode and will be refused. Call the `update_plan` tool to record the plan
-               as a checklist, then STOP and let the user review it. They will switch to
-               build mode and re-prompt to execute. All paths are relative to the workspace;
+               as a checklist, then STOP and let the user review it. Recording the plan
+               switches this session to build mode; the next prompt can execute. All paths
+               are relative to the workspace;
                a fenced context block at the start of the latest user message identifies the
                workspace root.
 

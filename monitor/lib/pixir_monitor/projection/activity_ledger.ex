@@ -11,8 +11,9 @@ defmodule PixirMonitor.Projection.ActivityLedger do
 
   It records nothing but the durable coordinates the caller already carries —
   the highest observed parent Log `seq` and the latest durable timestamp — keyed
-  by run identity. Comparing the current observation against the previously
-  recorded one yields the assertion the builder admits as `activity_evidence`.
+  by source-scoped run identity. Comparing the current observation against the
+  previously recorded one yields the assertion the builder admits as
+  `activity_evidence`.
 
   Every value here is recomputable and disposable. No projection, execution
   state, gate, advisory, usage, or evidence is stored, and no wall clock is
@@ -31,26 +32,51 @@ defmodule PixirMonitor.Projection.ActivityLedger do
   @max_entries 512
   @vocabulary ~w(advanced unchanged unknown)
 
+  @type identity :: String.t() | {:workspace, String.t(), String.t()}
+
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: name(opts))
 
   @doc """
-  Records this observation of `run_id` and returns the builder's
+  Records this observation of a run identity and returns the builder's
   `activity_evidence` input for it.
 
+  The default ledger remains available through `observe/3`. `observe/4` accepts
+  an explicit registered name or pid, which lets callers use a disposable
+  ledger without coupling to application supervision. A filesystem source uses
+  `{:workspace, stable_workspace, run_id}` as its identity so equal run ids from
+  different roots never share observation history.
+
   `as_of_seq` is the highest parent Log sequence in this observation and
-  `last_durable_at` the latest durable timestamp. Returns `nil` when the ledger
-  is unavailable, which the builder treats as "not asserted".
+  `last_durable_at` the latest durable timestamp. Returns `{:error, :unavailable}`
+  when the ledger is missing, stopped, or does not reply before the bounded call
+  timeout. Callers that supply optional Builder input may translate that closed
+  failure to `nil` ("not asserted"). Invalid observations return
+  `{:error, :invalid_observation}`.
   """
-  @spec observe(String.t(), integer() | nil, String.t() | nil) :: map() | nil
-  def observe(run_id, as_of_seq, last_durable_at)
-      when is_binary(run_id) and (is_integer(as_of_seq) or is_nil(as_of_seq)) do
-    GenServer.call(__MODULE__, {:observe, run_id, as_of_seq, last_durable_at}, 1_000)
+  @spec observe(identity(), integer() | nil, String.t() | nil) ::
+          {:ok, map()} | {:error, :invalid_observation | :unavailable}
+  def observe(identity, as_of_seq, last_durable_at),
+    do: observe(__MODULE__, identity, as_of_seq, last_durable_at)
+
+  @spec observe(GenServer.server(), identity(), integer() | nil, String.t() | nil) ::
+          {:ok, map()} | {:error, :invalid_observation | :unavailable}
+  def observe(server, identity, as_of_seq, last_durable_at)
+      when (is_binary(identity) or
+              (is_tuple(identity) and tuple_size(identity) == 3 and elem(identity, 0) == :workspace and
+                 is_binary(elem(identity, 1)) and is_binary(elem(identity, 2)))) and
+             (is_integer(as_of_seq) or is_nil(as_of_seq)) do
+    if valid_server?(server) do
+      {:ok, GenServer.call(server, {:observe, identity, as_of_seq, last_durable_at}, 1_000)}
+    else
+      {:error, :invalid_observation}
+    end
   catch
-    :exit, _reason -> nil
+    :exit, _reason -> {:error, :unavailable}
   end
 
-  def observe(_run_id, _as_of_seq, _last_durable_at), do: nil
+  def observe(_server, _identity, _as_of_seq, _last_durable_at),
+    do: {:error, :invalid_observation}
 
   @doc """
   Deterministic comparison of two successive durable observations.
@@ -59,6 +85,8 @@ defmodule PixirMonitor.Projection.ActivityLedger do
   sequences are `"unchanged"` even if the timestamps differ, because a Log whose
   `seq` did not move recorded nothing new. The timestamp comparison is only a
   fallback for observations where a sequence is unavailable on either side.
+  Valid ISO-8601 values are compared as instants; malformed evidence asserts
+  nothing.
   """
   @spec classify({integer() | nil, String.t() | nil}, {integer() | nil, String.t() | nil} | nil) ::
           String.t()
@@ -69,8 +97,7 @@ defmodule PixirMonitor.Projection.ActivityLedger do
       is_integer(seq) and is_integer(prior_seq) and seq > prior_seq -> "advanced"
       is_integer(seq) and is_integer(prior_seq) and seq < prior_seq -> "unknown"
       is_integer(seq) and is_integer(prior_seq) -> "unchanged"
-      is_binary(at) and is_binary(prior_at) and at > prior_at -> "advanced"
-      true -> "unknown"
+      true -> classify_instants(at, prior_at)
     end
   end
 
@@ -84,17 +111,17 @@ defmodule PixirMonitor.Projection.ActivityLedger do
   def init(_opts), do: {:ok, %{entries: %{}, tick: 0}}
 
   @impl true
-  def handle_call({:observe, run_id, seq, at}, _from, %{entries: entries, tick: tick}) do
+  def handle_call({:observe, identity, seq, at}, _from, %{entries: entries, tick: tick}) do
     current = {seq, at}
-    prior = with {coordinates, _seen} <- Map.get(entries, run_id), do: coordinates
+    prior = with {coordinates, _seen} <- Map.get(entries, identity), do: coordinates
     durable_evidence = classify(current, prior)
 
     tick = tick + 1
 
     entries =
       entries
-      |> evict_least_recent(run_id)
-      |> Map.put(run_id, {current, tick})
+      |> evict_least_recent(identity)
+      |> Map.put(identity, {current, tick})
 
     evidence = %{
       "durable_evidence" => durable_evidence,
@@ -111,14 +138,42 @@ defmodule PixirMonitor.Projection.ActivityLedger do
   # afterwards would report "unknown" for the life of the process, silently
   # reverting the feature. Evicting the least recently observed identity keeps the
   # bound while letting the memory follow the runs actually being polled.
-  defp evict_least_recent(entries, run_id) do
-    if Map.has_key?(entries, run_id) or map_size(entries) < @max_entries do
+  defp evict_least_recent(entries, identity) do
+    if Map.has_key?(entries, identity) or map_size(entries) < @max_entries do
       entries
     else
-      {oldest, _seen} = Enum.min_by(entries, fn {_id, {_coordinates, seen}} -> seen end)
+      {oldest, _seen} = Enum.min_by(entries, fn {_identity, {_coordinates, seen}} -> seen end)
       Map.delete(entries, oldest)
     end
   end
+
+  defp classify_instants(at, prior_at) when is_binary(at) and is_binary(prior_at) do
+    with {:ok, current, _offset} <- DateTime.from_iso8601(at),
+         {:ok, prior, _offset} <- DateTime.from_iso8601(prior_at) do
+      case DateTime.compare(current, prior) do
+        :gt -> "advanced"
+        :eq -> "unchanged"
+        :lt -> "unknown"
+      end
+    else
+      _ -> "unknown"
+    end
+  end
+
+  defp classify_instants(_at, _prior_at), do: "unknown"
+
+  defp valid_server?(server) when is_atom(server) or is_pid(server), do: true
+  defp valid_server?({:global, _name}), do: true
+
+  defp valid_server?({:via, module, _name}) when is_atom(module) do
+    Code.ensure_loaded?(module) and
+      Enum.all?(
+        [register_name: 2, unregister_name: 1, whereis_name: 1, send: 2],
+        fn {callback, arity} -> function_exported?(module, callback, arity) end
+      )
+  end
+
+  defp valid_server?(_server), do: false
 
   defp name(opts), do: Keyword.get(opts, :name, __MODULE__)
 end
