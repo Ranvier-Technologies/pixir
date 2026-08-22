@@ -2,6 +2,11 @@
 
 Date: 2026-05-30
 Status: Accepted
+Amended 2026-08-16 (issue #515-A): ACP `session/delete` hide becomes a
+workspace-confined sidecar consulted by the ACP presenter — see
+"Amendment (2026-08-16, issue #515-A): durable session hide" below.
+This amendment records persistence policy only; no new file is created
+under `.pixir` until #515-B.
 
 ## Context
 
@@ -155,6 +160,148 @@ input assembly, Provider transport, and `provider_usage` evidence.
    records bytes. Pixir does not inline arbitrary linked contents into the stable
    Provider prefix, and it preserves the Log-as-truth / Provider-projection boundary.
 
+## Amendment (2026-08-16, issue #515-A): durable session hide
+
+The original Decision above still stands for what ACP is: a Presenter
+over `Conversation` and the Events bus. Decision 6's historical sentence
+that `session/list`, `session/close`, and `session/delete` remain
+unadvertised is superseded in fact by #521, which advertised those
+capabilities and implemented in-memory hide (`deleted_sessions` MapSet).
+That MapSet dies with the ACP process; hidden Sessions reappear in
+`session/list` after restart. This amendment decides the durable form
+before #515-B creates any new path under `.pixir`.
+
+#521's hide contract on the wire stays: soft-hide from list, Log
+untouched, `gc` unchanged, delete-while-active rejected, missing or
+already-hidden ids succeed, load-after-hide fails closed. What changes
+is **where that hide lives**.
+
+### Why amend ADR 0009
+
+Hide is ACP presenter metadata, not a new runtime artifact class.
+ADR 0009 already owns `session/delete`. A new ADR would split that
+contract across two documents. Stretching 0009 would mean inventing a
+general workspace metadata store. This amendment does not: it records
+one hide sidecar for ACP `session/delete`.
+
+### Owner
+
+The local Harness owns hide. ACP `session/delete`, `session/list`,
+`session/load`, and `session/resume` consult it. It is not editor state,
+not a T3 or other Presenter Projection catalog, and not a conversation
+Event.
+
+Presenter asks; runtime is truth; the local Log remains the audit trail.
+
+### Location
+
+Workspace-confined sidecar, sibling of writer leases:
+
+`<workspace>/.pixir/session_hides/<session_id>.json`
+
+Per-id files, not a single catalog, not a line in the NDJSON Log, and
+not `~/.pixir/`. Filename membership is the list filter. The JSON body
+is bounded audit (`version`, `session_id`, `hidden_at`) with no
+conversation content and no secrets.
+
+Rejected alternatives:
+
+- A `session_deleted` Event contaminates History with presentation
+  state, requires opening a closed Session to append, would change Log
+  bytes, and would be an ADR 0004 canonical-type schema change.
+- An editor catalog is Presenter Projection, not Harness truth
+  (ADR 0017). After restart, Pixir `session/list` would still rediscover
+  the NDJSON.
+- A global hide list under `~/.pixir/` is not workspace-confined; ACP
+  list is workspace-scoped.
+- Renaming or mutating the NDJSON would make hide look like Log trash.
+- A marker inside `.pixir/sessions/` couples hide to the directory that
+  `gc` and `Log.fold/2` scan for `*.ndjson`.
+- One catalog JSON needs read-modify-write. `SessionLease` already
+  established exclusive create of per-id files.
+
+### Identity
+
+ACP `session/delete` receives `sessionId` only. `session/load` and
+`session/resume` already require `cwd`. After `session/close`, #521's
+`forget_session/3` drops the workspace map entry, so delete cannot
+assume the id is still registered.
+
+Resolve `sessionId` → workspace as follows:
+
+1. Validate the id with `Pixir.SessionId` first. Invalid ids are
+   `-32602` and must not be echoed.
+2. If the id is registered in this ACP Server (`state.sessions`),
+   reject as delete-while-active (`-32602`).
+3. Build the candidate workspace set: any absolute `cwd` the client
+   sent (optional extra field; honor when present and absolute),
+   workspaces this Server still has registered, workspaces this Server
+   has successfully listed in this process, and the ACP process working
+   directory.
+4. For each unique candidate, `Paths.inspect_state_path/3` the Log
+   `<ws>/.pixir/sessions/<id>.ndjson` without following symlinks.
+   Skip a candidate that is unsafe. Do not guess a workspace by
+   creating a hide file where no Log was observed.
+5. Exactly one candidate has a regular Log → that workspace owns the
+   hide file.
+6. Multiple candidates have a regular Log → fail closed (`-32602`,
+   ambiguous workspace).
+7. Zero candidates have a regular Log → idempotent success (missing
+   or already hidden). Do not invent a hide record in a guessed
+   workspace.
+
+`session/list` with `cwd` consults that workspace's hide directory.
+`session/list` without `cwd` consults each known workspace's hide
+directory. `session/load` and `session/resume` consult the hide file
+in the supplied `cwd`. #521's resume path does not check
+`deleted_sessions`; #515-B must apply the same fail-closed hide check
+to resume as to load.
+
+### Semantics
+
+- Hide survives ACP process restart.
+- The Session Log remains byte-identical. Hide never appends, rewrites,
+  renames, or deletes NDJSON.
+- `session/load` and `session/resume` of a hidden id fail closed
+  (`-32602`, "session has been deleted").
+- Delete while the id is registered in this ACP Server is rejected.
+  A writer lease in another process is not ACP-active for this check;
+  hide is presenter metadata, not a write lock.
+- Missing or already-hidden ids succeed. Exclusive create against an
+  existing hide file is success, not an error.
+- An unsafe hide path (symlink, unexpected type) is fail-closed: do
+  not re-expose the Session. `session/list` must not show an id whose
+  hide path cannot be classified as absent.
+
+### Relationship to GC
+
+Hiding does not make a Session collectable. `pixir gc` reclaims
+isolated Subagent workspaces and never deletes or moves NDJSON under
+`.pixir/sessions`, including child Logs inside snapshots. Parent
+Session Logs remain the only lifecycle evidence. A hidden Session's
+Log still anchors referenced isolated workspaces. Hide files are not
+a GC input and are not a GC target in this decision.
+
+### Concurrency
+
+#515-B must:
+
+- validate the Session id before any path construction;
+- create `.pixir/session_hides` through `Paths.ensure_state_dir/2`
+  (component-at-a-time, no `mkdir_p`, no symlink follow);
+- `lstat` every existing component below the trusted Workspace root;
+- create the hide file with exclusive create (same atomic pattern as
+  `SessionLease.acquire/2`);
+- treat an already-present regular hide file as idempotent success;
+- refuse existing or dangling symlinks with `unsafe_state_path`.
+
+This is the same static tripwire as `Pixir.Paths`, `Pixir.Log`, and
+`Pixir.SessionLease`: not a same-UID race-free guarantee.
+
+This amendment does not implement the sidecar (#515-B). Until that
+lands, shipped hide remains the in-memory `deleted_sessions` MapSet
+#521 left.
+
 ## Consequences
 
 - **Standards-based reach:** any ACP client can drive Pixir, not just T3 Code.
@@ -180,3 +327,62 @@ input assembly, Provider transport, and `provider_usage` evidence.
   late dynamic input, which Tool schemas are exposed, and whether WebSocket continuation
   or HTTP/SSE fallback is used. `previous_response_id` is Pixir/Provider transport
   optimization metadata, not T3 session truth.
+- **ACP hide is Harness metadata, not History.** After the 2026-08-16 amendment,
+  `session/delete` remains a Presenter request. The durable answer lives in
+  `.pixir/session_hides/`, not in the Session Log and not in an editor catalog.
+  Restart must not resurrect a hidden id in `session/list`. The NDJSON stays
+  byte-identical, so resume/replay/fork/gc keep their existing evidence.
+- **Identity is resolved, not guessed.** `session/delete` still accepts only
+  `sessionId` on the wire. The Server maps that id onto a workspace by probing
+  candidate Logs. Ambiguous multi-workspace hits fail closed; a missing Log is
+  idempotent success and does not invent a hide file.
+
+## Non-goals
+
+- Do not implement the sidecar in this amendment (#515-B).
+- Do not write a `session_deleted` Event or any other canonical type for hide.
+- Do not hard-delete, rename, or rewrite NDJSON.
+- Do not treat hide as chat trash or as a `gc` collectability signal.
+- Do not store hide in an editor catalog, `~/.pixir/`, or `.pixir/sessions/`.
+- Do not mix #516, #517, #520, #522, or #523.
+- Do not add MCP, client `fs/*`, client `terminal/*`, or ACP v2.
+
+## Verification Direction
+
+This amendment is documentation only. Later #515-B must prove, with ExUnit
+seams and no network:
+
+```bash
+mix test test/pixir/acp/server_test.exs
+mix compile --warnings-as-errors
+mix format --check-formatted
+git diff --check docs/adr
+```
+
+Regression coverage should prove:
+
+- a hidden id is absent from `session/list` after a new ACP Server process
+  opens the same workspace;
+- the Session Log bytes are unchanged by `session/delete`;
+- `session/load` and `session/resume` of a hidden id return `-32602`;
+- delete while the id is registered in this Server returns `-32602`;
+- missing and already-hidden ids succeed;
+- a Log present in two candidate workspaces fails closed;
+- a symlink or other unsafe hide path does not re-expose the Session;
+- `pixir gc` planning is unchanged for a hidden parent that still references
+  isolated Subagent workspaces;
+- no `session_deleted` Event is appended.
+
+## References
+
+- ADR 0003: stateless Turns; local Log is the source of truth.
+- ADR 0004: unified Event envelope; adding a canonical type is a Log schema
+  change.
+- ADR 0005: structured errors; invalid Session ids are not echoed.
+- ADR 0017: Presenters own presentation; Pixir owns runtime truth.
+- `Pixir.Paths` / `Pixir.SessionLease`: workspace-confined state paths,
+  `lstat` preflight, exclusive create, no symlink follow.
+- `Pixir.Subagents.GC`: parent Session Logs are the only lifecycle evidence;
+  NDJSON is never deleted or moved.
+- Issue #515 (soft-hide, not Log trash); parent epic #512.
+- #521: in-memory `deleted_sessions` MapSet.

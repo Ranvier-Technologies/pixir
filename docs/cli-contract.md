@@ -59,6 +59,36 @@ A failure before a Session starts cannot supply Session recovery commands. In
 Durable `turn_failed` data may add fields to an abnormal turn-result envelope. Those
 additive fields are not promised here.
 
+### Unknown-subcommand refusal
+
+An argv whose first positional token is a bare word (`^[a-z][a-z0-9-]*$`) that is
+not a known command, followed by at least one option-shaped token, is refused
+before any Session starts and exits with code 2 instead of running as a prompt.
+Option-shaped means a flag by unix convention: `--` followed by any character,
+or `-` followed by a letter. A negative number (`-3`) and a bare `-` are not
+option-shaped. In
+`--json` mode the refusal uses the structured error shape above with
+`error.kind: "invalid_args"`, and `error.details.command` carries the rejected
+first token.
+
+The shape is judged on the argv as typed: the permission mode flags (`--ask`,
+`--read-only`, `--yolo`) count as option-shaped when they follow the first
+positional token (`pixir serve --ask` refuses), and do not count when they
+precede it (`pixir --ask hello` stays a prompt). A value-taking runtime flag's
+value (`--bash-timeout-ms 500`, `--write-policy p.json`, `--attach f.txt`) is
+not a positional token for this judgment. The refusal also wins over a
+trailing `-h`/`--help` in this shape (`pixir serve --help` refuses, with the
+monitor hint); `pixir help`, `pixir --help`, and every known command's own
+`--help` are unaffected.
+
+Unaffected and promised to keep working: a quoted single-argument prompt (one
+argument containing spaces is not a bare word), bare prose with no option-shaped
+tokens, and stdin (`pixir -`). Known residuals, accepted as outside the shape:
+a bare word alone or followed only by more bare words (`pixir serve help`) still
+reaches prompt mode, as do heads with uppercase or underscore characters, a
+bare `--` (`pixir serve --`), and `-` followed by a non-letter (`pixir serve
+-@`).
+
 ## `pixir tree --json`
 
 A successful call returns `{"ok":true,"tree":...}`. Every nested child Session uses

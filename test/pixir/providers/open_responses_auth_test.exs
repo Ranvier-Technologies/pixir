@@ -15,12 +15,7 @@ defmodule Pixir.Provider.ResponsesAuthTest do
 
   setup do
     name = :"responses_auth_#{System.unique_integer([:positive])}"
-
-    path =
-      Path.join(
-        System.tmp_dir!(),
-        "pixir-responses-auth-#{System.unique_integer([:positive])}.json"
-      )
+    path = tmp_auth_store("pixir-responses-auth-")
 
     {:ok, _pid} =
       Auth.start_link(
@@ -30,8 +25,20 @@ defmodule Pixir.Provider.ResponsesAuthTest do
         oauth: __MODULE__.NoOAuth
       )
 
-    on_exit(fn -> File.rm_rf!(path) end)
     %{auth: name}
+  end
+
+  defp tmp_auth_store(prefix) do
+    directory =
+      Path.join(
+        System.tmp_dir!(),
+        prefix <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower)
+      )
+
+    File.rm_rf!(directory)
+    File.mkdir_p!(directory)
+    on_exit(fn -> File.rm_rf!(directory) end)
+    Path.join(directory, "auth.json")
   end
 
   defmodule NoOAuth do

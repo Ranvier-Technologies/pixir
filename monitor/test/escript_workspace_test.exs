@@ -66,7 +66,7 @@ defmodule PixirMonitor.EscriptWorkspaceTest do
   end
 
   defp foreign_dir! do
-    path = Path.join(System.tmp_dir!(), "pixir-monitor-foreign-#{System.unique_integer([:positive])}")
+    path = PixirMonitor.TestRun.tmp("pixir-monitor-foreign")
     File.mkdir_p!(path)
     on_exit(fn -> File.rm_rf!(path) end)
     path
@@ -217,7 +217,7 @@ defmodule PixirMonitor.EscriptWorkspaceTest do
     run_id = "20260713T225901-browser"
     unit_id = "delegate:#{run_id}:subagent:subagent-one"
     write_subagent_run!(sessions, run_id)
-    profiles_before = Path.wildcard(Path.join(System.tmp_dir!(), "pixir-monitor-browser-*")) |> MapSet.new()
+    profiles_before = Path.wildcard(PixirMonitor.TestRun.profile_glob("pixir-monitor-browser")) |> MapSet.new()
     browser_helpers_before = browser_profile_processes()
 
     {output, status} =
@@ -281,7 +281,7 @@ defmodule PixirMonitor.EscriptWorkspaceTest do
     run_id = "20260713T225902-browser-failure"
     unit_id = "delegate:#{run_id}:subagent:subagent-one"
     write_subagent_run!(sessions, run_id)
-    profiles_before = Path.wildcard(Path.join(System.tmp_dir!(), "pixir-monitor-browser-*")) |> MapSet.new()
+    profiles_before = Path.wildcard(PixirMonitor.TestRun.profile_glob("pixir-monitor-browser")) |> MapSet.new()
     browser_helpers_before = browser_profile_processes()
 
     {output, status} =
@@ -329,7 +329,7 @@ defmodule PixirMonitor.EscriptWorkspaceTest do
     run_id = "20260713T225903-browser-cdp-crash"
     unit_id = "delegate:#{run_id}:subagent:subagent-one"
     write_subagent_run!(sessions, run_id)
-    profiles_before = Path.wildcard(Path.join(System.tmp_dir!(), "pixir-monitor-browser-*")) |> MapSet.new()
+    profiles_before = Path.wildcard(PixirMonitor.TestRun.profile_glob("pixir-monitor-browser")) |> MapSet.new()
     browser_helpers_before = browser_profile_processes()
 
     {output, status} =
@@ -373,7 +373,7 @@ defmodule PixirMonitor.EscriptWorkspaceTest do
              "profile_removed" => true
            }
 
-    assert Path.wildcard(Path.join(System.tmp_dir!(), "pixir-monitor-browser-*")) |> MapSet.new() == profiles_before
+    assert Path.wildcard(PixirMonitor.TestRun.profile_glob("pixir-monitor-browser")) |> MapSet.new() == profiles_before
     {processes, 0} = System.cmd(System.find_executable("ps"), ["-axo", "command="])
     refute Enum.any?(String.split(processes, "\n"), &(&1 =~ @escript and &1 =~ workspace))
     assert MapSet.subset?(browser_profile_processes(), browser_helpers_before)
@@ -384,7 +384,7 @@ defmodule PixirMonitor.EscriptWorkspaceTest do
 
     processes
     |> String.split("\n")
-    |> Enum.filter(&String.contains?(&1, "pixir-monitor-browser-"))
+    |> Enum.filter(&String.contains?(&1, PixirMonitor.TestRun.profile_prefix("pixir-monitor-browser")))
     |> MapSet.new()
   end
 

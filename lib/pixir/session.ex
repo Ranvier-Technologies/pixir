@@ -15,10 +15,12 @@ defmodule Pixir.Session do
   ## Turns as supervised Tasks
 
   A **Turn** runs in a Task under `Pixir.TurnSupervisor`, monitored (not linked) by the
-  Session. `interrupt/1` kills that Task — the load-bearing invariant that makes a Turn
-  cleanly cancellable without taking the Session down. The Turn body is a 1-arity
-  function given a context map (`%{session_id, workspace, role, fork_root_session_id}`);
-  the real tool-loop (build step 7) plugs in here.
+  Session. `interrupt/1` fences that logical Turn by terminating its Task, draining known
+  committed calls, reconciling persisted orphans, and durably recording audit-only
+  interruption evidence. The reusable Session itself stays alive. This local fence makes
+  no claim about remote Provider billing/emission or host processes that already escaped
+  the Turn Task. The Turn body is a 1-arity function given a context map
+  (`%{session_id, workspace, role, fork_root_session_id}`); the real tool-loop plugs in here.
 
   ## Resume
 
@@ -39,11 +41,13 @@ defmodule Pixir.Session do
   @turn_supervisor Pixir.TurnSupervisor
 
   @type role :: atom()
+  @type turn_identity :: {reference(), pos_integer()}
   @type ctx :: %{
           session_id: String.t(),
           workspace: String.t(),
           role: role(),
           fork_root_session_id: String.t(),
+          session_incarnation: reference(),
           turn_generation: pos_integer()
         }
 
@@ -130,15 +134,20 @@ defmodule Pixir.Session do
   accumulated: the streaming runner outlives the Turn it belonged to, so a late
   declaration is real evidence with no Turn left to own it.
 
-  `generation` is the caller's TURN IDENTITY, not merely a claim that some Turn is
-  running (#462 round 3). Keying the drain on turn STATE alone (nil vs alive) is not
-  enough: the surviving runner of a killed Turn can declare while a NEW Turn is already
-  alive, and a state-only check accumulates that straggler into the successor, which
-  then drops it at its own clean end — the same silent evidence loss one Turn over.
-  Each Turn captures its generation at Turn start and stamps every declaration with it,
-  so the Session can tell "my live Turn's call" from "a dead Turn's straggler" and drain
-  the latter on the spot. Passing `nil` means "no identity claimed" and is always treated
-  as a straggler; it is never accumulated into the live Turn.
+  `turn_identity` is the caller's compound runtime TURN IDENTITY, not merely a claim
+  that some Turn is running (#462 round 3, #471). Keying the drain on turn STATE alone
+  (nil vs alive) is not enough: the surviving runner of a killed Turn can declare while
+  a NEW Turn is already alive, and a state-only check accumulates that straggler into the
+  successor, which then drops it at its own clean end — the same silent evidence loss one
+  Turn over. A numeric generation alone is also insufficient because `turn_generation`
+  restarts when the transient Session process restarts. Each actual Session process mints
+  an opaque runtime incarnation and pairs it with the Turn's generation. The Turn stamps
+  every declaration with that pair, so even generation one from a prior incarnation is a
+  straggler. Passing `nil` means "no identity claimed"; during a live Turn it is drained
+  under the honest `unstamped_declaration` classification rather than accumulated.
+
+  The incarnation token is runtime-only. It is never written to an Event, the Log, or
+  Pixir-authored Logger output.
 
   This call carries its own generous timeout rather than the `GenServer.call/2` default
   of 5 s (#462 round 3). The Session serializes Log appends and `Log.fold/2` history
@@ -147,22 +156,30 @@ defmodule Pixir.Session do
   inside the provider stream reducer, where an escaping exit is classified `:network`
   and IS provider-retryable, so a stalled fold would re-stream the request.
   """
-  @spec declare_committed_calls(String.t(), [map()], pos_integer() | nil) :: :ok | {:error, map()}
-  def declare_committed_calls(session_id, calls, generation \\ nil) when is_list(calls),
+  @spec declare_committed_calls(String.t(), [map()], turn_identity() | nil) ::
+          :ok | {:error, map()}
+  def declare_committed_calls(session_id, calls, turn_identity \\ nil) when is_list(calls),
     do:
       call_session(
         session_id,
-        {:declare_committed_calls, calls, generation},
+        {:declare_committed_calls, calls, turn_identity},
         @declare_timeout_ms
       )
 
-  @doc "Kill the currently running Turn's Task, if any."
+  @doc """
+  Fence the active logical Turn while keeping its Session reusable.
+
+  Success is returned only after the Turn Task is terminated, known committed calls are
+  drained/reconciled, and a bounded audit-only `turn_failed` interruption Event is durable.
+  This does not claim remote Provider billing/emission or escaped host-process quiescence.
+  """
   @spec interrupt(String.t()) :: :ok | {:error, :no_turn} | {:error, map()}
   def interrupt(session_id), do: call_session(session_id, :interrupt)
 
   @doc "Whether a Turn is currently running."
-  @spec turn_running?(String.t()) :: boolean() | {:error, map()}
-  def turn_running?(session_id), do: call_session(session_id, :turn_running?)
+  @spec turn_running?(String.t(), timeout()) :: boolean() | {:error, map()}
+  def turn_running?(session_id, timeout \\ 5_000),
+    do: call_session(session_id, :turn_running?, timeout)
 
   @doc """
   Hysteresis gate for context-pressure warnings (ADR 0020): returns `{:ok, :warn}`
@@ -230,10 +247,16 @@ defmodule Pixir.Session do
                 role: role,
                 seq: next_seq(history),
                 fork_root_session_id: Fork.fork_root_session_id(history, id),
+                # #471: an opaque capability minted once per actual Session process.
+                # It is paired with `turn_generation` for declaration matching and is
+                # deliberately absent from `info`, Events, Log data, and Pixir-authored
+                # Logger output.
+                session_incarnation: make_ref(),
                 turn: nil,
-                # #462 round 3: monotonic Turn identity. Lives above `turn` on purpose —
-                # it must keep counting across `turn: nil` so a generation is never reused
-                # and a dead Turn's straggler can never match a later Turn.
+                # #462 round 3: monotonic Turn generation within this process incarnation.
+                # It lives above `turn` on purpose so a generation is not reused until a
+                # transient Session restart; the incarnation capability disambiguates that
+                # restart boundary (#471).
                 turn_generation: 0,
                 committed_calls: [],
                 pressure_warnings: MapSet.new(),
@@ -298,7 +321,8 @@ defmodule Pixir.Session do
 
   # The declaration belongs to the Turn that is actually running: accumulate it, to be
   # drained if that Turn is killed or crashes and cleared if it ends cleanly. The match is
-  # on the GENERATION, not on `turn` being non-nil — see the straggler clause below.
+  # on the compound runtime IDENTITY, not on `turn` being non-nil and not on the numeric
+  # generation alone — see the straggler clause below.
   #
   # #462 round 5: a call id already declared for THIS generation is ignored, not appended.
   # The Provider retries transient failures itself (`Pixir.Provider.attempt/5`) with the
@@ -315,11 +339,11 @@ defmodule Pixir.Session do
   # entry instead would let a retry whose arguments re-serialized differently slip a second
   # declaration through.
   def handle_call(
-        {:declare_committed_calls, calls, generation},
+        {:declare_committed_calls, calls, turn_identity},
         _from,
-        %{turn: %{generation: generation}} = state
+        %{turn: %{identity: turn_identity}} = state
       )
-      when not is_nil(generation) do
+      when not is_nil(turn_identity) do
     declared = Enum.flat_map(calls, &normalize_committed_call/1)
     known = MapSet.new(state.committed_calls, & &1.call_id)
 
@@ -345,9 +369,9 @@ defmodule Pixir.Session do
   # spot under its own reason, and the next `start_turn`/`interrupt` reconciliation closes
   # it like any other drained call. On the Open Responses backend (no layer 2) losing it
   # instead would be permanent poison.
-  def handle_call({:declare_committed_calls, calls, generation}, _from, state) do
+  def handle_call({:declare_committed_calls, calls, turn_identity}, _from, state) do
     declared = Enum.flat_map(calls, &normalize_committed_call/1)
-    reason = straggler_drain_reason(state.turn, generation)
+    reason = straggler_drain_reason(state.turn, turn_identity)
 
     # The straggler is drained through a state whose `committed_calls` holds ONLY the
     # straggler, then the live Turn's own accumulated set is restored. A live successor
@@ -381,17 +405,19 @@ defmodule Pixir.Session do
     # to stop. Draining before the reconciliation below is what makes one pass enough.
     with {:ok, state} <- drain_committed_calls(state, "before_start_turn"),
          {:ok, state} <- reconcile_pending_tool_calls(state, "before_start_turn") do
-      # #462 round 3: a fresh TURN IDENTITY per Turn. Monotonic and never reused, so a
-      # killed Turn's surviving stream runner can never be mistaken for its successor no
-      # matter how late it speaks. It rides in `ctx` exactly as `session_id` does, and the
-      # Turn stamps every declaration with it.
+      # #462 round 3 / #471: a fresh compound runtime TURN IDENTITY per Turn. The
+      # generation remains in `ctx` as a compatibility field; declaration matching pairs
+      # it with the process-local incarnation so generation one is never mistaken for
+      # generation one from a restarted Session process.
       generation = state.turn_generation + 1
+      identity = {state.session_incarnation, generation}
 
       ctx = %{
         session_id: state.id,
         workspace: state.workspace,
         role: state.role,
         fork_root_session_id: state.fork_root_session_id,
+        session_incarnation: state.session_incarnation,
         turn_generation: generation
       }
 
@@ -402,7 +428,7 @@ defmodule Pixir.Session do
       {:reply, {:ok, task.ref},
        %{
          state
-         | turn: %{ref: task.ref, pid: task.pid, generation: generation},
+         | turn: %{ref: task.ref, pid: task.pid, generation: generation, identity: identity},
            turn_generation: generation,
            committed_calls: []
        }}
@@ -419,10 +445,11 @@ defmodule Pixir.Session do
   def handle_call(:interrupt, _from, %{turn: %{ref: ref, pid: pid}} = state) do
     Process.demonitor(ref, [:flush])
     _ = Task.Supervisor.terminate_child(@turn_supervisor, pid)
-    Events.publish(Event.status(state.id, "interrupted"))
 
     with {:ok, state} <- drain_committed_calls(%{state | turn: nil}, "interrupt"),
-         {:ok, state} <- reconcile_pending_tool_calls(state, "interrupt") do
+         {:ok, state} <- reconcile_pending_tool_calls(state, "interrupt"),
+         {:ok, state} <- record_interruption_failure(state) do
+      Events.publish(Event.status(state.id, "interrupted"))
       {:reply, :ok, state}
     else
       {:error, error, state} -> {:reply, {:error, error}, state}
@@ -538,6 +565,24 @@ defmodule Pixir.Session do
     end
   end
 
+  # Module-owned and deliberately context-free: interruption evidence must never project a
+  # Provider payload, tool arguments, a Task exit reason, or the opaque Session incarnation.
+  # It is appended only after drain/reconciliation, so `interrupt/1` returning `:ok` is a
+  # durable logical-Turn fence rather than merely a request to kill a Task.
+  defp record_interruption_failure(state) do
+    data = %{
+      "terminal_status" => "interrupted",
+      "error_kind" => "interrupted",
+      "error_message" => "Turn was interrupted before completion.",
+      "details" => %{"scope" => "turn"}
+    }
+
+    case record_event(state, Event.turn_failed(state.id, data)) do
+      {:ok, _event, state} -> {:ok, state}
+      {:error, error} -> {:error, error, state}
+    end
+  end
+
   # #462 layer 1: persist every Provider-committed call the killed Turn never recorded,
   # in declaration order, as a `tool_call` the ordinary orphan reconciliation below then
   # closes. Draining before reconciling is what makes one pass enough.
@@ -546,8 +591,9 @@ defmodule Pixir.Session do
   # and spoke over a SUCCESSOR, the second that it spoke into the gap. Both are drained on
   # the spot; the distinct reason keeps them apart in the Log, which is the only place this
   # is observable at all.
-  defp straggler_drain_reason(nil, _generation), do: "declared_without_turn"
-  defp straggler_drain_reason(%{}, _generation), do: "stale_turn_generation"
+  defp straggler_drain_reason(nil, _turn_identity), do: "declared_without_turn"
+  defp straggler_drain_reason(%{}, nil), do: "unstamped_declaration"
+  defp straggler_drain_reason(%{}, _turn_identity), do: "stale_turn_generation"
 
   defp drain_committed_calls(%{committed_calls: []} = state, _reason), do: {:ok, state}
 
@@ -630,15 +676,52 @@ defmodule Pixir.Session do
   # un-protects that call — #462's own failure mode one layer down — so it is named,
   # exactly as `Pixir.Turn.walk_output_items/3` names an unrecognized output item.
   defp normalize_committed_call(call) do
-    # The entry is inlined in the MESSAGE, not left in metadata: the default console
-    # formatter drops metadata, and evidence a reader never sees is not visible evidence.
+    # The bounded facts are inlined in the MESSAGE, not left in metadata: the default
+    # console formatter drops metadata, and evidence a reader never sees is not visible
+    # evidence. Values are never rendered because tool arguments may carry secrets.
     Logger.warning(
       "#462 dropped a malformed Provider-committed call declaration: " <>
-        inspect(call, limit: 5, printable_limit: 120)
+        malformed_committed_call_facts(call)
     )
 
     []
   end
+
+  # Only the keys a well-formed declaration could carry are ever rendered; every
+  # other key is COUNTED, never printed, because a malformed entry's keys are as
+  # untrusted as its values (a map-shaped key can embed argument material, and
+  # `inspect/2` would render it).
+  @known_committed_call_keys [:call_id, :name, :args, "call_id", "name", "args"]
+
+  defp malformed_committed_call_facts(call) when is_map(call) do
+    {known, unknown} = call |> Map.keys() |> Enum.split_with(&(&1 in @known_committed_call_keys))
+
+    facts =
+      "keys=" <>
+        inspect(Enum.sort_by(known, &to_string/1)) <> " unknown_keys=#{length(unknown)}"
+
+    call_id =
+      case call do
+        %{call_id: call_id} when is_binary(call_id) -> call_id
+        %{"call_id" => call_id} when is_binary(call_id) -> call_id
+        _other -> nil
+      end
+
+    if call_id do
+      facts <> " call_id=" <> inspect(binary_part(call_id, 0, min(byte_size(call_id), 40)))
+    else
+      facts
+    end
+  end
+
+  defp malformed_committed_call_facts(call) when is_binary(call), do: "type=binary"
+  defp malformed_committed_call_facts(call) when is_boolean(call), do: "type=boolean"
+  defp malformed_committed_call_facts(call) when is_atom(call), do: "type=atom"
+  defp malformed_committed_call_facts(call) when is_integer(call), do: "type=integer"
+  defp malformed_committed_call_facts(call) when is_float(call), do: "type=float"
+  defp malformed_committed_call_facts(call) when is_list(call), do: "type=list"
+  defp malformed_committed_call_facts(call) when is_tuple(call), do: "type=tuple"
+  defp malformed_committed_call_facts(_call), do: "type=other"
 
   defp reconcile_pending_tool_calls(state, reason) do
     case Log.fold(state.id, workspace: state.workspace) do

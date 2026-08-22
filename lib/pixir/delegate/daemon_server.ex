@@ -16,7 +16,7 @@ defmodule Pixir.Delegate.DaemonServer do
   use GenServer
 
   alias Pixir.Events
-  alias Pixir.Delegate.{Async, DaemonEndpoint, Handle, OwnerServer, Progress}
+  alias Pixir.Delegate.{Async, DaemonEndpoint, Handle, OwnerServer, Progress, Runner}
 
   @host {127, 0, 0, 1}
   @host_string "127.0.0.1"
@@ -144,13 +144,17 @@ defmodule Pixir.Delegate.DaemonServer do
            :ok <- require_list("runtime_opts", runtime_opts) do
         request = request_from_wire(request, state.workspace)
 
-        case apply(state.async, :start, [
-               request,
-               spec,
-               spec_meta,
-               [workspace: state.workspace, runtime_opts: runtime_opts]
-             ]) do
-          {:ok, payload} -> ipc_ok(annotate_daemon_payload(payload, state))
+        with {:ok, admitted_spec_meta} <- admit_wire_horizon(request, spec, spec_meta) do
+          case apply(state.async, :start, [
+                 request,
+                 spec,
+                 admitted_spec_meta,
+                 [workspace: state.workspace, runtime_opts: runtime_opts]
+               ]) do
+            {:ok, payload} -> ipc_ok(annotate_daemon_payload(payload, state))
+            {:error, error} -> ipc_error(error)
+          end
+        else
           {:error, error} -> ipc_error(error)
         end
       else
@@ -277,11 +281,46 @@ defmodule Pixir.Delegate.DaemonServer do
       output_dir: nil,
       progress: nil,
       quiet?: false,
-      allow_short_horizon?: Map.get(request, "allow_short_horizon?", false),
+      allow_short_horizon?: Map.get(request, "allow_short_horizon?", false) === true,
       spec_source: Map.get(request, "spec_source"),
       timeout_ms: Map.get(request, "timeout_ms"),
       contract_version: Map.get(request, "contract_version", 1)
     }
+  end
+
+  defp admit_wire_horizon(request, spec, spec_meta) do
+    spec_meta = Map.delete(spec_meta, "horizon_override")
+    strategy = Map.get(spec_meta, "strategy", Map.get(spec, "strategy"))
+
+    if strategy in ["subagents", "workflow"] do
+      case Runner.admit_horizon_details(request, spec_meta["critical_path"]) do
+        {:ok, nil} ->
+          {:ok, spec_meta}
+
+        {:ok, horizon_override} ->
+          {:ok, Map.put(spec_meta, "horizon_override", horizon_override)}
+
+        {:error, error} ->
+          {:error, error}
+      end
+    else
+      observed_class = if is_nil(strategy), do: "missing", else: "unsupported"
+
+      {:error,
+       error_payload(
+         "invalid_spec",
+         "Delegate daemon start requires a supported strategy before horizon admission",
+         %{
+           "observed_strategy_class" => observed_class,
+           "accepted_values" => ["subagents", "workflow"],
+           "fallback_allowed" => false,
+           "next_actions" => [
+             "send_a_supported_delegate_strategy",
+             "upgrade_pixir_client_and_daemon_together"
+           ]
+         }
+       )}
+    end
   end
 
   defp follow_context(

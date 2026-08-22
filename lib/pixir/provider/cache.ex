@@ -18,7 +18,8 @@ defmodule Pixir.Provider.Cache do
   # px1 = workspace path in the first instructions sentence. px2 = byte-stable
   # Layer 0 (discovery rule + checkpoint contract), late developer context.
   # px3 = Skill index rendered as routing-only metadata with when_to_use fields.
-  @prompt_contract_version "px3"
+  # px4 = plan Layer 0 records that Pixir switches the session to build (refs #520).
+  @prompt_contract_version "px4"
 
   @doc "The current Prompt Contract version segment (leads every cache key)."
   @spec prompt_contract_version() :: String.t()

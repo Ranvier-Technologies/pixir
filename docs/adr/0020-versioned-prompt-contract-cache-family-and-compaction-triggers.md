@@ -10,6 +10,11 @@ live-verified against the ChatGPT/Codex backend. Subsequent prompt-contract bump
 `px3` renders the Skill index as routing-only metadata with `when_to_use` fields and an
 explicit "do not list Skills unless asked" instruction, after dogfood showed the model
 could answer a system-prompt question by listing Skills first.
+Amended 2026-08-16 (issue #522-A): the parked non-goal that deferred
+provider-native compaction is lifted as a design decision in ADR 0040. The
+historical Decision and Non-goals text below are preserved. Native compact is
+not implemented here and does not become the default trigger policy — see
+"Amendment (2026-08-16, issue #522-A): native compact park lifted" below.
 
 ## Context
 
@@ -207,7 +212,8 @@ Regression coverage should prove:
 ## References
 
 - Design note 0002: context compaction vs summarization (provenance, rejected
-  alternatives, external-source verification, parked provider-native question).
+  alternatives, external-source verification; native compact later decided in
+  ADR 0040).
 - ADR 0003: stateless Turns; local Log is source of truth.
 - ADR 0007: encrypted reasoning items — the opaque-item replay pattern.
 - ADR 0018: durable History compaction and replay repair.
@@ -216,3 +222,34 @@ Regression coverage should prove:
   Activation, Provider Usage, WebSocket Continuation.
 - OpenAI prompt caching: https://developers.openai.com/api/docs/guides/prompt-caching
 - OpenAI compaction: https://developers.openai.com/api/docs/guides/compaction
+
+## Amendment (2026-08-16, issue #522-A): native compact park lifted
+
+The Decision above still stands for the Prompt Contract, cache-key family,
+compacted Skill Activations, and local trigger policy (manual first; advisory
+gauge; visible preflight, websocket-critical, and overflow recovery; no silent
+threshold auto-compact).
+
+The Non-goals bullet that parked `/responses/compact` and `compact_threshold`
+described this slice, not a permanent ban. ADR 0040 now owns that adoption:
+
+- native compact is an opt-in replay window on the existing
+  `history_compaction` Event, not a new Event type and not a replacement Log;
+- "save only `cmp_`" is not assumed correct for both OpenAI modes;
+- default `pixir compact`, ACP `/compact`, preflight, and overflow recovery
+  remain local;
+- `compact_threshold` is never an absence-of-override default.
+
+This amendment records the lifted park so later #522 slices have an accepted
+decision to implement against. It does not implement native compact, does not
+change px2/px3 prompt-contract bytes, and does not close #512 or #522.
+
+## Amendment (2026-08-16, overlay)
+
+The #522-A bullets that said default `pixir compact` / ACP `/compact` remain
+local and that `compact_threshold` is never an absence-of-override default
+are lifted by ADR 0040's overlay amendment. Native compact is one overlay:
+default-on after OpenAI Responses resolve to `chatgpt_codex` or API-key
+OpenAI; explicit `false` always wins; `open_responses` and Anthropic stay
+local; recovery paths stay local. Persist shapes and mid-turn timing stay
+as ADR 0040 decided. This amendment does not implement native compact.

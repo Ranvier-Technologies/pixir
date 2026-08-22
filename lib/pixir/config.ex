@@ -21,6 +21,10 @@ defmodule Pixir.Config do
   default. The effective cap is never lower than `bash_timeout_ms`; when config asks
   for a lower cap, `load/1` reports a warning and raises the effective cap so the
   default bash command remains executable.
+
+  `compaction.native` is a late-bound overlay preference (`nil` = no preference,
+  `false` = off, `true` = request on). Invalid values warn and stay `nil` so they
+  cannot force the overlay off.
   """
 
   alias Pixir.Paths
@@ -191,14 +195,33 @@ defmodule Pixir.Config do
   def compaction_tail_events(opts \\ []),
     do: get_in(load(opts), ["effective", "compaction", "tail_events"])
 
-  @doc "Resolved hosted web search config, or `nil` when disabled/absent."
-  @spec web_search(keyword()) :: map() | nil
+  @doc """
+  Resolved hosted web search preference.
+
+  This is not the runtime default. Absence (`nil`) means no preference; the
+  Provider/backend seam decides later. An explicit disable is `false`. A map
+  is an explicit enable (and may carry search policy fields). Invalid values
+  are ignored with a warning and stored as `false` so they cannot default-on.
+  """
+  @spec web_search(keyword()) :: map() | false | nil
   def web_search(opts \\ []), do: get_in(load(opts), ["effective", "web_search"])
 
   @doc "Whether model-assisted compaction is enabled (default `false`)."
   @spec compaction_model_assisted(keyword()) :: boolean()
   def compaction_model_assisted(opts \\ []),
     do: get_in(load(opts), ["effective", "compaction", "model_assisted"])
+
+  @doc """
+  Native OpenAI compaction overlay preference.
+
+  Absence (`nil`) means no preference; after Provider/backend resolve the
+  overlay defaults on for `chatgpt_codex` / API-key OpenAI. Explicit `false`
+  always wins. Explicit `true` still refuses `open_responses` and Anthropic.
+  Invalid values are ignored with a warning and stored as `nil`.
+  """
+  @spec compaction_native(keyword()) :: boolean() | nil
+  def compaction_native(opts \\ []),
+    do: get_in(load(opts), ["effective", "compaction", "native"])
 
   @doc "Effective model when config.json is present; application and env precedence still applies."
   @spec file_model(keyword()) :: String.t() | nil
@@ -669,7 +692,8 @@ defmodule Pixir.Config do
       "web_search" => resolve_web_search(raw, ignored),
       "compaction" => %{
         "tail_events" => resolve_tail_events(raw, ignored),
-        "model_assisted" => resolve_model_assisted(raw, ignored)
+        "model_assisted" => resolve_model_assisted(raw, ignored),
+        "native" => resolve_compaction_native(raw, ignored)
       },
       "model" => resolve_model(raw),
       "models" => resolve_models(raw, "models", ignored),
@@ -810,7 +834,7 @@ defmodule Pixir.Config do
 
     cond do
       not is_nil(app) -> normalize_web_search_config(app)
-      MapSet.member?(ignored, "web_search") -> nil
+      MapSet.member?(ignored, "web_search") -> false
       true -> normalize_web_search_config(Map.get(raw, "web_search"))
     end
   end
@@ -820,14 +844,14 @@ defmodule Pixir.Config do
   defp normalize_web_search_config(value) do
     case web_search_config_status(value) do
       {:ok, normalized} -> normalized
-      :invalid -> nil
+      :invalid -> false
     end
   end
 
-  # A validated-but-disabled config and a rejected config both normalize to nil;
-  # the status form keeps them distinguishable so warnings only name real errors.
+  # Explicit disable is `false`. Invalid values also become `false` so a later
+  # chatgpt_codex default cannot treat them as "no preference."
   # nil never reaches here: both call sites filter it before dispatching.
-  defp web_search_config_status(false), do: {:ok, nil}
+  defp web_search_config_status(false), do: {:ok, false}
   defp web_search_config_status(true), do: {:ok, %{"enabled" => true}}
 
   defp web_search_config_status(value) when is_map(value) and not is_struct(value) do
@@ -845,7 +869,7 @@ defmodule Pixir.Config do
          true <- json_safe_config_term?(normalized),
          :ok <- reject_web_search_config_fields(normalized),
          {:ok, _tool} <- HostedTools.web_search(normalized) do
-      if Map.get(normalized, "enabled") == false, do: {:ok, nil}, else: {:ok, normalized}
+      if Map.get(normalized, "enabled") == false, do: {:ok, false}, else: {:ok, normalized}
     else
       _ -> :invalid
     end
@@ -961,6 +985,31 @@ defmodule Pixir.Config do
     end
   end
 
+  defp resolve_compaction_native(raw, ignored) do
+    app = Application.get_env(:pixir, :compaction_native)
+
+    cond do
+      is_boolean(app) ->
+        app
+
+      MapSet.member?(ignored, "compaction") ||
+          MapSet.member?(ignored, "compaction.native") ->
+        nil
+
+      true ->
+        case Map.get(raw, "compaction") do
+          compaction when is_map(compaction) and not is_struct(compaction) ->
+            case normalized_config_value(compaction, "native") do
+              value when is_boolean(value) -> value
+              _ -> nil
+            end
+
+          _ ->
+            nil
+        end
+    end
+  end
+
   defp resolve_model(raw), do: elem(resolve_model_with_source(raw), 0)
 
   defp resolve_model_with_source(raw) do
@@ -1039,6 +1088,7 @@ defmodule Pixir.Config do
     |> maybe_warn_web_search(raw)
     |> maybe_warn_tail_events(raw)
     |> maybe_warn_model_assisted(raw)
+    |> maybe_warn_compaction_native(raw)
     |> maybe_warn_model(raw)
     |> maybe_warn_models(raw, "models")
     |> maybe_warn_models(raw, "anthropic_models")
@@ -1222,6 +1272,31 @@ defmodule Pixir.Config do
 
       _invalid_parent ->
         [warning("compaction", "must be an object; ignoring model_assisted") | warnings]
+    end
+  end
+
+  defp maybe_warn_compaction_native(warnings, raw) do
+    case Map.get(raw, "compaction") do
+      compaction when is_map(compaction) and not is_struct(compaction) ->
+        case fetch_normalized_config_value(compaction, "native") do
+          {:ok, value} when is_boolean(value) or is_nil(value) ->
+            warnings
+
+          {:ok, _value} ->
+            [warning("compaction.native", "must be a boolean or omitted; ignoring") | warnings]
+
+          :error ->
+            warnings
+
+          :collision ->
+            [warning("compaction.native", "must be a boolean or omitted; ignoring") | warnings]
+        end
+
+      nil ->
+        warnings
+
+      _invalid_parent ->
+        [warning("compaction", "must be an object; ignoring native") | warnings]
     end
   end
 

@@ -40,8 +40,9 @@ defmodule PixirMonitor.TriageHonestyMobileTest do
     refute js =~ "const values = name === \"attention\""
   end
 
-  test "units without registered safe actions expose an explicit limitation and projected identifier", %{js: js} do
-    assert js =~ ~s|"No registered safe actions for " + kind + " " + scalar(contextId, "unknown")|
+  test "units without registered safe actions expose a neutral empty state and projected identifier", %{js: js} do
+    assert js =~ ~s|"No registered safe actions for " + kind + " " + scalar(contextId, "unknown") + ".", "empty-state"|
+    refute js =~ ~s|"No registered safe actions for " + kind + " " + scalar(contextId, "unknown") + ".", "limitation"|
     assert js =~ "Registered copy_only actions are the only executable affordance the monitor ever offers."
     assert js =~ ~s|actionsPanel(run.safe_actions, "run", run.run.id)|
     assert js =~ ~s|actionsPanel(unit.safe_actions, "logical unit", unit.logical_id|

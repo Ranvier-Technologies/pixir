@@ -103,7 +103,7 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
   pass through the same fail-closed parent-evidence validation.
   """
 
-  alias PixirMonitor.Projection.{Advisory, AttemptStatus, Builder, Gate, Temporal, UnitIdentity, WorkflowGraph}
+  alias PixirMonitor.Projection.{ActivityLedger, Advisory, AttemptStatus, Builder, Gate, Temporal, UnitIdentity, WorkflowGraph}
 
   require Logger
 
@@ -119,28 +119,29 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
   @spec list_runs(keyword()) :: {:ok, map()} | {:error, map()}
   def list_runs(opts) do
     with {:ok, workspace} <- workspace(opts),
-         {:ok, ids, metadata} <- inventory(workspace, opts) do
+         {:ok, entries, metadata} <- inventory(workspace, opts) do
       {rows, dropped, non_parent_logs} =
-        ids
-        |> Enum.reduce({[], [], 0}, fn id, {rows, dropped, non_parent_logs} ->
+        Enum.reduce(entries, {[], [], 0}, fn entry, {rows, dropped, non_parent_logs} ->
+          id = entry.id
+
           case parent_history(id, workspace, opts) do
             {:ok, history} ->
               if run_parent?(history) do
                 case list_row(id, history, workspace, opts) do
                   {:ok, row} -> {[row | rows], dropped, non_parent_logs}
-                  {:error, error} -> {rows, [error | dropped], non_parent_logs}
+                  {:error, error} -> {rows, [dropped_log(entry, error, opts) | dropped], non_parent_logs}
                 end
               else
                 {rows, dropped, non_parent_logs + 1}
               end
 
             {:error, error} ->
-              {rows, [error | dropped], non_parent_logs}
+              {rows, [dropped_log(entry, error, opts) | dropped], non_parent_logs}
           end
         end)
 
       rows = Enum.reverse(rows)
-      metadata = inventory_projection_metadata(metadata, rows, dropped, non_parent_logs)
+      metadata = inventory_projection_metadata(metadata, rows, Enum.reverse(dropped), non_parent_logs)
 
       {:ok, %{"rows" => rows, "metadata" => metadata}}
     end
@@ -164,6 +165,7 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
 
   defp add_projection_limitation(metadata, rows, dropped) do
     dropped_count = length(dropped)
+    named = Enum.sort_by(dropped, &{&1["newest_rank"], &1["id"]})
 
     limitation = %{
       "kind" => "run_projection_incomplete",
@@ -172,14 +174,56 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
         "selected" => metadata["selected"],
         "projected_runs" => length(rows),
         "dropped_logs" => dropped_count,
-        "error_kinds" => dropped |> Enum.map(&projection_error_kind/1) |> Enum.frequencies()
+        "error_kinds" => named |> Enum.map(& &1["kind"]) |> Enum.frequencies(),
+        "dropped" => named
       }
     }
 
     Map.update(metadata, "limitations", [limitation], &(&1 ++ [limitation]))
   end
 
+  # `dropped_logs` is every selected Log that failed classification — fold, byte
+  # cap, event cap, identity, and lifecycle errors all land here. Name the real
+  # kind per id; do not collapse the bag onto `run_log_limit`.
+  defp dropped_log(entry, error, opts) do
+    kind = projection_error_kind(error)
+
+    record = %{
+      "id" => entry.id,
+      "bytes" => dropped_bytes(entry, error),
+      "mtime" => entry.mtime,
+      "newest_rank" => entry.newest_rank,
+      "kind" => kind
+    }
+
+    if kind == "run_log_limit" do
+      cap = Keyword.get(opts, :max_log_bytes, @default_max_bytes)
+
+      record
+      |> Map.put("max_log_bytes", cap)
+      |> Map.put("remedy", "max_log_bytes")
+    else
+      record
+    end
+  end
+
+  defp dropped_bytes(entry, error) do
+    details = error_details(error)
+
+    cond do
+      is_integer(entry.size) and entry.size >= 0 -> entry.size
+      is_integer(details[:bytes]) and details[:bytes] >= 0 -> details[:bytes]
+      is_integer(details["bytes"]) and details["bytes"] >= 0 -> details["bytes"]
+      true -> 0
+    end
+  end
+
+  defp error_details(%{details: details}) when is_map(details), do: details
+  defp error_details(%{"details" => details}) when is_map(details), do: details
+  defp error_details(_error), do: %{}
+
   defp projection_error_kind(%{kind: kind}) when is_binary(kind), do: kind
+  defp projection_error_kind(%{"kind" => kind}) when is_binary(kind), do: kind
   defp projection_error_kind(_error), do: "run_projection_failed"
 
   @impl true
@@ -188,7 +232,7 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
     with {:ok, workspace} <- workspace(opts),
          :ok <- safe_id(id),
          {:ok, parent} <- parent_history(id, workspace, opts),
-         true <- run_parent?(parent) || {:error, not_found(id)},
+         true <- run_parent?(parent) || {:error, not_found_or_dropped_parent(id, parent, workspace, opts)},
          :ok <- validate_parent_projection(parent),
          {:ok, children, missing?} <- child_histories(parent, workspace, opts) do
       diagnostics = diagnostics(id, workspace)
@@ -207,7 +251,7 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
            "child_logs" => children,
            "runtime_diagnostics" => diagnostics,
            "owner_state" => owner,
-           "activity_evidence" => activity_evidence(id, parent_events),
+           "activity_evidence" => activity_evidence(workspace, id, parent_events),
            "evidence_mirror" => nil
          },
          "completeness" => %{
@@ -272,18 +316,27 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
             path = Path.join(directory, name)
 
             case File.lstat(path, time: :posix) do
-              {:ok, %File.Stat{type: :regular, mtime: mtime}} when is_integer(mtime) ->
-                [{String.trim_trailing(name, ".ndjson"), mtime}]
+              {:ok, %File.Stat{type: :regular, mtime: mtime, size: size}}
+              when is_integer(mtime) and is_integer(size) and size >= 0 ->
+                [{String.trim_trailing(name, ".ndjson"), mtime, size}]
 
               _ ->
                 []
             end
           end)
-          |> Enum.sort_by(fn {id, mtime} -> {-mtime, id} end)
+          |> Enum.sort_by(fn {id, mtime, _size} -> {-mtime, id} end)
 
         total = length(logs)
-        ids = logs |> Enum.take(max) |> Enum.map(&elem(&1, 0))
-        selected = length(ids)
+
+        entries =
+          logs
+          |> Enum.take(max)
+          |> Enum.with_index(1)
+          |> Enum.map(fn {{id, mtime, size}, rank} ->
+            %{id: id, mtime: mtime, size: size, newest_rank: rank}
+          end)
+
+        selected = length(entries)
         truncated = total > selected
 
         limitations =
@@ -299,7 +352,7 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
             []
           end
 
-        {:ok, ids,
+        {:ok, entries,
          %{
            "total" => total,
            "selected" => selected,
@@ -432,11 +485,14 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
   # component permitted to say whether durable evidence advanced. It hands the
   # builder an assertion derived only from durable Log coordinates it already
   # carries; no wall clock, no SSE state, no projection comparison.
-  defp activity_evidence(id, parent_events) do
+  defp activity_evidence(workspace, id, parent_events) do
     seq = parent_events |> Enum.map(& &1["seq"]) |> Enum.filter(&is_integer/1) |> Enum.max(fn -> nil end)
-    at = parent_events |> Enum.map(& &1["ts"]) |> Enum.filter(&is_binary/1) |> Enum.max(fn -> nil end)
+    at = parent_events |> Enum.map(& &1["ts"]) |> Temporal.max_instant()
 
-    PixirMonitor.Projection.ActivityLedger.observe(id, seq, at)
+    case ActivityLedger.observe({:workspace, workspace, id}, seq, at) do
+      {:ok, evidence} -> evidence
+      {:error, _closed_reason} -> nil
+    end
   end
 
   defp owner_state(nil), do: nil
@@ -1264,6 +1320,46 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
   defp stringify(list) when is_list(list), do: Enum.map(list, &stringify/1)
   defp stringify(value), do: value
   defp not_found(id), do: %{kind: "run_not_found", message: "Run was not found", details: %{run_id: id}}
+
+  # A child Session Log can fold while its parent was disqualified by the
+  # existing run_log_limit byte bound. That is already-known filesystem
+  # evidence from the child's own Log plus the parent's lstat; it is not a
+  # new inventory policy. Garbage ids and children of projectable parents
+  # stay plain run_not_found so the presenter can split those classes.
+  defp not_found_or_dropped_parent(id, history, workspace, opts) do
+    case parent_session_id_from_history(history) do
+      parent_id when is_binary(parent_id) and parent_id != id ->
+        case Pixir.SessionId.valid?(parent_id) && safe_log(parent_id, workspace, opts) do
+          {:error, %{kind: "run_log_limit"}} ->
+            %{
+              kind: "run_not_found",
+              message: "Run was not found",
+              details: %{
+                run_id: id,
+                parent_session_id: parent_id,
+                parent_unprojected_reason: "run_log_limit"
+              }
+            }
+
+          _ ->
+            not_found(id)
+        end
+
+      _ ->
+        not_found(id)
+    end
+  end
+
+  defp parent_session_id_from_history(history) do
+    Enum.find_value(history, fn event ->
+      data = event_data(event)
+      parent_id = data["parent_session_id"]
+      if is_binary(parent_id) and parent_id != "", do: parent_id
+    end)
+  end
+
+  defp event_data(%{data: data}) when is_map(data), do: data
+  defp event_data(_event), do: %{}
   defp now, do: DateTime.utc_now() |> DateTime.to_iso8601()
 
   defp error_with_reason(kind, message, details, reason) do

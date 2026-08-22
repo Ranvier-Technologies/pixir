@@ -236,6 +236,31 @@ current one.
 - If stdout fails to parse as JSON in `--json` mode, treat the run as failed
   and read stderr; do not scrape partial stdout.
 
+`scripts/fanout.sh` applies a stricter wrapper verdict than a raw
+`work_complete` lookup. Wrapper exit 0 requires both an actual Pixir process
+exit 0 and one validated envelope whose top-level triple is exactly
+`ok: true`, `status: "completed"`, `work_complete: true`, whose child count
+matches the generated spec's task count, and whose every child status is
+`completed`. A validated terminal-incomplete triple (`ok: false`,
+`work_complete: false`, with `status` `partial`, `timed_out`, `failed`, or
+`cancelled`) becomes wrapper exit 3 only when Pixir exits exactly 6. Ordinary
+partial evidence must have the same child/task count and at least one
+non-completed child. The sole count-mismatch exception is a genuine
+`status: "partial"` spawn failure: `spawn_failure` and `beam_coordination` are
+objects, their nonnegative integer counts prove planned equals the spec task
+count, spawned equals the actual child count, and planned is greater than
+spawned. Those spawned children may all be completed. Recovery output is
+bounded and points to each child's fields in `envelope.json` instead of
+echoing arbitrary commands or paths.
+
+Rejected/error or contradictory envelopes, a nonzero process paired with
+forged completion, a partial envelope paired with any process exit other than
+6, malformed or missing child shape, an unproven child/task count mismatch,
+malformed/multiple JSON values, and signal termination all fail closed as
+wrapper exit 2. The script validates that `children` is an array and validates
+every child object before the first operational `.children[]` traversal;
+shape errors print a fixed diagnostic, never the unsafe payload.
+
 A delegation does not close when the process exits — it closes when the
 envelope is reconciled: every child status read, every `summary` parsed against
 its contract, every failure dispositioned (resumed, retried, or reported).

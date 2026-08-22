@@ -127,6 +127,99 @@ defmodule Pixir.EventTest do
     e = Event.history_compaction("s", data)
     assert e.type == :history_compaction
     assert e.data == data
+    refute Map.has_key?(e.data, "native_replay")
+  end
+
+  test "history_compaction remains the only compaction Event type; native_replay is optional string-keyed" do
+    refute :native_replay in Event.canonical_types()
+    refute :provider_compaction in Event.canonical_types()
+    assert :history_compaction in Event.canonical_types()
+
+    replay = %{
+      "mode" => "threshold_item",
+      "provider" => "openai_responses",
+      "backend" => "chatgpt_codex",
+      "dialect" => "chatgpt_codex",
+      "model" => "gpt-5.5",
+      "items" => [
+        %{
+          "type" => "compaction",
+          "id" => "cmp_test1",
+          "encrypted_content" => "CIPHERTEXT_MUST_ROUND_TRIP"
+        }
+      ],
+      "compaction_item_ids" => ["cmp_test1"],
+      "recorded_usable" => true
+    }
+
+    e =
+      Event.history_compaction("s", %{
+        "range" => %{"from_seq" => 0, "to_seq" => 2},
+        "summary" => "older context",
+        "strategy" => "deterministic_operational_summary_v1",
+        "native_replay" => replay
+      })
+
+    assert e.type == :history_compaction
+    assert e.data["native_replay"]["mode"] == "threshold_item"
+    assert Enum.all?(Map.keys(e.data), &is_binary/1)
+    assert Enum.all?(Map.keys(e.data["native_replay"]), &is_binary/1)
+    assert Enum.all?(Map.keys(hd(e.data["native_replay"]["items"])), &is_binary/1)
+  end
+
+  test "NDJSON cold decode of history_compaction native_replay keeps string keys" do
+    ws =
+      Path.join(
+        System.tmp_dir!(),
+        "pixir-event-native-replay-" <> Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)
+      )
+
+    sid = "native-replay-cold"
+    File.mkdir_p!(ws)
+    on_exit(fn -> File.rm_rf!(ws) end)
+    Pixir.Paths.ensure_sessions_dir(ws)
+
+    line =
+      Jason.encode!(%{
+        "id" => "evt-native",
+        "session_id" => sid,
+        "seq" => 0,
+        "ts" => "2026-08-17T00:00:00Z",
+        "type" => "history_compaction",
+        "data" => %{
+          "range" => %{"from_seq" => 0, "to_seq" => 3},
+          "strategy" => "deterministic_operational_summary_v1",
+          "summary" => "cold checkpoint",
+          "limitations" => ["full Log remains authoritative"],
+          "native_replay" => %{
+            "mode" => "threshold_item",
+            "provider" => "openai_responses",
+            "backend" => "chatgpt_codex",
+            "dialect" => "chatgpt_codex",
+            "model" => "gpt-5.5",
+            "recorded_usable" => true,
+            "compaction_item_ids" => ["cmp_cold"],
+            "items" => [
+              %{
+                "type" => "compaction",
+                "id" => "cmp_cold",
+                "encrypted_content" => "COLD_CIPHERTEXT"
+              }
+            ]
+          }
+        }
+      })
+
+    File.write!(Pixir.Log.path(sid, workspace: ws), line <> "\n")
+
+    assert {:ok, [event]} = Pixir.Log.fold(sid, workspace: ws)
+    assert event.type == :history_compaction
+    assert Enum.all?(Map.keys(event.data), &is_binary/1)
+    assert Enum.all?(Map.keys(event.data["native_replay"]), &is_binary/1)
+    assert Enum.all?(Map.keys(hd(event.data["native_replay"]["items"])), &is_binary/1)
+
+    assert event.data["native_replay"]["items"] |> hd() |> Map.fetch!("encrypted_content") ==
+             "COLD_CIPHERTEXT"
   end
 
   test "provider_usage/2 carries durable Provider accounting evidence" do

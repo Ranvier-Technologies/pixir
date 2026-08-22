@@ -701,6 +701,9 @@ defmodule PixirMonitor.ProjectionSourceTest do
              metadata["limitations"]
 
     assert details["error_kinds"] == %{"run_execution_identity_unresolved" => 1}
+    assert_every_dropped_log_named(metadata)
+    assert hd(details["dropped"])["id"] == "partial-join"
+    assert hd(details["dropped"])["kind"] == "run_execution_identity_unresolved"
   end
 
   test "parent-only fan-out attention exposes every terminal execution reason" do
@@ -788,6 +791,120 @@ defmodule PixirMonitor.ProjectionSourceTest do
              metadata["limitations"]
 
     assert details["error_kinds"] == %{"run_event_limit" => 1}
+    assert_every_dropped_log_named(metadata)
+    assert hd(details["dropped"])["id"] == "over-limit-parent"
+    assert hd(details["dropped"])["kind"] == "run_event_limit"
+    refute Map.has_key?(hd(details["dropped"]), "max_log_bytes")
+    refute Map.has_key?(hd(details["dropped"]), "remedy")
+  end
+
+  test "limitations name every dropped Log with its real kind, not a collapsed cap" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "pixir-monitor-source-named-drops-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    sessions = Path.join([workspace, ".pixir", "sessions"])
+    File.mkdir_p!(sessions)
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    healthy_path =
+      write_log(sessions, "healthy-parent", [
+        event("healthy-parent", "child-healthy", 0, "2026-07-10T00:00:00Z", "queued", "queued", "sub-healthy")
+      ])
+
+    event_limit_path =
+      write_log(sessions, "event-limit-parent", [
+        event("event-limit-parent", "child-event", 0, "2026-07-10T00:00:00Z", "started", "running", "sub-event"),
+        event("event-limit-parent", "child-event", 1, "2026-07-10T00:00:01Z", "finished", "completed", "sub-event")
+      ])
+
+    identity_path =
+      write_log(sessions, "identity-parent", [
+        workflow_event("identity-parent", 0, "2026-07-10T00:00:00Z", "workflow_started", %{
+          "workflow_id" => "wf:unsafe",
+          "workflow_name" => "Identity drop",
+          "graph" => %{"steps" => [%{"id" => "step-a"}]}
+        })
+      ])
+
+    cap_path =
+      write_log(sessions, "cap-parent", [
+        event("cap-parent", "child-cap", 0, "2026-08-14T15:40:53Z", "started", "running", "sub-cap"),
+        event("cap-parent", "child-cap", 1, "2026-08-14T15:40:54Z", "finished", "completed", "sub-cap")
+      ])
+
+    File.write!(cap_path, File.read!(cap_path) <> String.duplicate("x", 400))
+    cap_bytes = File.stat!(cap_path).size
+
+    child_path =
+      write_log(sessions, "child-only", [
+        %{
+          "id" => "event-child-only-0",
+          "session_id" => "child-only",
+          "seq" => 0,
+          "ts" => "2026-07-10T00:00:00Z",
+          "type" => "session_fork",
+          "data" => %{"parent_session_id" => "healthy-parent"}
+        }
+      ])
+
+    File.touch!(cap_path, 1_776_400_000)
+    File.touch!(event_limit_path, 1_776_300_000)
+    File.touch!(identity_path, 1_776_200_000)
+    File.touch!(healthy_path, 1_776_100_000)
+    File.touch!(child_path, 1_776_000_000)
+
+    assert {:ok, %{"rows" => [%{"id" => "healthy-parent"}], "metadata" => metadata}} =
+             PixirMonitor.Projection.Source.Filesystem.list_runs(
+               workspace: workspace,
+               max_events: 1,
+               max_log_bytes: 600
+             )
+
+    assert metadata["selected"] == 5
+    assert metadata["projected_runs"] == 1
+    assert metadata["non_parent_logs"] == 1
+    assert metadata["dropped_logs"] == 3
+    assert_every_dropped_log_named(metadata)
+
+    assert [%{"kind" => "run_projection_incomplete", "details" => details}] =
+             metadata["limitations"]
+
+    assert details["error_kinds"] == %{
+             "run_log_limit" => 1,
+             "run_event_limit" => 1,
+             "run_graph_identity_invalid" => 1
+           }
+
+    by_id = Map.new(details["dropped"], &{&1["id"], &1})
+    assert Map.keys(by_id) |> Enum.sort() == ["cap-parent", "event-limit-parent", "identity-parent"]
+    refute Map.has_key?(by_id, "healthy-parent")
+    refute Map.has_key?(by_id, "child-only")
+
+    cap = by_id["cap-parent"]
+    assert cap["kind"] == "run_log_limit"
+    assert cap["bytes"] == cap_bytes
+    assert cap["mtime"] == 1_776_400_000
+    assert cap["newest_rank"] == 1
+    assert cap["max_log_bytes"] == 600
+    assert cap["remedy"] == "max_log_bytes"
+
+    event_drop = by_id["event-limit-parent"]
+    assert event_drop["kind"] == "run_event_limit"
+    assert is_integer(event_drop["bytes"]) and event_drop["bytes"] > 0
+    assert event_drop["mtime"] == 1_776_300_000
+    assert event_drop["newest_rank"] == 2
+    refute Map.has_key?(event_drop, "max_log_bytes")
+    refute Map.has_key?(event_drop, "remedy")
+
+    identity = by_id["identity-parent"]
+    assert identity["kind"] == "run_graph_identity_invalid"
+    assert identity["mtime"] == 1_776_200_000
+    assert identity["newest_rank"] == 3
+    refute Map.has_key?(identity, "max_log_bytes")
+    refute Map.has_key?(identity, "remedy")
   end
 
   test "multiple subagents bound to one step contribute only the latest advisory" do
@@ -1182,8 +1299,12 @@ defmodule PixirMonitor.ProjectionSourceTest do
            ] =
              metadata["limitations"]
 
+    assert_every_dropped_log_named(metadata)
+
     assert {:error, %{kind: "parent_unit_attempt_overlap"}} =
              PixirMonitor.Projection.Source.Filesystem.fetch_input("unit-overlap", workspace: workspace)
+
+    assert_every_dropped_log_named(metadata)
 
     assert {:error, %{kind: "parent_start_status_invalid"}} =
              PixirMonitor.Projection.Source.Filesystem.fetch_input("terminal-start", workspace: workspace)
@@ -1336,6 +1457,8 @@ defmodule PixirMonitor.ProjectionSourceTest do
              "run_graph_identity_invalid" => 5,
              "run_workflow_identity_conflict" => 1
            }
+
+    assert_every_dropped_log_named(metadata)
 
     expected_detail_errors = %{
       "terminal-only" => "parent_terminal_target_unresolved",
@@ -1555,6 +1678,8 @@ defmodule PixirMonitor.ProjectionSourceTest do
              "run_unit_identity_invalid" => 1
            }
 
+    assert_every_dropped_log_named(metadata)
+
     assert {:error, %{kind: "run_graph_identity_invalid"}} =
              PixirMonitor.Projection.Source.Filesystem.fetch_input(
                "colon-step",
@@ -1581,6 +1706,103 @@ defmodule PixirMonitor.ProjectionSourceTest do
 
     assert {:ok, dotted_projection} = PixirMonitor.Projection.project(dotted_input)
     assert dotted_projection["run"]["id"] == "run.with.dots"
+  end
+
+  test "child of a run_log_limit parent names that parent; a missing id stays plain not-found" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "pixir-monitor-source-dropped-parent-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    sessions = Path.join([workspace, ".pixir", "sessions"])
+    File.mkdir_p!(sessions)
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    parent_path =
+      write_log(sessions, "oversized-parent", [
+        event(
+          "oversized-parent",
+          "oversized-child",
+          0,
+          "2026-08-13T19:17:47Z",
+          "started",
+          "running",
+          "sub-over"
+        ),
+        event(
+          "oversized-parent",
+          "oversized-child",
+          1,
+          "2026-08-13T19:17:48Z",
+          "finished",
+          "completed",
+          "sub-over"
+        )
+      ])
+
+    File.write!(parent_path, File.read!(parent_path) <> String.duplicate("x", 500))
+
+    write_log(sessions, "oversized-child", [
+      %{
+        "id" => "event-oversized-child-0",
+        "session_id" => "oversized-child",
+        "seq" => 0,
+        "ts" => "2026-08-13T19:22:26Z",
+        "type" => "session_fork",
+        "data" => %{
+          "parent_session_id" => "oversized-parent",
+          "fork_root_session_id" => "oversized-parent"
+        }
+      }
+    ])
+
+    opts = [workspace: workspace, max_log_bytes: 400]
+
+    assert {:error,
+            %{
+              kind: "run_not_found",
+              details: %{
+                run_id: "oversized-child",
+                parent_session_id: "oversized-parent",
+                parent_unprojected_reason: "run_log_limit"
+              }
+            }} =
+             PixirMonitor.Projection.Source.Filesystem.fetch_input("oversized-child", opts)
+
+    assert {:error, %{kind: "run_log_limit", details: %{run_id: "oversized-parent"}}} =
+             PixirMonitor.Projection.Source.Filesystem.fetch_input("oversized-parent", opts)
+
+    assert {:error, %{kind: "run_not_found", details: details}} =
+             PixirMonitor.Projection.Source.Filesystem.fetch_input("20260101T000000-badbad", opts)
+
+    assert details == %{run_id: "20260101T000000-badbad"}
+    refute Map.has_key?(details, :parent_session_id)
+    refute Map.has_key?(details, :parent_unprojected_reason)
+  end
+
+  defp assert_every_dropped_log_named(metadata) do
+    count = metadata["dropped_logs"]
+    limitation = Enum.find(metadata["limitations"] || [], &(&1["kind"] == "run_projection_incomplete"))
+
+    if count == 0 do
+      refute limitation && limitation["details"]["dropped"] not in [nil, []]
+    else
+      dropped = limitation["details"]["dropped"]
+      assert length(dropped) == count
+
+      ids =
+        Enum.map(dropped, fn row ->
+          assert is_binary(row["id"]) and row["id"] != ""
+          assert is_binary(row["kind"]) and row["kind"] != ""
+          assert is_integer(row["bytes"]) and row["bytes"] >= 0
+          assert is_integer(row["mtime"])
+          assert is_integer(row["newest_rank"]) and row["newest_rank"] >= 1
+          row["id"]
+        end)
+
+      assert length(Enum.uniq(ids)) == count
+    end
   end
 
   defp write_log(sessions, session_id, events) do

@@ -49,6 +49,27 @@ defmodule PixirMonitor.WorkspaceSetContractFailingSource do
   def fetch_run(id, source), do: PixirMonitor.WorkspaceSetContractSource.fetch_run(id, source)
 end
 
+defmodule PixirMonitor.WorkspaceSetDroppedParentSource do
+  @moduledoc false
+
+  def list_runs(source), do: PixirMonitor.WorkspaceSetContractSource.list_runs(source)
+
+  def fetch_run("oversized-child", _source) do
+    {:error,
+     %{
+       kind: "run_not_found",
+       message: "Run was not found",
+       details: %{
+         run_id: "oversized-child",
+         parent_session_id: "oversized-parent",
+         parent_unprojected_reason: "run_log_limit"
+       }
+     }}
+  end
+
+  def fetch_run(id, source), do: PixirMonitor.WorkspaceSetContractSource.fetch_run(id, source)
+end
+
 defmodule PixirMonitor.WorkspaceSetContractTest do
   use ExUnit.Case, async: false
 
@@ -67,7 +88,7 @@ defmodule PixirMonitor.WorkspaceSetContractTest do
       active_port: Application.get_env(:pixir_monitor, :active_port)
     }
 
-    root = Path.join(System.tmp_dir!(), "pixir-workspace-set-#{System.unique_integer([:positive])}")
+    root = PixirMonitor.TestRun.tmp("pixir-workspace-set")
     left = Path.join(root, "private-left-root")
     right = Path.join(root, "private-right-root")
     File.mkdir_p!(left)
@@ -143,6 +164,18 @@ defmodule PixirMonitor.WorkspaceSetContractTest do
 
     frame = frame_data(PixirMonitor.InvalidationHub.frame(7, "left", "same-session"))
     assert_schema_valid(schema, "invalidation_frame", frame)
+  end
+
+  test "scoped run_not_found preserves already-known dropped-parent details" do
+    Application.put_env(:pixir_monitor, :run_source, PixirMonitor.WorkspaceSetDroppedParentSource)
+
+    {:error, error} = PixirMonitor.WorkspaceSet.fetch_run("left", "oversized-child")
+
+    assert error.kind == "run_not_found"
+    assert error.details.workspace == "left"
+    assert error.details.run_id == "oversized-child"
+    assert error.details.parent_session_id == "oversized-parent"
+    assert error.details.parent_unprojected_reason == "run_log_limit"
   end
 
   test "configured workspace set rejects malformed sources and duplicate keys", %{left: left, right: right} do
@@ -288,6 +321,35 @@ defmodule PixirMonitor.WorkspaceSetContractTest do
     refute Map.has_key?(list_envelope, "observed_at")
     refute Map.has_key?(list_envelope, "projected_at")
     refute Map.has_key?(list_envelope, "authority")
+  end
+
+  test "the activity ledger scopes equal run ids to their workspace across alternating polls", %{
+    left: left,
+    right: right
+  } do
+    run = "same-ledger-run-#{System.unique_integer([:positive])}"
+    create_real_run(left, run, 1)
+    create_real_run(right, run, 10)
+
+    assert {:ok, left_first} =
+             PixirMonitor.Projection.Source.Filesystem.fetch_input(run, workspace: left)
+
+    assert left_first["inputs"]["activity_evidence"]["durable_evidence"] == "unknown"
+
+    assert {:ok, right_first} =
+             PixirMonitor.Projection.Source.Filesystem.fetch_input(run, workspace: right)
+
+    assert right_first["inputs"]["activity_evidence"]["durable_evidence"] == "unknown"
+
+    assert {:ok, left_second} =
+             PixirMonitor.Projection.Source.Filesystem.fetch_input(run, workspace: left)
+
+    assert left_second["inputs"]["activity_evidence"]["durable_evidence"] == "unchanged"
+
+    assert {:ok, right_second} =
+             PixirMonitor.Projection.Source.Filesystem.fetch_input(run, workspace: right)
+
+    assert right_second["inputs"]["activity_evidence"]["durable_evidence"] == "unchanged"
   end
 
   test "equal run ids remain unambiguous workspace-scoped identities with no collision inference" do
@@ -534,6 +596,12 @@ defmodule PixirMonitor.WorkspaceSetContractTest do
     assert js =~ "![\"observed\", \"absent\"].includes(envelope.source.sessions_directory)"
     assert js =~ "snapshot.schema !== \"pixir.monitor.runs\" || snapshot.schema_version !== 1"
     assert js =~ "typeof row.id === \"string\" && row.id.length > 0"
+    assert js =~ "function encodableComponent(value)"
+    assert js =~ "function validListRow(row)"
+    assert js =~ "function confessUnlinkableListRows(snapshot)"
+    assert js =~ "function confessUnlinkableListEnvelope(envelope)"
+    assert js =~ "encodableComponent(row.id) !== null"
+    assert js =~ "confessUnlinkableListEnvelope(validateScopedEnvelope(fetchedEnvelope, workspace, \"list\"))"
     assert js =~ "snapshot.schema !== \"pixir.presenter.run\" || snapshot.schema_version !== 1"
     assert js =~ "inventoryAllowed = inventoryRequired.concat([\"dropped_logs\", \"non_parent_logs\", \"projected_runs\"])"
     assert js =~ "throw projectionFailure(\"decode\", \"scoped_envelope_invalid\", 200)"
@@ -620,7 +688,7 @@ defmodule PixirMonitor.WorkspaceSetContractTest do
     end
   end
 
-  defp create_real_run(workspace, id) do
+  defp create_real_run(workspace, id, seq \\ 0) do
     event =
       Pixir.Event.new(
         id,
@@ -632,7 +700,7 @@ defmodule PixirMonitor.WorkspaceSetContractTest do
           "child_session_id" => "child-1",
           "agent" => "default"
         },
-        seq: 0,
+        seq: seq,
         ts: "2026-01-01T00:00:00Z"
       )
 

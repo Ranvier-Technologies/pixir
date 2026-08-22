@@ -3,11 +3,15 @@ defmodule Pixir.ProviderTest do
 
   alias Pixir.{Auth, Event, Provider}
 
-  @default_body_golden ~S({"include":["reasoning.encrypted_content"],"input":[],"instructions":"You are a helpful coding assistant.","model":"gpt-5.5","parallel_tool_calls":true,"store":false,"stream":true,"tool_choice":"auto"})
+  @default_body_golden ~S({"context_management":[{"compact_threshold":200000,"type":"compaction"}],"include":["reasoning.encrypted_content","web_search_call.action.sources"],"input":[],"instructions":"You are a helpful coding assistant.","model":"gpt-5.5","parallel_tool_calls":true,"store":false,"stream":true,"tool_choice":"auto","tools":[{"search_context_size":"low","type":"web_search"}]})
 
   setup do
+    # #563: plant operator-like ~/.pixir config, then isolate PIXIR_HOME so
+    # native_replay fold identity cannot inherit the real operator model.
+    Pixir.Test.OperatorState.isolate_pixir_home!()
+
     name = :"auth_#{System.unique_integer([:positive])}"
-    path = Path.join(System.tmp_dir!(), "pixir-prov-#{System.unique_integer([:positive])}.json")
+    path = tmp_auth_store("pixir-prov-auth-")
 
     {:ok, _} =
       Auth.start_link(
@@ -17,8 +21,20 @@ defmodule Pixir.ProviderTest do
         oauth: __MODULE__.NoOAuth
       )
 
-    on_exit(fn -> File.rm_rf!(path) end)
     %{auth: name}
+  end
+
+  defp tmp_auth_store(prefix) do
+    directory =
+      Path.join(
+        System.tmp_dir!(),
+        prefix <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower)
+      )
+
+    File.rm_rf!(directory)
+    File.mkdir_p!(directory)
+    on_exit(fn -> File.rm_rf!(directory) end)
+    Path.join(directory, "auth.json")
   end
 
   defmodule NoOAuth do
@@ -53,6 +69,14 @@ defmodule Pixir.ProviderTest do
     end
 
     def stream(_request, _opts), do: {:error, :not_called}
+  end
+
+  defp official_responses_backend do
+    %{
+      "mode" => "open_responses",
+      "responses_url" => "https://api.openai.com/v1/responses",
+      "auth" => %{"policy" => "none"}
+    }
   end
 
   # A transport that records the request and replays canned SSE blocks.
@@ -1620,6 +1644,252 @@ defmodule Pixir.ProviderTest do
            }
   end
 
+  test "usable native_replay folds items when capturing identity matches", %{auth: auth} do
+    native_replay = %{
+      "mode" => "threshold_item",
+      "provider" => "openai_responses",
+      "backend" => "chatgpt_codex",
+      "dialect" => "chatgpt_codex",
+      "model" => "gpt-5.5",
+      "recorded_usable" => true,
+      "compaction_item_ids" => ["cmp_provider_fold"],
+      "items" => [
+        %{
+          "type" => "compaction",
+          "id" => "cmp_provider_fold",
+          "encrypted_content" => "CIPHERTEXT_NATIVE_WINDOW"
+        }
+      ]
+    }
+
+    data = %{
+      "range" => %{"from_seq" => 0, "to_seq" => 1},
+      "source_event_count" => 2,
+      "tail_event_count" => 1,
+      "strategy" => "deterministic_operational_summary_v1",
+      "summary" => "The user discussed an old task.",
+      "files_touched" => [],
+      "open_tasks" => ["user: continue carefully"],
+      "limitations" => ["full Log remains authoritative"],
+      "native_replay" => native_replay
+    }
+
+    assert Pixir.Compaction.native_replay_fold_usable?(data, %{
+             "provider" => "openai_responses",
+             "backend" => "chatgpt_codex",
+             "dialect" => "chatgpt_codex",
+             "model" => "gpt-5.5"
+           })
+
+    history = [
+      Event.user_message("s", "very old prompt") |> Event.with_seq(0),
+      Event.assistant_message("s", "very old answer") |> Event.with_seq(1),
+      Event.history_compaction("s", data) |> Event.with_seq(2),
+      Event.user_message("s", "recent prompt") |> Event.with_seq(3)
+    ]
+
+    {:ok, _} =
+      Provider.stream(%{history: history},
+        auth: auth,
+        native: false,
+        transport: canned([sse(%{type: "response.completed"})])
+      )
+
+    assert_received {:request, %{body: body}}
+    decoded = Jason.decode!(body)
+    refute decoded["context_management"]
+    refute inspect(decoded) =~ "compact_threshold"
+
+    refute decoded["input"] |> hd() |> Map.get("role") == "user" and
+             get_in(hd(decoded["input"]), ["content", Access.at(0), "text"]) =~
+               "Compressed session memory"
+
+    assert [window, recent] = decoded["input"]
+    assert window["type"] == "compaction"
+    assert window["id"] == "cmp_provider_fold"
+    assert window["encrypted_content"] == "CIPHERTEXT_NATIVE_WINDOW"
+
+    assert recent == %{
+             "role" => "user",
+             "content" => [%{"type" => "input_text", "text" => "recent prompt"}]
+           }
+  end
+
+  test "usable standalone_window folds items and never mixes local text", %{auth: auth} do
+    native_replay = %{
+      "mode" => "standalone_window",
+      "provider" => "openai_responses",
+      "backend" => "chatgpt_codex",
+      "dialect" => "chatgpt_codex",
+      "model" => "gpt-5.5",
+      "recorded_usable" => true,
+      "compaction_item_ids" => ["cmp_standalone_fold"],
+      "items" => [
+        %{"type" => "message", "role" => "user", "content" => "kept prefix"},
+        %{
+          "type" => "compaction",
+          "id" => "cmp_standalone_fold",
+          "encrypted_content" => "CIPHERTEXT_STANDALONE_WINDOW"
+        }
+      ]
+    }
+
+    data = %{
+      "range" => %{"from_seq" => 0, "to_seq" => 1},
+      "source_event_count" => 2,
+      "tail_event_count" => 1,
+      "strategy" => "deterministic_operational_summary_v1",
+      "summary" => "The user discussed an old task.",
+      "files_touched" => [],
+      "open_tasks" => ["user: continue carefully"],
+      "limitations" => ["full Log remains authoritative"],
+      "native_replay" => native_replay
+    }
+
+    history = [
+      Event.history_compaction("s", data) |> Event.with_seq(2),
+      Event.user_message("s", "recent prompt") |> Event.with_seq(3)
+    ]
+
+    {:ok, _} =
+      Provider.stream(%{history: history},
+        auth: auth,
+        transport: canned([sse(%{type: "response.completed"})])
+      )
+
+    assert_received {:request, %{body: body}}
+    decoded = Jason.decode!(body)
+    refute inspect(decoded["input"]) =~ "Compressed session memory"
+    assert [kept, window, recent] = decoded["input"]
+    assert kept["type"] == "message"
+    assert window["type"] == "compaction"
+    assert window["id"] == "cmp_standalone_fold"
+    assert window["encrypted_content"] == "CIPHERTEXT_STANDALONE_WINDOW"
+
+    assert recent == %{
+             "role" => "user",
+             "content" => [%{"type" => "input_text", "text" => "recent prompt"}]
+           }
+  end
+
+  test "native_replay mismatch still folds local render_for_provider text", %{auth: auth} do
+    data = %{
+      "range" => %{"from_seq" => 0, "to_seq" => 1},
+      "source_event_count" => 2,
+      "tail_event_count" => 1,
+      "strategy" => "deterministic_operational_summary_v1",
+      "summary" => "The user discussed an old task.",
+      "files_touched" => [],
+      "open_tasks" => ["user: continue carefully"],
+      "limitations" => ["full Log remains authoritative"],
+      "native_replay" => %{
+        "mode" => "threshold_item",
+        "provider" => "openai_responses",
+        "backend" => "chatgpt_codex",
+        "dialect" => "chatgpt_codex",
+        "model" => "other-model",
+        "recorded_usable" => true,
+        "compaction_item_ids" => ["cmp_mismatch"],
+        "items" => [
+          %{
+            "type" => "compaction",
+            "id" => "cmp_mismatch",
+            "encrypted_content" => "CIPHERTEXT_MISMATCH"
+          }
+        ]
+      }
+    }
+
+    history = [
+      Event.history_compaction("s", data) |> Event.with_seq(2),
+      Event.user_message("s", "recent prompt") |> Event.with_seq(3)
+    ]
+
+    {:ok, _} =
+      Provider.stream(%{history: history},
+        auth: auth,
+        transport: canned([sse(%{type: "response.completed"})])
+      )
+
+    assert_received {:request, %{body: body}}
+    decoded = Jason.decode!(body)
+    refute inspect(decoded) =~ "CIPHERTEXT_MISMATCH"
+    refute inspect(decoded) =~ "cmp_mismatch"
+    assert [checkpoint, recent] = decoded["input"]
+    assert [%{"text" => checkpoint_text}] = checkpoint["content"]
+    assert checkpoint_text =~ "Compressed session memory"
+    assert checkpoint_text == Pixir.Compaction.render_for_provider(data)
+
+    assert recent == %{
+             "role" => "user",
+             "content" => [%{"type" => "input_text", "text" => "recent prompt"}]
+           }
+  end
+
+  test "compact client posts JSON to official /responses/compact without stream or threshold" do
+    output = [
+      %{"type" => "message", "role" => "user", "content" => "kept"},
+      %{
+        "type" => "compaction",
+        "id" => "cmp_client",
+        "encrypted_content" => "CIPHERTEXT_CLIENT"
+      }
+    ]
+
+    transport = fn http_request, acc, fun ->
+      send(self(), {:request, http_request})
+      acc = fun.({:status, 200}, acc)
+
+      acc =
+        fun.(
+          {:data, Jason.encode!(%{"output" => output, "usage" => %{"input_tokens" => 4}})},
+          acc
+        )
+
+      {:ok, acc}
+    end
+
+    assert {:ok, result} =
+             Provider.compact(%{history: [Event.user_message("s", "old")]},
+               responses_backend: official_responses_backend(),
+               transport: transport
+             )
+
+    assert_received {:request, request}
+    assert request.url == "https://api.openai.com/v1/responses/compact"
+    body = Jason.decode!(request.body)
+    assert body["store"] == false
+    refute Map.has_key?(body, "stream")
+    refute Map.has_key?(body, "compact_threshold")
+    refute Map.has_key?(body, "context_management")
+    refute Map.has_key?(body, "previous_response_id")
+    assert result.output == output
+    assert result.usage["input_tokens"] == 4
+  end
+
+  test "compact client refuses chatgpt_codex and vendor open_responses", %{auth: auth} do
+    flunk_transport = fn _request, _acc, _fun -> flunk("compact transport must not run") end
+
+    assert {:error, %{error: %{kind: :native_unavailable, details: details}}} =
+             Provider.compact(%{history: []},
+               auth: auth,
+               transport: flunk_transport
+             )
+
+    assert details[:compact_attempted] == false or details["compact_attempted"] == false
+
+    assert {:error, %{error: %{kind: :native_unavailable}}} =
+             Provider.compact(%{history: []},
+               auth: auth,
+               responses_backend: %{
+                 "mode" => "open_responses",
+                 "responses_url" => "https://vendor.example/v1/responses",
+                 "auth" => %{"policy" => "none"}
+               },
+               transport: flunk_transport
+             )
+  end
+
   test "a text_verbosity opt sets text.verbosity in the request body", %{auth: auth} do
     {:ok, _} =
       Provider.stream(%{history: []},
@@ -1667,6 +1937,40 @@ defmodule Pixir.ProviderTest do
     assert "web_search_call.action.sources" in body["include"]
     assert body["store"] == false
     assert body["stream"] == true
+  end
+
+  test "request_body_preview defaults hosted web_search on for chatgpt_codex" do
+    assert {:ok, body} = Provider.request_body_preview(%{history: []}, raw_config: %{})
+    assert %{"type" => "web_search", "search_context_size" => "low"} in body["tools"]
+    assert "web_search_call.action.sources" in body["include"]
+  end
+
+  test "request_body_preview keeps hosted web_search off for open_responses" do
+    assert {:ok, body} =
+             Provider.request_body_preview(%{history: []},
+               responses_backend: %{
+                 "mode" => "open_responses",
+                 "responses_url" => "https://vendor.example/v1/responses",
+                 "auth" => %{"policy" => "none"}
+               },
+               raw_config: %{}
+             )
+
+    refute Enum.any?(body["tools"] || [], &(&1["type"] == "web_search"))
+    refute "web_search_call.action.sources" in (body["include"] || [])
+  end
+
+  test "request_body_preview honors explicit web_search false on chatgpt_codex" do
+    assert {:ok, body} =
+             Provider.request_body_preview(%{history: [], web_search: false}, raw_config: %{})
+
+    refute Enum.any?(body["tools"] || [], &(&1["type"] == "web_search"))
+    refute "web_search_call.action.sources" in (body["include"] || [])
+
+    assert {:ok, config_off} =
+             Provider.request_body_preview(%{history: []}, raw_config: %{"web_search" => false})
+
+    refute Enum.any?(config_off["tools"] || [], &(&1["type"] == "web_search"))
   end
 
   test "request_body_preview preserves supported Provider-hosted web_search policy fields" do
@@ -1900,7 +2204,8 @@ defmodule Pixir.ProviderTest do
 
     assert body["instructions"] == "system"
     assert [%{"role" => "developer"}] = body["input"]
-    assert body["tools"] == [tool]
+    assert tool in body["tools"]
+    assert %{"type" => "web_search", "search_context_size" => "low"} in body["tools"]
     assert body["text"]["format"]["schema"] == output_schema["schema"]
     assert body["prompt_cache_key"] == "px:test"
   end
@@ -2804,9 +3109,7 @@ defmodule Pixir.ProviderTest do
 
   test "propagates a not-authenticated error before streaming" do
     name = :"auth_#{System.unique_integer([:positive])}"
-
-    path =
-      Path.join(System.tmp_dir!(), "pixir-prov-noauth-#{System.unique_integer([:positive])}.json")
+    path = tmp_auth_store("pixir-prov-noauth-")
 
     {:ok, _} = Auth.start_link(name: name, store_path: path, env_api_key: nil, oauth: NoOAuth)
 
@@ -3506,5 +3809,176 @@ defmodule Pixir.ProviderTest do
                transport: transport,
                max_retries: 0
              )
+  end
+
+  test "official api.openai.com overlay-on Turns send compact_threshold" do
+    assert {:ok, body} =
+             Provider.request_body_preview(%{history: []},
+               responses_backend: official_responses_backend()
+             )
+
+    assert body["context_management"] == [
+             %{
+               "type" => "compaction",
+               "compact_threshold" => Pixir.Compaction.compact_threshold()
+             }
+           ]
+  end
+
+  test "overlay-on ordinary Turn request includes compact_threshold after resolve", %{auth: auth} do
+    assert {:ok, body} = Provider.request_body_preview(%{history: []}, raw_config: %{})
+
+    assert body["context_management"] == [
+             %{
+               "type" => "compaction",
+               "compact_threshold" => Pixir.Compaction.compact_threshold()
+             }
+           ]
+
+    assert Pixir.Compaction.compact_threshold() == 200_000
+    assert Pixir.Compaction.compact_threshold_minimum() == 1_000
+
+    {:ok, _} =
+      Provider.stream(%{history: []},
+        auth: auth,
+        raw_config: %{},
+        transport: canned([sse(%{type: "response.completed"})])
+      )
+
+    assert_received {:request, %{body: encoded}}
+    decoded = Jason.decode!(encoded)
+
+    assert decoded["context_management"] == [
+             %{"type" => "compaction", "compact_threshold" => 200_000}
+           ]
+  end
+
+  test "compact_threshold below the API minimum is omitted from the request body" do
+    assert {:ok, body} =
+             Provider.request_body_preview(%{history: [], compact_threshold: 999},
+               native: false,
+               raw_config: %{}
+             )
+
+    refute Map.has_key?(body, "context_management")
+    refute inspect(body) =~ "compact_threshold"
+  end
+
+  test "API-minimum compact_threshold remains legal when passed explicitly" do
+    assert {:ok, body} =
+             Provider.request_body_preview(%{history: [], compact_threshold: 1_000},
+               native: false,
+               raw_config: %{}
+             )
+
+    assert body["context_management"] == [
+             %{"type" => "compaction", "compact_threshold" => 1_000}
+           ]
+  end
+
+  test "explicit compaction.native false omits compact_threshold on ordinary Turns" do
+    assert {:ok, body} =
+             Provider.request_body_preview(%{history: []}, native: false, raw_config: %{})
+
+    refute Map.has_key?(body, "context_management")
+    refute inspect(body) =~ "compact_threshold"
+  end
+
+  test "open_responses refuses compact_threshold with a structured overlay reason" do
+    identity = %{
+      "provider" => "openai_responses",
+      "backend" => "open_responses",
+      "dialect" => "open_responses",
+      "model" => "gpt-5.5"
+    }
+
+    assert {:off, "native_unavailable"} =
+             Pixir.Compaction.overlay_after_resolve(nil, identity)
+
+    assert {:off, "native_unavailable"} =
+             Pixir.Compaction.overlay_after_resolve(true, identity)
+
+    assert {:ok, body} =
+             Provider.request_body_preview(%{history: []},
+               responses_backend: %{
+                 "mode" => "open_responses",
+                 "responses_url" => "https://vendor.example/v1/responses",
+                 "auth" => %{"policy" => "none"}
+               }
+             )
+
+    refute Map.has_key?(body, "context_management")
+    refute inspect(body) =~ "compact_threshold"
+  end
+
+  test "captures the latest stream cmp_ item and does not put later output in it", %{auth: auth} do
+    parent = self()
+
+    item = %{
+      "type" => "compaction",
+      "id" => "cmp_stream_latest",
+      "encrypted_content" => "CIPHERTEXT_STREAM"
+    }
+
+    chunks = [
+      sse(%{type: "response.output_item.done", item: item}),
+      sse(%{type: "response.output_text.delta", delta: "tail after cmp_"}),
+      sse(%{
+        type: "response.output_item.done",
+        item: %{
+          type: "function_call",
+          call_id: "call_after",
+          name: "read",
+          arguments: ~s({"path":"a.txt"})
+        }
+      }),
+      sse(%{type: "response.completed"})
+    ]
+
+    assert {:ok, result} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned(chunks),
+               on_compaction_item: fn captured -> send(parent, {:cmp, captured}) end
+             )
+
+    assert_received {:cmp, ^item}
+    assert result.compaction_item == item
+    assert result.compact_threshold_sent == true
+    assert result.text == "tail after cmp_"
+    assert result.finish_reason == :tool_calls
+    assert [{:compaction, ^item}, {:function_call, _call}] = result.output_items
+  end
+
+  test "classifies a compact_threshold 400 as backend_rejected without overflow", %{auth: auth} do
+    body =
+      ~s({"error":{"type":"invalid_request_error","param":"compact_threshold","message":"Unknown parameter: compact_threshold"}})
+
+    assert {:error,
+            %{
+              error: %{
+                kind: :backend_rejected,
+                details: %{compact_threshold_rejected: true, status: 400}
+              }
+            }} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned([body], 400),
+               max_retries: 0
+             )
+  end
+
+  test "an overflow 400 naming context_management stays :context_overflow", %{auth: auth} do
+    body =
+      ~s({"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window. Enable context_management compaction."}})
+
+    assert {:error, %{error: %{kind: :context_overflow, details: details}}} =
+             Provider.stream(%{history: []},
+               auth: auth,
+               transport: canned([body], 400),
+               max_retries: 0
+             )
+
+    refute Map.has_key?(details, :compact_threshold_rejected)
   end
 end

@@ -3,6 +3,8 @@
 .workspace-source { display: grid; gap: .9rem; border: 1px solid var(--line); border-radius: .75rem; background: var(--surface); padding: 1.2rem; }
 .workspace-source > h2 { margin: 0; color: #e6edf3; font-size: 1.55rem; }
 .source-condition { display: grid; gap: .75rem; margin: 0; border-left: 4px solid var(--accent); background: #0c151d; padding: 1rem; }
+.source-condition.source-absent { border-left-color: var(--muted); }
+.source-absent-note { color: var(--muted); }
 .source-condition h3, .source-attention h3, .source-runs h3 { margin-bottom: .1rem; }
 .source-condition > p, .source-degradation p, .source-evidence p { margin: 0; }
 .source-degradation { display: flex; align-items: flex-start; gap: .75rem; }
@@ -90,10 +92,16 @@ button:hover { border-color: var(--accent); }
 .projected-text, code, pre, td, dd, li { unicode-bidi: plaintext; overflow-wrap: anywhere; white-space: pre-wrap; }
 .sr-only { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; clip-path: inset(50%) !important; white-space: nowrap !important; border: 0 !important; }
 .inventory-notice { margin: 1rem 0; border: 2px solid var(--attention); border-radius: .6rem; background: rgba(244, 184, 96, .12); padding: 1rem; }
+.inventory-limitation-disclosure { margin-top: .65rem; }
+.inventory-limitation-disclosure > summary { cursor: pointer; }
 .inventory-notice > p { margin: 0; font-weight: 700; }
 .inventory-limitations { margin: .8rem 0 0; padding-left: 1.4rem; }
 .inventory-limitations p { margin: .3rem 0; }
 .inventory-limitation-details { display: flex; flex-wrap: wrap; gap: 1rem; margin: .5rem 0 0; }
+.inventory-dropped-logs { margin: .55rem 0 0; }
+.inventory-dropped-logs > p { margin: .3rem 0; font-weight: 600; }
+.inventory-dropped-log-rows { margin: .35rem 0 0; padding-left: 1.2rem; }
+.inventory-dropped-log-rows > li { margin: .25rem 0; }
 .empty-state { border: 1px dashed var(--line); border-radius: .45rem; color: var(--muted); padding: 1rem; }
 .truncation { display: block; margin-top: .35rem; color: var(--attention); font-size: .82rem; }
 .filters { display: flex; flex-wrap: wrap; gap: .75rem; align-items: end; margin: 1.2rem 0; padding: .9rem; border: 1px solid var(--line); border-radius: .55rem; background: #0c151d; }
@@ -128,6 +136,38 @@ tbody tr:last-child td { border-bottom: 0; }
 .truth-rail { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: .7rem; margin: 1.2rem 0 0; overflow-x: auto; }
 .truth-card { min-height: 8.7rem; border: 1px solid var(--line); border-radius: .55rem; padding: .8rem; background: linear-gradient(145deg, #14232e, #0d171f); }
 .truth-card .marker { margin-top: .75rem; }
+/* Dotted labelled terms: the typographic honesty rule, in CSS.
+
+   `.labelled-term` is a DEDICATED class and the only selector that paints the
+   dotted underline. It deliberately does not ride `.marker` (values),
+   `.provenance` (basis lines, monospace) or `code`/monospace evidence: those
+   are the three places DESIGN.md constraint 3 forbids the affordance, and
+   coupling the treatment to any of them would make the prohibition one
+   stylesheet edit away from silently collapsing.
+
+   The dotted border-bottom replaces the default link underline rather than
+   stacking on it, so an axis name reads as annotated-and-definable, visibly
+   distinct from an ordinary navigation link. Sans-serif is inherited from the
+   surface: the Monitor is speaking. */
+.labelled-term { border-bottom: 1px dotted currentcolor; color: var(--muted); text-decoration: none; padding-bottom: 1px; }
+.labelled-term:hover, .labelled-term:focus-visible { border-bottom-style: solid; color: #8dd9e8; }
+h1 > .labelled-term, h2 > .labelled-term, h3 > .labelled-term, h4 > .labelled-term { color: inherit; }
+th > .labelled-term { color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; }
+/* The orientation line, and the live-activity front door. Both are the MONITOR
+   speaking about its own notation, so both are sans-serif: monospace here would
+   dress an explanation up as transported agent output. The orientation line
+   spans the rail grid so it introduces the cards rather than becoming one. */
+.rail-orientation { grid-column: 1 / -1; margin: 0 0 .15rem; color: var(--muted); font-size: .78rem; line-height: 1.45; }
+.stream-vocabulary { margin: .5rem 0 0; color: var(--muted); font-size: .82rem; line-height: 1.5; }
+/* The runs-list dimension front door. Same voice and weight as the stream line:
+   the Monitor naming its own axes, not transported output. It is painted at
+   EVERY width on purpose — below 480px the runs table clips its <thead>, so
+   this sentence is the only surviving dotted path to those seven terms. */
+.dimension-vocabulary { margin: .4rem 0 0; color: var(--muted); font-size: .82rem; line-height: 1.5; }
+/* A MONITOR DEFECT is our bug, and the diagnostic is authored by this file, so
+   it is NOT dressed in .provenance monospace: that class is reserved for basis
+   lines about transported evidence, and an authoring bug is not evidence. */
+.monitor-defect-diagnostic { margin: .5rem 0 0; padding: .55rem .65rem; border-left: 3px solid var(--attention); background: var(--surface); color: #e6edf3; font-size: .82rem; line-height: 1.5; }
 .provenance, .truth-extra { margin: .5rem 0 0; color: var(--muted); font: .76rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .mutation-panel { border-left: 4px solid #9b7bd1; }
 .dag-waves { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(17rem, 1fr); gap: .8rem; overflow-x: auto; padding-bottom: .4rem; }
@@ -175,6 +215,7 @@ summary { cursor: pointer; color: #a7dbe5; font-weight: 650; }
 .follow-identity-conflict { border-left: 3px solid var(--attention); padding-left: 1rem; }
 .follow-render-failure { border-left: 3px solid var(--attention); padding-left: 1rem; }
 .parent-resolution { margin-top: 1rem; border: 1px solid var(--line); border-radius: .6rem; background: rgba(16, 26, 35, .92); padding: 1rem; }
+.resolved-child-view .parent-resolution { margin-top: 0; border-color: var(--accent); }
 .parent-resolution-candidates { display: grid; gap: .4rem; margin: .6rem 0 0; padding-left: 1.1rem; }
 .review-dialog { width: min(46rem, calc(100% - 2rem)); border: 1px solid #567084; border-radius: .6rem; color: #e6edf3; background: #111d26; padding: 1rem; }
 .review-dialog::backdrop { background: rgba(0, 0, 0, .72); }
@@ -187,10 +228,54 @@ summary { cursor: pointer; color: #a7dbe5; font-weight: 650; }
 .duration-completeness-malformed { color: var(--danger); border: 1px solid var(--danger); }
 .absolute-ts { display: block; }
 .relative-label { display: block; color: var(--muted); font-size: .78rem; }
+/* Instrument manual: an overlay DIMENSION beside the view, not a replacement
+   for it. The grid PUSHES the painted view narrower (minmax(0, 1fr) keeps it
+   shrinkable rather than overflowing) and gives the pane the mock's 452px.
+   Below the existing 900px breakpoint the pane stacks under the view instead of
+   squeezing both: at that width a 452px column would leave the run itself
+   unreadable, and the manual is a reference, not the subject. */
+.manual-shell { display: grid; grid-template-columns: minmax(0, 1fr) 452px; align-items: start; gap: 1.1rem; }
+.manual-shell > * { min-width: 0; }
+.manual-pane { position: sticky; top: 1rem; display: grid; align-content: start; gap: .8rem; max-height: calc(100vh - 2rem); overflow-y: auto; border: 1px solid var(--line); border-radius: .6rem; background: rgba(16, 26, 35, .92); padding: 1rem; }
+.manual-pane-header { display: flex; align-items: baseline; flex-wrap: wrap; gap: .65rem; }
+.manual-pane-header h2 { margin: 0; margin-right: auto; font-size: .78rem; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+.manual-route-id { min-width: 0; overflow-wrap: anywhere; color: var(--accent); font: .76rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.manual-pane-body { display: grid; gap: .9rem; }
+.manual-lede, .manual-group-blurb { margin: 0; color: var(--muted); }
+.manual-empty, .manual-partial { margin: 0; }
+.manual-unknown-slug { margin: 0; border-left: 3px solid var(--attention); background: rgba(244, 184, 96, .08); padding: .5rem .6rem; color: #ffd69b; }
+.manual-group { display: grid; gap: .35rem; border-top: 1px solid #263744; padding-top: .8rem; }
+.manual-group > h3 { color: #e6edf3; font-size: .95rem; letter-spacing: -.02em; }
+.manual-term-list { display: grid; gap: .15rem; margin: .3rem 0 0; padding-left: 1.1rem; }
+.manual-entry-term { margin: 0; font-size: 1.35rem; }
+.manual-entry-surface { margin: 0; color: var(--muted); font: .76rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.manual-parts { display: grid; gap: .2rem; margin: 0; }
+.manual-parts > dt { margin-top: .7rem; }
+.manual-parts > dt:first-child { margin-top: 0; }
+.manual-parts > dd { margin: 0; }
+.manual-citation { color: var(--muted); font: .76rem/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+/* ON THIS RUN. The VALUE is the Monitor speaking about live projection state,
+   so it is set in the same monospace the truth rail uses for its own readings;
+   the basis and as-of seq are subordinate and muted. The no-run and unbound
+   statements are Monitor prose, not readings, so they stay in the body face. */
+.manual-on-this-run { margin: 0; font: .8rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.manual-run-value { color: #e6edf3; }
+.manual-run-scope, .manual-run-basis, .manual-run-seq { color: var(--muted); }
+.manual-no-run { color: var(--muted); }
+.manual-unbound { margin: .35rem 0 0; }
+.manual-keys { margin: 0; border-top: 1px solid #263744; padding-top: .6rem; color: var(--muted); font-size: .78rem; }
+/* The runs table never trades column legibility for fit: below its natural
+   width it scrolls inside .table-scroll (the body never scrolls sideways).
+   These floors are BASE rules, not narrow-viewport rules, because the manual
+   pane shrinks the content area at ANY viewport width — keyed on the viewport
+   they let a desktop-width pane crush the Run column to two characters a line
+   while the scroll container sat idle. The <=480px stack overrides both. */
+.runs-table { min-width: 72rem; }
+.runs-table th:first-child, .runs-table td:first-child { min-width: 14rem; }
 @media (max-width: 900px) {
+  .manual-shell { grid-template-columns: minmax(0, 1fr); }
+  .manual-pane { position: static; max-height: none; }
   .truth-rail, .unit-dimensions { grid-template-columns: repeat(2, minmax(13rem, 1fr)); }
-  .runs-table { min-width: 72rem; }
-  .runs-table th:first-child, .runs-table td:first-child { min-width: 14rem; }
 }
 @media (max-width: 640px) {
   .cluster-overview { grid-template-columns: minmax(0, 1fr); }
@@ -213,6 +298,23 @@ summary { cursor: pointer; color: #a7dbe5; font-weight: 650; }
   .runs-table { min-width: 0; }
   .runs-table th:first-child, .runs-table td:first-child { min-width: 0; }
   .runs-table thead { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
+  /* The header row is CLIPPED here, not removed: assistive tech still reads the
+     column names while sighted readers get them back from td::before below.
+     But the doctrine headers are ANCHORS, so clipping alone would leave seven
+     invisible tab stops per group table (measured at 390x844: a 1x1 clipped
+     thead holding seven focusable anchors) — a keyboard operator would tab into
+     nothing with no visible focus target. The sr-only pattern's mandatory
+     companion rule: the moment focus enters the row, un-clip it and pin it as a
+     visible band so the operator sees what they landed on. It reverts the
+     instant focus leaves, so nothing is added to the resting layout. */
+  .runs-table thead:focus-within { position: static; width: auto; height: auto; margin: 0; padding: .3rem .2rem; overflow: visible; clip-path: none; white-space: normal; display: block; border-bottom: 1px solid var(--line); }
+  .runs-table thead:focus-within tr { display: flex; flex-wrap: wrap; gap: .2rem .7rem; }
+  .runs-table thead:focus-within th { display: inline-block; padding: 0; font-size: .7rem; letter-spacing: .06em; text-transform: uppercase; }
+  /* The reveal shows the WHOLE row, not just the focused cell, so the operator
+     reads the vocabulary in context rather than one word out of seven. That
+     makes an explicit focus ring necessary: without it the revealed band gives
+     no answer to "which of these am I on?". */
+  .runs-table thead:focus-within .labelled-term:focus-visible { outline: 2px solid #8dd9e8; outline-offset: 2px; }
   .runs-table tbody tr { margin: .65rem 0; border: 1px solid var(--line); border-radius: .5rem; background: var(--surface); padding: .55rem .6rem; }
   .runs-table tbody tr.attention-row { border-left: 3px solid var(--attention); }
   .runs-table td { border-bottom: 0; padding: .28rem .2rem; }

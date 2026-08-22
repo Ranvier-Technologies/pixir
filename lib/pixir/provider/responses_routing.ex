@@ -84,6 +84,10 @@ defmodule Pixir.Provider.ResponsesRouting do
   @spec http_url(t()) :: String.t()
   def http_url(%__MODULE__{url: value}), do: value
 
+  @doc "Standalone compact URL (`POST /responses/compact`). Keep this request-internal."
+  @spec compact_url(t()) :: String.t()
+  def compact_url(%__MODULE__{} = routing), do: http_url(routing) <> "/compact"
+
   @doc "Resolved ChatGPT WebSocket URL, or `nil` for an HTTP/SSE-only backend."
   @spec websocket_url(t()) :: String.t() | nil
   def websocket_url(%__MODULE__{websocket_url: value}), do: value

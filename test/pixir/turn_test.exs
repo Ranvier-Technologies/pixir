@@ -50,6 +50,88 @@ defmodule Pixir.TurnTest do
     end
   end
 
+  defmodule ThresholdScriptedProvider do
+    def stream(request, opts) do
+      send(Keyword.fetch!(opts, :test_pid), {:threshold_request, request})
+      on_item = Keyword.get(opts, :on_compaction_item, fn _ -> :ok end)
+      on_call = Keyword.get(opts, :on_committed_call, fn _ -> :ok end)
+      agent = Keyword.fetch!(opts, :agent)
+      result = Agent.get_and_update(agent, fn [head | tail] -> {head, tail} end)
+
+      case result do
+        {:threshold_then_tools, item, call} ->
+          on_item.(item)
+          on_call.(call)
+
+          {:ok,
+           %{
+             text: "",
+             reasoning: "",
+             function_calls: [call],
+             output_items: [{:compaction, item}, {:function_call, call}],
+             finish_reason: :tool_calls,
+             compaction_item: item,
+             compact_threshold_sent: true,
+             usage_summary: Pixir.Provider.usage_summary(nil)
+           }}
+
+        {:threshold_then_stop, item, text} ->
+          on_item.(item)
+
+          {:ok,
+           %{
+             text: text,
+             reasoning: "",
+             function_calls: [],
+             output_items: [{:compaction, item}],
+             finish_reason: :stop,
+             compaction_item: item,
+             compact_threshold_sent: true,
+             usage_summary: Pixir.Provider.usage_summary(nil)
+           }}
+
+        {:two_threshold_items, first, second, text} ->
+          on_item.(first)
+          on_item.(second)
+
+          {:ok,
+           %{
+             text: text,
+             reasoning: "",
+             function_calls: [],
+             output_items: [{:compaction, first}, {:compaction, second}],
+             finish_reason: :stop,
+             compaction_item: second,
+             compact_threshold_sent: true,
+             usage_summary: Pixir.Provider.usage_summary(nil)
+           }}
+
+        {:capture_handler_then_stop, text} ->
+          send(Keyword.fetch!(opts, :test_pid), {:committed_call_handler, on_call})
+
+          {:ok,
+           %{
+             text: text,
+             reasoning: "",
+             function_calls: [],
+             finish_reason: :stop,
+             usage_summary: Pixir.Provider.usage_summary(nil)
+           }}
+
+        {:threshold_then_error, item, call, error} ->
+          on_item.(item)
+          send(Keyword.fetch!(opts, :test_pid), {:declared, on_call.(call)})
+          error
+
+        {:ok, map} when is_map(map) ->
+          {:ok, Map.put_new(map, :usage_summary, Pixir.Provider.usage_summary(map[:usage]))}
+
+        other ->
+          other
+      end
+    end
+  end
+
   defmodule RequestCaptureProvider do
     def stream(request, opts) do
       send(Keyword.fetch!(opts, :test_pid), {:provider_request, request})
@@ -176,6 +258,39 @@ defmodule Pixir.TurnTest do
 
     assert_received {:provider_request, request}
     refute Map.has_key?(request, :web_search)
+  end
+
+  test "chatgpt_codex turns default hosted web_search on unless explicitly disabled", %{ctx: ctx} do
+    auth = start_auth()
+    test_pid = self()
+
+    transport = fn http_request, acc, fun ->
+      send(test_pid, {:request, http_request})
+      acc = fun.({:status, 200}, acc)
+
+      {:ok,
+       fun.({:data, "data: " <> Jason.encode!(%{type: "response.completed"}) <> "\n\n"}, acc)}
+    end
+
+    assert {:ok, _} =
+             Turn.run(ctx, "search default",
+               config_opts: [raw_config: %{}],
+               provider_opts: [auth: auth, transport: transport, max_retries: 0]
+             )
+
+    assert_received {:request, %{body: body}}
+    decoded = Jason.decode!(body)
+    assert %{"type" => "web_search", "search_context_size" => "low"} in decoded["tools"]
+
+    assert {:ok, _} =
+             Turn.run(ctx, "search off",
+               config_opts: [raw_config: %{"web_search" => false}],
+               provider_opts: [auth: auth, transport: transport, max_retries: 0]
+             )
+
+    assert_received {:request, %{body: off_body}}
+    off = Jason.decode!(off_body)
+    refute Enum.any?(off["tools"] || [], &(&1["type"] == "web_search"))
   end
 
   test "custom Provider runtime opts omit consumed Config ingress seams", %{ctx: ctx} do
@@ -415,17 +530,22 @@ defmodule Pixir.TurnTest do
     assert usage.data["fallback_reason"] == "websocket_connect_failed"
   end
 
-  test "provider_usage record failure after Session shutdown returns structured error", %{
-    ctx: ctx,
-    pid: pid
-  } do
+  test "provider_usage record failure after Session shutdown returns a bounded structured error",
+       %{
+         ctx: ctx,
+         pid: pid,
+         sid: sid,
+         ws: ws
+       } do
+    sentinel = "SAFE_RECORD_METADATA_SECRET_SENTINEL"
+
     log =
       capture_log(fn ->
         assert {:error,
                 %{
                   error: %{
                     kind: :session_record_unavailable,
-                    details: %{event_type: "provider_usage"}
+                    details: details
                   }
                 }} =
                  Turn.run(ctx, "hello",
@@ -437,15 +557,36 @@ defmodule Pixir.TurnTest do
                        text: "late answer",
                        reasoning: "",
                        function_calls: [],
-                       finish_reason: :stop
+                       finish_reason: :stop,
+                       usage: %{
+                         "input_tokens" => 1,
+                         "output_tokens" => 1,
+                         "#{sentinel}_hostile_key" => sentinel
+                       },
+                       provider_metadata: %{
+                         "path" => "/secret/#{sentinel}",
+                         "nested" => %{"value" => sentinel}
+                       }
                      }
                    ]
                  )
+
+        assert details == %{
+                 session_id: sid,
+                 event_type: "provider_usage",
+                 failure_class: "noproc"
+               }
+
+        refute inspect(details) =~ sentinel
       end)
 
     assert_receive {:session_down_observed, _reason}
     assert log =~ "provider_usage evidence could not be recorded"
     refute log =~ "MatchError"
+    refute log =~ sentinel
+
+    ndjson = File.read!(Log.path(sid, workspace: ws))
+    refute ndjson =~ sentinel
   end
 
   test "tool-call provider_usage record failure after Session shutdown returns structured error",
@@ -1815,15 +1956,25 @@ defmodule Pixir.TurnTest do
 
   defp start_auth do
     name = :"turn_auth_#{System.unique_integer([:positive])}"
-
-    path =
-      Path.join(System.tmp_dir!(), "pixir-turn-auth-#{System.unique_integer([:positive])}.json")
+    path = tmp_auth_store("pixir-turn-auth-")
 
     {:ok, _} =
       Pixir.Auth.start_link(name: name, store_path: path, env_api_key: "sk-test", oauth: NoOAuth)
 
-    on_exit(fn -> File.rm_rf!(path) end)
     name
+  end
+
+  defp tmp_auth_store(prefix) do
+    directory =
+      Path.join(
+        System.tmp_dir!(),
+        prefix <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower)
+      )
+
+    File.rm_rf!(directory)
+    File.mkdir_p!(directory)
+    on_exit(fn -> File.rm_rf!(directory) end)
+    Path.join(directory, "auth.json")
   end
 
   describe "context-pressure advisories (ADR 0020)" do
@@ -2038,7 +2189,10 @@ defmodule Pixir.TurnTest do
 
       :ok = Events.subscribe(sid)
 
-      assert {:ok, "recovered"} = run_with(ctx, "go", [overflow_error(), stop("recovered")])
+      assert {:ok, "recovered"} =
+               run_with(ctx, "go", [overflow_error(), stop("recovered")],
+                 provider_opts: [native: true]
+               )
 
       # User-visible recovery notice on the ephemeral channel.
       assert_receive {:pixir_event, %{type: :context_pressure, data: notice}}
@@ -2049,6 +2203,7 @@ defmodule Pixir.TurnTest do
       assert {:ok, history} = Log.fold(sid, workspace: ws)
       compaction = Enum.find(history, &(&1.type == :history_compaction))
       assert compaction.data["trigger"] == "overflow_recovery"
+      refute Map.has_key?(compaction.data, "native_replay")
       # 45 fillers (seq 0..44) + "go" (seq 45); the default 40-event tail leaves
       # the oldest 6 events compacted: seq 0..5.
       assert compaction.data["range"] == %{"from_seq" => 0, "to_seq" => 5}
@@ -2323,6 +2478,13 @@ defmodule Pixir.TurnTest do
       assert prompt =~ "<available_skills>"
     end
 
+    test "plan Layer 0 does not tell the model the human will switch modes", %{ctx: ctx} do
+      prompt = Turn.system_prompt(ctx, :plan, [])
+      refute prompt =~ "They will switch"
+      assert prompt =~ "Recording the plan"
+      assert prompt =~ "switches this session to build mode"
+    end
+
     test "workspace rides as late developer context, not instructions", %{
       ctx: ctx,
       ws: ws
@@ -2451,8 +2613,8 @@ defmodule Pixir.TurnTest do
 
       assert {:ok, history} = Log.fold(sid, workspace: ws)
       usage = Enum.find(history, &(&1.type == :provider_usage))
-      assert usage.data["prompt_contract_version"] == "px3"
-      assert String.starts_with?(usage.data["prompt_cache_key"], "px3:")
+      assert usage.data["prompt_contract_version"] == "px4"
+      assert String.starts_with?(usage.data["prompt_cache_key"], "px4:")
     end
 
     test "Layer 0/1 and developer-context bytes are pinned to the prompt-contract version" do
@@ -2485,7 +2647,7 @@ defmodule Pixir.TurnTest do
       pinned_hash = :crypto.hash(:sha256, combined) |> Base.encode16(case: :lower)
 
       assert {Pixir.Provider.Cache.prompt_contract_version(), pinned_hash} ==
-               {"px3", "c5377ffabbf626fb740146c1c2460abbdc45379cb1993573546717331be6362d"},
+               {"px4", "86afcfd20e269b552c511b4d5e45d00ae69584eaea2fcc0b8b660cd2614ab2db"},
              "Stable prompt layers changed. If intentional: bump " <>
                "Pixir.Provider.Cache.prompt_contract_version, re-pin this " <>
                "hash, and note the contract change. Never ship prompt-byte changes " <>
@@ -2522,6 +2684,277 @@ defmodule Pixir.TurnTest do
       assert fork_usage.data["prompt_cache_key"] == root_usage.data["prompt_cache_key"]
       assert fork_usage.data["session_family_hash"] == root_usage.data["session_family_hash"]
     end
+  end
+
+  describe "native compact_threshold (#522-D)" do
+    test "fires a native_threshold checkpoint with frozen input_to_seq and tail tool_calls",
+         %{ctx: ctx, sid: sid, ws: ws} do
+      :ok = Events.subscribe(sid)
+
+      item = %{
+        "type" => "compaction",
+        "id" => "cmp_turn_fire",
+        "encrypted_content" => "CIPHERTEXT_TURN_FIRE"
+      }
+
+      call = %{call_id: "c_after_cmp", name: "read", args: %{"path" => "a.txt"}}
+
+      {:ok, agent} =
+        Agent.start_link(fn -> [{:threshold_then_tools, item, call}, stop("done")] end)
+
+      assert {:ok, "done"} =
+               Turn.run(ctx, "compact mid-turn",
+                 provider: ThresholdScriptedProvider,
+                 provider_opts: [agent: agent, test_pid: self()]
+               )
+
+      assert_receive {:pixir_event, %{type: :context_pressure, data: notice}}
+      assert notice["trigger"] == "native_threshold"
+      assert notice["presentation"] == "notice"
+
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+      types = Enum.map(history, & &1.type)
+      compaction = Enum.find(history, &(&1.type == :history_compaction))
+
+      tool_call =
+        Enum.find(history, &(&1.type == :tool_call and &1.data["call_id"] == "c_after_cmp"))
+
+      usage = Enum.find(history, &(&1.type == :provider_usage))
+
+      assert compaction.data["trigger"] == "native_threshold"
+
+      assert compaction.data["range"]["to_seq"] ==
+               Compaction.input_to_seq(Enum.take_while(history, &(&1.seq < compaction.seq)))
+
+      assert compaction.data["native_replay"]["mode"] == "threshold_item"
+      assert compaction.data["native_replay"]["items"] == [item]
+      refute Enum.any?(compaction.data["native_replay"]["items"], &(&1["type"] == "message"))
+      refute inspect(compaction.data["native_replay"]["compaction_item_ids"]) =~ "CIPHERTEXT"
+      refute inspect(usage.data) =~ "CIPHERTEXT"
+      refute inspect(usage.data) =~ "encrypted_content"
+
+      assert tool_call.seq > compaction.data["range"]["to_seq"]
+      compaction_index = Enum.find_index(types, &(&1 == :history_compaction))
+      tool_index = Enum.find_index(types, &(&1 == :tool_call))
+      usage_index = Enum.find_index(types, &(&1 == :provider_usage))
+      assert compaction_index < tool_index
+      assert tool_index < usage_index
+
+      assert usage.data["native_compact"]["mode"] == "threshold_item"
+      assert usage.data["native_compact"]["threshold"] == Compaction.compact_threshold()
+      assert usage.data["native_compact"]["recorded_usable"] == true
+      assert usage.data["native_compact"]["compaction_item_ids"] == ["cmp_turn_fire"]
+      assert usage.data["native_compact"]["input_to_seq"] == compaction.data["range"]["to_seq"]
+    end
+
+    test "failed native capture still writes local fallback and continues", %{
+      ctx: ctx,
+      sid: sid,
+      ws: ws
+    } do
+      :ok = Events.subscribe(sid)
+
+      item = %{"type" => "compaction", "id" => "cmp_unusable"}
+      {:ok, agent} = Agent.start_link(fn -> [{:threshold_then_stop, item, "still going"}] end)
+
+      assert {:ok, "still going"} =
+               Turn.run(ctx, "unusable cmp",
+                 provider: ThresholdScriptedProvider,
+                 provider_opts: [agent: agent, test_pid: self()]
+               )
+
+      assert_receive {:pixir_event, %{type: :context_pressure, data: notice}}
+      assert notice["trigger"] == "native_threshold"
+      assert notice["recovered"] == false
+
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+      compaction = Enum.find(history, &(&1.type == :history_compaction))
+      usage = Enum.find(history, &(&1.type == :provider_usage))
+      assert compaction.data["trigger"] == "native_threshold"
+      assert compaction.data["native_replay"]["recorded_usable"] == false
+      assert compaction.data["native_replay"]["fallback_reason"] == "missing_encrypted_content"
+      assert usage.data["native_compact"]["recorded_usable"] == false
+
+      assistant = Enum.find(history, &(&1.type == :assistant_message))
+      assert assistant.data["text"] == "still going"
+      assert usage.seq < assistant.seq
+      assert get_in(usage.data, ["output_truncation", "call_role"]) == "final_answer"
+    end
+
+    test "a late on_committed_call after the threshold gate stops still reaches Session",
+         %{ctx: ctx, sid: sid, ws: ws} do
+      {:ok, agent} = Agent.start_link(fn -> [{:capture_handler_then_stop, "done"}] end)
+
+      assert {:ok, "done"} =
+               Turn.run(ctx, "capture handler",
+                 provider: ThresholdScriptedProvider,
+                 provider_opts: [agent: agent, test_pid: self()]
+               )
+
+      assert_receive {:committed_call_handler, declare}
+      call = %{call_id: "call_after_gate_stop", name: "read", args: %{"path" => "a.txt"}}
+      assert :ok = declare.(call)
+
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+      assert late =
+               Enum.find(
+                 history,
+                 &(&1.type == :tool_call and &1.data["call_id"] == "call_after_gate_stop")
+               )
+
+      assert late.data["drained"]["reason"] == "declared_without_turn"
+    end
+
+    test "stream error after a threshold item still declares the committed call", %{
+      ctx: ctx,
+      sid: sid,
+      ws: ws
+    } do
+      item = %{
+        "type" => "compaction",
+        "id" => "cmp_error_flush",
+        "encrypted_content" => "CIPHERTEXT_ERROR_FLUSH"
+      }
+
+      call = %{call_id: "c_error_flush", name: "read", args: %{"path" => "a.txt"}}
+      error = {:error, %{ok: false, error: %{kind: :network, details: %{}}}}
+
+      {:ok, agent} = Agent.start_link(fn -> [{:threshold_then_error, item, call, error}] end)
+
+      assert {:error, %{error: %{kind: :network}}} =
+               Turn.run(ctx, "threshold then error",
+                 provider: ThresholdScriptedProvider,
+                 provider_opts: [agent: agent, test_pid: self()]
+               )
+
+      assert_receive {:declared, :ok}
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+      compaction = Enum.find(history, &(&1.type == :history_compaction))
+      assert compaction.data["trigger"] == "native_threshold"
+    end
+
+    test "a compact_threshold 400 records hysteresis and omits the field on retry", %{
+      ctx: ctx,
+      sid: sid,
+      ws: ws
+    } do
+      :ok = Events.subscribe(sid)
+      auth = start_auth()
+      test_pid = self()
+
+      reject =
+        ~s({"error":{"type":"invalid_request_error","param":"compact_threshold","message":"Unknown parameter: compact_threshold"}})
+
+      {:ok, agent} = Agent.start_link(fn -> [{[reject], 400}, {sse_completed("ok"), 200}] end)
+
+      transport = fn http_request, acc, fun ->
+        send(test_pid, {:request, http_request})
+
+        {chunks, status} =
+          Agent.get_and_update(agent, fn [head | tail] -> {head, tail} end)
+
+        acc = fun.({:status, status}, acc)
+        acc = Enum.reduce(chunks, acc, fn chunk, a -> fun.({:data, chunk}, a) end)
+        {:ok, acc}
+      end
+
+      assert {:ok, "ok"} =
+               Turn.run(ctx, "reject threshold",
+                 config_opts: [raw_config: %{}],
+                 provider_opts: [auth: auth, transport: transport, max_retries: 0]
+               )
+
+      assert_receive {:request, first}
+      assert_receive {:request, second}
+      first_body = Jason.decode!(first.body)
+      second_body = Jason.decode!(second.body)
+      assert first_body["context_management"]
+      refute Map.has_key?(second_body, "context_management")
+
+      notice =
+        Enum.find(collect_context_pressure_events(), &(&1["trigger"] == "native_threshold"))
+
+      assert notice["fallback_reason"] == "backend_rejected"
+
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+      refute Enum.any?(history, &(&1.type == :history_compaction))
+      usage = Enum.find(history, &(&1.type == :provider_usage))
+      assert usage.data["native_compact"]["fallback_reason"] == "backend_rejected"
+      refute get_in(usage.data, ["output_truncation", "call_role"]) == "final_answer"
+      assert Compaction.compact_threshold_suppressed?(history)
+    end
+
+    test "stream plus finalize write one native_threshold checkpoint per Turn", %{
+      ctx: ctx,
+      sid: sid,
+      ws: ws
+    } do
+      first = %{
+        "type" => "compaction",
+        "id" => "cmp_first",
+        "encrypted_content" => "CIPHERTEXT_FIRST"
+      }
+
+      second = %{
+        "type" => "compaction",
+        "id" => "cmp_second",
+        "encrypted_content" => "CIPHERTEXT_SECOND"
+      }
+
+      {:ok, agent} =
+        Agent.start_link(fn -> [{:two_threshold_items, first, second, "one write"}] end)
+
+      assert {:ok, "one write"} =
+               Turn.run(ctx, "two cmp items",
+                 provider: ThresholdScriptedProvider,
+                 provider_opts: [agent: agent, test_pid: self()]
+               )
+
+      assert {:ok, history} = Log.fold(sid, workspace: ws)
+      checkpoints = Enum.filter(history, &(&1.type == :history_compaction))
+      assert length(checkpoints) == 1
+      [compaction] = checkpoints
+      assert compaction.data["trigger"] == "native_threshold"
+      assert compaction.data["native_replay"]["compaction_item_ids"] == ["cmp_first"]
+    end
+
+    test "ordinary overlay-on Turns send compact_threshold through the real Provider", %{
+      ctx: ctx
+    } do
+      auth = start_auth()
+      test_pid = self()
+
+      transport = fn http_request, acc, fun ->
+        send(test_pid, {:request, http_request})
+        acc = fun.({:status, 200}, acc)
+
+        {:ok,
+         fun.({:data, "data: " <> Jason.encode!(%{type: "response.completed"}) <> "\n\n"}, acc)}
+      end
+
+      assert {:ok, _} =
+               Turn.run(ctx, "send threshold",
+                 config_opts: [raw_config: %{}],
+                 provider_opts: [auth: auth, transport: transport, max_retries: 0]
+               )
+
+      assert_receive {:request, %{body: body}}
+      decoded = Jason.decode!(body)
+
+      assert decoded["context_management"] == [
+               %{"type" => "compaction", "compact_threshold" => Compaction.compact_threshold()}
+             ]
+
+      assert Compaction.compact_threshold() == 200_000
+    end
+  end
+
+  defp sse_completed(text) do
+    [
+      "data: " <> Jason.encode!(%{type: "response.output_text.delta", delta: text}) <> "\n\n",
+      "data: " <> Jason.encode!(%{type: "response.completed"}) <> "\n\n"
+    ]
   end
 
   defp write_skill(dir, name, description, body) do

@@ -6,7 +6,7 @@ defmodule Pixir.Fork do
   canonical History. The parent Log is never mutated.
   """
 
-  alias Pixir.{BranchSummary, Event, Log, Session, SessionId, SessionResources, Tool}
+  alias Pixir.{BranchSummary, Event, Log, Session, SessionId, SessionResources, Subagents, Tool}
 
   @strategy "replay_v1"
 
@@ -27,7 +27,7 @@ defmodule Pixir.Fork do
     workspace = workspace(opts)
 
     with {:ok, plan} <- plan(parent_session_id, opts),
-         {:ok, child_session_id} <- write_child_log(plan, workspace) do
+         {:ok, child_session_id} <- write_child_log(plan, workspace, opts) do
       {:ok,
        plan
        |> Map.put("recorded", true)
@@ -102,7 +102,7 @@ defmodule Pixir.Fork do
     end
   end
 
-  defp write_child_log(plan, workspace) do
+  defp write_child_log(plan, workspace, opts) do
     child_session_id = plan["child_session_id"]
 
     case Log.exists(child_session_id, workspace: workspace) do
@@ -116,14 +116,14 @@ defmodule Pixir.Fork do
 
       {:ok, false} ->
         with {:ok, events} <- build_child_events(child_session_id, plan, workspace),
-             :ok <-
-               SessionResources.copy_referenced_resources(
+             {:ok, _written} <-
+               SessionResources.with_copied_resources(
                  plan["parent_session_id"],
                  child_session_id,
                  events,
-                 workspace: workspace
-               ),
-             {:ok, _} <- Log.create_session(child_session_id, events, workspace: workspace) do
+                 resource_copy_opts(opts, workspace),
+                 fn -> create_child_session(child_session_id, events, workspace, opts) end
+               ) do
           {:ok, child_session_id}
         end
 
@@ -132,29 +132,33 @@ defmodule Pixir.Fork do
     end
   end
 
+  defp resource_copy_opts(opts, workspace) do
+    [parent_workspace: workspace, child_workspace: workspace]
+    |> Keyword.merge(Keyword.take(opts, [:resource_copy_failpoint]))
+  end
+
+  # Test injection is confined to the atomic Log-create call and never enters Events.
+  defp create_child_session(child_session_id, events, workspace, opts) do
+    case Keyword.get(opts, :log_create_fun, &Log.create_session/3) do
+      create when is_function(create, 3) ->
+        create.(child_session_id, events, workspace: workspace)
+
+      _other ->
+        {:error,
+         Tool.error(:invalid_args, "log_create_fun must be a three-arity function", %{
+           expected_arity: 3
+         })}
+    end
+  end
+
   defp build_child_events(child_session_id, plan, workspace) do
     parent_session_id = plan["parent_session_id"]
 
-    fork_event =
-      Event.session_fork(child_session_id, %{
-        "parent_session_id" => plan["parent_session_id"],
-        "fork_root_session_id" => plan["fork_root_session_id"],
-        "forked_to_seq" => plan["to_seq"],
-        "parent_workspace" => plan["workspace"],
-        "child_workspace" => plan["workspace"],
-        "replay_event_count" => plan["event_count"],
-        "from_seq" => plan["from_seq"],
-        "strategy" => @strategy,
-        "limitations" => [
-          "full replayed prefix remains authoritative; session_fork is lineage metadata only"
-        ]
-      })
-      |> Event.with_seq(0)
-
     with {:ok, history} <- Log.fold(parent_session_id, workspace: workspace) do
+      source_events = select_replay_events(history, plan["to_seq"])
+
       replayed =
-        history
-        |> select_replay_events(plan["to_seq"])
+        source_events
         |> Enum.with_index(1)
         |> Enum.map(fn {event, seq} ->
           %{
@@ -165,6 +169,30 @@ defmodule Pixir.Fork do
           }
           |> Event.with_seq(seq)
         end)
+
+      warm_lineage =
+        inherited_warm_lineage(parent_session_id, workspace, source_events, replayed)
+
+      fork_data =
+        %{
+          "parent_session_id" => plan["parent_session_id"],
+          "fork_root_session_id" => plan["fork_root_session_id"],
+          "forked_to_seq" => plan["to_seq"],
+          "parent_workspace" => plan["workspace"],
+          "child_workspace" => plan["workspace"],
+          "replay_event_count" => plan["event_count"],
+          "from_seq" => plan["from_seq"],
+          "strategy" => @strategy,
+          "limitations" => [
+            "full replayed prefix remains authoritative; session_fork is lineage metadata only"
+          ]
+        }
+        |> maybe_put_warm_lineage(warm_lineage)
+
+      fork_event =
+        child_session_id
+        |> Event.session_fork(fork_data)
+        |> Event.with_seq(0)
 
       events = [fork_event | replayed]
 
@@ -184,6 +212,36 @@ defmodule Pixir.Fork do
        end}
     end
   end
+
+  defp inherited_warm_lineage(parent_session_id, workspace, source_events, replayed) do
+    with {:ok, proof} <- Subagents.warm_lineage_proof(parent_session_id, workspace: workspace),
+         boundary_source_index when is_integer(boundary_source_index) <-
+           Enum.find_index(source_events, &(&1 == proof.boundary_event)),
+         %{id: _boundary_id} = boundary <- Enum.at(replayed, boundary_source_index) do
+      posture_source_index = Enum.find_index(source_events, &(&1 == proof.posture_event))
+
+      posture =
+        if posture_source_index == boundary_source_index + 1 do
+          Enum.at(replayed, posture_source_index)
+        end
+
+      %{
+        "version" => 1,
+        "boundary_event_id" => boundary.id,
+        "posture_event_id" => posture && posture.id,
+        "boundary_index" => boundary_source_index + 1,
+        "posture_index" => boundary_source_index + 2,
+        "seed_session_id" => proof.seed_session_id,
+        "fork_root_session_id" => proof.fork_root_session_id,
+        "replay_event_count" => proof.replay_event_count
+      }
+    else
+      _no_trusted_or_selected_segment -> nil
+    end
+  end
+
+  defp maybe_put_warm_lineage(data, nil), do: data
+  defp maybe_put_warm_lineage(data, warm_lineage), do: Map.put(data, "warm_lineage", warm_lineage)
 
   defp branch_summary_strategy(true), do: BranchSummary.strategy()
   defp branch_summary_strategy(false), do: nil

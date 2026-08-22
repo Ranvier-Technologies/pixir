@@ -738,6 +738,7 @@ defmodule Pixir.Providers.Anthropic do
           text -> append_history_text(state, "user", text, model)
         end
 
+      # ADR 0040 / #522-B: Anthropic never folds `native_replay.items`.
       :history_compaction ->
         append_history_text(
           state,

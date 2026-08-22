@@ -32,6 +32,13 @@ what is real today vs proposed.
   cache break, key family preserved); the versioned prompt-contract re-layering (px2) with
   AGENTS.md discovery rule, fork-root cache-key family, explicit skill-activation
   limitations, and an advisory + overflow-recovery trigger policy. Provider-native
-  compaction parked pending the production WebSocket transport. Grilled 2026-06-09 against
-  external sources (Manus, LangChain/Deep Agents, OpenAI compaction docs) and live code.
-  Builds on ADR 0003/0007/0018/0019; resolved directions promoted as ADR 0020.
+  compaction was parked here and is now decided in ADR 0040 (issue #522-A): an
+  opt-in replay window on `history_compaction`, not a silent replacement for
+  local compact. Grilled 2026-06-09 against external sources (Manus,
+  LangChain/Deep Agents, OpenAI compaction docs) and live code. Builds on
+  ADR 0003/0007/0018/0019; resolved directions promoted as ADR 0020 and ADR 0040.
+- [0004 — Native OpenAI compaction implementation plan (#522-B/C/D)](0004-native-openai-compaction-implementation.md)
+  — serial B→C→D map against accepted ADR 0040 plus the 2026-08-16 overlay
+  amendment: one default-on overlay after OpenAI resolve, distinct persist
+  shapes, mid-turn threshold timing. Documentation only; does not implement
+  native compact or rewrite ADR 0040's historical Decision.

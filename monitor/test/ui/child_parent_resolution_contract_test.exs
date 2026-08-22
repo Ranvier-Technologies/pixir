@@ -95,7 +95,7 @@ defmodule PixirMonitor.UI.ChildParentResolutionContractTest do
 
   describe "the dead end names the owning parent and offers a directed exit" do
     test "the Follow degraded view renders the resolved-parent affordance alongside Retry, Refetch, and Unfollow", %{js: js} do
-      assert js =~ "function parentResolutionPanel(route)"
+      assert js =~ "function parentResolutionPanel(route, options)"
       assert js =~ "const resolution = parentResolutionPanel(route);"
       assert js =~ "if (resolution) root.append(resolution);"
       # The three existing exits are untouched and still present.
@@ -106,10 +106,12 @@ defmodule PixirMonitor.UI.ChildParentResolutionContractTest do
                ~s|link("Unfollow and return to Runs", semanticZoomRoute(route, {runId: null, unitId: null, attemptId: null, follow: false}), "return-runs")|
     end
 
-    test "the non-follow Projection unavailable view renders the same resolution", %{js: js} do
+    test "the non-follow resolved-child page headlines the resolution, not Projection unavailable", %{js: js} do
       assert js =~ "function renderUnavailable(message, failure)"
-      assert js =~ ~s|const unavailableResolution = parentResolutionPanel(route);|
-      assert js =~ "if (unavailableResolution) root.append(unavailableResolution);"
+      assert js =~ ~s|parentResolutionPanel(route, {headline: true})|
+      assert js =~ ~s|root.dataset.unavailableClass = "resolved_child"|
+      assert js =~ "root.append(resolution);"
+      refute js =~ ~s|const unavailableResolution = parentResolutionPanel(route);|
     end
 
     test "the panel only appears for a run-scoped run_not_found route", %{js: js} do
@@ -142,7 +144,7 @@ defmodule PixirMonitor.UI.ChildParentResolutionContractTest do
       assert js =~
                ~s|"Basis: parent-observed child evidence from parent Session Logs only. The child Session itself was not projected, fetched, or observed for liveness; no freshness is claimed for it."|
 
-      assert js =~ ~s|heading(2, "Parent-observed child Session")|
+      assert js =~ ~s|heading(options && options.headline ? 1 : 2, "Parent-observed child Session")|
     end
 
     test "the panel is announced and reachable on the same accessibility path as the other dead-end actions", %{js: js, css: css} do

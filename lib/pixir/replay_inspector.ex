@@ -9,7 +9,7 @@ defmodule Pixir.ReplayInspector do
   audit-only evidence that must not be replayed as clean Provider context.
   """
 
-  alias Pixir.{Log, Provider, Tool}
+  alias Pixir.{Compaction, Log, Provider, Tool}
   alias Pixir.Provider.OutputTruncationSummary
 
   @type inspect_opts :: [
@@ -121,7 +121,8 @@ defmodule Pixir.ReplayInspector do
       },
       "replay_contract" => replay_contract_summary(scoped_history, assistant_messages),
       "output_truncation" => OutputTruncationSummary.summarize(scoped_history),
-      "continuation" => continuation_summary(scoped_history)
+      "continuation" => continuation_summary(scoped_history),
+      "history_compaction" => history_compaction_inspect(scoped_history)
     }
   end
 
@@ -198,6 +199,25 @@ defmodule Pixir.ReplayInspector do
       "tool" => details["tool"],
       "kind" => get_in(decoded, ["error", "kind"])
     }
+  end
+
+  defp history_compaction_inspect(history) do
+    compaction =
+      history
+      |> Enum.filter(&(&1.type == :history_compaction))
+      |> Enum.max_by(&(&1.seq || -1), fn -> nil end)
+
+    case compaction do
+      nil ->
+        %{"present" => false}
+
+      %{seq: seq, data: data} ->
+        %{
+          "present" => true,
+          "seq" => seq,
+          "native_replay" => Compaction.inspect_native_replay(data)
+        }
+    end
   end
 
   defp continuation_summary(history) do

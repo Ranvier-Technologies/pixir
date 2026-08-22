@@ -42,6 +42,7 @@ defmodule Pixir.Provider do
   alias Pixir.Providers.{ErrBody, Registry, ResolvedProviderRequest, ResponsesBackend}
 
   alias Pixir.Provider.{
+    Compact,
     FinchTransport,
     HostedTools,
     OutputTruncation,
@@ -104,7 +105,10 @@ defmodule Pixir.Provider do
           reasoning_items: [map()],
           function_calls: [%{call_id: String.t(), name: String.t(), args: map()}],
           output_items: [
-            {:reasoning, map()} | {:function_call, map()} | {:provider_hosted_tool, map()}
+            {:reasoning, map()}
+            | {:function_call, map()}
+            | {:provider_hosted_tool, map()}
+            | {:compaction, map()}
           ],
           provider_hosted_tools: map(),
           web_search: map(),
@@ -112,7 +116,9 @@ defmodule Pixir.Provider do
           usage: map() | nil,
           usage_summary: map(),
           provider_metadata: map(),
-          output_truncation: OutputTruncation.t()
+          output_truncation: OutputTruncation.t(),
+          compaction_item: map() | nil,
+          compact_threshold_sent: boolean()
         }
 
   @doc """
@@ -131,7 +137,12 @@ defmodule Pixir.Provider do
       max_retries = Keyword.get(opts, :max_retries, @default_max_retries)
       sleep = Keyword.get(opts, :sleep, &Process.sleep/1)
 
-      request = Map.put(request, :model, ResolvedProviderRequest.model(resolved))
+      request =
+        request
+        |> Map.put(:model, ResolvedProviderRequest.model(resolved))
+        |> put_resolved_web_search(opts)
+        |> put_resolved_compact_threshold(opts, resolved)
+
       attempt(request, opts, 0, max_retries, sleep)
     end
   end
@@ -141,6 +152,61 @@ defmodule Pixir.Provider do
      err(:invalid_args, "stream/2 requires a plain Provider request map.", %{
        expected: "plain_map"
      })}
+  end
+
+  @doc """
+  Standalone `POST /responses/compact` client (ADR 0040 / #522-C).
+
+  Distinct from `stream/2`. Inject `transport:` in tests. `store: false` stays.
+  Does not send `compact_threshold` or `context_management`.
+  """
+  @spec compact(request(), keyword()) :: {:ok, map()} | {:error, map()}
+  def compact(request, opts \\ [])
+
+  def compact(request, opts) when is_map(request) and not is_struct(request) do
+    with {:ok, resolved, opts} <- ensure_resolved(request, opts),
+         :ok <- Compact.ensure_supported_backend(resolved),
+         {:ok, routing, opts} <- resolve_routing(resolved, opts),
+         {:ok, body} <- compact_body(resolved, request, opts),
+         {:ok, encoded_body} <- encode_body(body),
+         {:ok, request_auth} <- ResponsesAuth.resolve(resolved, routing, opts) do
+      backend = ResolvedProviderRequest.responses_backend(resolved)
+
+      http_request = %{
+        method: :post,
+        url: ResponsesRouting.compact_url(routing),
+        headers: ResponsesExtensions.headers(backend) ++ ResponsesAuth.headers(request_auth),
+        body: encoded_body
+      }
+
+      Compact.dispatch(http_request, opts)
+    else
+      {:error, %{kind: kind, message: message, details: details}} ->
+        {:error, err(kind, message, details)}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  def compact(_request, _opts) do
+    {:error,
+     err(:invalid_args, "compact/2 requires a plain Provider request map.", %{
+       expected: "plain_map"
+     })}
+  end
+
+  @doc false
+  @spec resolve_for_compact(keyword()) ::
+          {:ok, ResolvedProviderRequest.t(), keyword()} | {:error, map()}
+  def resolve_for_compact(opts) when is_list(opts) do
+    ensure_resolved(%{history: []}, opts)
+  end
+
+  @doc false
+  @spec fold_input_items([Event.t()], String.t(), keyword()) :: [map()]
+  def fold_input_items(history, model, opts \\ []) when is_list(history) do
+    fold_input(history, model, opts)
   end
 
   @doc "Whether this Provider accepts an explicit Responses backend selection."
@@ -184,6 +250,7 @@ defmodule Pixir.Provider do
   defp do_stream(request, opts) do
     on_delta = Keyword.get(opts, :on_delta, fn _ -> :ok end)
     on_committed_call = Keyword.get(opts, :on_committed_call, fn _ -> :ok end)
+    on_compaction_item = Keyword.get(opts, :on_compaction_item, fn _ -> :ok end)
     resolved = Keyword.fetch!(opts, :resolved_provider_request)
     routing = Keyword.fetch!(opts, :responses_routing)
     request_url = ResponsesRouting.http_url(routing)
@@ -238,7 +305,10 @@ defmodule Pixir.Provider do
         # the kill window: `Session.interrupt/1` brutally kills the Turn Task (and with it
         # this stream), so a call the Provider already committed is lost unless it has been
         # handed to a process that survives the kill before the stream ends.
-        on_committed_call: on_committed_call
+        on_committed_call: on_committed_call,
+        on_compaction_item: on_compaction_item,
+        compaction_item: nil,
+        compact_threshold_sent: compact_threshold_sent?(request)
       }
 
       case run(request, opts, http_request, init) do
@@ -334,7 +404,10 @@ defmodule Pixir.Provider do
 
       build_body(
         model,
-        Map.put(request, :model, model),
+        request
+        |> Map.put(:model, model)
+        |> put_resolved_web_search(opts)
+        |> put_resolved_compact_threshold(opts, resolved),
         reasoning_effort,
         text_verbosity,
         backend
@@ -419,7 +492,10 @@ defmodule Pixir.Provider do
 
       folded_input =
         developer_context_items(inputs.developer_context) ++
-          fold_input(history, model, workspace: inputs.workspace)
+          fold_input(history, model,
+            workspace: inputs.workspace,
+            native_replay_current: native_replay_current(model, backend)
+          )
 
       body = %{
         "model" => model,
@@ -447,7 +523,8 @@ defmodule Pixir.Provider do
        |> maybe_put_prompt_cache_retention(
          inputs.prompt_cache_retention,
          backend
-       )}
+       )
+       |> maybe_put_compact_threshold(request)}
     end
   end
 
@@ -680,6 +757,67 @@ defmodule Pixir.Provider do
     _kind, _reason -> invalid_request_field(:body, "not_json_encodable")
   end
 
+  defp compact_body(resolved, request, opts) do
+    model = ResolvedProviderRequest.model(resolved)
+    backend = ResolvedProviderRequest.responses_backend(resolved)
+
+    with {:ok, history} <- request_history(request) do
+      workspace = Keyword.get(opts, :workspace, File.cwd!())
+
+      folded =
+        fold_input(history, model,
+          workspace: workspace,
+          native_replay_current: native_replay_current(model, backend)
+        )
+
+      body = %{
+        "model" => model,
+        "store" => false,
+        "input" =>
+          folded
+          |> openai_input_items()
+          |> then(&ResponsesExtensions.project_input(backend, &1))
+      }
+
+      {:ok, body}
+    end
+  end
+
+  defp native_replay_current(model, %ResponsesBackend{} = backend) do
+    mode = Atom.to_string(ResponsesBackend.mode(backend))
+
+    %{
+      "provider" => "openai_responses",
+      "backend" => mode,
+      "dialect" => mode,
+      "model" => model
+    }
+  end
+
+  defp native_replay_current(model, _backend) do
+    %{
+      "provider" => "openai_responses",
+      "backend" => "unknown",
+      "dialect" => "unknown",
+      "model" => model
+    }
+  end
+
+  defp native_replay_items(data) when is_map(data) do
+    replay = string_map_get(data, "native_replay")
+    replay = if is_map(replay), do: replay, else: %{}
+    items = string_map_get(replay, "items")
+    if is_list(items), do: items, else: []
+  end
+
+  defp string_map_get(map, "native_replay") when is_map(map),
+    do: Map.get(map, "native_replay") || Map.get(map, :native_replay)
+
+  defp string_map_get(map, "items") when is_map(map),
+    do: Map.get(map, "items") || Map.get(map, :items)
+
+  defp string_map_get(_map, _key), do: nil
+
   defp ensure_resolved(request, opts) do
     with {:ok, resolved} <- resolved_for_entry(request, opts),
          :ok <- validate_entry_resolution(resolved),
@@ -692,6 +830,78 @@ defmodule Pixir.Provider do
         )
 
       {:ok, resolved, opts}
+    end
+  end
+
+  defp put_resolved_compact_threshold(request, opts, resolved) do
+    if send_compact_threshold?(request, opts, resolved) do
+      Map.put(request, :compact_threshold, Compaction.compact_threshold())
+    else
+      request
+    end
+  end
+
+  defp send_compact_threshold?(request, opts, resolved) do
+    cond do
+      Keyword.get(opts, :suppress_compact_threshold) == true ->
+        false
+
+      true ->
+        preference = Compaction.native_preference(opts)
+
+        case Compaction.overlay_after_resolve(preference, resolved) do
+          {:on, _} ->
+            history =
+              case fetch_request_value(request, :history) do
+                {:ok, events} when is_list(events) -> events
+                _ -> []
+              end
+
+            not Compaction.compact_threshold_suppressed?(history)
+
+          {:off, _reason} ->
+            false
+        end
+    end
+  end
+
+  # Attach the request's compact_threshold when it meets the OpenAI API
+  # floor (`Compaction.compact_threshold_minimum/0`, 1000). Overlay-on
+  # ordinary Turns put the product N (`Compaction.compact_threshold/0`,
+  # 200_000) on the request first. 1000 is a legal value if passed
+  # explicitly; it is not the product threshold sent by default.
+  defp maybe_put_compact_threshold(body, request) do
+    case fetch_request_value(request, :compact_threshold) do
+      {:ok, threshold} ->
+        if valid_compact_threshold?(threshold) do
+          Map.put(body, "context_management", [
+            %{"type" => "compaction", "compact_threshold" => threshold}
+          ])
+        else
+          body
+        end
+
+      _other ->
+        body
+    end
+  end
+
+  defp valid_compact_threshold?(threshold),
+    do: is_integer(threshold) and threshold >= Compaction.compact_threshold_minimum()
+
+  # attach_to_provider_opts/2 decides the preference after Provider + backend
+  # resolution. stream/2 and request_body_preview/2 still read web_search from
+  # the request map, so copy a resolved opts value only when the request omitted it.
+  defp put_resolved_web_search(request, opts) do
+    case {Map.fetch(request, :web_search), Map.fetch(request, "web_search")} do
+      {:error, :error} ->
+        case Keyword.fetch(opts, :web_search) do
+          {:ok, value} -> Map.put(request, :web_search, value)
+          :error -> request
+        end
+
+      _present ->
+        request
     end
   end
 
@@ -898,6 +1108,7 @@ defmodule Pixir.Provider do
     events = Compaction.provider_history(history)
     latest_user_index = latest_user_index(events)
     workspace = Keyword.get(opts, :workspace, File.cwd!())
+    native_replay_current = Keyword.get(opts, :native_replay_current)
 
     events
     |> Enum.with_index()
@@ -906,7 +1117,8 @@ defmodule Pixir.Provider do
       fn {event, index}, state ->
         fold_event(event, state, model, workspace,
           current_user?: latest_user_index == index,
-          active_turn?: is_integer(latest_user_index) and index >= latest_user_index
+          active_turn?: is_integer(latest_user_index) and index >= latest_user_index,
+          native_replay_current: native_replay_current
         )
       end
     )
@@ -993,7 +1205,8 @@ defmodule Pixir.Provider do
       &(&1 ++
           to_input_item(event, model,
             workspace: workspace,
-            current_user?: Keyword.get(opts, :current_user?, false)
+            current_user?: Keyword.get(opts, :current_user?, false),
+            native_replay_current: Keyword.get(opts, :native_replay_current)
           ))
     )
   end
@@ -1189,13 +1402,21 @@ defmodule Pixir.Provider do
 
   defp to_input_item(%{type: :workflow_event}, _model, _opts), do: []
 
-  defp to_input_item(%{type: :history_compaction, data: data}, _model, _opts) do
-    [
-      %{
-        "role" => "user",
-        "content" => [%{"type" => "input_text", "text" => Compaction.render_for_provider(data)}]
-      }
-    ]
+  # ADR 0040 / #522-C: send `native_replay.items` when the window is fold-usable.
+  # Never mix the native window and local text in the same prefix.
+  defp to_input_item(%{type: :history_compaction, data: data}, _model, opts) do
+    current = Keyword.get(opts, :native_replay_current)
+
+    if is_map(current) and Compaction.native_replay_fold_usable?(data, current) do
+      native_replay_items(data)
+    else
+      [
+        %{
+          "role" => "user",
+          "content" => [%{"type" => "input_text", "text" => Compaction.render_for_provider(data)}]
+        }
+      ]
+    end
   end
 
   defp to_input_item(%{type: :branch_summary, data: data}, _model, _opts) do
@@ -1778,6 +1999,19 @@ defmodule Pixir.Provider do
     %{acc | output_items: [{:reasoning, item} | acc.output_items]}
   end
 
+  # ADR 0040 / #522-D: latest complete `cmp_` item from an ordinary Turn stream.
+  # Same-turn output after this item is tail History, not part of `items`.
+  defp apply_event(
+         {:ok,
+          %{"type" => "response.output_item.done", "item" => %{"type" => "compaction"} = item}},
+         acc
+       ) do
+    acc
+    |> Map.put(:compaction_item, item)
+    |> Map.update!(:output_items, &[{:compaction, item} | &1])
+    |> put_compaction_item_error(acc.on_compaction_item.(item))
+  end
+
   defp apply_event({:ok, %{"type" => type} = event}, acc)
        when type in ["response.completed", "response.incomplete"] do
     {usage, evidence} =
@@ -1851,6 +2085,18 @@ defmodule Pixir.Provider do
     do: %{acc | stream_error: acc.stream_error || error}
 
   defp put_committed_call_error(acc, _ok), do: acc
+
+  defp put_compaction_item_error(acc, {:error, %{error: %{}} = error}),
+    do: %{acc | stream_error: acc.stream_error || error}
+
+  defp put_compaction_item_error(acc, _ok), do: acc
+
+  defp compact_threshold_sent?(request) do
+    case fetch_request_value(request, :compact_threshold) do
+      {:ok, threshold} -> valid_compact_threshold?(threshold)
+      _ -> false
+    end
+  end
 
   defp maybe_retryable_stream_error_details(:provider_http_error, type, code, details) do
     if transient_stream_error?(type, code) do
@@ -2280,7 +2526,9 @@ defmodule Pixir.Provider do
        provider_metadata: acc.provider_metadata,
        finish_reason: if(calls == [], do: :stop, else: :tool_calls),
        output_truncation:
-         acc.terminal_evidence || OutputTruncation.unknown(:missing_terminal_evidence)
+         acc.terminal_evidence || OutputTruncation.unknown(:missing_terminal_evidence),
+       compaction_item: acc.compaction_item,
+       compact_threshold_sent: acc.compact_threshold_sent == true
      }}
   end
 
@@ -2408,6 +2656,19 @@ defmodule Pixir.Provider do
           usage_details(status, error)
         )
 
+      compact_threshold_rejected?(status, error) ->
+        err(
+          :backend_rejected,
+          message || "compact_threshold was rejected",
+          %{
+            status: status,
+            type: error["type"],
+            code: error["code"],
+            param: error["param"],
+            compact_threshold_rejected: true
+          }
+        )
+
       context_overflow?(status, type, code, message) ->
         err(
           :context_overflow,
@@ -2436,6 +2697,26 @@ defmodule Pixir.Provider do
           body: body
         })
     end
+  end
+
+  defp compact_threshold_rejected?(400, error) when is_map(error) do
+    compact_threshold_signal?(error)
+  end
+
+  defp compact_threshold_rejected?(_status, _error), do: false
+
+  defp compact_threshold_signal?(error) when is_map(error) do
+    param = error["param"]
+    message = error["message"] || ""
+    code = error["code"] || ""
+
+    param in [
+      "context_management",
+      "compact_threshold",
+      "context_management.compact_threshold"
+    ] or
+      (is_binary(code) and code =~ ~r/unknown_parameter|unsupported_parameter/i and
+         message =~ ~r/compact|context_management/i)
   end
 
   # ADR 0020: a context/window-exceeded rejection gets its own stable kind so the

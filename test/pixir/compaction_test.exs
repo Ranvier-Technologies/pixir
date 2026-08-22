@@ -1,7 +1,7 @@
 defmodule Pixir.CompactionTest do
   use ExUnit.Case, async: false
 
-  alias Pixir.{Auth, Compaction, Event, Log}
+  alias Pixir.{Auth, Compaction, Event, Log, Provider}
 
   @skill_limitation "Skills activated only inside the compacted range are not replayed unless they remain in the recent raw tail or are explicitly re-activated."
   @named_skill_limitation "Compacted skill activations: diagnose (seq 1, .pixir/skills/diagnose/SKILL.md, sha256 deadbeef)."
@@ -13,6 +13,10 @@ defmodule Pixir.CompactionTest do
   }
 
   setup do
+    # #563: plant operator-like ~/.pixir config, then isolate PIXIR_HOME so
+    # overlay/model assertions cannot inherit the real operator home.
+    Pixir.Test.OperatorState.isolate_pixir_home!()
+
     ws =
       Path.join(
         System.tmp_dir!(),
@@ -80,6 +84,69 @@ defmodule Pixir.CompactionTest do
     assert {:ok, history} = Log.fold(sid, workspace: ws)
     assert List.last(history).type == :history_compaction
     assert List.last(history).seq == 5
+  end
+
+  test "complete returns a structured recorded result without fabricating pressure", %{
+    ws: ws,
+    sid: sid
+  } do
+    append_history(ws, [
+      Event.user_message(sid, "one"),
+      Event.assistant_message(sid, "two"),
+      Event.assistant_message(sid, "three")
+    ])
+
+    assert {:ok,
+            %{
+              "status" => "recorded",
+              "range" => %{"from_seq" => 0, "to_seq" => 1},
+              "checkpoint" => %{
+                "seq" => 3,
+                "event_id" => event_id,
+                "data" => %{"trigger" => "manual"}
+              }
+            } = completion} =
+             Compaction.complete(sid, workspace: ws, tail_events: 1)
+
+    assert is_binary(event_id)
+    refute Map.has_key?(completion, "pressure_snapshot")
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+    assert Enum.count(history, &(&1.type == :history_compaction)) == 1
+  end
+
+  test "complete returns a structured no-op without a fake checkpoint or pressure", %{
+    ws: ws,
+    sid: sid
+  } do
+    append_history(ws, [Event.user_message(sid, "one")])
+
+    assert {:ok,
+            %{
+              "status" => "no_op",
+              "range" => nil,
+              "checkpoint" => nil,
+              "reason" => "history does not exceed requested tail"
+            } = completion} = Compaction.complete(sid, workspace: ws, tail_events: 1)
+
+    refute Map.has_key?(completion, "pressure_snapshot")
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+    refute Enum.any?(history, &(&1.type == :history_compaction))
+  end
+
+  test "complete returns a structured error without a fake checkpoint or pressure", %{
+    ws: ws,
+    sid: sid
+  } do
+    assert {:ok,
+            %{
+              "status" => "error",
+              "range" => nil,
+              "checkpoint" => nil,
+              "error" => %{error: %{kind: :invalid_args}}
+            } = completion} = Compaction.complete(sid, workspace: ws, tail_events: 0)
+
+    refute Map.has_key?(completion, "pressure_snapshot")
   end
 
   test "compact records trigger \"manual\" by default (ADR 0020)", %{ws: ws, sid: sid} do
@@ -439,6 +506,187 @@ defmodule Pixir.CompactionTest do
     refute Enum.any?(event_data["limitations"], &(&1 =~ "Compacted skill activations:"))
   end
 
+  test "persist_threshold_item writes a singleton cmp_ window with local text", %{sid: sid} do
+    local = local_checkpoint_data()
+    item = cmp_item("cmp_threshold_ok")
+
+    assert {:ok, data} =
+             Compaction.persist_threshold_item(local, item,
+               provider: "openai_responses",
+               backend: "chatgpt_codex",
+               dialect: "chatgpt_codex",
+               model: "gpt-5.5"
+             )
+
+    replay = data["native_replay"]
+    assert replay["mode"] == "threshold_item"
+    assert replay["recorded_usable"] == true
+    refute Map.has_key?(replay, "fallback_reason")
+    assert replay["items"] == [item]
+    assert replay["compaction_item_ids"] == ["cmp_threshold_ok"]
+    assert data["summary"] == local["summary"]
+    assert data["range"] == local["range"]
+    assert data["strategy"] == local["strategy"]
+    assert data["limitations"] == local["limitations"]
+    assert Enum.all?(Map.keys(replay), &is_binary/1)
+
+    event = Event.history_compaction(sid, data)
+    assert event.type == :history_compaction
+    assert event.data["native_replay"]["compaction_item_ids"] == ["cmp_threshold_ok"]
+  end
+
+  test "persist_threshold_item rejects a full compact output as threshold_item_not_singleton" do
+    output = [
+      %{"type" => "message", "role" => "user", "content" => "kept"},
+      cmp_item("cmp_not_alone")
+    ]
+
+    assert {:error, %{error: %{kind: :threshold_item_not_singleton}}} =
+             Compaction.persist_threshold_item(local_checkpoint_data(), output,
+               backend: "chatgpt_codex",
+               dialect: "chatgpt_codex",
+               model: "gpt-5.5"
+             )
+  end
+
+  test "validate_native_replay marks standalone_window_pruned when output is reduced to cmp_" do
+    cmp = cmp_item("cmp_standalone")
+    output = [%{"type" => "message", "role" => "assistant", "content" => "kept"}, cmp]
+
+    replay = %{
+      "mode" => "standalone_window",
+      "provider" => "openai_responses",
+      "backend" => "chatgpt_codex",
+      "dialect" => "chatgpt_codex",
+      "model" => "gpt-5.5",
+      "items" => [cmp]
+    }
+
+    assert {:ok,
+            %{
+              "recorded_usable" => false,
+              "fallback_reason" => "standalone_window_pruned"
+            }} = Compaction.validate_native_replay(replay, compact_output: output)
+
+    assert {:ok, %{"recorded_usable" => true}} =
+             Compaction.validate_native_replay(%{replay | "items" => output},
+               compact_output: output
+             )
+  end
+
+  test "function_call with missing or blank call_id is unpaired" do
+    base = %{
+      "mode" => "standalone_window",
+      "provider" => "openai_responses",
+      "backend" => "chatgpt_codex",
+      "dialect" => "chatgpt_codex",
+      "model" => "gpt-5.5"
+    }
+
+    for call <- [
+          %{"type" => "function_call", "name" => "read"},
+          %{"type" => "function_call", "name" => "read", "call_id" => ""},
+          %{"type" => "function_call", "name" => "read", "call_id" => "call_missing_output"}
+        ] do
+      replay = Map.put(base, "items", [call, cmp_item("cmp_unpaired_validate")])
+
+      assert {:ok,
+              %{
+                "recorded_usable" => false,
+                "fallback_reason" => "unpaired_function_call"
+              }} = Compaction.validate_native_replay(replay)
+    end
+  end
+
+  test "project_compact_result_for_inspect strips ciphertext from compact JSON" do
+    assert {:ok, data} =
+             Compaction.persist_threshold_item(local_checkpoint_data(), cmp_item("cmp_json"),
+               backend: "chatgpt_codex",
+               dialect: "chatgpt_codex",
+               model: "gpt-5.5"
+             )
+
+    result = %{
+      "ok" => true,
+      "recorded" => true,
+      "event" => data,
+      "checkpoint" => %{"data" => data}
+    }
+
+    projected = Compaction.project_compact_result_for_inspect(result)
+    encoded = Jason.encode!(projected)
+
+    assert projected["event"]["native_replay"]["mode"] == "threshold_item"
+    assert projected["event"]["native_replay"]["compaction_item_ids"] == ["cmp_json"]
+    refute Map.has_key?(projected["event"]["native_replay"], "items")
+    refute encoded =~ "encrypted_content"
+    refute encoded =~ "CIPHERTEXT"
+  end
+
+  test "inspect_native_replay shows mode, usable, and ids without ciphertext" do
+    assert {:ok, data} =
+             Compaction.persist_threshold_item(local_checkpoint_data(), cmp_item("cmp_inspect"),
+               backend: "chatgpt_codex",
+               dialect: "chatgpt_codex",
+               model: "gpt-5.5"
+             )
+
+    inspected = Compaction.inspect_native_replay(data)
+    encoded = Jason.encode!(inspected)
+    projected = Compaction.project_checkpoint_for_inspect(data)
+    projected_json = Jason.encode!(projected)
+
+    assert inspected == %{
+             "mode" => "threshold_item",
+             "recorded_usable" => true,
+             "compaction_item_ids" => ["cmp_inspect"]
+           }
+
+    refute Map.has_key?(inspected, "items")
+    refute encoded =~ "encrypted_content"
+    refute encoded =~ "CIPHERTEXT"
+    refute projected_json =~ "encrypted_content"
+    refute projected_json =~ "CIPHERTEXT"
+    assert projected["native_replay"]["mode"] == "threshold_item"
+    assert projected["summary"] == data["summary"]
+  end
+
+  test "native_replay_fold_usable? can be true while provider_history still keeps local text", %{
+    sid: sid
+  } do
+    assert {:ok, data} =
+             Compaction.persist_threshold_item(local_checkpoint_data(), cmp_item("cmp_fold"),
+               backend: "chatgpt_codex",
+               dialect: "chatgpt_codex",
+               model: "gpt-5.5"
+             )
+
+    current = %{
+      "provider" => "openai_responses",
+      "backend" => "chatgpt_codex",
+      "dialect" => "chatgpt_codex",
+      "model" => "gpt-5.5"
+    }
+
+    assert Compaction.native_replay_fold_usable?(data, current)
+    refute Compaction.native_replay_fold_usable?(data, %{current | "model" => "other-model"})
+
+    history = [
+      Event.user_message(sid, "old") |> Event.with_seq(0),
+      Event.history_compaction(sid, data) |> Event.with_seq(1),
+      Event.user_message(sid, "recent") |> Event.with_seq(3)
+    ]
+
+    assert [%{type: :history_compaction, data: checkpoint}, %{type: :user_message}] =
+             Compaction.provider_history(history)
+
+    rendered = Compaction.render_for_provider(checkpoint)
+    assert rendered =~ "Compressed session memory"
+    assert rendered =~ checkpoint["summary"]
+    refute rendered =~ "CIPHERTEXT"
+    refute rendered =~ "cmp_fold"
+  end
+
   test "render_for_provider exposes summary, range, limitations, and open tasks" do
     text =
       Compaction.render_for_provider(%{
@@ -718,14 +966,519 @@ defmodule Pixir.CompactionTest do
              Compaction.validate_model_checkpoint(%{"summary" => "only summary"})
   end
 
+  test "chatgpt_codex overlay-on compact stays local and does not POST /compact", %{
+    ws: ws,
+    sid: sid
+  } do
+    append_history(ws, [
+      Event.user_message(sid, "one"),
+      Event.assistant_message(sid, "two"),
+      Event.user_message(sid, "three")
+    ])
+
+    assert {:ok, result} =
+             Compaction.compact(sid,
+               workspace: ws,
+               tail_events: 1,
+               transport: fn _request, _acc, _fun ->
+                 flunk("chatgpt_codex standalone compact must not POST /compact")
+               end
+             )
+
+    assert result["recorded"] == true
+    assert result["event"]["trigger"] == "manual"
+    assert result["event"]["summary"]
+    refute Map.has_key?(result["event"], "native_replay")
+    assert result["native_replay_usable"] == false
+    assert result["native_replay_reason"] == "native_unavailable"
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+    compaction = Enum.find(history, &(&1.type == :history_compaction))
+    assert compaction.data["trigger"] == "manual"
+    refute Map.has_key?(compaction.data, "native_replay")
+    refute Enum.any?(history, &(&1.type == :provider_usage))
+  end
+
+  test "official api.openai.com overlay-on compact persists entire standalone_window", %{
+    ws: ws,
+    sid: sid
+  } do
+    output = standalone_output("cmp_overlay_on")
+
+    append_history(ws, [
+      Event.user_message(sid, "one"),
+      Event.assistant_message(sid, "two"),
+      Event.user_message(sid, "three")
+    ])
+
+    assert {:ok, %{"recorded" => true, "event" => event} = result} =
+             Compaction.compact(sid,
+               workspace: ws,
+               tail_events: 1,
+               responses_backend: official_responses_backend(),
+               transport: standalone_transport(output)
+             )
+
+    assert_received {:compact_request, request}
+    assert request.url == "https://api.openai.com/v1/responses/compact"
+    body = Jason.decode!(request.body)
+    assert body["store"] == false
+    refute Map.has_key?(body, "stream")
+    refute Map.has_key?(body, "compact_threshold")
+    refute Map.has_key?(body, "context_management")
+    refute Map.has_key?(body, "previous_response_id")
+    assert length(body["input"]) == 2
+
+    replay = event["native_replay"]
+    assert replay["mode"] == "standalone_window"
+    assert replay["recorded_usable"] == true
+    assert replay["items"] == output
+    assert replay["compaction_item_ids"] == ["cmp_overlay_on"]
+    assert replay["provider"] == "openai_responses"
+    assert replay["backend"] == "open_responses"
+    assert replay["dialect"] == "open_responses"
+    refute Map.has_key?(replay, "fallback_reason")
+    assert result["native_replay_usable"] == true
+    assert event["summary"]
+    assert event["range"]["from_seq"] == 0
+    refute Map.has_key?(event, "previous_response_id")
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+    assert Enum.any?(history, &(&1.type == :user_message and &1.data["text"] == "one"))
+    assert Enum.any?(history, &(&1.type == :history_compaction))
+
+    usage = Enum.find(history, &(&1.type == :provider_usage))
+    assert usage.data["call_role"] == "compaction"
+    assert usage.data["native_compact"]["mode"] == "standalone_window"
+    assert usage.data["native_compact"]["recorded_usable"] == true
+    refute inspect(usage.data) =~ "CIPHERTEXT"
+    refute inspect(usage.data) =~ "encrypted_content"
+
+    folded =
+      history
+      |> Compaction.provider_history()
+      |> Provider.fold_input_items("gpt-5.5", native_replay_current: official_capturing_current())
+
+    assert Enum.any?(folded, &(&1["type"] == "compaction" and &1["id"] == "cmp_overlay_on"))
+
+    refute Enum.any?(folded, fn item ->
+             is_map(item) and
+               (item["call_role"] == "compaction" or item["type"] == "provider_usage")
+           end)
+
+    encoded = Jason.encode!(Compaction.project_compact_result_for_inspect(%{"event" => event}))
+    refute encoded =~ "CIPHERTEXT"
+    refute encoded =~ "encrypted_content"
+  end
+
+  test "standalone 404 and transport failures are not malformed_native_replay", %{
+    ws: ws,
+    sid: sid
+  } do
+    append_history(ws, [
+      Event.user_message(sid, "one"),
+      Event.assistant_message(sid, "two"),
+      Event.user_message(sid, "three")
+    ])
+
+    not_found = fn http_request, acc, fun ->
+      send(self(), {:compact_request, http_request})
+      acc = fun.({:status, 404}, acc)
+      acc = fun.({:data, ~s({"error":{"message":"not found"}})}, acc)
+      {:ok, acc}
+    end
+
+    assert {:ok, result} =
+             Compaction.compact(sid,
+               workspace: ws,
+               tail_events: 1,
+               responses_backend: official_responses_backend(),
+               transport: not_found
+             )
+
+    assert_received {:compact_request, request}
+    assert String.ends_with?(request.url, "/compact")
+    assert result["recorded"] == true
+    assert result["event"]["summary"]
+    assert result["native_replay_usable"] == false
+    assert result["native_replay_reason"] == "http_404"
+    replay = result["event"]["native_replay"]
+    assert replay["mode"] == "standalone_window"
+    assert replay["recorded_usable"] == false
+    assert replay["fallback_reason"] == "http_404"
+    assert replay["items"] == []
+    refute Compaction.native_replay_fold_usable?(result["event"], official_capturing_current())
+
+    sid2 = sid <> "-transport"
+
+    append_history(ws, [
+      Event.user_message(sid2, "one"),
+      Event.assistant_message(sid2, "two"),
+      Event.user_message(sid2, "three")
+    ])
+
+    assert {:ok, transport_result} =
+             Compaction.compact(sid2,
+               workspace: ws,
+               tail_events: 1,
+               responses_backend: official_responses_backend(),
+               transport: fn _request, _acc, _fun -> {:error, :econnrefused} end
+             )
+
+    assert transport_result["native_replay_reason"] == "transport"
+    assert transport_result["event"]["native_replay"]["fallback_reason"] == "transport"
+    assert transport_result["event"]["native_replay"]["recorded_usable"] == false
+    assert transport_result["event"]["summary"]
+  end
+
+  test "explicit compaction.native false stays local and does not call compact client", %{
+    ws: ws,
+    sid: sid
+  } do
+    append_history(ws, [
+      Event.user_message(sid, "one"),
+      Event.assistant_message(sid, "two"),
+      Event.user_message(sid, "three")
+    ])
+
+    assert {:ok, %{"recorded" => true, "event" => event}} =
+             Compaction.compact(sid,
+               workspace: ws,
+               tail_events: 1,
+               native: false,
+               transport: fn _request, _acc, _fun ->
+                 flunk("standalone compact client must not run")
+               end
+             )
+
+    refute Map.has_key?(event, "native_replay")
+  end
+
+  test "open_responses and Anthropic explicit compact stay local", %{ws: ws, sid: sid} do
+    append_history(ws, [
+      Event.user_message(sid, "one"),
+      Event.assistant_message(sid, "two"),
+      Event.user_message(sid, "three")
+    ])
+
+    flunk_transport = fn _request, _acc, _fun ->
+      flunk("standalone compact client must not run")
+    end
+
+    assert {:ok, %{"recorded" => true, "event" => open_event}} =
+             Compaction.compact(sid,
+               workspace: ws,
+               tail_events: 1,
+               responses_backend: %{
+                 "mode" => "open_responses",
+                 "responses_url" => "https://vendor.example/v1/responses",
+                 "auth" => %{"policy" => "none"}
+               },
+               transport: flunk_transport
+             )
+
+    refute Map.has_key?(open_event, "native_replay")
+
+    sid2 = sid <> "-ant"
+
+    append_history(ws, [
+      Event.user_message(sid2, "one"),
+      Event.assistant_message(sid2, "two"),
+      Event.user_message(sid2, "three")
+    ])
+
+    assert {:ok, %{"recorded" => true, "event" => anthropic_event}} =
+             Compaction.compact(sid2,
+               workspace: ws,
+               tail_events: 1,
+               provider: Pixir.Providers.Anthropic,
+               native: true,
+               transport: flunk_transport
+             )
+
+    refute Map.has_key?(anthropic_event, "native_replay")
+  end
+
+  test "recovery triggers stay local even when overlay is on", %{ws: ws, sid: sid} do
+    auth = start_auth()
+
+    for trigger <- [
+          "overflow_recovery",
+          "critical_pressure_preflight",
+          "websocket_critical_recovery"
+        ] do
+      trigger_sid = sid <> "-" <> trigger
+
+      append_history(ws, [
+        Event.user_message(trigger_sid, "one"),
+        Event.assistant_message(trigger_sid, "two"),
+        Event.user_message(trigger_sid, "three")
+      ])
+
+      assert {:ok, %{"recorded" => true, "event" => event}} =
+               Compaction.compact(trigger_sid,
+                 workspace: ws,
+                 tail_events: 1,
+                 trigger: trigger,
+                 auth: auth,
+                 native: true,
+                 transport: fn _request, _acc, _fun ->
+                   flunk("standalone compact client must not run for #{trigger}")
+                 end
+               )
+
+      refute Map.has_key?(event, "native_replay")
+      assert event["trigger"] == trigger
+    end
+  end
+
+  test "persist_standalone_window marks standalone_window_pruned when output is reduced to cmp_" do
+    cmp = cmp_item("cmp_pruned")
+    output = [%{"type" => "message", "role" => "assistant", "content" => "kept"}, cmp]
+
+    assert {:ok, %{"native_replay" => replay}} =
+             Compaction.persist_standalone_window(local_checkpoint_data(), [cmp],
+               backend: "chatgpt_codex",
+               dialect: "chatgpt_codex",
+               model: "gpt-5.5",
+               compact_output: output
+             )
+
+    assert replay["recorded_usable"] == false
+    assert replay["fallback_reason"] == "standalone_window_pruned"
+  end
+
+  test "unusable standalone blobs fold local text with structured fallback_reason" do
+    missing_cipher = [
+      %{"type" => "message", "role" => "user", "content" => "kept"},
+      %{"type" => "compaction", "id" => "cmp_plain", "encrypted_content" => ""}
+    ]
+
+    assert {:ok, data} =
+             Compaction.persist_standalone_window(local_checkpoint_data(), missing_cipher,
+               backend: "chatgpt_codex",
+               dialect: "chatgpt_codex",
+               model: "gpt-5.5"
+             )
+
+    assert data["native_replay"]["fallback_reason"] == "missing_encrypted_content"
+    refute Compaction.native_replay_fold_usable?(data, capturing_current())
+
+    unpaired = [
+      %{"type" => "function_call", "name" => "read"},
+      cmp_item("cmp_unpaired")
+    ]
+
+    assert {:ok, unpaired_data} =
+             Compaction.persist_standalone_window(local_checkpoint_data(), unpaired,
+               backend: "chatgpt_codex",
+               dialect: "chatgpt_codex",
+               model: "gpt-5.5"
+             )
+
+    assert unpaired_data["native_replay"]["fallback_reason"] == "unpaired_function_call"
+    refute Compaction.native_replay_fold_usable?(unpaired_data, capturing_current())
+  end
+
+  test "compact_threshold product N is distinct from the OpenAI API minimum" do
+    assert Compaction.compact_threshold() == 200_000
+    assert Compaction.compact_threshold_minimum() == 1_000
+    assert Compaction.compact_threshold() > Compaction.compact_threshold_minimum()
+  end
+
+  test "C and D read the same compaction.native overlay preference" do
+    chatgpt = capturing_current()
+
+    assert Compaction.native_preference([]) == nil
+    assert Compaction.native_preference(native: false) == false
+    assert Compaction.native_preference(native: true) == true
+    assert {:on, nil} = Compaction.overlay_after_resolve(nil, chatgpt)
+    assert {:on, nil} = Compaction.overlay_after_resolve(true, chatgpt)
+    assert {:off, "overlay_off"} = Compaction.overlay_after_resolve(false, chatgpt)
+
+    assert {:off, "native_unavailable"} =
+             Compaction.overlay_after_resolve(nil, %{
+               "provider" => "openai_responses",
+               "backend" => "open_responses",
+               "dialect" => "open_responses",
+               "model" => "gpt-5.5"
+             })
+
+    assert {:off, "native_unavailable"} =
+             Compaction.overlay_after_resolve(true, %{
+               "provider" => "anthropic",
+               "backend" => "not_applicable",
+               "dialect" => "anthropic",
+               "model" => "claude-fable-5"
+             })
+
+    assert {:on, nil} =
+             Compaction.overlay_after_resolve(nil, %{
+               "provider" => "openai_responses",
+               "backend" => "open_responses",
+               "dialect" => "open_responses",
+               "model" => "gpt-5.5",
+               "responses_host" => "official_responses"
+             })
+
+    assert "http_404" in Compaction.NativeReplay.fallback_reasons()
+    assert "transport" in Compaction.NativeReplay.fallback_reasons()
+  end
+
+  test "native_threshold_event_data freezes to_seq at input_to_seq and keeps a singleton cmp_" do
+    sid = "sess-threshold-seq"
+
+    history = [
+      Event.user_message(sid, "old") |> Event.with_seq(0),
+      Event.assistant_message(sid, "old answer") |> Event.with_seq(1),
+      Event.user_message(sid, "current") |> Event.with_seq(2)
+    ]
+
+    assert Compaction.input_to_seq(history) == 2
+
+    item = cmp_item("cmp_to_seq")
+
+    assert {:ok, data} =
+             Compaction.native_threshold_event_data(history, 2, item,
+               provider: "openai_responses",
+               backend: "chatgpt_codex",
+               dialect: "chatgpt_codex",
+               model: "gpt-5.5"
+             )
+
+    assert data["trigger"] == "native_threshold"
+    assert data["range"]["to_seq"] == 2
+    assert data["summary"]
+    replay = data["native_replay"]
+    assert replay["mode"] == "threshold_item"
+    assert replay["recorded_usable"] == true
+    assert replay["items"] == [item]
+    refute Enum.any?(replay["items"], &(&1["type"] == "message"))
+  end
+
+  test "native_threshold with no compactable prefix still writes an honest local checkpoint" do
+    assert Compaction.input_to_seq([]) == nil
+
+    assert {:ok, data} =
+             Compaction.native_threshold_event_data([], nil, cmp_item("cmp_empty_prefix"),
+               provider: "openai_responses",
+               backend: "chatgpt_codex",
+               dialect: "chatgpt_codex",
+               model: "gpt-5.5"
+             )
+
+    assert data["trigger"] == "native_threshold"
+    assert data["range"] == %{"from_seq" => 0, "to_seq" => 0}
+    assert data["source_event_count"] == 0
+    assert data["summary"] =~ "no additional compactable prefix events"
+    assert data["limitations"] != []
+    assert data["native_replay"]["recorded_usable"] == true
+  end
+
+  test "failed threshold capture still writes local text with recorded_usable false" do
+    sid = "sess-threshold-fallback"
+
+    history = [
+      Event.user_message(sid, "one") |> Event.with_seq(0),
+      Event.assistant_message(sid, "two") |> Event.with_seq(1)
+    ]
+
+    assert {:ok, data} =
+             Compaction.native_threshold_event_data(
+               history,
+               1,
+               %{"type" => "compaction", "id" => "cmp_empty"},
+               provider: "openai_responses",
+               backend: "chatgpt_codex",
+               dialect: "chatgpt_codex",
+               model: "gpt-5.5"
+             )
+
+    assert data["trigger"] == "native_threshold"
+    assert data["range"]["to_seq"] == 1
+    assert data["summary"]
+    assert data["native_replay"]["recorded_usable"] == false
+    assert data["native_replay"]["fallback_reason"] == "missing_encrypted_content"
+  end
+
+  test "compact_threshold_suppressed? keys hysteresis to the current checkpoint range" do
+    sid = "sess-threshold-hysteresis"
+
+    usage =
+      Event.provider_usage(sid, %{
+        "native_compact" => %{
+          "mode" => "threshold_item",
+          "fallback_reason" => "backend_rejected",
+          "checkpoint_to_seq" => nil
+        }
+      })
+      |> Event.with_seq(1)
+
+    history = [Event.user_message(sid, "hi") |> Event.with_seq(0), usage]
+    assert Compaction.compact_threshold_suppressed?(history)
+
+    checkpoint =
+      Event.history_compaction(sid, %{
+        "range" => %{"from_seq" => 0, "to_seq" => 0},
+        "strategy" => "deterministic_operational_summary_v1",
+        "summary" => "later local compact",
+        "limitations" => ["full Log remains authoritative"]
+      })
+      |> Event.with_seq(2)
+
+    refute Compaction.compact_threshold_suppressed?(history ++ [checkpoint])
+  end
+
+  test "persist_threshold_item does not raise on unstringifiable keys or validate errors" do
+    assert {:error, %{error: %{kind: :malformed_native_replay}}} =
+             Compaction.persist_threshold_item(
+               Map.put(local_checkpoint_data(), 1, "bad"),
+               cmp_item("cmp_bad"),
+               backend: "chatgpt_codex",
+               dialect: "chatgpt_codex",
+               model: "gpt-5.5"
+             )
+
+    assert {:error, %{error: %{kind: :malformed_native_replay}}} =
+             Compaction.persist_threshold_item(local_checkpoint_data(), [%{1 => "bad"}],
+               backend: "chatgpt_codex",
+               dialect: "chatgpt_codex",
+               model: "gpt-5.5"
+             )
+  end
+
+  test "compacted skill_activation stays out of replay and limitation is recorded", %{
+    ws: ws,
+    sid: sid
+  } do
+    append_history(ws, [
+      Event.user_message(sid, "one"),
+      skill_activation_event(sid),
+      Event.assistant_message(sid, "two"),
+      Event.user_message(sid, "three")
+    ])
+
+    assert {:ok, %{"recorded" => true, "event" => event}} =
+             Compaction.compact(sid,
+               workspace: ws,
+               tail_events: 1
+             )
+
+    assert @skill_limitation in event["limitations"]
+    assert event["compacted_skill_activation_count"] >= 1
+
+    history = [
+      Event.history_compaction(sid, event) |> Event.with_seq(4),
+      Event.user_message(sid, "recent") |> Event.with_seq(5)
+    ]
+
+    folded = Compaction.provider_history(history)
+    refute Enum.any?(folded, &(&1.type == :skill_activation))
+  end
+
   defp start_auth do
     name = :"auth_#{System.unique_integer([:positive])}"
-
-    path =
-      Path.join(
-        System.tmp_dir!(),
-        "pixir-compaction-auth-#{System.unique_integer([:positive])}.json"
-      )
+    path = tmp_auth_store("pixir-compaction-auth-")
 
     {:ok, _} =
       Auth.start_link(
@@ -735,8 +1488,20 @@ defmodule Pixir.CompactionTest do
         oauth: __MODULE__.NoOAuth
       )
 
-    on_exit(fn -> File.rm_rf!(path) end)
     name
+  end
+
+  defp tmp_auth_store(prefix) do
+    directory =
+      Path.join(
+        System.tmp_dir!(),
+        prefix <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower)
+      )
+
+    File.rm_rf!(directory)
+    File.mkdir_p!(directory)
+    on_exit(fn -> File.rm_rf!(directory) end)
+    Path.join(directory, "auth.json")
   end
 
   defmodule NoOAuth do
@@ -818,6 +1583,71 @@ defmodule Pixir.CompactionTest do
       "content" => "# Skill #{index}\nTest.",
       "activated_by" => "explicit_mention"
     })
+  end
+
+  defp local_checkpoint_data do
+    %{
+      "range" => %{"from_seq" => 0, "to_seq" => 2},
+      "strategy" => "deterministic_operational_summary_v1",
+      "summary" => "Compacted old context.",
+      "limitations" => ["full Log remains authoritative"],
+      "source_event_count" => 3,
+      "files_touched" => [],
+      "open_tasks" => []
+    }
+  end
+
+  defp cmp_item(id) do
+    %{
+      "type" => "compaction",
+      "id" => id,
+      "encrypted_content" => "CIPHERTEXT_#{id}"
+    }
+  end
+
+  defp capturing_current do
+    %{
+      "provider" => "openai_responses",
+      "backend" => "chatgpt_codex",
+      "dialect" => "chatgpt_codex",
+      "model" => "gpt-5.5"
+    }
+  end
+
+  defp official_capturing_current do
+    %{
+      "provider" => "openai_responses",
+      "backend" => "open_responses",
+      "dialect" => "open_responses",
+      "model" => "gpt-5.5"
+    }
+  end
+
+  defp official_responses_backend do
+    %{
+      "mode" => "open_responses",
+      "responses_url" => "https://api.openai.com/v1/responses",
+      "auth" => %{"policy" => "none"}
+    }
+  end
+
+  defp standalone_output(id) do
+    [
+      %{"type" => "message", "role" => "user", "content" => "kept prefix"},
+      cmp_item(id)
+    ]
+  end
+
+  defp standalone_transport(output, usage \\ %{"input_tokens" => 11, "output_tokens" => 3}) do
+    test = self()
+    payload = %{"output" => output, "usage" => usage}
+
+    fn http_request, acc, fun ->
+      send(test, {:compact_request, http_request})
+      acc = fun.({:status, 200}, acc)
+      acc = fun.({:data, Jason.encode!(payload)}, acc)
+      {:ok, acc}
+    end
   end
 
   defp append_history(ws, events) do

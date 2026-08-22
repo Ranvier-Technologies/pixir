@@ -1,7 +1,8 @@
 # 0002 - Context compaction vs summarization
 
 Status: Investigation / grilled — resolved directions promoted to ADR 0020 (2026-06-09);
-provider-native compaction remains parked here
+provider-native compaction adopted as design in ADR 0040 (2026-08-16, issue #522-A).
+This note remains provenance. It is not the decision record.
 Date: 2026-06-09
 
 ## Source Check
@@ -452,6 +453,16 @@ Advisory before failure, recovery after failure. Not silent rewriting.
 
 ## Parked: Provider-Native Compaction
 
+Resolved 2026-08-16 by ADR 0040 (issue #522-A). The historical notes below are
+preserved as the parked candidate; they are not the accepted contract. In
+particular, "store only the `cmp_` item" is **not** accepted for
+`/responses/compact`, whose full returned window must be persisted unpruned.
+Threshold mode may persist the latest compaction item. Local compact remains
+the default. Native compact is opt-in, model/Provider/backend/dialect-guarded,
+and falls back to the local checkpoint.
+
+Historical parked text (2026-06-09), preserved:
+
 Deferred pending the production WebSocket transport (ADR 0019, in progress). Nothing is
 locked. What is recorded:
 
@@ -565,10 +576,16 @@ Resolved 2026-06-09 (recorded above, promoted as ADR 0020):
 - ~~Trigger policy~~ → advisory gauge + overflow recovery; full-auto only behind a
   future explicit `compaction: auto` policy.
 
-Still open:
+Resolved 2026-08-16 (ADR 0040, issue #522-A):
 
-- Provider-native compaction adoption (parked; revisit when the production WebSocket
-  transport lands; seam candidate = ADR 0007 analogy).
+- ~~Provider-native compaction adoption~~ → opt-in `native_replay` window on
+  `history_compaction`; standalone persists the full compact output; threshold
+  persists the latest `cmp_` item; local compact remains the default; unusable
+  blobs fall back to local text. Overlay amendment (2026-08-16): one
+  default-on overlay after OpenAI Responses resolve; recovery stays local.
+  Implementation map: design note 0004 (#522-B/C/D).
+
+Still open:
 - Should model-assisted compaction use a small tool/schema-only request with no normal
   coding tools exposed? (Leaning yes — ADR 0018's `model_contract/3` already shapes
   this — but unexercised until the networked pass exists.)

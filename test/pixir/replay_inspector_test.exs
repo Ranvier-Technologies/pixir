@@ -3,6 +3,51 @@ defmodule Pixir.ReplayInspectorTest do
 
   alias Pixir.{Event, Log, Provider, ReplayInspector}
 
+  test "inspects native_replay mode and ids without printing ciphertext" do
+    ws = tmp_ws()
+    sid = "inspect-native-replay"
+
+    assert {:ok, data} =
+             Pixir.Compaction.persist_threshold_item(
+               %{
+                 "range" => %{"from_seq" => 0, "to_seq" => 0},
+                 "strategy" => "deterministic_operational_summary_v1",
+                 "summary" => "inspect checkpoint",
+                 "limitations" => ["full Log remains authoritative"]
+               },
+               %{
+                 "type" => "compaction",
+                 "id" => "cmp_inspect_replay",
+                 "encrypted_content" => "CIPHERTEXT_INSPECT_REPLAY"
+               },
+               backend: "chatgpt_codex",
+               dialect: "chatgpt_codex",
+               model: "gpt-5.5"
+             )
+
+    append_all(ws, sid, [
+      Event.user_message(sid, "old"),
+      Event.history_compaction(sid, data),
+      Event.user_message(sid, "recent")
+    ])
+
+    on_exit(fn -> File.rm_rf!(ws) end)
+
+    assert {:ok, result} = ReplayInspector.inspect(sid, workspace: ws)
+    encoded = Jason.encode!(result)
+
+    assert result["history_compaction"]["present"] == true
+    assert result["history_compaction"]["native_replay"]["mode"] == "threshold_item"
+    assert result["history_compaction"]["native_replay"]["recorded_usable"] == true
+
+    assert result["history_compaction"]["native_replay"]["compaction_item_ids"] ==
+             ["cmp_inspect_replay"]
+
+    refute Map.has_key?(result["history_compaction"]["native_replay"], "items")
+    refute encoded =~ "encrypted_content"
+    refute encoded =~ "CIPHERTEXT_INSPECT_REPLAY"
+  end
+
   test "reports balanced function calls for paired tool history" do
     ws = tmp_ws()
     sid = "inspect-balanced"

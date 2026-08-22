@@ -10,6 +10,9 @@ defmodule Pixir.Compaction do
   """
 
   alias Pixir.{Config, Event, Log, Provider, Session, SessionId, SessionSupervisor, Tool}
+  alias Pixir.Compaction.NativeReplay
+  alias Pixir.Provider.Compact
+  alias Pixir.Providers.{ResolvedProviderRequest, ResponsesBackend}
 
   @summary_limit 480
   @max_named_skill_identities 5
@@ -26,14 +29,31 @@ defmodule Pixir.Compaction do
   # are the new gauge-driven paths (preflight before a Turn when the last
   # provider_usage was "critical"; pragmatic recovery when a low-level transport
   # failure like "Could not read WebSocket frame" occurs under critical pressure).
-  # All automatic paths still record an explicit, user-visible
-  # `history_compaction` Event with the trigger — never silent rewrite.
+  # "native_threshold" is the #522-D overlay fire: a `cmp_` item arrived on an
+  # ordinary Turn that sent `compact_threshold`. All automatic paths still record
+  # an explicit, user-visible `history_compaction` Event with the trigger — never
+  # silent rewrite.
   @valid_triggers [
     "manual",
     "overflow_recovery",
     "critical_pressure_preflight",
+    "websocket_critical_recovery",
+    "native_threshold"
+  ]
+
+  @recovery_triggers [
+    "overflow_recovery",
+    "critical_pressure_preflight",
     "websocket_critical_recovery"
   ]
+
+  # Product N sent on overlay-on ordinary Turns. Chosen so native D fires
+  # first around advisory (~70–74% of the ChatGPT-sub 272_000 input ceiling).
+  # OpenAI's documented compact_threshold minimum is 1000; that is the API
+  # floor only, not the product threshold. One number — no per-SKU table
+  # (including gpt-5.3-codex-spark). Do not add a config key for N.
+  @compact_threshold 200_000
+  @compact_threshold_minimum 1_000
 
   @skill_activation_limitation "Skills activated only inside the compacted range are not replayed unless they remain in the recent raw tail or are explicitly re-activated."
 
@@ -170,23 +190,85 @@ defmodule Pixir.Compaction do
   def compact(session_id, opts \\ []) do
     workspace = workspace(opts)
 
-    with {:ok, plan} <- plan(session_id, opts),
-         {:compactable, true} <- {:compactable, plan["compactable"]},
-         {:ok, event_data} <- resolve_event_data(session_id, plan, opts),
+    with {:ok, plan} <- plan(session_id, opts) do
+      if plan["compactable"] do
+        record_compaction(session_id, workspace, plan, opts)
+      else
+        {:ok, plan}
+      end
+    end
+  end
+
+  @doc """
+  Run compaction and normalize its terminal outcome for runtime presenters.
+
+  The result always distinguishes `recorded`, `no_op`, and `error`, and carries the
+  compacted range/checkpoint only when they exist. It deliberately has no token-pressure
+  field: local deterministic compaction does not call a Provider or own a tokenizer, so
+  it cannot honestly calculate the post-compaction `used` gauge.
+  """
+  @spec complete(String.t(), keyword()) :: {:ok, map()}
+  def complete(session_id, opts \\ []) do
+    case compact(session_id, opts) do
+      {:ok, %{"recorded" => true} = result} ->
+        {:ok,
+         %{
+           "status" => "recorded",
+           "range" => get_in(result, ["event", "range"]),
+           "checkpoint" => %{
+             "event_id" => result["compaction_event_id"],
+             "seq" => result["compaction_seq"],
+             "data" => result["event"]
+           }
+         }}
+
+      {:ok, %{"compactable" => false} = result} ->
+        {:ok,
+         %{
+           "status" => "no_op",
+           "range" => nil,
+           "checkpoint" => nil,
+           "reason" => result["reason"] || "no compactable history"
+         }}
+
+      {:ok, result} ->
+        {:ok,
+         %{
+           "status" => "error",
+           "range" => nil,
+           "checkpoint" => nil,
+           "error" =>
+             Tool.error(:invalid_state, "compaction returned an unexpected result", %{
+               result: inspect(result)
+             })
+         }}
+
+      {:error, error} ->
+        {:ok,
+         %{
+           "status" => "error",
+           "range" => nil,
+           "checkpoint" => nil,
+           "error" => error
+         }}
+    end
+  end
+
+  defp record_compaction(session_id, workspace, plan, opts) do
+    with {:ok, event_data, usage} <- resolve_event_data(session_id, plan, opts),
          {:ok, ^session_id, _pid} <-
            SessionSupervisor.start_session(id: session_id, workspace: workspace),
          {:ok, event} <-
-           Session.record(session_id, Event.history_compaction(session_id, event_data)) do
+           Session.record(session_id, Event.history_compaction(session_id, event_data)),
+         :ok <- maybe_record_standalone_usage(session_id, usage) do
       {:ok,
        plan
        |> Map.put("event", event_data)
        |> Map.put("recorded", true)
        |> Map.put("compaction_event_id", event.id)
-       |> Map.put("compaction_seq", event.seq)}
+       |> Map.put("compaction_seq", event.seq)
+       |> Map.merge(native_replay_result_status(event_data, opts))}
     else
-      {:compactable, false} ->
-        {:ok, %{"ok" => true, "compactable" => false, "recorded" => false}}
-
       {:error, _} = error ->
         error
 
@@ -246,6 +328,204 @@ defmodule Pixir.Compaction do
     |> String.trim()
   end
 
+  @doc """
+  Attach a `threshold_item` native replay window to local checkpoint data.
+
+  `item_or_items` must be exactly the latest `cmp_` compaction item. A full
+  compact `output` list is rejected as `threshold_item_not_singleton`.
+  Live Turn ingest uses `native_threshold_event_data/4`.
+  """
+  @spec persist_threshold_item(map(), map() | [map()], keyword()) ::
+          {:ok, map()} | {:error, map()}
+  def persist_threshold_item(local_event_data, item_or_items, opts \\ []) do
+    NativeReplay.persist_threshold_item(local_event_data, item_or_items, opts)
+  end
+
+  @doc """
+  Persist a live threshold capture, always keeping local text.
+
+  A usable singleton `cmp_` becomes `recorded_usable` true. Failed or missing
+  capture still returns local checkpoint data with `recorded_usable` false and
+  a stable `fallback_reason`.
+  """
+  @spec persist_threshold_capture(map(), term(), keyword()) :: {:ok, map()} | {:error, map()}
+  def persist_threshold_capture(local_event_data, item_or_items, opts \\ []) do
+    NativeReplay.persist_threshold_capture(local_event_data, item_or_items, opts)
+  end
+
+  @doc """
+  Product `compact_threshold` sent on overlay-on ordinary Turns.
+
+  This is 200_000, not OpenAI's API minimum. Native D should fire around
+  advisory pressure; local 90% critical preflight / overflow / websocket
+  recovery stay the backstop.
+  """
+  @spec compact_threshold() :: pos_integer()
+  def compact_threshold, do: @compact_threshold
+
+  @doc """
+  OpenAI Responses validation minimum for `compact_threshold`.
+
+  Values below 1000 are rejected by the API. The product default is
+  `compact_threshold/0`; this accessor exists so a future override cannot
+  send below the floor.
+  """
+  @spec compact_threshold_minimum() :: pos_integer()
+  def compact_threshold_minimum, do: @compact_threshold_minimum
+
+  @doc """
+  Operator overlay preference for C and D.
+
+  `nil` means no preference (default-on after resolve for `chatgpt_codex`
+  and official `api.openai.com`). Explicit `false` always wins. One key —
+  not a second threshold switch. Standalone C still requires a host that
+  serves `/responses/compact`; on `chatgpt_codex` C stays local.
+  """
+  @spec native_preference(keyword()) :: nil | boolean()
+  def native_preference(opts \\ []) do
+    case Keyword.get(opts, :native) do
+      value when is_boolean(value) -> value
+      _ -> Config.compaction_native(config_opts(opts))
+    end
+  end
+
+  @doc """
+  Last seq of History actually sent as Provider input after `provider_history/1`.
+
+  This is the frozen `input_to_seq` for a `native_threshold` checkpoint.
+  """
+  @spec input_to_seq([Event.t()]) :: non_neg_integer() | nil
+  def input_to_seq(history) when is_list(history) do
+    history
+    |> provider_history()
+    |> Enum.flat_map(fn
+      %{seq: seq} when is_integer(seq) -> [seq]
+      %{"seq" => seq} when is_integer(seq) -> [seq]
+      _event -> []
+    end)
+    |> case do
+      [] -> nil
+      seqs -> Enum.max(seqs)
+    end
+  end
+
+  @doc """
+  True when a prior Turn already recorded a `compact_threshold` rejection for
+  the current checkpoint range. Prevents retrying the field every Turn.
+  """
+  @spec compact_threshold_suppressed?([Event.t()]) :: boolean()
+  def compact_threshold_suppressed?(history) when is_list(history) do
+    events = proper_events(history)
+    current = latest_checkpoint_to_seq(events)
+
+    Enum.any?(events, fn
+      %{type: :provider_usage, data: data} when is_map(data) ->
+        compact = Map.get(data, "native_compact") || %{}
+        reason = Map.get(compact, "fallback_reason")
+        stored = Map.get(compact, "checkpoint_to_seq")
+
+        reason in ["backend_rejected", "native_unavailable"] and stored == current
+
+      _event ->
+        false
+    end)
+  end
+
+  def compact_threshold_suppressed?(_history), do: false
+
+  @doc """
+  Local `history_compaction` data for a mid-Turn `native_threshold` fire.
+
+  `range.to_seq` is the frozen `input_to_seq`, not Log tip. Local text fields
+  remain mandatory. `item` is the latest stream `cmp_` (or nil on failed capture).
+  """
+  @spec native_threshold_event_data([Event.t()], non_neg_integer() | nil, term(), keyword()) ::
+          {:ok, map()} | {:error, map()}
+  def native_threshold_event_data(history, input_to_seq, item, opts \\ [])
+
+  def native_threshold_event_data(history, input_to_seq, item, opts)
+      when is_list(history) and (is_integer(input_to_seq) or is_nil(input_to_seq)) do
+    to_seq = input_to_seq || 0
+    local = threshold_local_event_data(history, to_seq)
+    persist_threshold_capture(local, item, opts)
+  end
+
+  def native_threshold_event_data(_history, _input_to_seq, _item, _opts) do
+    {:error,
+     Tool.error(:invalid_args, "native_threshold event data requires History and input_to_seq", %{
+       field: "history"
+     })}
+  end
+
+  @doc """
+  Attach a `standalone_window` from a compact `output` list.
+
+  Persists the entire unpruned `output`. Local text fields remain mandatory.
+  """
+  @spec persist_standalone_window(map(), term(), keyword()) :: {:ok, map()} | {:error, map()}
+  def persist_standalone_window(local_event_data, output, opts \\ []) do
+    NativeReplay.persist_standalone_window(local_event_data, output, opts)
+  end
+
+  @doc """
+  Overlay bit after Provider/backend resolve.
+
+  `preference` is `nil` (no preference), `true` (request on), or `false`.
+  """
+  @spec overlay_after_resolve(nil | boolean(), map() | ResolvedProviderRequest.t()) ::
+          {:on, nil} | {:off, String.t()}
+  def overlay_after_resolve(preference, resolved) do
+    NativeReplay.overlay_after_resolve(preference, overlay_identity(resolved))
+  end
+
+  @doc "Capturing identity used to persist and fold a native window."
+  @spec capturing_current(map() | ResolvedProviderRequest.t() | keyword()) :: map()
+  def capturing_current(resolved) when is_list(resolved),
+    do: NativeReplay.capturing_identity(resolved)
+
+  def capturing_current(resolved), do: overlay_identity(resolved)
+
+  @doc """
+  Validate `native_replay` for `threshold_item` or `standalone_window`.
+
+  Pass `compact_output:` so reducing that output to `cmp_` alone is
+  `standalone_window_pruned`.
+  """
+  @spec validate_native_replay(term(), keyword()) :: {:ok, map()} | {:error, map()}
+  def validate_native_replay(native_replay, opts \\ []) do
+    NativeReplay.validate_native_replay(native_replay, opts)
+  end
+
+  @doc """
+  Bounded inspect of `native_replay`: mode, usable, ids, fallback reason.
+
+  Never includes `encrypted_content` or verbatim items.
+  """
+  @spec inspect_native_replay(term()) :: map() | nil
+  def inspect_native_replay(data), do: NativeReplay.inspect_native_replay(data)
+
+  @doc "Replace checkpoint `native_replay` with the inspect projection."
+  @spec project_checkpoint_for_inspect(map()) :: map()
+  def project_checkpoint_for_inspect(data) when is_map(data) do
+    NativeReplay.project_checkpoint_for_inspect(data)
+  end
+
+  @doc "Sanitize compact/complete JSON so ciphertext never prints."
+  @spec project_compact_result_for_inspect(map()) :: map()
+  def project_compact_result_for_inspect(result) when is_map(result) do
+    NativeReplay.project_compact_result_for_inspect(result)
+  end
+
+  @doc """
+  True when Provider fold may send `native_replay.items` as the compacted prefix.
+
+  Anthropic fold never takes this branch.
+  """
+  @spec native_replay_fold_usable?(map(), map()) :: boolean()
+  def native_replay_fold_usable?(event_data, current) do
+    NativeReplay.fold_usable?(event_data, current)
+  end
+
   @doc "Build the deterministic compaction plan for a Session."
   @spec plan(String.t(), keyword()) :: {:ok, map()} | {:error, map()}
   def plan(session_id, opts \\ []) do
@@ -274,7 +554,9 @@ defmodule Pixir.Compaction do
            "compactable" => false,
            "recorded" => false,
            "tail_events" => length(tail),
-           "reason" => "history does not exceed requested tail"
+           "reason" => "history does not exceed requested tail",
+           "native_replay_usable" => false,
+           "native_replay_reason" => compact_native_skip_reason(opts)
          }}
       else
         event_data =
@@ -291,7 +573,8 @@ defmodule Pixir.Compaction do
            "tail_events" => length(tail),
            "would_compact_events" => length(compact_prefix),
            "event" => event_data
-         }}
+         }
+         |> Map.merge(native_replay_result_status(event_data, opts))}
       end
     end
   end
@@ -325,10 +608,20 @@ defmodule Pixir.Compaction do
 
   defp maybe_mark_model_assisted(event_data, false), do: event_data
 
-  defp resolve_event_data(_session_id, %{"model_assisted" => false, "event" => event}, _opts),
-    do: {:ok, event}
+  defp resolve_event_data(session_id, plan, opts) do
+    with {:ok, local} <- resolve_local_event_data(session_id, plan, opts) do
+      maybe_attach_standalone(session_id, local, opts)
+    end
+  end
 
-  defp resolve_event_data(session_id, %{"model_assisted" => true, "event" => event}, opts) do
+  defp resolve_local_event_data(
+         _session_id,
+         %{"model_assisted" => false, "event" => event},
+         _opts
+       ),
+       do: {:ok, event}
+
+  defp resolve_local_event_data(session_id, %{"model_assisted" => true, "event" => event}, opts) do
     with {:ok, compact_prefix, _tail, _trigger} <- compaction_material(session_id, opts),
          {:ok, model_event} <-
            model_assisted_event_data(session_id, compact_prefix, event, opts) do
@@ -347,7 +640,325 @@ defmodule Pixir.Compaction do
     end
   end
 
-  defp resolve_event_data(_session_id, %{"event" => event}, _opts), do: {:ok, event}
+  defp resolve_local_event_data(_session_id, %{"event" => event}, _opts), do: {:ok, event}
+
+  defp maybe_attach_standalone(session_id, local, opts) do
+    if trigger(opts) in @recovery_triggers or trigger(opts) == "native_threshold" do
+      {:ok, local, nil}
+    else
+      case overlay_decision(opts) do
+        {:on, resolved} ->
+          if Compact.standalone_supported?(resolved) do
+            attach_standalone(session_id, local, opts, resolved)
+          else
+            {:ok, local, nil}
+          end
+
+        {:off, _reason} ->
+          {:ok, local, nil}
+
+        {:unresolved, _reason} ->
+          {:ok, local, nil}
+      end
+    end
+  end
+
+  defp overlay_decision(opts) do
+    preference = native_preference(opts)
+
+    case resolve_for_overlay(opts) do
+      {:ok, resolved} ->
+        case overlay_after_resolve(preference, resolved) do
+          {:on, _} -> {:on, resolved}
+          {:off, reason} -> {:off, reason}
+        end
+
+      {:error, _reason} ->
+        {:unresolved, :resolve_failed}
+    end
+  end
+
+  defp resolve_for_overlay(opts) do
+    case Keyword.get(opts, :provider) do
+      Pixir.Providers.Anthropic ->
+        {:ok, :anthropic}
+
+      _other ->
+        case Provider.resolve_for_compact(overlay_provider_opts(opts)) do
+          {:ok, resolved, _opts} -> {:ok, resolved}
+          {:error, _} = error -> error
+        end
+    end
+  end
+
+  defp overlay_provider_opts(opts) do
+    opts
+    |> Keyword.take([
+      :auth,
+      :model,
+      :base_url,
+      :responses_backend,
+      :resolved_provider_request,
+      :config_path,
+      :raw_config,
+      :request_snapshot_loader
+    ])
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp overlay_identity(:anthropic) do
+    %{
+      "provider" => "anthropic",
+      "backend" => "not_applicable",
+      "dialect" => "anthropic",
+      "model" => "",
+      "responses_host" => "other"
+    }
+  end
+
+  defp overlay_identity(%ResolvedProviderRequest{} = resolved) do
+    backend = ResolvedProviderRequest.responses_backend(resolved)
+    provider = overlay_provider_name(ResolvedProviderRequest.provider(resolved))
+
+    {backend_name, dialect} =
+      overlay_backend_identity(backend, ResolvedProviderRequest.dialect(resolved))
+
+    %{
+      "provider" => provider,
+      "backend" => backend_name,
+      "dialect" => dialect,
+      "model" => ResolvedProviderRequest.model(resolved),
+      "responses_host" => Atom.to_string(Compact.responses_host(resolved))
+    }
+  end
+
+  defp overlay_identity(identity) when is_map(identity), do: identity
+
+  defp overlay_provider_name(Pixir.Provider), do: "openai_responses"
+  defp overlay_provider_name(Pixir.Providers.Anthropic), do: "anthropic"
+  defp overlay_provider_name(other) when is_atom(other), do: inspect(other)
+  defp overlay_provider_name(_other), do: "unknown"
+
+  defp overlay_backend_identity(%ResponsesBackend{} = backend, _dialect) do
+    mode = Atom.to_string(ResponsesBackend.mode(backend))
+    {mode, mode}
+  end
+
+  defp overlay_backend_identity(:not_applicable, :anthropic),
+    do: {"not_applicable", "anthropic"}
+
+  defp overlay_backend_identity(_backend, dialect) when is_atom(dialect),
+    do: {"unknown", Atom.to_string(dialect)}
+
+  defp overlay_backend_identity(_backend, _dialect), do: {"unknown", "unknown"}
+
+  defp attach_standalone(session_id, local, opts, resolved) do
+    capturing = capturing_current(resolved)
+    capturing_opts = capturing_persist_opts(capturing)
+
+    case compaction_material(session_id, opts) do
+      {:ok, compact_prefix, _tail, _trigger} ->
+        call_standalone(local, compact_prefix, opts, capturing_opts)
+
+      {:error, _} ->
+        {:ok, local, nil}
+    end
+  end
+
+  defp call_standalone(local, compact_prefix, opts, capturing_opts) do
+    provider_opts = standalone_provider_opts(opts)
+
+    case Provider.compact(%{history: compact_prefix}, provider_opts) do
+      {:ok, %{output: output} = result} ->
+        persist_standalone_result(local, output, capturing_opts, result)
+
+      {:error, error} ->
+        standalone_error_result(local, capturing_opts, error)
+    end
+  end
+
+  defp persist_standalone_result(local, output, capturing_opts, result) do
+    case persist_standalone_window(local, output, capturing_opts) do
+      {:ok, event_data} ->
+        {:ok, event_data, standalone_usage_payload(result, event_data)}
+
+      {:error, _error} ->
+        {:ok, local, nil}
+    end
+  end
+
+  defp standalone_error_result(local, capturing_opts, error) do
+    cond do
+      compact_attempted?(error) ->
+        reason = standalone_fallback_reason(error)
+
+        case persist_standalone_window(local, [], capturing_opts ++ [fallback_reason: reason]) do
+          {:ok, event_data} -> {:ok, event_data, nil}
+          {:error, _} -> {:ok, local, nil}
+        end
+
+      true ->
+        {:ok, local, nil}
+    end
+  end
+
+  defp compact_attempted?(error) do
+    get_in(error, [:error, :details, :compact_attempted]) == true or
+      get_in(error, [:error, :details, "compact_attempted"]) == true
+  end
+
+  defp standalone_fallback_reason(%{error: %{kind: :backend_rejected}}), do: "backend_rejected"
+
+  defp standalone_fallback_reason(%{error: %{kind: :native_unavailable}}),
+    do: "native_unavailable"
+
+  defp standalone_fallback_reason(%{error: %{kind: kind, details: details}})
+       when is_map(details) do
+    cond do
+      compact_http_status(details) == 404 ->
+        "http_404"
+
+      kind in [:network, :provider_http_error] ->
+        "transport"
+
+      true ->
+        "malformed_native_replay"
+    end
+  end
+
+  defp standalone_fallback_reason(_error), do: "malformed_native_replay"
+
+  defp compact_http_status(details) when is_map(details) do
+    details[:status] || details["status"]
+  end
+
+  defp native_replay_result_status(event_data, opts) when is_map(event_data) do
+    case inspect_native_replay(event_data) do
+      %{"recorded_usable" => true} ->
+        %{"native_replay_usable" => true}
+
+      %{"recorded_usable" => _false, "fallback_reason" => reason} ->
+        %{
+          "native_replay_usable" => false,
+          "native_replay_reason" => reason
+        }
+
+      %{"recorded_usable" => _false} ->
+        %{
+          "native_replay_usable" => false,
+          "native_replay_reason" => compact_native_skip_reason(opts)
+        }
+
+      nil ->
+        %{
+          "native_replay_usable" => false,
+          "native_replay_reason" => compact_native_skip_reason(opts)
+        }
+    end
+  end
+
+  defp compact_native_skip_reason(opts) do
+    cond do
+      trigger(opts) in @recovery_triggers or trigger(opts) == "native_threshold" ->
+        "native_unavailable"
+
+      true ->
+        case overlay_decision(opts) do
+          {:off, reason} when is_binary(reason) ->
+            reason
+
+          {:on, resolved} ->
+            if Compact.standalone_supported?(resolved),
+              do: "malformed_native_replay",
+              else: "native_unavailable"
+
+          {:unresolved, _reason} ->
+            "native_unavailable"
+        end
+    end
+  end
+
+  defp capturing_persist_opts(capturing) when is_map(capturing) do
+    [
+      provider: capturing["provider"],
+      backend: capturing["backend"],
+      dialect: capturing["dialect"],
+      model: capturing["model"]
+    ]
+  end
+
+  defp standalone_provider_opts(opts) do
+    opts
+    |> Keyword.take([
+      :transport,
+      :auth,
+      :model,
+      :base_url,
+      :max_retries,
+      :sleep,
+      :responses_backend,
+      :resolved_provider_request,
+      :config_path,
+      :raw_config,
+      :request_snapshot_loader,
+      :workspace
+    ])
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp standalone_usage_payload(result, event_data) do
+    replay = event_data["native_replay"] || %{}
+    inspected = inspect_native_replay(event_data) || %{}
+    usage = Map.get(result, :usage) || %{}
+    summary = Map.get(result, :usage_summary) || %{}
+
+    %{
+      "model" => replay["model"],
+      "call_role" => "compaction",
+      "usage" => stringify_usage(usage),
+      "usage_summary" => stringify_usage(summary),
+      "native_compact" =>
+        %{
+          "mode" => inspected["mode"],
+          "recorded_usable" => inspected["recorded_usable"],
+          "compaction_item_ids" => inspected["compaction_item_ids"] || []
+        }
+        |> maybe_put_usage_fallback(inspected)
+    }
+  end
+
+  defp maybe_put_usage_fallback(payload, %{"fallback_reason" => reason})
+       when is_binary(reason) and reason != "",
+       do: Map.put(payload, "fallback_reason", reason)
+
+  defp maybe_put_usage_fallback(payload, _inspected), do: payload
+
+  defp stringify_usage(value) when is_map(value) do
+    Map.new(value, fn
+      {key, nested} when is_atom(key) and is_map(nested) ->
+        {Atom.to_string(key), stringify_usage(nested)}
+
+      {key, nested} when is_binary(key) and is_map(nested) ->
+        {key, stringify_usage(nested)}
+
+      {key, nested} when is_atom(key) ->
+        {Atom.to_string(key), nested}
+
+      {key, nested} ->
+        {key, nested}
+    end)
+  end
+
+  defp stringify_usage(value), do: value
+
+  defp maybe_record_standalone_usage(_session_id, nil), do: :ok
+
+  defp maybe_record_standalone_usage(session_id, usage) when is_map(usage) do
+    case Session.record(session_id, Event.provider_usage(session_id, usage)) do
+      {:ok, _event} -> :ok
+      {:error, _error} -> :ok
+    end
+  end
 
   defp compaction_material(session_id, opts) do
     workspace = workspace(opts)
@@ -692,11 +1303,78 @@ defmodule Pixir.Compaction do
     history |> latest_compaction() |> compaction_to_seq()
   end
 
-  defp latest_compaction(history) do
+  defp threshold_local_event_data(history, input_to_seq) when is_integer(input_to_seq) do
+    latest = latest_compaction(history)
+    latest_to_seq = compaction_to_seq(latest)
+
+    prefix =
+      history
+      |> Enum.reject(&(&1.type == :history_compaction))
+      |> Enum.filter(fn event ->
+        is_integer(event.seq) and event.seq <= input_to_seq and
+          (is_nil(latest_to_seq) or event.seq > latest_to_seq)
+      end)
+
+    tail =
+      history
+      |> Enum.reject(&(&1.type == :history_compaction))
+      |> Enum.filter(fn event -> is_integer(event.seq) and event.seq > input_to_seq end)
+
+    compact_prefix = carry_forward(latest, prefix)
+
+    local =
+      if compact_prefix == [] do
+        empty_threshold_local(input_to_seq)
+      else
+        event_data(compact_prefix, tail, "native_threshold")
+      end
+
+    put_in(local, ["range", "to_seq"], input_to_seq)
+  end
+
+  defp empty_threshold_local(input_to_seq) do
+    %{
+      "strategy" => @strategy_deterministic,
+      "trigger" => "native_threshold",
+      "range" => %{"from_seq" => 0, "to_seq" => input_to_seq},
+      "source_event_count" => 0,
+      "tail_event_count" => 0,
+      "event_counts" => %{},
+      "compacted_skill_activation_count" => 0,
+      "compacted_skill_activations" => [],
+      "tool_calls" => [],
+      "files_touched" => [],
+      "open_tasks" => [],
+      "limitations" => [
+        "Deterministic compaction keeps operational facts and recent tail; it is not a semantic substitute for the full Log.",
+        "The full NDJSON Log remains authoritative for audit, resume repair, and deeper reconstruction."
+      ],
+      "summary" => "Native compact_threshold fired with no additional compactable prefix events."
+    }
+  end
+
+  defp latest_compaction(history) when is_list(history) do
     history
-    |> Enum.filter(&(&1.type == :history_compaction))
+    |> proper_events()
+    |> Enum.filter(fn
+      %{type: :history_compaction} -> true
+      _event -> false
+    end)
     |> Enum.max_by(&(&1.seq || -1), fn -> nil end)
   end
+
+  defp latest_compaction(_history), do: nil
+
+  # Overlay hysteresis may inspect request History before `validate_history/1`.
+  # Walk only a proper list of maps so hostile/improper input fails closed later.
+  defp proper_events(list) when is_list(list), do: proper_events(list, [])
+
+  defp proper_events([head | tail], acc) when is_map(head),
+    do: proper_events(tail, [head | acc])
+
+  defp proper_events([_head | tail], acc), do: proper_events(tail, acc)
+  defp proper_events([], acc), do: Enum.reverse(acc)
+  defp proper_events(_improper, acc), do: Enum.reverse(acc)
 
   defp compaction_to_seq(nil), do: nil
 

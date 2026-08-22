@@ -194,6 +194,50 @@ defmodule PixirMonitor.UIContractTest do
     assert css =~ ".sr-only"
   end
 
+  test "every landmark-level region carries an accessible name, the manual pane included", %{
+    js: js
+  } do
+    # `<aside>` is a COMPLEMENTARY landmark: assistive technology announces it in
+    # the landmark rota whether or not it has a name, and an unnamed one is
+    # announced as a bare "complementary" — which tells the operator nothing
+    # about which of the page's regions they just landed in. The instrument
+    # manual pane shipped as the only landmark-level region in the bundle
+    # without a name.
+    assert js =~ ~s|const pane = el("aside", "manual-pane");|
+    assert js =~ ~s|pane.setAttribute("aria-label", "Instrument manual");|
+
+    # The name is applied to the PANE ELEMENT ITSELF, before its content is
+    # built: a label hung on the header or the body would name a child of the
+    # landmark rather than the landmark.
+    assert js =~ ~s|const header = el("header", "manual-pane-header");|,
+           "the pane header construction moved; re-anchor the ordering pin below"
+
+    {pane_at, _} = :binary.match(js, ~s|const pane = el("aside", "manual-pane");|)
+    {label_at, _} = :binary.match(js, ~s|pane.setAttribute("aria-label", "Instrument manual");|)
+    {header_at, _} = :binary.match(js, ~s|const header = el("header", "manual-pane-header");|)
+    assert pane_at < label_at
+    assert label_at < header_at
+
+    # The convention the pane now follows, pinned alongside it so the pane is not
+    # the only named region should one of these ever lose its label. All five use
+    # the same direct aria-label idiom.
+    for name <- [
+          ~s|form.setAttribute("aria-label", "Run filters")|,
+          ~s|form.setAttribute("aria-label", "Run search")|,
+          ~s|rail.setAttribute("aria-label", "Seven independent truth dimensions")|,
+          ~s|overview.setAttribute("aria-label", "Workflow cluster overview")|,
+          ~s|nav.setAttribute("aria-label", "Attempt lineage for "|
+        ] do
+      assert js =~ name
+    end
+
+    # `<aside>` appears exactly once in the bundle, so pinning the manual pane's
+    # label is pinning every complementary landmark there is. A second unnamed
+    # one appearing later must land here as a failure rather than slip in
+    # unnoticed.
+    assert length(String.split(js, ~s|el("aside"|)) - 1 == 1
+  end
+
   test "bundle has same-origin read-only transport and no remote or mutation request surface", %{js: js, css: css} do
     assert js =~ "method: \"GET\""
     assert js =~ "credentials: \"same-origin\""
@@ -217,9 +261,16 @@ defmodule PixirMonitor.UIContractTest do
     assert js =~ "const rows = grouped[group].slice(0, budget)"
     assert js =~ "runs:" <> "\" + group.toLowerCase()"
     assert js =~ "Gate\", \"Advisory"
-    assert js =~ "runTable(rows, grouped[group].length, group, matches, groupFocusKey)"
-    assert js =~ "labeledMarker(count + \" \""
+    assert js =~ "runTable(rows, grouped[group].length, group, matches, groupFocusKey, route)"
+    assert js =~ "phrase: count + \" \""
     assert js =~ "residual + \" unrecognized\""
+    # The residual bucket lives in ONE fold, which both the truth rail's markers
+    # and the manual pane's prose read. A second private loop on either side is
+    # how the pane came to read "0 observed" over a run the rail called
+    # "N unrecognized".
+    assert js =~ "function distributionBuckets(counts, order, aliases)"
+    assert js =~ "return distributionBuckets(counts, order, aliases).map("
+    assert js =~ "distributionBuckets(counts, order, aliases).forEach("
     assert js =~ "MARKER_TONES.has(tone) ? tone : \"unknown\""
     assert js =~ "[\"stop\", \"needs_review\", \"pass\", \"unknown\", \"invalid\"]"
     assert js =~ "marker(unit.liveness && unit.liveness.state"
@@ -283,7 +334,15 @@ defmodule PixirMonitor.UIContractTest do
     assert js =~ ~s|params.set("sort", route.sort)|
     assert js =~ "const sorted = filtered.slice().sort(runsComparator(route.sort || DEFAULT_SORT));"
     assert js =~ "const searched = sorted.filter"
-    assert js =~ ~s|routeHash({view: "runs", filters: route.filters, sort: route.sort, q: route.q})|
+
+    # The per-group PAGE KEY composes the same filters/sort/query the route
+    # carries, so paging is scoped to the exact list being paged. It pins the
+    # manual field CLOSED because it is a state key rather than a navigation
+    # target: opening the overlay is a pure re-render, and an overlay-sensitive
+    # key would silently reset every group back to page 1 when the pane opens.
+    assert js =~
+             ~s|routeHash({view: "runs", filters: route.filters, sort: route.sort, q: route.q, manual: null})|
+
     assert js =~ ~s|routeHash({view: "runs", filters: next, sort: route.sort, q: route.q})|
     assert js =~ "sortVocabulary: SORT_VOCABULARY"
   end
@@ -307,7 +366,8 @@ defmodule PixirMonitor.UIContractTest do
 
     # Relative labels are display conveniences: the projected absolute value stays
     # rendered, and a non-complete boundary never gains a browser-clock value.
-    assert js =~ ~s|untrustedText("span", scalar(latest.value, "Unknown"), "absolute-ts")|
+    assert js =~ "displayInstant(latest.value)"
+    assert js =~ ~s|"absolute-ts"|
     assert js =~ ~s|if (boundary.completeness !== "complete") return null;|
     assert css =~ ".relative-label"
   end
@@ -323,7 +383,12 @@ defmodule PixirMonitor.UIContractTest do
     # Composition: filters first, then search, then grouping and per-group pages.
     assert js =~ "const match = searchMatch(row, route.q)"
     assert js =~ ~s|grouped[group] = searched.filter(function (row) { return groupFor(row) === group; })|
-    assert js =~ ~s|routeHash({view: "runs", filters: route.filters, sort: route.sort, q: route.q})|
+
+    # As above: the page key composes filters/sort/query and pins the manual
+    # overlay closed, because paging state must not move when the pane opens.
+    assert js =~
+             ~s|routeHash({view: "runs", filters: route.filters, sort: route.sort, q: route.q, manual: null})|
+
     assert js =~ ~s|location.hash = routeHash({view: "runs", filters: next, sort: route.sort, q: route.q})|
 
     # Exact parent-observed child Session id resolution; no child Log scan, no index.
@@ -367,5 +432,22 @@ defmodule PixirMonitor.UIContractTest do
     assert js =~ ~S|if (left.normalized !== right.normalized) {|
     assert js =~ ~S|if (sort === "recency_desc") return left.normalized > right.normalized ? -1 : 1;|
     assert js =~ ~S|return left.normalized < right.normalized ? -1 : 1;|
+  end
+
+  test "manual keyboard bindings are inert on the boot-error screen", %{js: js} do
+    # The malformed-shell-config paint deliberately starts no fetch and no
+    # stream; a live `?` binding there would fire the suppressed authoritative
+    # fetch and replace the honest failure message with a painted view. The
+    # guard must be the handler's first statement, ahead of every other check.
+    [_, handler_head] = String.split(js, ~S|document.addEventListener("keydown", function (event) {|, parts: 2)
+
+    first_statement =
+      handler_head
+      |> String.split("\n")
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == "" or String.starts_with?(&1, "//")))
+      |> hd()
+
+    assert first_statement == "if (shellConfigError) return;"
   end
 end

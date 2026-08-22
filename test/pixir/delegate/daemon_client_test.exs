@@ -157,6 +157,22 @@ defmodule Pixir.Delegate.DaemonClientTest do
     %{ws: ws}
   end
 
+  defp daemon_start_spec_meta(effective_timeout_ms) do
+    %{
+      "strategy" => "subagents",
+      "planned_child_count" => 1,
+      "critical_path" => %{
+        "strategy" => "subagents",
+        "effective_timeout_ms" => effective_timeout_ms,
+        "estimated_critical_path_ms" => 120_000,
+        "waves" => 1,
+        "suggested_timeout_ms" => 120_000,
+        "per_wave_budget_ms" => 120_000,
+        "wave_budgets_ms" => [120_000]
+      }
+    }
+  end
+
   test "daemon client routes start status cancel through loopback IPC", %{ws: ws} do
     assert {:ok, pid} = DaemonServer.start_link(workspace: ws, async: FakeAsync)
 
@@ -196,8 +212,8 @@ defmodule Pixir.Delegate.DaemonClientTest do
                "delegate_start",
                %{
                  "request" => %{"json?" => true, "contract_version" => 1},
-                 "spec" => %{"task" => "inspect"},
-                 "spec_meta" => %{"planned_child_count" => 1}
+                 "spec" => %{"strategy" => "subagents", "task" => "inspect"},
+                 "spec_meta" => daemon_start_spec_meta(120_000)
                },
                workspace: ws
              )
@@ -254,10 +270,11 @@ defmodule Pixir.Delegate.DaemonClientTest do
                  "request" => %{
                    "json?" => true,
                    "contract_version" => 1,
+                   "timeout_ms" => 60_000,
                    "allow_short_horizon?" => true
                  },
-                 "spec" => %{"task" => "inspect"},
-                 "spec_meta" => %{"planned_child_count" => 1}
+                 "spec" => %{"strategy" => "subagents", "task" => "inspect"},
+                 "spec_meta" => daemon_start_spec_meta(60_000)
                },
                workspace: ws
              )

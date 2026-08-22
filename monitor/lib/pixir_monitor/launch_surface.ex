@@ -54,11 +54,11 @@ defmodule PixirMonitor.LaunchSurface do
   Starts the launch surface without linking it to the caller.
 
   `PixirMonitor.CLI` uses this so no auxiliary exit can reach serving. Linking
-  first and calling `Process.unlink/1` afterwards leaves a window: the darwin
-  launch runs in `handle_continue(:begin, ...)`, and an exit or throw raised
-  there (a `:browser_launcher` seam is arbitrary code, and the `rescue` in
-  `launch_once/1` covers neither) would propagate to a serving process that does
-  not trap exits before the unlink runs.
+  first and calling `Process.unlink/1` afterwards leaves a window while the
+  darwin launch runs in `handle_continue(:begin, ...)`. `launch_once/1`
+  classifies the injected launcher's raise, throw, and exit modes, but starting
+  unlinked remains the defense against any future auxiliary crash escaping that
+  boundary.
   """
   @spec start_unlinked(keyword()) :: GenServer.on_start()
   def start_unlinked(opts), do: GenServer.start(__MODULE__, opts, Keyword.take(opts, [:name]))
@@ -372,13 +372,18 @@ defmodule PixirMonitor.LaunchSurface do
     # Same boundary rule as PixirMonitor.Runtime: a raised message can carry the
     # capability URL, so report a fixed atom instead of the exception.
     _error -> launcher_error(:launcher_raised)
+  catch
+    # Throw and exit payloads are equally untrusted. Never inspect or retain
+    # either term: each mode collapses to this module's fixed classification.
+    :throw, _reason -> launcher_error(:launcher_threw)
+    :exit, _reason -> launcher_error(:launcher_exited)
   end
 
   # Fixed reasons only. A launcher error never travels as a term: an atom from
   # this module's own vocabulary is mapped through, and everything else — every
   # map, string, and term the callback chose — collapses to a single opaque
   # reason. `inspect/1` runs on the atom, never on the callback's payload.
-  @launcher_reasons ~w(launcher_contract_violation launcher_raised)a
+  @launcher_reasons ~w(launcher_contract_violation launcher_raised launcher_threw launcher_exited)a
 
   defp launcher_error(reason) when reason in @launcher_reasons, do: launcher_error_frame(inspect(reason))
   defp launcher_error(_reason), do: launcher_error_frame(":launcher_reported_failure")

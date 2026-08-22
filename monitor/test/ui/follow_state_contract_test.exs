@@ -24,10 +24,22 @@ defmodule PixirMonitor.FollowStateContractTest do
       # Detail and unit routes carry follow; the runs list never does.
       # Detail routes gained the source-scoped workspace discriminator (#349);
       # follow still rides in the same position.
-      assert js =~ ~s|{view: "detail", workspace: workspace, runId: routeSegments[1], filters: filters, sort: sort, q: q, follow: follow}|
-      assert js =~ ~s|attemptId: params.get("attempt"), filters: filters, sort: sort, q: q, follow: follow}|
-      assert js =~ ~s|{view: "runs", workspace: workspace, filters: filters, sort: sort, q: q, follow: false}|
-      assert js =~ ~s|if (segments.some(function (segment) { return segment === null; })) return Object.assign({view: "invalid", filters: filters, sort: sort, q: q, follow: false}, zoom);|
+      # #551 appended the orthogonal `manual` overlay field AFTER follow on every
+      # family. follow's own position, value, and per-family truth are unchanged;
+      # the literals below are widened only to admit the trailing field.
+      assert js =~ ~s|{view: "detail", workspace: workspace, runId: routeSegments[1], filters: filters, sort: sort, q: q, follow: follow, manual: manual}|
+      assert js =~ ~s|attemptId: params.get("attempt"), filters: filters, sort: sort, q: q, follow: follow, manual: manual}|
+      assert js =~ ~s|{view: "runs", workspace: workspace, filters: filters, sort: sort, q: q, follow: false, manual: manual}|
+
+      # The unavailable route also gained `invalidPath`, which preserves the raw
+      # undecodable path so routeHash can re-emit it instead of falling through
+      # to the runs-path construction and DEMOTING the route when the manual
+      # overlay opens over it. follow is still pinned false here: an unavailable
+      # route can never be a followed one, whatever the hash claimed.
+      invalid_route =
+        ~S/if (segments.some(function (segment) { return segment === null; })) return Object.assign({view: "invalid", invalidPath: parts[0] || "", filters: filters, sort: sort, q: q, follow: false, manual: manual}, zoom);/
+
+      assert js =~ invalid_route
     end
 
     test "follow is enterable and leavable from run selection via labeled links", %{js: js} do

@@ -1,7 +1,20 @@
 defmodule Pixir.ForkTest do
   use ExUnit.Case, async: false
 
-  alias Pixir.{Compaction, Event, Fork, Log, Session, SessionResources, SessionSupervisor}
+  alias Pixir.{
+    Compaction,
+    Event,
+    Fork,
+    Log,
+    Paths,
+    Session,
+    SessionResources,
+    SessionSupervisor,
+    Subagents,
+    Tool
+  }
+
+  alias Pixir.Subagents.WarmStart
 
   setup do
     ws = Path.join(System.tmp_dir!(), "pixir-fork-#{System.unique_integer([:positive])}")
@@ -127,6 +140,168 @@ defmodule Pixir.ForkTest do
     assert length(parent_history) == 3
   end
 
+  test "forking a warm Log preserves its boundary-scoped current posture", %{ws: ws} do
+    warm_parent = "parent-warm-boundary"
+    seed = "seed-warm-boundary"
+
+    seed_parent(ws, warm_parent, [
+      Event.session_fork(warm_parent, %{
+        "parent_session_id" => seed,
+        "fork_root_session_id" => seed,
+        "replay_event_count" => 2,
+        "strategy" => "replay_v1",
+        "source" => "delegate_warm_start"
+      }),
+      Event.subagent_event(warm_parent, %{
+        "event" => "permission_posture",
+        "scope" => "session",
+        "lineage" => "root",
+        "source" => "root_session_start",
+        "permission_mode" => "auto",
+        "write_policy" => nil,
+        "workspace_mode" => "shared",
+        "workspace" => ws
+      }),
+      Event.user_message(warm_parent, "historical seed context"),
+      Event.new(warm_parent, :user_message, %{
+        "text" => WarmStart.boundary_text(seed),
+        "lineage_boundary" => true,
+        "author" => "runtime",
+        "marker_kind" => WarmStart.boundary_marker_kind(),
+        "seed_session_id" => seed,
+        "fork_root_session_id" => seed,
+        "replay_event_count" => 2
+      }),
+      Event.subagent_event(warm_parent, %{
+        "event" => "permission_posture",
+        "scope" => "session",
+        "lineage" => "child",
+        "source" => "subagent_spawn",
+        "subagent_id" => "sub_warm_parent",
+        "parent_session_id" => "parent_of_warm_parent",
+        "permission_mode" => "read_only",
+        "write_policy" => nil,
+        "workspace_mode" => "shared",
+        "workspace" => ws,
+        "warm_start" => %{
+          "warm_started" => true,
+          "seed_session_id" => seed,
+          "fork_root_session_id" => seed,
+          "replay_event_count" => 2,
+          "strategy" => "replay_v1",
+          "boundary_marker_kind" => WarmStart.boundary_marker_kind()
+        }
+      }),
+      Event.user_message(warm_parent, "current warm work")
+    ])
+
+    child = "child-of-warm-boundary"
+    assert {:ok, _} = Fork.fork(warm_parent, workspace: ws, child_session_id: child)
+    assert {:ok, history} = Log.fold(child, workspace: ws)
+
+    boundary_index = Enum.find_index(history, &(&1.data["lineage_boundary"] == true))
+    assert is_integer(boundary_index)
+
+    fork_proof = List.first(history).data["warm_lineage"]
+    assert fork_proof["version"] == 1
+    assert fork_proof["boundary_index"] == boundary_index
+    assert fork_proof["posture_index"] == boundary_index + 1
+    assert fork_proof["boundary_event_id"] == Enum.at(history, boundary_index).id
+
+    posture = Enum.at(history, boundary_index + 1)
+    assert %{type: :subagent_event, data: %{"event" => "permission_posture"}} = posture
+    assert fork_proof["posture_event_id"] == posture.id
+
+    assert {:ok, posture} = Subagents.resume_posture(child, workspace: ws)
+    assert posture.lineage == :child
+    assert posture.permission_mode == :read_only
+
+    grandchild = "grandchild-of-warm-boundary"
+    assert {:ok, _} = Fork.fork(child, workspace: ws, child_session_id: grandchild)
+    assert {:ok, grandchild_history} = Log.fold(grandchild, workspace: ws)
+
+    grandchild_boundary_index =
+      Enum.find_index(grandchild_history, &(&1.data["lineage_boundary"] == true))
+
+    assert is_integer(grandchild_boundary_index)
+    grandchild_proof = List.first(grandchild_history).data["warm_lineage"]
+    assert grandchild_proof["boundary_index"] == grandchild_boundary_index
+    assert grandchild_proof["posture_index"] == grandchild_boundary_index + 1
+
+    assert grandchild_proof["boundary_event_id"] ==
+             Enum.at(grandchild_history, grandchild_boundary_index).id
+
+    assert grandchild_proof["posture_event_id"] ==
+             Enum.at(grandchild_history, grandchild_boundary_index + 1).id
+
+    refute grandchild_proof["boundary_event_id"] == fork_proof["boundary_event_id"]
+    refute grandchild_proof["posture_event_id"] == fork_proof["posture_event_id"]
+
+    assert {:ok, grandchild_posture} = Subagents.resume_posture(grandchild, workspace: ws)
+    assert grandchild_posture.lineage == :child
+    assert grandchild_posture.permission_mode == :read_only
+
+    truncated_child = "child-of-warm-boundary-truncated"
+
+    assert {:ok, _} =
+             Fork.fork(warm_parent,
+               workspace: ws,
+               child_session_id: truncated_child,
+               to_seq: 3
+             )
+
+    assert {:ok, truncated_history} = Log.fold(truncated_child, workspace: ws)
+    truncated_proof = List.first(truncated_history).data["warm_lineage"]
+    assert truncated_proof["boundary_event_id"] == Enum.at(truncated_history, 3).id
+    assert truncated_proof["posture_event_id"] == nil
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: details}}} =
+             Subagents.resume_posture(truncated_child, workspace: ws)
+
+    assert details["reason"] == "missing_current_posture"
+
+    forged_posture =
+      truncated_child
+      |> Event.subagent_event(Enum.at(history, boundary_index + 1).data, id: nil)
+      |> Event.with_seq(4)
+
+    assert forged_posture.id == nil
+    assert {:ok, _} = Log.append(forged_posture, workspace: ws)
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: forged_details}}} =
+             Subagents.resume_posture(truncated_child, workspace: ws)
+
+    assert forged_details["reason"] == "missing_current_posture"
+
+    boundary_only_grandchild = "grandchild-of-warm-boundary-truncated"
+
+    assert {:ok, _} =
+             Fork.fork(truncated_child,
+               workspace: ws,
+               child_session_id: boundary_only_grandchild
+             )
+
+    assert {:ok, boundary_only_history} = Log.fold(boundary_only_grandchild, workspace: ws)
+    boundary_only_proof = List.first(boundary_only_history).data["warm_lineage"]
+
+    boundary_only_index =
+      Enum.find_index(boundary_only_history, &(&1.data["lineage_boundary"] == true))
+
+    assert is_integer(boundary_only_index)
+    assert boundary_only_proof["boundary_index"] == boundary_only_index
+    assert boundary_only_proof["posture_index"] == boundary_only_index + 1
+
+    assert boundary_only_proof["boundary_event_id"] ==
+             Enum.at(boundary_only_history, boundary_only_index).id
+
+    assert boundary_only_proof["posture_event_id"] == nil
+
+    assert {:error, %{error: %{kind: :resume_policy_unavailable, details: inherited_details}}} =
+             Subagents.resume_posture(boundary_only_grandchild, workspace: ws)
+
+    assert inherited_details["reason"] == "missing_current_posture"
+  end
+
   test "fork respects --to-seq boundary", %{ws: ws} do
     parent = "parent-boundary"
 
@@ -233,6 +408,100 @@ defmodule Pixir.ForkTest do
 
     assert {:ok, data_url} = SessionResources.data_url(child, descriptor, workspace: ws)
     assert data_url == "data:image/png;base64,#{encoded}"
+
+    assert {:ok, child_history} = Log.fold(child, workspace: ws)
+    replayed_message = Enum.find(child_history, &(&1.data["text"] == "inspect this"))
+    assert replayed_message.data["resources"] == [descriptor]
+
+    [replayed_descriptor] = replayed_message.data["resources"]
+    assert replayed_descriptor["store_ref"] =~ "session://#{parent}/resources/"
+  end
+
+  test "fork compensates a partial resource copy at a deterministic failpoint", %{ws: ws} do
+    parent = "parent-resource-copy-failure"
+    child = "child-resource-copy-failure"
+
+    {:ok, descriptors} =
+      SessionResources.ingest_attachments(
+        parent,
+        Enum.map(["first", "second"], fn bytes ->
+          %{
+            "type" => "image",
+            "name" => "#{bytes}.png",
+            "mimeType" => "image/png",
+            "dataUrl" => "data:image/png;base64,#{Base.encode64(bytes)}"
+          }
+        end),
+        workspace: ws
+      )
+
+    [first, _second] = descriptors
+
+    seed_parent(ws, parent, [
+      Event.user_message(parent, "inspect both", resources: descriptors)
+    ])
+
+    fail_second_copy = fn
+      %{index: 1} -> {:error, :injected_copy_failure}
+      %{index: 0} -> :ok
+    end
+
+    assert {:error, %{error: %{kind: :write_failed}}} =
+             Fork.fork(parent,
+               workspace: ws,
+               child_session_id: child,
+               resource_copy_failpoint: fail_second_copy
+             )
+
+    {:ok, copied_path} = SessionResources.resource_path(child, first, ws)
+    refute File.exists?(copied_path)
+    assert_child_resource_dirs_absent(ws, child)
+    assert {:ok, false} = Log.exists(child, workspace: ws)
+  end
+
+  test "fork compensates finalized resources when child Log creation returns an error", %{
+    ws: ws
+  } do
+    parent = "parent-resource-log-failure"
+    child = "child-resource-log-failure"
+    bytes = "bytes finalized before Log creation"
+
+    {:ok, [descriptor]} =
+      SessionResources.ingest_attachments(
+        parent,
+        [
+          %{
+            "type" => "image",
+            "name" => "finalized.png",
+            "mimeType" => "image/png",
+            "dataUrl" => "data:image/png;base64,#{Base.encode64(bytes)}"
+          }
+        ],
+        workspace: ws
+      )
+
+    seed_parent(ws, parent, [
+      Event.user_message(parent, "inspect", resources: [descriptor])
+    ])
+
+    test_pid = self()
+
+    log_create_failpoint = fn ^child, _events, log_opts ->
+      final = Paths.session_resources_dir(child, Keyword.fetch!(log_opts, :workspace))
+      send(test_pid, {:log_create_saw_final_resources, File.dir?(final)})
+      {:error, Tool.error(:log_write_failed, "injected Log.create_session failure", %{})}
+    end
+
+    assert {:error, %{error: %{kind: :log_write_failed}}} =
+             Fork.fork(parent,
+               workspace: ws,
+               child_session_id: child,
+               log_create_fun: log_create_failpoint
+             )
+
+    assert_received {:log_create_saw_final_resources, true}
+    assert_child_resource_dirs_absent(ws, child)
+    assert {:ok, false} = Log.exists(child, workspace: ws)
   end
 
   test "plan rejects non-binary parent_session_id", %{ws: ws} do
@@ -286,5 +555,11 @@ defmodule Pixir.ForkTest do
     assert summary_data["source_event_count"] == 3
     assert summary_data["summary"] =~ "Forked 3 replayed events"
     assert summary_data["limitations"] != []
+  end
+
+  defp assert_child_resource_dirs_absent(workspace, child_session_id) do
+    final = Paths.session_resources_dir(child_session_id, workspace)
+    refute File.exists?(final)
+    assert Path.wildcard(final <> ".staging*") == []
   end
 end

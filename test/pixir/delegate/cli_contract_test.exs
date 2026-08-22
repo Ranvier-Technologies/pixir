@@ -331,12 +331,13 @@ defmodule Pixir.Delegate.CLIContractTest do
               exit_code: 0,
               payload: %{
                 "status" => "completed",
-                "horizon_override" => %{
-                  "effective_timeout_ms" => 100_000,
-                  "estimated_critical_path_ms" => 120_000,
-                  "waves" => 2,
-                  "suggested_timeout_ms" => 120_000
-                }
+                "horizon_override" =>
+                  %{
+                    "effective_timeout_ms" => 100_000,
+                    "estimated_critical_path_ms" => 120_000,
+                    "waves" => 2,
+                    "suggested_timeout_ms" => 120_000
+                  } = horizon_override
               }
             }} =
              CLIContract.run(
@@ -352,6 +353,9 @@ defmodule Pixir.Delegate.CLIContractTest do
                runner: HorizonRunner,
                runtime_opts: [test_pid: self()]
              )
+
+    assert Map.keys(horizon_override) |> Enum.sort() ==
+             ~w(effective_timeout_ms estimated_critical_path_ms suggested_timeout_ms waves)
 
     assert_receive {:runner_called, %{allow_short_horizon?: true}, _spec_meta}
   end

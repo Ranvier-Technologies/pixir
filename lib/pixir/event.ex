@@ -206,6 +206,11 @@ defmodule Pixir.Event do
   A durable History compaction checkpoint. `data` is a string-keyed summary with the
   compacted `range`, deterministic `summary`, and audit metadata used by Provider
   replay to keep context bounded without losing the Log as source of truth.
+
+  Optional `"native_replay"` is a string-keyed OpenAI replay window (ADR 0040).
+  It is payload on this Event, not a second canonical type. Overlay-on explicit
+  compact may persist `standalone_window`. Provider fold sends `items` when the
+  window is usable; Anthropic stays local text.
   """
   @spec history_compaction(String.t(), map(), keyword()) :: t()
   def history_compaction(session_id, data, opts \\ []) when is_map(data) do

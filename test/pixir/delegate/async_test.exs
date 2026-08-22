@@ -159,6 +159,40 @@ defmodule Pixir.Delegate.AsyncTest do
     assert "check_status_later_with_backoff" in next_actions
   end
 
+  # #479 product-level pin: the phantom flipped exactly this surface. A completed
+  # --allow-short-horizon delegation (finished child + parent-scoped horizon_override
+  # record) must snapshot completed, not partial.
+  test "durable status of a completed run with a horizon_override stays completed", %{
+    ws: ws,
+    sid: sid
+  } do
+    write_raw_log(ws, sid, [
+      raw_event(sid, 0, "subagent_event", %{
+        "event" => "horizon_override",
+        "source" => "allow_short_horizon",
+        "scope" => "delegate",
+        "horizon_override" => %{"declared_timeout_ms" => 100}
+      }),
+      raw_event(sid, 1, "subagent_event", %{
+        "subagent_id" => "sub_done",
+        "child_session_id" => "child-done",
+        "event" => "finished",
+        "status" => "completed",
+        "agent" => "explorer",
+        "task" => "inspect",
+        "workspace" => ws
+      })
+    ])
+
+    assert {:ok,
+            %{
+              "ok" => true,
+              "status" => "completed",
+              "kind" => "delegate_status",
+              "counts" => %{"total" => 1, "completed" => 1, "active" => 0, "terminal" => 1}
+            }} = Async.status(sid, workspace: ws)
+  end
+
   test "status, attach, and cancel normalize invalid Session handles without echo", %{ws: ws} do
     hostile = " valid "
     encoded_hostile = "dlg1_" <> Base.url_encode64("../../../outside;PWN", padding: false)

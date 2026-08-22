@@ -402,6 +402,61 @@ defmodule Pixir.Providers.AnthropicFoldTest do
              |> Map.fetch!("text") ==
                "legacy current question"
     end
+
+    test "usable native_replay still folds through render_for_provider/1" do
+      data = %{
+        "range" => %{"from_seq" => 1, "to_seq" => 2},
+        "source_event_count" => 2,
+        "strategy" => "deterministic_operational_summary_v1",
+        "summary" => "anthropic local fallback summary",
+        "files_touched" => [],
+        "open_tasks" => [],
+        "limitations" => [],
+        "native_replay" => %{
+          "mode" => "threshold_item",
+          "provider" => "openai_responses",
+          "backend" => "chatgpt_codex",
+          "dialect" => "chatgpt_codex",
+          "model" => "gpt-5.5",
+          "recorded_usable" => true,
+          "compaction_item_ids" => ["cmp_anthropic"],
+          "items" => [
+            %{
+              "type" => "compaction",
+              "id" => "cmp_anthropic",
+              "encrypted_content" => "CIPHERTEXT_ANTHROPIC_MUST_NOT_FOLD"
+            }
+          ]
+        }
+      }
+
+      history = [
+        raw(~s({"seq":1,"type":"user_message","data":{"text":"compacted-away question"}})),
+        raw(~s({"seq":2,"type":"assistant_message","data":{"text":"compacted-away answer"}})),
+        %{
+          "seq" => 3,
+          "type" => "history_compaction",
+          "data" => data
+        },
+        raw(~s({"seq":4,"type":"user_message","data":{"text":"current question"}}))
+      ]
+
+      assert {:ok, _} =
+               Anthropic.stream(%{history: history, system_prompt: "legacy system"},
+                 api_key: "sk-ant-test",
+                 model: "claude-fable-5",
+                 transport: capture_transport(ok_chunks())
+               )
+
+      assert_received {:anthropic_body, body}
+      body_text = inspect(body)
+      refute body_text =~ "CIPHERTEXT_ANTHROPIC_MUST_NOT_FOLD"
+      refute body_text =~ "cmp_anthropic"
+      refute body_text =~ "compact_threshold"
+
+      assert body["messages"] |> hd() |> Map.fetch!("content") |> hd() |> Map.fetch!("text") ==
+               Pixir.Compaction.render_for_provider(data)
+    end
   end
 end
 

@@ -6,7 +6,7 @@ import {mkdtemp, readFile, rm} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {dirname, join} from "node:path";
 import {createInterface} from "node:readline";
-import {extraBrowserArgs} from "./chrome_args.mjs";
+import {extraBrowserArgs, testRunPrefix} from "./chrome_args.mjs";
 
 const HELP = `Usage: node browser_harness.mjs [options]
 
@@ -276,7 +276,7 @@ async function stopChild(child) {
 }
 
 async function run(options) {
-  const profile = await mkdtemp(join(tmpdir(), "pixir-monitor-browser-"));
+  const profile = await mkdtemp(join(tmpdir(), testRunPrefix("pixir-monitor-browser")));
   let browser = null;
   let monitor = null;
   let client = null;

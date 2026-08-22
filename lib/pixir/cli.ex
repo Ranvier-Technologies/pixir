@@ -67,7 +67,7 @@ defmodule Pixir.CLI do
   def main(argv) do
     {:ok, _} = Application.ensure_all_started(:pixir)
     {mode, positional} = extract_mode(argv)
-    positional |> route(mode) |> halt()
+    positional |> route(mode, trailing_mode_flag?(argv)) |> halt()
   end
 
   @doc false
@@ -75,17 +75,44 @@ defmodule Pixir.CLI do
   def permission_mode_from_argv(argv), do: elem(extract_mode(argv), 0)
 
   @doc "Pure-ish router (permission mode defaults to config or `:auto`). IO happens inside."
-  @spec route([String.t()], Permissions.mode()) :: :ok | {:error, non_neg_integer()}
-  def route(argv, mode \\ :auto)
+  @spec route([String.t()], Permissions.mode(), boolean()) :: :ok | {:error, non_neg_integer()}
+  def route(argv, mode \\ :auto, trailing_mode_flag \\ false)
 
-  def route(argv, mode) when is_list(argv) do
+  def route(argv, mode, trailing_mode_flag) when is_list(argv) do
     case extract_runtime_options(argv) do
       {:ok, positional, runtime} ->
-        route_command(positional, mode, runtime)
+        route_command(
+          positional,
+          mode,
+          Map.put(runtime, :trailing_mode_flag?, trailing_mode_flag)
+        )
 
       {:error, error, json?} ->
         print_runtime_error_exit(error, json?)
     end
+  end
+
+  # The subcommand-shape refusal (#546) must see mode flags, which extract_mode/1
+  # strips before routing: on the escript path `pixir serve --ask` is the same
+  # operator gesture as `pixir serve --launch-mode help`. A mode flag BEFORE the
+  # first positional token (`pixir --ask hello`) stays a prompt signal. The
+  # leading walk mirrors extract_runtime_options/2's flag arity: a value-taking
+  # flag's value is not the first positional token.
+  @mode_flags ["--ask", "--read-only", "--yolo"]
+  @value_taking_runtime_flags ["--write-policy", "--bash-timeout-ms", "--attach"]
+
+  defp trailing_mode_flag?(argv), do: mode_flag_after_positional?(argv)
+
+  defp mode_flag_after_positional?([]), do: false
+
+  defp mode_flag_after_positional?([flag, _value | rest])
+       when flag in @value_taking_runtime_flags,
+       do: mode_flag_after_positional?(rest)
+
+  defp mode_flag_after_positional?([token | rest]) do
+    if String.starts_with?(token, "-"),
+      do: mode_flag_after_positional?(rest),
+      else: Enum.any?(rest, &(&1 in @mode_flags))
   end
 
   defp route_command([], _mode, _runtime), do: usage()
@@ -214,7 +241,55 @@ defmodule Pixir.CLI do
   end
 
   defp route_command([prompt | rest], mode, runtime) do
-    if help?(rest), do: usage(), else: one_shot(mode, read_prompt([prompt | rest]), runtime)
+    cond do
+      subcommand_shaped?(prompt, rest, runtime) -> refuse_subcommand_shape(prompt, runtime)
+      help?(rest) -> usage()
+      true -> one_shot(mode, read_prompt([prompt | rest]), runtime)
+    end
+  end
+
+  # A bare-word head followed by an option-shaped token reads as a subcommand
+  # invocation, never as prose (#546). Every known command matched an earlier
+  # clause, so a head reaching the prompt fall-through is always unknown; running
+  # that argv as an auto-permission Turn is the incident class. The refusal wins
+  # over the trailing -h/--help form too: the contract promises refusal for the
+  # shape, and the serve hint beats generic usage for exactly that head. A quoted
+  # prompt arrives as a single argument whose spaces fail the bare-word shape.
+  defp subcommand_shaped?(head, rest, runtime) do
+    Regex.match?(~r/\A[a-z][a-z0-9-]*\z/, head) and
+      (Enum.any?(rest, &option_shaped?/1) or runtime.trailing_mode_flag? == true)
+  end
+
+  # Option-shaped means a flag by unix convention: `--word` or `-x`. A negative
+  # number (`-3`) or a bare `-` inside prose is not a flag and keeps reaching
+  # prompt mode.
+  defp option_shaped?(token),
+    do: Regex.match?(~r/\A--./, token) or Regex.match?(~r/\A-[A-Za-z]/, token)
+
+  defp refuse_subcommand_shape(command, runtime) do
+    hint =
+      if command == "serve",
+        do:
+          "the monitor is a separate escript: run `pixir-monitor serve ...` (built in monitor/)",
+        else: "run `pixir help` to list commands"
+
+    next_actions =
+      if command == "serve",
+        do: ["run_pixir-monitor_serve", "quote_the_prompt_to_run_it_as_prose"],
+        else: ["check_pixir_help_for_commands", "quote_the_prompt_to_run_it_as_prose"]
+
+    Pixir.Tool.error(
+      :invalid_args,
+      "unknown subcommand: #{command} (#{hint}; to run this as a prompt, quote it as one argument and put any flags before it)",
+      %{
+        "command" => command,
+        "usage" => "pixir \"prompt\" | pixir <command> [args]",
+        "next_actions" => next_actions
+      }
+    )
+    |> print_runtime_error(runtime.json?)
+
+    {:error, 2}
   end
 
   defp extract_resume_attachments([session_id | rest], runtime) do
@@ -930,7 +1005,7 @@ defmodule Pixir.CLI do
 
   defp render_compaction_result({:ok, result}, json?) do
     if json? do
-      IO.puts(Jason.encode!(json_ready(result)))
+      IO.puts(Jason.encode!(json_ready(Compaction.project_compact_result_for_inspect(result))))
     else
       render_compaction(result)
     end
@@ -945,6 +1020,7 @@ defmodule Pixir.CLI do
 
   defp render_compaction(%{"compactable" => false} = result) do
     IO.puts("Nothing to compact: #{result["reason"] || "no compactable history"}")
+    render_compaction_native_replay(result)
   end
 
   defp render_compaction(%{"recorded" => true} = result) do
@@ -953,6 +1029,8 @@ defmodule Pixir.CLI do
     IO.puts(
       "Recorded compaction checkpoint at seq #{result["compaction_seq"]} for seq #{range["from_seq"]}..#{range["to_seq"]}."
     )
+
+    render_compaction_native_replay(result)
   end
 
   defp render_compaction(%{"compactable" => true} = result) do
@@ -961,6 +1039,30 @@ defmodule Pixir.CLI do
     IO.puts(
       "Would compact #{result["would_compact_events"]} events, seq #{range["from_seq"]}..#{range["to_seq"]}."
     )
+
+    render_compaction_native_replay(result)
+  end
+
+  defp render_compaction_native_replay(result) when is_map(result) do
+    usable? = result["native_replay_usable"] == true
+    reason = result["native_replay_reason"]
+    replay = Compaction.inspect_native_replay(result["event"] || %{}) || %{}
+    mode = replay["mode"]
+    ids = Enum.join(replay["compaction_item_ids"] || [], ", ")
+
+    cond do
+      usable? and is_binary(mode) ->
+        IO.puts("Native replay: usable mode=#{mode} ids=#{ids}")
+
+      usable? ->
+        IO.puts("Native replay: usable")
+
+      is_binary(reason) and reason != "" ->
+        IO.puts("Native replay: unused (#{reason})")
+
+      true ->
+        IO.puts("Native replay: unused")
+    end
   end
 
   defp inspect_replay(args) do
@@ -1062,6 +1164,20 @@ defmodule Pixir.CLI do
       )
     else
       IO.puts("Continuation: none")
+    end
+
+    case get_in(result, ["history_compaction", "native_replay"]) do
+      %{"mode" => mode} = replay ->
+        ids = Enum.join(replay["compaction_item_ids"] || [], ", ")
+
+        IO.puts("Native replay: mode=#{mode} usable=#{replay["recorded_usable"]} ids=#{ids}")
+
+        if reason = replay["fallback_reason"] do
+          IO.puts("Native replay fallback: #{reason}")
+        end
+
+      _ ->
+        :ok
     end
   end
 
@@ -2078,6 +2194,9 @@ defmodule Pixir.CLI do
       pixir --version           Print the version and exit
       pixir help                Show this help
 
+    The Pixir Monitor UI is a separate escript: build it in monitor/ and run
+    `pixir-monitor serve`. There is no `pixir serve`.
+
     Permission flags (default is auto — tools run without prompts):
       --ask                     Prompt before writes / unsafe shell commands
                                 (requires an interactive TTY; headless runs fail fast)
@@ -2155,6 +2274,11 @@ defmodule Pixir.CLI do
     plus the recent uncompressed tail. Use --dry-run to inspect the plan without
     appending an event, --json for machine-readable output, and --tail-events to keep a
     larger or smaller recent tail.
+
+    On chatgpt_codex, explicit compact stays local (Codex /compact 404s). Overlay-on
+    Turns may already have written a native_threshold checkpoint, so the default tail
+    can report nothing to compact. JSON and human output say whether native replay
+    was usable and the fallback reason.
     """)
 
     :ok

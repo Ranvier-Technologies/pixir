@@ -3,6 +3,10 @@
 Date: 2026-06-08
 Status: Accepted
 Implementation status: Initial deterministic slice implemented
+Amended 2026-08-16 (issue #522-A): `history_compaction` data may carry an optional
+provider-native replay window. The Event type, range/tail split, and Log-is-truth
+rule do not change — see "Amendment (2026-08-16, issue #522-A): native replay
+window" below and ADR 0040.
 
 ## Context
 
@@ -127,3 +131,19 @@ Regression coverage should prove:
 - ADR 0017: minimal Harness core and Presenter boundary.
 - ADR 0032: Minimal Workflow Events for durable run decisions.
 - CONTEXT.md: Compaction, History, Log, Provider, Session.
+
+## Amendment (2026-08-16, issue #522-A): native replay window
+
+The Decision above still stands: compaction is a canonical `history_compaction`
+Event, the full Log is never deleted or rewritten, Provider replay is latest
+checkpoint plus uncompressed tail, and orphan tool-call repair stays Log-first.
+
+What changes is the optional checkpoint *payload*. ADR 0040 may store a
+Provider-native replay window (`native_replay`) beside the existing local
+summary fields. When that window is usable, fold sends those verbatim items
+instead of the local text render. When it is missing or unusable, the local
+text checkpoint decided here remains the projection.
+
+This amendment does not add a second canonical Event type, does not make native
+compact the default, and does not implement the window. Implementation is a
+later #522 slice.

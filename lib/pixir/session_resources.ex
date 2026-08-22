@@ -200,26 +200,131 @@ defmodule Pixir.SessionResources do
   Copy stored resource payloads referenced in replayed Events from parent to child Session.
 
   Link-only descriptors without `content_sha256` are skipped. Payload copy uses the same
-  `resource_id` and checksum paths under the child Session store.
+  `resource_id` and checksum paths under the child Session store. The copy is staged and
+  finalized as one resource-directory unit. Copy/finalization errors remove only the
+  operation's unique staging directory. After a non-empty transfer is finalized, the
+  final child directory is operation-owned and is also removed if the following
+  operation returns an error.
   """
   @spec copy_referenced_resources(String.t(), String.t(), [map()], keyword()) ::
           :ok | {:error, map()}
   def copy_referenced_resources(parent_session_id, child_session_id, events, opts \\ [])
       when is_binary(parent_session_id) and is_binary(child_session_id) and is_list(events) do
-    workspace = Keyword.get(opts, :workspace, File.cwd!())
+    case with_copied_resources(parent_session_id, child_session_id, events, opts, fn -> :ok end) do
+      {:ok, _value} -> :ok
+      {:error, _error} = error -> error
+    end
+  end
 
+  @doc """
+  Stage referenced payloads in the child workspace, finalize the complete resource
+  directory, and run `operation`.
+
+  This is the compensation boundary used by Fork and WarmStart for both shared and
+  isolated workspaces. Copy and finalization errors remove the unique staging
+  directory. After a non-empty transfer is finalized, `{:error, map()}` returned by
+  `operation` removes both staging and the operation-owned final child resource
+  directory. Successful descriptors are not rewritten: replay keeps the original
+  `resource_id`, `content_sha256`, and `store_ref` evidence while the payload bytes live
+  at the equivalent child-local path.
+
+  Existing final child resources are never deleted as preparation: a non-empty
+  transfer rejects that collision, while an empty transfer leaves them untouched.
+  Compensation covers returned errors only. It is not VM-crash atomicity and does
+  not roll back work performed after `operation` has returned success.
+  """
+  @spec with_copied_resources(
+          String.t(),
+          String.t(),
+          [map()],
+          keyword(),
+          (-> :ok | {:ok, term()} | {:error, map()})
+        ) :: {:ok, term()} | {:error, map()}
+  def with_copied_resources(
+        parent_session_id,
+        child_session_id,
+        events,
+        opts,
+        operation
+      )
+      when is_binary(parent_session_id) and is_binary(child_session_id) and is_list(events) and
+             is_list(opts) and is_function(operation, 0) do
+    if Keyword.keyword?(opts) do
+      with_keyword_copy_options(
+        parent_session_id,
+        child_session_id,
+        events,
+        opts,
+        operation
+      )
+    else
+      invalid_copy_arguments()
+    end
+  end
+
+  def with_copied_resources(
+        _parent_session_id,
+        _child_session_id,
+        _events,
+        _opts,
+        _operation
+      ),
+      do: invalid_copy_arguments()
+
+  defp with_keyword_copy_options(parent_session_id, child_session_id, events, opts, operation) do
+    workspace = Keyword.get(opts, :workspace, File.cwd!())
+    parent_workspace = Keyword.get(opts, :parent_workspace, workspace)
+    child_workspace = Keyword.get(opts, :child_workspace, workspace)
+
+    if is_binary(parent_workspace) and is_binary(child_workspace) do
+      with_expanded_copy_options(
+        parent_session_id,
+        child_session_id,
+        events,
+        Path.expand(parent_workspace),
+        Path.expand(child_workspace),
+        opts,
+        operation
+      )
+    else
+      invalid_copy_arguments()
+    end
+  end
+
+  defp with_expanded_copy_options(
+         parent_session_id,
+         child_session_id,
+         events,
+         parent_workspace,
+         child_workspace,
+         opts,
+         operation
+       ) do
     with :ok <- SessionId.validate(parent_session_id),
          :ok <- SessionId.validate(child_session_id) do
-      events
-      |> Enum.flat_map(&event_resources/1)
-      |> Enum.uniq_by(& &1["resource_id"])
-      |> Enum.reduce_while(:ok, fn descriptor, :ok ->
-        case copy_descriptor_payload(parent_session_id, child_session_id, descriptor, workspace) do
-          :ok -> {:cont, :ok}
-          {:error, _} = error -> {:halt, error}
-        end
-      end)
+      descriptors =
+        events
+        |> Enum.flat_map(&event_resources/1)
+        |> Enum.filter(&stored_descriptor?/1)
+        |> Enum.uniq_by(& &1["resource_id"])
+
+      do_with_copied_resources(
+        parent_session_id,
+        child_session_id,
+        descriptors,
+        parent_workspace,
+        child_workspace,
+        opts,
+        operation
+      )
     end
+  end
+
+  defp invalid_copy_arguments do
+    {:error,
+     Tool.error(:invalid_args, "session resource copy arguments are invalid", %{
+       expected: "parent id, child id, event list, keyword options, and a zero-arity operation"
+     })}
   end
 
   @doc "Find one resource descriptor in folded History by Session resource id."
@@ -519,20 +624,298 @@ defmodule Pixir.SessionResources do
     |> compact_descriptor()
   end
 
-  defp copy_descriptor_payload(parent_session_id, child_session_id, descriptor, workspace) do
-    case descriptor_field(descriptor, "content_sha256") do
-      {:error, _} ->
-        :ok
+  defp do_with_copied_resources(
+         parent_session_id,
+         child_session_id,
+         descriptors,
+         parent_workspace,
+         child_workspace,
+         opts,
+         operation
+       ) do
+    final = Paths.session_resources_dir(child_session_id, child_workspace)
+    staged = staging_path(final)
 
-      {:ok, _} ->
-        with {:ok, src} <- resource_path(parent_session_id, descriptor, workspace),
-             {:ok, bytes} <- read_resource(src, descriptor),
-             {:ok, dst} <- resource_path(child_session_id, descriptor, workspace) do
-          File.mkdir_p!(Path.dirname(dst))
-          atomic_write(dst, bytes)
-        end
+    with :ok <- remove_resource_dirs([staged], child_session_id, :prepare),
+         :ok <- ensure_final_available(final, descriptors, child_session_id) do
+      case copy_descriptors_to_staging(
+             parent_session_id,
+             descriptors,
+             parent_workspace,
+             child_workspace,
+             staged,
+             opts
+           ) do
+        :ok ->
+          case finalize_staged_resources(staged, final, descriptors, child_session_id) do
+            :ok ->
+              owned_paths = if descriptors == [], do: [staged], else: [staged, final]
+              normalize_operation_result(operation.(), owned_paths, child_session_id)
+
+            {:error, _error} = error ->
+              compensate_resource_dirs(error, [staged], child_session_id)
+          end
+
+        {:error, _error} = error ->
+          compensate_resource_dirs(error, [staged], child_session_id)
+      end
     end
   end
+
+  defp staging_path(final) do
+    final <> ".staging-" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+  end
+
+  defp ensure_final_available(_final, [], _child_session_id), do: :ok
+
+  defp ensure_final_available(final, _descriptors, child_session_id) do
+    if File.exists?(final) do
+      {:error,
+       Tool.error(:already_exists, "child session resources already exist", %{
+         child_session_id: child_session_id,
+         path: final,
+         next_actions: [
+           "inspect_or_remove_the_existing_child_resource_directory",
+           "retry_with_a_new_child_session_id"
+         ]
+       })}
+    else
+      :ok
+    end
+  end
+
+  defp normalize_operation_result(:ok, _owned_paths, _child_session_id), do: {:ok, :ok}
+
+  defp normalize_operation_result({:ok, _value} = success, _owned_paths, _child_session_id),
+    do: success
+
+  defp normalize_operation_result(
+         {:error, %{error: %{kind: _kind}}} = error,
+         owned_paths,
+         child_session_id
+       ),
+       do: compensate_resource_dirs(error, owned_paths, child_session_id)
+
+  defp normalize_operation_result(other, owned_paths, child_session_id) do
+    error =
+      Tool.error(:write_failed, "session resource operation returned an invalid result", %{
+        child_session_id: child_session_id,
+        observed_type: operation_result_type(other)
+      })
+
+    compensate_resource_dirs({:error, error}, owned_paths, child_session_id)
+  end
+
+  defp operation_result_type(value) when is_atom(value), do: "atom"
+  defp operation_result_type(value) when is_binary(value), do: "binary"
+  defp operation_result_type(value) when is_number(value), do: "number"
+  defp operation_result_type(value) when is_list(value), do: "list"
+  defp operation_result_type(value) when is_map(value), do: "map"
+  defp operation_result_type(value) when is_tuple(value), do: "tuple"
+  defp operation_result_type(value) when is_function(value), do: "function"
+  defp operation_result_type(_value), do: "other"
+
+  defp copy_descriptors_to_staging(
+         parent_session_id,
+         descriptors,
+         parent_workspace,
+         child_workspace,
+         staged,
+         opts
+       ) do
+    descriptors
+    |> Enum.with_index()
+    |> Enum.reduce_while(:ok, fn {descriptor, index}, :ok ->
+      result =
+        with {:ok, src} <- resource_path(parent_session_id, descriptor, parent_workspace),
+             {:ok, bytes} <- read_resource(src, descriptor),
+             {:ok, dst} <- staged_resource_path(staged, descriptor),
+             :ok <- ensure_staged_dir(child_workspace, dst, descriptor),
+             :ok <- run_copy_failpoint(opts, descriptor, dst, index),
+             :ok <- write_copied_payload(dst, bytes, descriptor) do
+          :ok
+        end
+
+      case result do
+        :ok -> {:cont, :ok}
+        {:error, _error} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp staged_resource_path(staged, descriptor) do
+    with {:ok, resource_id} <- descriptor_field(descriptor, "resource_id"),
+         {:ok, sha} <- descriptor_field(descriptor, "content_sha256"),
+         {:ok, extension} <- descriptor_field(descriptor, "extension") do
+      {:ok, Path.join([staged, resource_id, sha <> "." <> extension])}
+    end
+  end
+
+  defp ensure_staged_dir(child_workspace, destination, descriptor) do
+    expected = Path.dirname(destination)
+
+    case Paths.ensure_state_dir(child_workspace, expected) do
+      {:ok, ^expected} ->
+        :ok
+
+      {:error, %{error: _payload}} = error ->
+        error
+
+      {:error, reason} ->
+        {:error, copy_failed(descriptor, destination, filesystem_failure(reason))}
+
+      _other ->
+        {:error, copy_failed(descriptor, destination, "invalid_state_dir_result")}
+    end
+  end
+
+  # A deliberately narrow deterministic seam for compensation tests. It receives only
+  # copy-local identity/path metadata and is never reflected into a descriptor or Event.
+  defp run_copy_failpoint(opts, descriptor, destination, index) do
+    case Keyword.get(opts, :resource_copy_failpoint) do
+      nil ->
+        :ok
+
+      failpoint when is_function(failpoint, 1) ->
+        case failpoint.(%{
+               index: index,
+               resource_id: descriptor["resource_id"],
+               destination: destination
+             }) do
+          :ok ->
+            :ok
+
+          {:error, _reason} ->
+            {:error, copy_failed(descriptor, destination, "injected_failure")}
+
+          _other ->
+            {:error, copy_failed(descriptor, destination, "invalid_failpoint_result")}
+        end
+
+      _other ->
+        {:error, copy_failed(descriptor, destination, "invalid_failpoint")}
+    end
+  end
+
+  defp write_copied_payload(path, bytes, descriptor) do
+    case atomic_write(path, bytes) do
+      :ok -> :ok
+      {:error, reason} -> {:error, copy_failed(descriptor, path, filesystem_failure(reason))}
+    end
+  end
+
+  defp copy_failed(descriptor, path, failure_class) do
+    Tool.error(:write_failed, "could not copy session resource payload", %{
+      resource_id: descriptor["resource_id"],
+      path: path,
+      failure_class: failure_class
+    })
+  end
+
+  defp filesystem_failure(reason)
+       when reason in [
+              :eacces,
+              :eagain,
+              :ebadf,
+              :ebusy,
+              :edquot,
+              :eexist,
+              :efbig,
+              :eintr,
+              :einval,
+              :eio,
+              :eloop,
+              :emfile,
+              :enfile,
+              :enodev,
+              :enoent,
+              :enomem,
+              :enospc,
+              :enotdir,
+              :enotempty,
+              :enotsup,
+              :eperm,
+              :erofs,
+              :estale,
+              :exdev
+            ],
+       do: Atom.to_string(reason)
+
+  defp filesystem_failure(_reason), do: "filesystem_error"
+
+  defp finalize_staged_resources(_staged, _final, [], _child_session_id), do: :ok
+
+  defp finalize_staged_resources(staged, final, _descriptors, child_session_id) do
+    # ADR 0021 payloads make a completed competing final directory non-empty. POSIX
+    # rename may replace an empty directory but fails on a non-empty destination; on
+    # that failure compensation removes only this operation's unique staging path.
+    case File.rename(staged, final) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        {:error,
+         Tool.error(:write_failed, "could not finalize child session resources", %{
+           child_session_id: child_session_id,
+           path: final,
+           filesystem_reason: filesystem_failure(reason)
+         })}
+    end
+  end
+
+  defp compensate_resource_dirs({:error, original_error} = error, paths, child_session_id) do
+    case remove_resource_dirs(paths, child_session_id, :compensate) do
+      :ok ->
+        error
+
+      {:error, cleanup_error} ->
+        {:error, put_cleanup_cause(cleanup_error, original_error)}
+    end
+  end
+
+  defp put_cleanup_cause(%{error: %{details: details} = payload} = cleanup_error, original_error)
+       when is_map(details) do
+    %{
+      cleanup_error
+      | error: %{payload | details: Map.put(details, :original_error, original_error)}
+    }
+  end
+
+  defp put_cleanup_cause(cleanup_error, _original_error), do: cleanup_error
+
+  defp remove_resource_dirs(paths, child_session_id, phase) do
+    Enum.reduce(paths, :ok, fn path, first_error ->
+      cleanup_result = remove_resource_dir(path, child_session_id, phase)
+
+      case {first_error, cleanup_result} do
+        {:ok, :ok} -> :ok
+        {:ok, {:error, _cleanup_error} = error} -> error
+        {{:error, _first_error} = error, _later_result} -> error
+      end
+    end)
+  end
+
+  defp remove_resource_dir(path, child_session_id, phase) do
+    case File.rm_rf(path) do
+      {:ok, _removed} ->
+        :ok
+
+      {:error, reason, failed_path} ->
+        {:error,
+         Tool.error(:write_failed, "could not clean child session resources", %{
+           child_session_id: child_session_id,
+           path: failed_path,
+           resource_path: path,
+           phase: phase,
+           filesystem_reason: filesystem_failure(reason)
+         })}
+    end
+  end
+
+  defp stored_descriptor?(%{"content_sha256" => sha}) when is_binary(sha) and sha != "",
+    do: true
+
+  defp stored_descriptor?(_descriptor), do: false
 
   defp atomic_write(path, bytes) do
     tmp = path <> ".tmp-" <> Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)

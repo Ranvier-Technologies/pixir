@@ -17,6 +17,29 @@ defmodule Pixir.Subagents.WarmStartSpawnTest do
     end
   end
 
+  defmodule LatchProvider do
+    def stream(_request, opts) do
+      test_pid = Keyword.fetch!(opts, :test_pid)
+      token = Keyword.fetch!(opts, :token)
+      send(test_pid, {:warm_provider_entered, token, self()})
+
+      receive do
+        {:release_warm_provider, ^token} ->
+          {:ok,
+           %{
+             text: "released child answer",
+             reasoning: "",
+             reasoning_items: [],
+             function_calls: [],
+             finish_reason: :stop
+           }}
+      after
+        5_000 ->
+          {:error, %{kind: :timeout, message: "test provider release was not received"}}
+      end
+    end
+  end
+
   setup do
     workspace =
       Path.join(
@@ -108,6 +131,16 @@ defmodule Pixir.Subagents.WarmStartSpawnTest do
     assert marker.data["author"] == "runtime"
     assert marker.data["seed_session_id"] == seed
 
+    posture = Enum.at(history, marker_index + 1)
+    assert posture.type == :subagent_event
+    assert posture.data["event"] == "permission_posture"
+    assert posture.data["warm_start"]["seed_session_id"] == seed
+
+    assert Enum.count(
+             history,
+             &(&1.type == :subagent_event and &1.data["event"] == "permission_posture")
+           ) == 1
+
     first_new_user_index =
       history
       |> Enum.with_index()
@@ -117,7 +150,82 @@ defmodule Pixir.Subagents.WarmStartSpawnTest do
       end)
 
     assert is_integer(first_new_user_index)
-    assert marker_index < first_new_user_index
+    assert first_new_user_index == marker_index + 2
+  end
+
+  test "queued warm spawn refolds lineage and writes only that current posture", %{
+    session_id: sid,
+    workspace: ws
+  } do
+    seed = seed_log(ws, "warm-seed-refold", [Event.user_message("warm-seed-refold", "one")])
+
+    {:ok, blocker} =
+      Subagents.spawn_agent(
+        sid,
+        %{
+          "task" => "hold the only slot",
+          "max_threads" => 1,
+          "timeout_ms" => 10_000,
+          "workspace_mode" => "shared"
+        },
+        workspace: ws,
+        provider: LatchProvider,
+        provider_opts: [test_pid: self(), token: :blocker],
+        permission_mode: :read_only
+      )
+
+    assert_receive {:warm_provider_entered, :blocker, blocker_pid}, 1_000
+
+    {:ok, warm} =
+      Subagents.spawn_agent(
+        sid,
+        %{
+          "task" => "use the refolded lineage",
+          "max_threads" => 1,
+          "timeout_ms" => 10_000,
+          "workspace_mode" => "shared"
+        },
+        workspace: ws,
+        provider: EchoProvider,
+        permission_mode: :read_only,
+        seed_session_id: seed
+      )
+
+    assert warm["status"] == "queued"
+
+    assert {:ok, _} =
+             Log.append(
+               Event.with_seq(
+                 Event.session_fork(seed, %{
+                   "parent_session_id" => "refold-parent",
+                   "fork_root_session_id" => "refold-root",
+                   "strategy" => "replay_v1"
+                 }),
+                 1
+               ),
+               workspace: ws
+             )
+
+    send(blocker_pid, {:release_warm_provider, :blocker})
+
+    assert {:ok, [blocker_done, warm_done]} =
+             Subagents.wait(sid, [blocker["id"], warm["id"]], 10_000, workspace: ws)
+
+    assert blocker_done["status"] == "completed"
+    assert warm_done["status"] == "completed"
+    assert warm_done["warm_start"]["fork_root_session_id"] == "refold-root"
+
+    assert {:ok, history} = Log.fold(warm_done["child_session_id"], workspace: ws)
+    marker_index = Enum.find_index(history, &(&1.data["lineage_boundary"] == true))
+    posture = Enum.at(history, marker_index + 1)
+
+    assert posture.data["event"] == "permission_posture"
+    assert posture.data["warm_start"]["fork_root_session_id"] == "refold-root"
+
+    assert Enum.count(
+             history,
+             &(&1.type == :subagent_event and &1.data["event"] == "permission_posture")
+           ) == 1
   end
 
   test "the warm-started child joins the seed's fork-root cache family", %{
@@ -168,6 +276,10 @@ defmodule Pixir.Subagents.WarmStartSpawnTest do
     refute Enum.any?(history, &(&1.type == :session_fork))
     refute Enum.any?(history, &(&1.data["lineage_boundary"] == true))
     assert Fork.fork_root_session_id(history, child_sid) == child_sid
+
+    assert {:ok, posture} = Subagents.resume_posture(child_sid, workspace: ws)
+    assert posture.permission_mode == :read_only
+    assert posture.lineage == :child
   end
 
   test "a replayed broader posture and granted permission decision do not widen the child", %{
@@ -225,7 +337,15 @@ defmodule Pixir.Subagents.WarmStartSpawnTest do
     assert own.data["parent_session_id"] == sid
 
     # the effective policy matches what a cold child with the same request produces
-    assert own.data["write_policy"] == nil or own.data["write_policy"]["mode"] != "bounded_write"
+    assert own.data["write_policy"] == nil
+
+    # A completed warm child must cold-resume from the posture in its current
+    # lineage segment. The copied posture remains replay evidence, but it must
+    # not make the live child ambiguous.
+    assert {:ok, resumed} = Subagents.resume_posture(child_sid, workspace: ws)
+    assert resumed.permission_mode == :read_only
+    assert resumed.write_policy == nil
+    assert resumed.lineage == :child
   end
 
   test "an unusable seed is rejected before any child Session is created", %{

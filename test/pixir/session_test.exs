@@ -158,7 +158,8 @@ defmodule Pixir.SessionTest do
     refute Session.turn_running?(sid)
 
     Process.sleep(350)
-    assert {:ok, []} = Log.fold(sid, workspace: ws)
+    assert {:ok, [failure] = history} = Log.fold(sid, workspace: ws)
+    assert ^failure = assert_interruption_failure(history)
   end
 
   test "starting a second Turn while one runs returns :busy", %{sid: sid} do
@@ -213,6 +214,7 @@ defmodule Pixir.SessionTest do
 
     assert {:ok, history} = Log.fold(sid, workspace: ws)
     assert Enum.map(history, & &1.type) == [:tool_call, :tool_result]
+    refute Enum.any?(history, &(&1.type == :turn_failed))
 
     assert %{
              data: %{
@@ -247,14 +249,15 @@ defmodule Pixir.SessionTest do
     assert :ok = Session.interrupt(sid)
 
     assert {:ok, history} = Log.fold(sid, workspace: ws)
-    assert Enum.map(history, & &1.type) == [:tool_call, :tool_result]
+    assert Enum.map(history, & &1.type) == [:tool_call, :tool_result, :turn_failed]
+    assert_interruption_failure(history)
 
     assert %{
              data: %{
                "call_id" => "call_active",
                "error" => %{"kind" => "orphan_tool_call", "details" => %{"reason" => "interrupt"}}
              }
-           } = List.last(history)
+           } = Enum.at(history, 1)
   end
 
   # #462 layer 1. The failing reproduction is a call the Provider committed and the
@@ -274,7 +277,7 @@ defmodule Pixir.SessionTest do
           Session.declare_committed_calls(
             ctx.session_id,
             [%{call_id: "call_committed", name: "bash", args: %{"command" => "sleep 4"}}],
-            ctx.turn_generation
+            turn_identity(ctx)
           )
 
         send(test_pid, :calls_declared)
@@ -286,7 +289,8 @@ defmodule Pixir.SessionTest do
     assert :ok = Session.interrupt(sid)
 
     assert {:ok, history} = Log.fold(sid, workspace: ws)
-    assert Enum.map(history, & &1.type) == [:tool_call, :tool_result]
+    assert Enum.map(history, & &1.type) == [:tool_call, :tool_result, :turn_failed]
+    assert_interruption_failure(history)
 
     assert %{
              data: %{
@@ -323,7 +327,7 @@ defmodule Pixir.SessionTest do
               %{call_id: "call_ran", name: "bash", args: %{}},
               %{call_id: "call_never_ran", name: "bash", args: %{}}
             ],
-            ctx.turn_generation
+            turn_identity(ctx)
           )
 
         {:ok, _} = Session.record(sid, Event.tool_call(sid, "call_ran", "bash", %{}))
@@ -342,8 +346,11 @@ defmodule Pixir.SessionTest do
              {:tool_call, "call_ran"},
              {:tool_result, "call_ran"},
              {:tool_call, "call_never_ran"},
-             {:tool_result, "call_never_ran"}
+             {:tool_result, "call_never_ran"},
+             {:turn_failed, nil}
            ]
+
+    assert_interruption_failure(history)
 
     # The completed call keeps its real result; only the un-persisted one is drained.
     assert %{data: %{"ok" => true}} = Enum.at(history, 1)
@@ -366,7 +373,7 @@ defmodule Pixir.SessionTest do
             Session.declare_committed_calls(
               ctx.session_id,
               [%{call_id: "call_retried", name: "bash", args: %{}}],
-              ctx.turn_generation
+              turn_identity(ctx)
             )
         end
 
@@ -381,8 +388,11 @@ defmodule Pixir.SessionTest do
 
     assert Enum.map(history, &{&1.type, &1.data["call_id"]}) == [
              {:tool_call, "call_retried"},
-             {:tool_result, "call_retried"}
+             {:tool_result, "call_retried"},
+             {:turn_failed, nil}
            ]
+
+    assert_interruption_failure(history)
   end
 
   # #462 round 5, surface (b): the duplicate inside a SINGLE declaration list. The drain's
@@ -401,7 +411,7 @@ defmodule Pixir.SessionTest do
               %{call_id: "call_dup", name: "bash", args: %{}},
               %{call_id: "call_other", name: "bash", args: %{}}
             ],
-            ctx.turn_generation
+            turn_identity(ctx)
           )
 
         send(test_pid, :declared)
@@ -417,8 +427,11 @@ defmodule Pixir.SessionTest do
              {:tool_call, "call_dup"},
              {:tool_call, "call_other"},
              {:tool_result, "call_dup"},
-             {:tool_result, "call_other"}
+             {:tool_result, "call_other"},
+             {:turn_failed, nil}
            ]
+
+    assert_interruption_failure(history)
   end
 
   test "committed-call declarations do not survive into the next Turn", %{ws: ws, sid: sid} do
@@ -430,7 +443,7 @@ defmodule Pixir.SessionTest do
           Session.declare_committed_calls(
             ctx.session_id,
             [%{call_id: "call_stale", name: "bash", args: %{}}],
-            ctx.turn_generation
+            turn_identity(ctx)
           )
 
         send(test_pid, :declared)
@@ -447,7 +460,8 @@ defmodule Pixir.SessionTest do
     assert :ok = Session.interrupt(sid)
 
     assert {:ok, history} = Log.fold(sid, workspace: ws)
-    assert history == []
+    assert_interruption_failure(history)
+    refute Enum.any?(history, &(&1.data["call_id"] == "call_stale"))
   end
 
   test "committed-call declarations do not outlive their Turn", %{ws: ws, sid: sid} do
@@ -462,7 +476,7 @@ defmodule Pixir.SessionTest do
           Session.declare_committed_calls(
             ctx.session_id,
             [%{call_id: "call_abandoned", name: "bash", args: %{}}],
-            ctx.turn_generation
+            turn_identity(ctx)
           )
 
         send(test_pid, :declared)
@@ -493,7 +507,7 @@ defmodule Pixir.SessionTest do
             Session.declare_committed_calls(
               ctx.session_id,
               [%{call_id: "call_crashed", name: "bash", args: %{"command" => "echo hi"}}],
-              ctx.turn_generation
+              turn_identity(ctx)
             )
 
           send(test_pid, :declared)
@@ -556,10 +570,16 @@ defmodule Pixir.SessionTest do
                 ctx.session_id,
                 [
                   %{call_id: "call_ok", name: "bash", args: %{}},
-                  # No `args`: fails the guard.
-                  %{call_id: "call_bad", name: "bash"}
+                  %{
+                    # No `name`: fails the guard. Neither the args sentinel (a value)
+                    # nor the unknown-key sentinel (a KEY) may ever render: keys of a
+                    # malformed entry are as untrusted as its values.
+                    "SECRET_KEY_SENTINEL" => true,
+                    call_id: "call_bad",
+                    args: %{"payload" => "SECRET_ARG_SENTINEL"}
+                  }
                 ],
-                ctx.turn_generation
+                turn_identity(ctx)
               )
 
             send(test_pid, :declared)
@@ -572,12 +592,237 @@ defmodule Pixir.SessionTest do
 
     assert log =~ "dropped a malformed Provider-committed call declaration"
     assert log =~ "call_bad"
+    refute log =~ "SECRET_ARG_SENTINEL"
+    refute log =~ "SECRET_KEY_SENTINEL"
+    assert log =~ "unknown_keys=1"
 
     # The well-formed sibling is unaffected: one bad entry does not poison the batch.
     assert {:ok, history} = Log.fold(sid, workspace: ws)
     logged = Enum.map(history, &{&1.type, &1.data["call_id"]})
     assert {:tool_call, "call_ok"} in logged
     refute {:tool_call, "call_bad"} in logged
+  end
+
+  # #471: `turn_generation` restarts at one with each Session process incarnation. A
+  # declaration producer from incarnation A can therefore carry the same numeric
+  # generation as a live successor Turn in incarnation B. The producer is deliberately
+  # unlinked from Turn A and held behind a receive latch until B explicitly acknowledges
+  # that it is active; this is the real orphan topology, not reconstructed GenServer
+  # state. The Session itself is crashed through an unsupported call so its transient
+  # supervisor performs the real abnormal restart.
+  test "a declaration from a prior Session incarnation cannot contaminate generation one",
+       %{ws: ws, sid: sid} do
+    test_pid = self()
+    incarnation_a_pid = GenServer.whereis(Session.via(sid))
+    incarnation_a_monitor = Process.monitor(incarnation_a_pid)
+
+    {:ok, _ref} =
+      Session.start_turn(sid, fn ctx ->
+        producer =
+          spawn(fn ->
+            send(test_pid, {:producer_a_held, self(), ctx})
+
+            receive do
+              :release_declaration_a ->
+                result =
+                  Session.declare_committed_calls(
+                    ctx.session_id,
+                    [
+                      %{
+                        call_id: "call_incarnation_a",
+                        name: "bash",
+                        args: %{"command" => "echo incarnation-a"}
+                      }
+                    ],
+                    turn_identity(ctx)
+                  )
+
+                send(test_pid, {:producer_a_declared, result})
+            after
+              5_000 -> send(test_pid, :producer_a_watchdog_expired)
+            end
+          end)
+
+        send(test_pid, {:turn_a_active, ctx, producer})
+
+        receive do
+          :finish_turn_a -> :done
+        after
+          5_000 -> :turn_a_watchdog_expired
+        end
+      end)
+
+    assert_receive {:producer_a_held, producer_a, ctx_a}, 1_000
+    assert_receive {:turn_a_active, ^ctx_a, ^producer_a}, 1_000
+    assert ctx_a.turn_generation == 1
+
+    # No test-only crash callback exists: the ordinary GenServer function-clause crash is
+    # abnormal, so DynamicSupervisor applies the Session's real `restart: :transient`.
+    ExUnit.CaptureLog.capture_log(fn ->
+      assert catch_exit(GenServer.call(Session.via(sid), :force_issue_471_restart))
+    end)
+
+    assert_receive {:DOWN, ^incarnation_a_monitor, :process, ^incarnation_a_pid, _reason}, 1_000
+
+    incarnation_b_pid =
+      wait_until(
+        fn ->
+          case Registry.lookup(Pixir.Sessions.Registry, sid) do
+            [{pid, _}] when pid != incarnation_a_pid -> pid
+            _ -> false
+          end
+        end,
+        5_000
+      )
+
+    on_exit(fn ->
+      if Process.alive?(incarnation_b_pid),
+        do: DynamicSupervisor.terminate_child(SessionSupervisor, incarnation_b_pid)
+    end)
+
+    {:ok, _ref} =
+      Session.start_turn(sid, fn ctx ->
+        :ok =
+          Session.declare_committed_calls(
+            ctx.session_id,
+            [%{call_id: "call_incarnation_b", name: "bash", args: %{}}],
+            turn_identity(ctx)
+          )
+
+        {:ok, _} =
+          Session.record(
+            ctx.session_id,
+            Event.tool_call(ctx.session_id, "call_incarnation_b", "bash", %{})
+          )
+
+        {:ok, _} =
+          Session.record(
+            ctx.session_id,
+            Event.tool_result(ctx.session_id, "call_incarnation_b", %{"ok" => true})
+          )
+
+        send(test_pid, {:turn_b_active, ctx, self()})
+
+        receive do
+          :finish_turn_b ->
+            Session.record(
+              ctx.session_id,
+              Event.assistant_message(ctx.session_id, "incarnation B remained isolated")
+            )
+        after
+          5_000 ->
+            :turn_b_watchdog_expired
+        end
+      end)
+
+    assert_receive {:turn_b_active, ctx_b, turn_b_pid}, 1_000
+    assert Session.turn_running?(sid)
+    assert ctx_b.turn_generation == 1
+    assert ctx_a.turn_generation == ctx_b.turn_generation
+
+    send(producer_a, :release_declaration_a)
+    assert_receive {:producer_a_declared, :ok}, 1_000
+    refute_received :producer_a_watchdog_expired
+
+    # This is the anti-vacuity edge: numeric-only matching sees generation 1 == 1 and
+    # accumulates A into B. Compound matching drains A immediately while B is still live.
+    stale =
+      wait_until(fn ->
+        with {:ok, history} <- Log.fold(sid, workspace: ws) do
+          Enum.find(
+            history,
+            &(&1.type == :tool_call and &1.data["call_id"] == "call_incarnation_a")
+          ) || false
+        end
+      end)
+
+    assert stale.data["drained"]["reason"] == "stale_turn_generation"
+    assert Session.turn_running?(sid)
+
+    send(turn_b_pid, :finish_turn_b)
+    wait_until(fn -> not Session.turn_running?(sid) end)
+
+    # Starting the next Turn invokes the existing orphan reconciliation and proves the
+    # stale call is not poison: it gets one matching result and the Session stays usable.
+    {:ok, _ref} = Session.start_turn(sid, fn _ctx -> :ok end)
+    wait_until(fn -> not Session.turn_running?(sid) end)
+
+    raw = File.read!(Paths.session_log(sid, ws))
+    decoded = raw |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    assert Enum.map(history, &{&1.type, &1.data["call_id"]}) == [
+             {:tool_call, "call_incarnation_b"},
+             {:tool_result, "call_incarnation_b"},
+             {:tool_call, "call_incarnation_a"},
+             {:assistant_message, nil},
+             {:tool_result, "call_incarnation_a"}
+           ]
+
+    assert Enum.count(history, &(&1.data["call_id"] == "call_incarnation_a")) == 2
+    assert Enum.count(history, &(&1.data["call_id"] == "call_incarnation_b")) == 2
+
+    assert Enum.at(history, 0).data["drained"] == nil
+    assert Enum.at(history, 1).data["ok"] == true
+    assert Enum.at(history, 3).data["text"] == "incarnation B remained isolated"
+
+    assert get_in(Enum.at(history, 4).data, ["error", "details", "reason"]) ==
+             "before_start_turn"
+
+    incarnation_a = Map.fetch!(ctx_a, :session_incarnation)
+    incarnation_b = Map.fetch!(ctx_b, :session_incarnation)
+    refute incarnation_a == incarnation_b
+
+    # The incarnation capability is runtime-only: neither its representation nor the ctx
+    # key is allowed into raw NDJSON or any decoded durable Event data.
+    refute raw =~ inspect(incarnation_a)
+    refute raw =~ inspect(incarnation_b)
+    refute raw =~ "session_incarnation"
+    refute raw =~ "turn_identity"
+    refute raw =~ "#Reference"
+
+    refute Enum.any?(decoded, fn event ->
+             durable_key_present?(event["data"], ["session_incarnation", "turn_identity"])
+           end)
+  end
+
+  test "an unstamped declaration during a live Turn is classified honestly", %{
+    ws: ws,
+    sid: sid
+  } do
+    test_pid = self()
+
+    {:ok, _ref} =
+      Session.start_turn(sid, fn ctx ->
+        send(test_pid, {:unstamped_turn_active, self(), ctx})
+
+        receive do
+          :finish -> :done
+        after
+          5_000 -> :watchdog_expired
+        end
+      end)
+
+    assert_receive {:unstamped_turn_active, turn_pid, _ctx}, 1_000
+    assert Session.turn_running?(sid)
+
+    assert :ok =
+             Session.declare_committed_calls(
+               sid,
+               [%{call_id: "call_unstamped", name: "bash", args: %{}}],
+               nil
+             )
+
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    assert %{data: %{"drained" => %{"reason" => "unstamped_declaration"}}} =
+             Enum.find(
+               history,
+               &(&1.type == :tool_call and &1.data["call_id"] == "call_unstamped")
+             )
+
+    send(turn_pid, :finish)
+    wait_until(fn -> not Session.turn_running?(sid) end)
   end
 
   # #462 round 3: the declare-after-drain race. `interrupt/1` drains, sets `turn: nil` and
@@ -609,7 +854,7 @@ defmodule Pixir.SessionTest do
              Session.declare_committed_calls(
                sid,
                [%{call_id: "call_late", name: "bash", args: %{"command" => "echo late"}}],
-               ctx.turn_generation
+               turn_identity(ctx)
              )
 
     assert {:ok, history} = Log.fold(sid, workspace: ws)
@@ -649,15 +894,15 @@ defmodule Pixir.SessionTest do
   } do
     test_pid = self()
 
-    # Turn A starts and captures its generation, exactly as the committed-call handler
-    # closure does at Turn start.
+    # Turn A starts and captures its compound runtime identity, exactly as the
+    # committed-call handler closure does at Turn start.
     {:ok, _ref} =
       Session.start_turn(sid, fn ctx ->
-        send(test_pid, {:turn_a, ctx.turn_generation})
+        send(test_pid, {:turn_a, turn_identity(ctx), ctx.turn_generation})
         Process.sleep(5_000)
       end)
 
-    assert_receive {:turn_a, gen_a}, 1_000
+    assert_receive {:turn_a, identity_a, gen_a}, 1_000
 
     # A is interrupted: the drain runs and the Task dies, but A's stream runner survives it
     # (unlinked `spawn_monitor` on the default StreamIdle topology).
@@ -667,7 +912,7 @@ defmodule Pixir.SessionTest do
     # Turn B starts and is alive when A's straggler finally lands.
     {:ok, _ref} =
       Session.start_turn(sid, fn ctx ->
-        send(test_pid, {:turn_b, ctx.turn_generation, self()})
+        send(test_pid, {:turn_b, turn_identity(ctx), ctx.turn_generation, self()})
 
         receive do
           :finish_b -> :done
@@ -676,15 +921,16 @@ defmodule Pixir.SessionTest do
         end
       end)
 
-    assert_receive {:turn_b, gen_b, turn_b_pid}, 1_000
+    assert_receive {:turn_b, identity_b, gen_b, turn_b_pid}, 1_000
     assert gen_b != gen_a, "start_turn must issue a fresh generation per Turn"
+    assert identity_b != identity_a
 
     # A's late declaration, stamped with A's generation, arriving while B is alive.
     assert :ok =
              Session.declare_committed_calls(
                sid,
                [%{call_id: "call_a_straggler", name: "bash", args: %{"command" => "echo a"}}],
-               gen_a
+               identity_a
              )
 
     # B's own declaration, stamped with B's generation: unaffected, still accumulated.
@@ -692,7 +938,7 @@ defmodule Pixir.SessionTest do
              Session.declare_committed_calls(
                sid,
                [%{call_id: "call_live_b", name: "bash", args: %{"command" => "echo b"}}],
-               gen_b
+               identity_b
              )
 
     # A's call is durable evidence NOW, under its own reason, while B still runs.
@@ -743,7 +989,7 @@ defmodule Pixir.SessionTest do
           Session.declare_committed_calls(
             ctx.session_id,
             [%{call_id: "call_same_gen", name: "bash", args: %{}}],
-            ctx.turn_generation
+            turn_identity(ctx)
           )
 
         send(test_pid, {:declared, self()})
@@ -827,6 +1073,32 @@ defmodule Pixir.SessionTest do
     assert length(history) == 3
     assert Enum.map(history, & &1.seq) == [0, 1, 2]
   end
+
+  defp assert_interruption_failure(history) do
+    assert [failure] = Enum.filter(history, &(&1.type == :turn_failed))
+
+    assert failure.data == %{
+             "terminal_status" => "interrupted",
+             "error_kind" => "interrupted",
+             "error_message" => "Turn was interrupted before completion.",
+             "details" => %{"scope" => "turn"}
+           }
+
+    failure
+  end
+
+  defp turn_identity(ctx), do: {ctx.session_incarnation, ctx.turn_generation}
+
+  defp durable_key_present?(value, forbidden_keys) when is_map(value) do
+    Enum.any?(value, fn {key, nested} ->
+      key in forbidden_keys or durable_key_present?(nested, forbidden_keys)
+    end)
+  end
+
+  defp durable_key_present?(value, forbidden_keys) when is_list(value),
+    do: Enum.any?(value, &durable_key_present?(&1, forbidden_keys))
+
+  defp durable_key_present?(_value, _forbidden_keys), do: false
 
   defp wait_until(fun, timeout_ms \\ 1_000) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms

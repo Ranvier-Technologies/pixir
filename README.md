@@ -189,7 +189,8 @@ the Monitor exposes no runtime mutation routes. See
 - **Orchestration:** BEAM-native Subagents, structural Workflows, Workflow Templates,
   checkpoint bundles, durable terminal states, and honest partial outcomes.
 - **Operator surfaces:** CLI, ACP stdio, permissions, ChatGPT subscription OAuth,
-  API-key fallback, Skills, attachments, and opt-in Provider-hosted Web Search.
+  API-key fallback, Skills, attachments, and Provider-hosted Web Search
+  (default-on for `chatgpt_codex`; off for `open_responses` and Anthropic).
 
 ## Subagents And Workflows Readiness
 

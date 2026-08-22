@@ -14,6 +14,8 @@ This directory is the ACP stdio presenter over Conversation and Events.
 - Presenter context, attachments, and T3-specific projection details must remain
   Presenter input/projection until Pixir records canonical Events or Session Resources.
 - `session/load` replays History; `session/resume` reattaches without replay.
+- Plan→build is produced by `Pixir.ACP.RuntimeMode` from `update_plan`, not by
+  a raw test call to `runtime_config_change/3`.
 - Sticky model selection should use `session/set_config_option` with `configId:"model"`.
   `session/set_model` is a compatibility extension only.
 

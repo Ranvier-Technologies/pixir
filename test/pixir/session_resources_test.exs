@@ -1,7 +1,7 @@
 defmodule Pixir.SessionResourcesTest do
   use ExUnit.Case, async: true
 
-  alias Pixir.{Event, Log, Paths, SessionResources}
+  alias Pixir.{Event, Log, Paths, SessionResources, Tool}
 
   setup do
     ws =
@@ -256,6 +256,289 @@ defmodule Pixir.SessionResourcesTest do
     assert {:ok, link} = SessionResources.local_attachment_link("FILE:///tmp/notes.txt", "/ws")
     assert link["uri"] == "file:///tmp/notes.txt"
     assert link["name"] == "notes.txt"
+  end
+
+  test "with_copied_resources stages cross-workspace bytes without rewriting descriptors", %{
+    ws: ws,
+    sid: sid
+  } do
+    child_workspace = Path.join(ws, "isolated-child")
+    File.mkdir_p!(child_workspace)
+    child = "child-cross-workspace"
+    bytes = "cross-workspace payload bytes"
+
+    assert {:ok, [descriptor]} =
+             SessionResources.ingest_attachments(
+               sid,
+               [
+                 %{
+                   "type" => "image",
+                   "name" => "cross.png",
+                   "mimeType" => "image/png",
+                   "dataUrl" => "data:image/png;base64,#{Base.encode64(bytes)}"
+                 }
+               ],
+               workspace: ws
+             )
+
+    event = Event.user_message(child, "replayed", resources: [descriptor])
+
+    assert {:ok, :committed} =
+             SessionResources.with_copied_resources(
+               sid,
+               child,
+               [event],
+               [parent_workspace: ws, child_workspace: child_workspace],
+               fn ->
+                 assert File.dir?(Paths.session_resources_dir(child, child_workspace))
+
+                 assert Path.wildcard(
+                          Paths.session_resources_dir(child, child_workspace) <> ".staging*"
+                        ) == []
+
+                 case Log.create_session(child, [event], workspace: child_workspace) do
+                   {:ok, _written} -> {:ok, :committed}
+                   {:error, _error} = error -> error
+                 end
+               end
+             )
+
+    assert {:ok, child_history} = Log.fold(child, workspace: child_workspace)
+    persisted_event = Enum.find(child_history, &(&1.data["text"] == "replayed"))
+    [persisted_descriptor] = persisted_event.data["resources"]
+
+    assert persisted_descriptor["resource_id"] == descriptor["resource_id"]
+    assert persisted_descriptor["content_sha256"] == descriptor["content_sha256"]
+    assert persisted_descriptor["store_ref"] =~ "session://#{sid}/resources/"
+
+    assert {:ok, data_url} =
+             SessionResources.data_url(child, persisted_descriptor, workspace: child_workspace)
+
+    assert data_url == "data:image/png;base64,#{Base.encode64(bytes)}"
+  end
+
+  test "with_copied_resources preserves existing final resources and normalizes empty success", %{
+    ws: ws,
+    sid: sid
+  } do
+    child = "child-existing-resources"
+    final = Paths.session_resources_dir(child, ws)
+    kept = Path.join(final, "kept/payload.bin")
+    File.mkdir_p!(Path.dirname(kept))
+    File.write!(kept, "durable child payload")
+
+    assert {:ok, :ok} =
+             SessionResources.with_copied_resources(
+               sid,
+               child,
+               [],
+               [parent_workspace: ws, child_workspace: ws],
+               fn -> :ok end
+             )
+
+    assert File.read!(kept) == "durable child payload"
+
+    assert {:ok, [descriptor]} =
+             SessionResources.ingest_attachments(
+               sid,
+               [
+                 %{
+                   "type" => "image",
+                   "name" => "collision.png",
+                   "mimeType" => "image/png",
+                   "dataUrl" => "data:image/png;base64,#{Base.encode64("new payload")}"
+                 }
+               ],
+               workspace: ws
+             )
+
+    event = Event.user_message(child, "collision", resources: [descriptor])
+
+    assert {:error, %{error: %{kind: :already_exists, details: collision_details}}} =
+             SessionResources.with_copied_resources(
+               sid,
+               child,
+               [event],
+               [parent_workspace: ws, child_workspace: ws],
+               fn ->
+                 flunk("operation must not run across an existing final resource directory")
+               end
+             )
+
+    assert collision_details.next_actions == [
+             "inspect_or_remove_the_existing_child_resource_directory",
+             "retry_with_a_new_child_session_id"
+           ]
+
+    assert File.read!(kept) == "durable child payload"
+    assert Path.wildcard(final <> ".staging*") == []
+  end
+
+  test "stored descriptors win deduplication over earlier link-only evidence", %{ws: ws, sid: sid} do
+    child = "child-stored-descriptor-order"
+    bytes = "stored descriptor wins"
+
+    assert {:ok, [stored]} =
+             SessionResources.ingest_attachments(
+               sid,
+               [
+                 %{
+                   "type" => "image",
+                   "name" => "ordered.png",
+                   "mimeType" => "image/png",
+                   "dataUrl" => "data:image/png;base64,#{Base.encode64(bytes)}"
+                 }
+               ],
+               workspace: ws
+             )
+
+    link_only =
+      stored
+      |> Map.drop(["content_sha256", "extension", "store_ref"])
+      |> Map.put("kind", "resource_link")
+      |> Map.put("rehydratable", false)
+
+    events = [
+      Event.user_message(child, "link first", resources: [link_only]),
+      Event.user_message(child, "stored second", resources: [stored])
+    ]
+
+    assert {:ok, :copied} =
+             SessionResources.with_copied_resources(
+               sid,
+               child,
+               events,
+               [parent_workspace: ws, child_workspace: ws],
+               fn -> {:ok, :copied} end
+             )
+
+    assert {:ok, data_url} = SessionResources.data_url(child, stored, workspace: ws)
+    assert data_url == "data:image/png;base64,#{Base.encode64(bytes)}"
+  end
+
+  test "with_copied_resources bounds invalid arguments and callback results", %{ws: ws, sid: sid} do
+    assert {:error, %{error: %{kind: :invalid_args}}} =
+             SessionResources.with_copied_resources(
+               sid,
+               "invalid-args-child",
+               [],
+               :not_options,
+               fn ->
+                 :ok
+               end
+             )
+
+    assert {:error, %{error: %{kind: :invalid_args}}} =
+             SessionResources.with_copied_resources(
+               sid,
+               "non-keyword-options-child",
+               [],
+               [1, 2],
+               fn -> :ok end
+             )
+
+    for invalid_workspace_opts <- [[parent_workspace: :invalid], [child_workspace: nil]] do
+      assert {:error, %{error: %{kind: :invalid_args}}} =
+               SessionResources.with_copied_resources(
+                 sid,
+                 "invalid-workspace-child",
+                 [],
+                 invalid_workspace_opts,
+                 fn -> :ok end
+               )
+    end
+
+    child = "child-invalid-operation-result"
+    sentinel = "INVALID_OPERATION_RESULT_SECRET"
+
+    assert {:ok, [descriptor]} =
+             SessionResources.ingest_attachments(
+               sid,
+               [
+                 %{
+                   "type" => "image",
+                   "name" => "invalid-result.png",
+                   "mimeType" => "image/png",
+                   "dataUrl" => "data:image/png;base64,#{Base.encode64("payload")}"
+                 }
+               ],
+               workspace: ws
+             )
+
+    event = Event.user_message(child, "invalid result", resources: [descriptor])
+
+    assert {:error, %{error: %{kind: :write_failed, details: details}} = error} =
+             SessionResources.with_copied_resources(
+               sid,
+               child,
+               [event],
+               [parent_workspace: ws, child_workspace: ws],
+               fn -> {:error, String.duplicate(sentinel, 100)} end
+             )
+
+    assert details.observed_type == "tuple"
+    refute inspect(error) =~ sentinel
+
+    final = Paths.session_resources_dir(child, ws)
+    refute File.exists?(final)
+    assert Path.wildcard(final <> ".staging*") == []
+  end
+
+  test "with_copied_resources compensates deterministic partial copies in both workspace modes",
+       %{ws: ws, sid: sid} do
+    assert {:ok, descriptors} =
+             SessionResources.ingest_attachments(
+               sid,
+               Enum.map(["first", "second"], fn bytes ->
+                 %{
+                   "type" => "image",
+                   "name" => "#{bytes}.png",
+                   "mimeType" => "image/png",
+                   "dataUrl" => "data:image/png;base64,#{Base.encode64(bytes)}"
+                 }
+               end),
+               workspace: ws
+             )
+
+    sentinel = "COPY_FAILPOINT_SECRET"
+
+    fail_second_copy = fn
+      %{index: 0} ->
+        :ok
+
+      %{index: 1} ->
+        {:error,
+         Tool.error(:write_failed, String.duplicate(sentinel, 100), %{
+           hostile: String.duplicate(sentinel, 100)
+         })}
+    end
+
+    for {child, child_workspace} <- [
+          {"child-shared-copy-failure", ws},
+          {"child-cross-copy-failure", Path.join(ws, "isolated-copy-failure")}
+        ] do
+      File.mkdir_p!(child_workspace)
+      events = [Event.user_message(child, "replayed", resources: descriptors)]
+
+      assert {:error, %{error: %{kind: :write_failed}} = error} =
+               SessionResources.with_copied_resources(
+                 sid,
+                 child,
+                 events,
+                 [
+                   parent_workspace: ws,
+                   child_workspace: child_workspace,
+                   resource_copy_failpoint: fail_second_copy
+                 ],
+                 fn -> flunk("operation must not run after a copy failure") end
+               )
+
+      refute inspect(error) =~ sentinel
+
+      final = Paths.session_resources_dir(child, child_workspace)
+      refute File.exists?(final)
+      assert Path.wildcard(final <> ".staging*") == []
+    end
   end
 
   defp tmp_source_dir(label) do

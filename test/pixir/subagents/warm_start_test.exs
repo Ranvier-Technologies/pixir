@@ -3,7 +3,8 @@ defmodule Pixir.Subagents.WarmStartTest do
 
   import Pixir.Test.RawLogHelpers
 
-  alias Pixir.{Event, Fork, Log, Provider.Cache}
+  alias Pixir.{Event, Fork, Log, Paths, Provider.Cache, SessionResources, Subagents, Tool}
+  alias Pixir.Permissions.WritePolicy
   alias Pixir.Subagents.WarmStart
 
   setup do
@@ -81,7 +82,7 @@ defmodule Pixir.Subagents.WarmStartTest do
       ])
 
       child = "child-full"
-      assert {:ok, result} = WarmStart.seed_child_log(child, seed, workspace: ws)
+      assert {:ok, result} = seed_child_log(child, seed, workspace: ws)
 
       assert result["seed_session_id"] == seed
       assert result["warm_started"] == true
@@ -118,7 +119,7 @@ defmodule Pixir.Subagents.WarmStartTest do
       ])
 
       child = "child-raw"
-      assert {:ok, result} = WarmStart.seed_child_log(child, seed, workspace: ws)
+      assert {:ok, result} = seed_child_log(child, seed, workspace: ws)
       assert result["warm_started"] == true
       assert result["replay_event_count"] == 3
 
@@ -153,7 +154,11 @@ defmodule Pixir.Subagents.WarmStartTest do
       child = "child-cross-ws"
 
       assert {:ok, result} =
-               WarmStart.seed_child_log(child, seed, workspace: ws, child_workspace: child_ws)
+               seed_child_log(child, seed,
+                 workspace: ws,
+                 child_workspace: child_ws,
+                 permission_posture: permission_posture(child_ws, %{workspace_mode: "isolated"})
+               )
 
       assert result["child_workspace"] == child_ws
 
@@ -166,6 +171,11 @@ defmodule Pixir.Subagents.WarmStartTest do
       assert fork.data["parent_workspace"] == ws
       assert fork.data["child_workspace"] == child_ws
       refute fork.data["child_workspace"] == fork.data["parent_workspace"]
+
+      assert {:ok, posture} = Subagents.resume_posture(child, workspace: child_ws)
+      assert posture.permission_mode == :read_only
+      assert posture.workspace_mode == "isolated"
+      assert posture.workspace == child_ws
     end
 
     test "never replays provider_usage, history_compaction, session_fork, branch_summary", %{
@@ -185,7 +195,7 @@ defmodule Pixir.Subagents.WarmStartTest do
       ])
 
       child = "child-excluded"
-      assert {:ok, _} = WarmStart.seed_child_log(child, seed, workspace: ws)
+      assert {:ok, _} = seed_child_log(child, seed, workspace: ws)
       assert {:ok, history} = Log.fold(child, workspace: ws)
 
       replayed = Enum.drop(history, 1)
@@ -210,7 +220,7 @@ defmodule Pixir.Subagents.WarmStartTest do
       ])
 
       child = "child-forked"
-      assert {:ok, result} = WarmStart.seed_child_log(child, seed, workspace: ws)
+      assert {:ok, result} = seed_child_log(child, seed, workspace: ws)
       assert result["fork_root_session_id"] == "root-family"
 
       assert {:ok, history} = Log.fold(child, workspace: ws)
@@ -222,14 +232,18 @@ defmodule Pixir.Subagents.WarmStartTest do
       seed_log(ws, [Event.user_message(seed, "one"), Event.assistant_message(seed, "two")])
 
       child = "child-marker"
-      assert {:ok, _} = WarmStart.seed_child_log(child, seed, workspace: ws)
+      assert {:ok, _} = seed_child_log(child, seed, workspace: ws)
       assert {:ok, history} = Log.fold(child, workspace: ws)
 
-      marker = List.last(history)
+      marker = Enum.at(history, -2)
+      posture = List.last(history)
       assert marker.type == :user_message
       assert marker.data["lineage_boundary"] == true
       assert marker.data["author"] == "runtime"
       assert marker.data["seed_session_id"] == seed
+
+      assert posture.type == :subagent_event
+      assert posture.data["event"] == "permission_posture"
 
       text = marker.data["text"]
       assert text =~ seed
@@ -238,9 +252,140 @@ defmodule Pixir.Subagents.WarmStartTest do
       assert text =~ ~r/only .*follows/i
       assert text =~ ~r/re-?verif/i
 
-      # The marker is the last event in the seeded Log: the child's first new
-      # user message is appended after it by the Turn.
-      assert Enum.at(history, -2).type == :assistant_message
+      # The marker and current posture are the final atomic pair in the seeded
+      # Log; the child's first new user message is appended after them by Turn.
+      assert Enum.at(history, -3).type == :assistant_message
+      assert posture.seq == marker.seq + 1
+    end
+
+    test "creates current posture immediately after the runtime boundary", %{ws: ws} do
+      seed = "seed-atomic-posture"
+      seed_log(ws, [Event.user_message(seed, "one"), Event.assistant_message(seed, "two")])
+
+      child = "child-atomic-posture"
+
+      assert {:ok, _} =
+               seed_child_log(child, seed,
+                 workspace: ws,
+                 permission_posture: permission_posture(ws)
+               )
+
+      assert {:ok, history} = Log.fold(child, workspace: ws)
+      [boundary, posture] = Enum.take(history, -2)
+
+      assert boundary.type == :user_message
+      assert boundary.data["marker_kind"] == WarmStart.boundary_marker_kind()
+      assert posture.type == :subagent_event
+      assert posture.data["event"] == "permission_posture"
+      assert posture.seq == boundary.seq + 1
+    end
+
+    test "the seeding fold owns posture lineage instead of an earlier validation snapshot", %{
+      ws: ws
+    } do
+      seed = "seed-lineage-race"
+      seed_log(ws, [Event.user_message(seed, "one")])
+
+      assert {:ok, %{"fork_root_session_id" => ^seed}} = WarmStart.validate(seed, workspace: ws)
+
+      assert {:ok, _} =
+               Log.append(
+                 Event.with_seq(
+                   Event.session_fork(seed, %{
+                     "parent_session_id" => "new-parent",
+                     "fork_root_session_id" => "new-root"
+                   }),
+                   1
+                 ),
+                 workspace: ws
+               )
+
+      child = "child-lineage-race"
+      assert {:ok, result} = seed_child_log(child, seed, workspace: ws)
+      assert result["fork_root_session_id"] == "new-root"
+
+      assert {:ok, history} = Log.fold(child, workspace: ws)
+      posture = List.last(history)
+      assert posture.data["event"] == "permission_posture"
+      assert posture.data["warm_start"]["fork_root_session_id"] == "new-root"
+      assert posture.data["warm_start"]["replay_event_count"] == 1
+    end
+
+    test "nested warm segments restore their own bounded and read-only posture", %{ws: ws} do
+      root = "seed-root-auto-nested"
+
+      seed_log(ws, [
+        Event.subagent_event(root, %{
+          "event" => "permission_posture",
+          "scope" => "session",
+          "lineage" => "root",
+          "source" => "root_session_start",
+          "permission_mode" => "auto",
+          "write_policy" => nil,
+          "workspace_mode" => "shared",
+          "workspace" => ws
+        }),
+        Event.user_message(root, "root context")
+      ])
+
+      {:ok, bounded_policy} =
+        WritePolicy.normalize(%{
+          "version" => 1,
+          "metadata" => %{"id" => "nested-bounded"},
+          "allow_writes" => ["lib/**"],
+          "deny_writes" => [],
+          "bash" => "disabled"
+        })
+
+      bounded_child = "child-bounded-nested"
+
+      assert {:ok, _} =
+               seed_child_log(bounded_child, root,
+                 workspace: ws,
+                 permission_posture:
+                   permission_posture(ws, %{
+                     subagent_id: "sub_bounded",
+                     permission_mode: :auto,
+                     write_policy: bounded_policy
+                   })
+               )
+
+      assert {:ok, bounded} = Subagents.resume_posture(bounded_child, workspace: ws)
+      assert bounded.permission_mode == :auto
+      assert bounded.write_policy["hash"] == bounded_policy["hash"]
+      assert bounded.lineage == :child
+
+      read_only_child = "child-read-only-nested"
+
+      assert {:ok, _} =
+               seed_child_log(read_only_child, bounded_child,
+                 workspace: ws,
+                 permission_posture:
+                   permission_posture(ws, %{
+                     subagent_id: "sub_read_only",
+                     parent_session_id: bounded_child
+                   })
+               )
+
+      assert {:ok, history} = Log.fold(read_only_child, workspace: ws)
+      assert Enum.count(history, &(&1.data["lineage_boundary"] == true)) == 2
+
+      assert Enum.count(
+               history,
+               &(&1.type == :subagent_event and &1.data["event"] == "permission_posture")
+             ) == 3
+
+      assert {:ok, read_only} = Subagents.resume_posture(read_only_child, workspace: ws)
+      assert read_only.permission_mode == :read_only
+      assert read_only.write_policy == nil
+      assert read_only.lineage == :child
+
+      nested_fork = "fork-of-nested-warm"
+      assert {:ok, _} = Fork.fork(read_only_child, workspace: ws, child_session_id: nested_fork)
+      assert {:ok, forked_posture} = Subagents.resume_posture(nested_fork, workspace: ws)
+      assert forked_posture.permission_mode == :read_only
+      assert forked_posture.write_policy == nil
+      assert forked_posture.lineage == :child
     end
 
     test "refuses to seed into a child session id that already has a Log", %{ws: ws} do
@@ -250,23 +395,43 @@ defmodule Pixir.Subagents.WarmStartTest do
       child = "child-clash"
       seed_log(ws, [Event.user_message(child, "already here")])
 
-      assert {:error, error} = WarmStart.seed_child_log(child, seed, workspace: ws)
+      assert {:error, error} = seed_child_log(child, seed, workspace: ws)
       assert error_kind(error) == :already_exists
     end
 
     test "leaves no partial child Log when the seed is unusable", %{ws: ws} do
       child = "child-no-partial"
-      assert {:error, _} = WarmStart.seed_child_log(child, "seed-absent", workspace: ws)
+      assert {:error, _} = seed_child_log(child, "seed-absent", workspace: ws)
       assert {:ok, false} = Log.exists(child, workspace: ws)
     end
 
-    test "copies referenced Session Resources into the child store", %{ws: ws} do
+    test "rejects malformed posture without reflecting arbitrary values", %{ws: ws} do
+      seed = "seed-malformed-posture"
+      child = "child-malformed-posture"
+      secret = "C5A_SECRET_POSTURE_SENTINEL"
+      seed_log(ws, [Event.user_message(seed, "one")])
+
+      assert {:error, error} =
+               WarmStart.seed_child_log(child, seed,
+                 workspace: ws,
+                 permission_posture: %{secret => secret}
+               )
+
+      assert error_kind(error) == :invalid_args
+      refute inspect(error) =~ secret
+      assert {:ok, false} = Log.exists(child, workspace: ws)
+    end
+
+    test "copies referenced Session Resources into the child store without rewriting descriptors",
+         %{
+           ws: ws
+         } do
       seed = "seed-resources"
       bytes = "payload bytes"
       encoded = Base.encode64(bytes)
 
       {:ok, [descriptor]} =
-        Pixir.SessionResources.ingest_attachments(
+        SessionResources.ingest_attachments(
           seed,
           [
             %{
@@ -285,10 +450,111 @@ defmodule Pixir.Subagents.WarmStartTest do
       ])
 
       child = "child-resources"
-      assert {:ok, _} = WarmStart.seed_child_log(child, seed, workspace: ws)
+      assert {:ok, _} = seed_child_log(child, seed, workspace: ws)
 
-      assert {:ok, data_url} = Pixir.SessionResources.data_url(child, descriptor, workspace: ws)
+      assert {:ok, data_url} = SessionResources.data_url(child, descriptor, workspace: ws)
       assert data_url == "data:image/png;base64,#{encoded}"
+
+      assert {:ok, child_history} = Log.fold(child, workspace: ws)
+      replayed_message = Enum.find(child_history, &(&1.data["text"] == "look at this"))
+      assert replayed_message.data["resources"] == [descriptor]
+
+      [replayed_descriptor] = replayed_message.data["resources"]
+      assert replayed_descriptor["store_ref"] =~ "session://#{seed}/resources/"
+    end
+
+    test "copies referenced Session Resources into a cross-workspace child store", %{ws: ws} do
+      seed = "seed-cross-workspace-resources"
+      child = "child-cross-workspace-resources"
+      child_ws = Path.join(ws, "isolated-resource-child")
+      File.mkdir_p!(child_ws)
+      bytes = "isolated payload bytes"
+
+      [descriptor] = seed_with_resources(ws, seed, [bytes])
+
+      assert {:ok, _} =
+               seed_child_log(child, seed,
+                 workspace: ws,
+                 child_workspace: child_ws,
+                 permission_posture: permission_posture(child_ws, %{workspace_mode: "isolated"})
+               )
+
+      assert {:ok, data_url} =
+               SessionResources.data_url(child, descriptor, workspace: child_ws)
+
+      assert data_url == "data:image/png;base64,#{Base.encode64(bytes)}"
+      assert_child_resource_dirs_absent(ws, child)
+      assert Path.wildcard(Paths.session_resources_dir(child, child_ws) <> ".staging*") == []
+
+      assert {:ok, child_history} = Log.fold(child, workspace: child_ws)
+      replayed_message = Enum.find(child_history, &(&1.data["text"] == "resource message"))
+      assert replayed_message.data["resources"] == [descriptor]
+    end
+
+    test "compensates deterministic partial resource copies in shared and cross workspaces", %{
+      ws: ws
+    } do
+      fail_second_copy = fn
+        %{index: 0} -> :ok
+        %{index: 1} -> {:error, :injected_copy_failure}
+      end
+
+      for {mode, child_ws} <- [
+            {"shared", ws},
+            {"isolated", Path.join(ws, "isolated-copy-compensation")}
+          ] do
+        File.mkdir_p!(child_ws)
+        seed = "seed-copy-compensation-#{mode}"
+        child = "child-copy-compensation-#{mode}"
+        descriptors = seed_with_resources(ws, seed, ["first", "second"])
+
+        assert {:error, %{error: %{kind: :write_failed}}} =
+                 seed_child_log(child, seed,
+                   workspace: ws,
+                   child_workspace: child_ws,
+                   permission_posture: permission_posture(child_ws, %{workspace_mode: mode}),
+                   resource_copy_failpoint: fail_second_copy
+                 )
+
+        assert_seed_payloads_readable(ws, seed, descriptors)
+        assert_child_resource_dirs_absent(child_ws, child)
+        assert_child_resource_dirs_absent(ws, child)
+        assert {:ok, false} = Log.exists(child, workspace: child_ws)
+      end
+    end
+
+    test "compensates finalized resources when Log creation fails in shared and cross workspaces",
+         %{ws: ws} do
+      for {mode, child_ws} <- [
+            {"shared", ws},
+            {"isolated", Path.join(ws, "isolated-log-compensation")}
+          ] do
+        File.mkdir_p!(child_ws)
+        seed = "seed-log-compensation-#{mode}"
+        child = "child-log-compensation-#{mode}"
+        descriptors = seed_with_resources(ws, seed, ["finalized"])
+        test_pid = self()
+
+        log_create_failpoint = fn ^child, _events, log_opts ->
+          final = Paths.session_resources_dir(child, Keyword.fetch!(log_opts, :workspace))
+          send(test_pid, {:warm_log_create_saw_final_resources, mode, File.dir?(final)})
+          {:error, Tool.error(:log_write_failed, "injected Log.create_session failure", %{})}
+        end
+
+        assert {:error, %{error: %{kind: :log_write_failed}}} =
+                 seed_child_log(child, seed,
+                   workspace: ws,
+                   child_workspace: child_ws,
+                   permission_posture: permission_posture(child_ws, %{workspace_mode: mode}),
+                   log_create_fun: log_create_failpoint
+                 )
+
+        assert_received {:warm_log_create_saw_final_resources, ^mode, true}
+        assert_seed_payloads_readable(ws, seed, descriptors)
+        assert_child_resource_dirs_absent(child_ws, child)
+        assert_child_resource_dirs_absent(ws, child)
+        assert {:ok, false} = Log.exists(child, workspace: child_ws)
+      end
     end
   end
 
@@ -299,7 +565,7 @@ defmodule Pixir.Subagents.WarmStartTest do
 
       child = "child-cache"
       cold = "cold-cache"
-      assert {:ok, _} = WarmStart.seed_child_log(child, seed, workspace: ws)
+      assert {:ok, _} = seed_child_log(child, seed, workspace: ws)
 
       assert {:ok, warm_history} = Log.fold(child, workspace: ws)
       warm_root = Fork.fork_root_session_id(warm_history, child)
@@ -317,6 +583,70 @@ defmodule Pixir.Subagents.WarmStartTest do
       assert warm_meta["prompt_cache_key"] == seed_meta["prompt_cache_key"]
       refute warm_meta["prompt_cache_key"] == cold_meta["prompt_cache_key"]
     end
+  end
+
+  defp seed_with_resources(workspace, seed, payloads) do
+    attachments =
+      Enum.map(payloads, fn bytes ->
+        %{
+          "type" => "image",
+          "name" => "#{bytes}.png",
+          "mimeType" => "image/png",
+          "dataUrl" => "data:image/png;base64,#{Base.encode64(bytes)}"
+        }
+      end)
+
+    assert {:ok, descriptors} =
+             SessionResources.ingest_attachments(seed, attachments, workspace: workspace)
+
+    seed_log(workspace, [
+      Event.user_message(seed, "resource message", resources: descriptors),
+      Event.assistant_message(seed, "resource reply")
+    ])
+
+    descriptors
+  end
+
+  defp assert_seed_payloads_readable(workspace, seed, descriptors) do
+    Enum.each(descriptors, fn descriptor ->
+      assert {:ok, data_url} =
+               SessionResources.data_url(seed, descriptor, workspace: workspace)
+
+      assert String.starts_with?(data_url, "data:image/png;base64,")
+    end)
+  end
+
+  defp assert_child_resource_dirs_absent(workspace, child_session_id) do
+    final = Paths.session_resources_dir(child_session_id, workspace)
+    refute File.exists?(final)
+    assert Path.wildcard(final <> ".staging*") == []
+  end
+
+  defp seed_child_log(child, seed, opts) do
+    posture_workspace = Keyword.get(opts, :child_workspace, Keyword.fetch!(opts, :workspace))
+
+    opts =
+      Keyword.put_new(
+        opts,
+        :permission_posture,
+        permission_posture(Path.expand(posture_workspace))
+      )
+
+    WarmStart.seed_child_log(child, seed, opts)
+  end
+
+  defp permission_posture(ws, overrides \\ %{}) do
+    Map.merge(
+      %{
+        subagent_id: "sub_atomic",
+        parent_session_id: "parent_atomic",
+        permission_mode: :read_only,
+        write_policy: nil,
+        workspace_mode: "shared",
+        workspace: ws
+      },
+      overrides
+    )
   end
 
   defp error_kind(%{error: %{kind: kind}}), do: kind

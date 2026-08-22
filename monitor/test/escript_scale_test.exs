@@ -63,13 +63,10 @@ defmodule PixirMonitor.EscriptScaleTest do
   @tag skip: @browser_skip
   @tag timeout: 240_000
   test "triage surfaces pin inventory, pagination, and exclusive 32 KiB boundaries" do
-    workspace =
-      Path.join(
-        System.tmp_dir!(),
-        "pixir-monitor-escript-scale-#{System.unique_integer([:positive])}"
-      )
+    workspace = PixirMonitor.TestRun.tmp("pixir-monitor-escript-scale")
+    profile_base = Path.join(workspace, "chrome-profiles")
 
-    File.mkdir_p!(workspace)
+    File.mkdir_p!(profile_base)
     on_exit(fn -> File.rm_rf!(workspace) end)
 
     expansion_prefix =
@@ -122,7 +119,7 @@ defmodule PixirMonitor.EscriptScaleTest do
           "--browser",
           @browser,
           "--profile-base",
-          System.tmp_dir!(),
+          profile_base,
           "--cap-run-id",
           cap_run_id,
           "--at-cap-unit-id",

@@ -241,6 +241,8 @@ ACP `resource_link` blocks are also accepted as Session Resource descriptors. Re
 local `file://` links are copied into Pixir's local resource store; remote links are
 recorded as references but are not fetched automatically.
 
-Provider-hosted Web Search is opt-in. It is not MCP and not a local browser tool:
-OpenAI runs the hosted search and Pixir records bounded source evidence in
-`provider_usage`.
+Provider-hosted Web Search is a Provider-hosted Tool, not MCP and not a local
+browser tool. After Provider and backend resolution, it is on by default for
+`chatgpt_codex` and off for `open_responses` and Anthropic. An explicit
+`web_search: false` always wins. OpenAI runs the hosted search and Pixir
+records bounded source evidence in `provider_usage`.

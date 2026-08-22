@@ -698,6 +698,7 @@ defmodule Pixir.Subagents.Manager do
       elapsed_ms: nil,
       timeout_reason: nil,
       next_actions: [],
+      cancellation_evidence: nil,
       last_seen_child_event_seq: nil,
       last_seen_child_event_type: nil,
       last_seen_child_event_ts: nil,
@@ -787,7 +788,7 @@ defmodule Pixir.Subagents.Manager do
   defp json_type(_value), do: "unknown"
 
   defp validate_optional_web_search(nil), do: {:ok, nil}
-  defp validate_optional_web_search(false), do: {:ok, nil}
+  defp validate_optional_web_search(false), do: {:ok, false}
   defp validate_optional_web_search(true), do: {:ok, %{"enabled" => true}}
 
   defp validate_optional_web_search(%{} = web_search) do
@@ -1056,7 +1057,8 @@ defmodule Pixir.Subagents.Manager do
     # so the two are not the same directory.
     case WarmStart.seed_child_log(child_sid, agent.seed_session_id,
            workspace: agent.workspace,
-           child_workspace: child_workspace
+           child_workspace: child_workspace,
+           permission_posture: child_permission_posture_request(agent, child_workspace)
          ) do
       {:ok, lineage} -> {:ok, child_sid, lineage}
       {:error, _error} = error -> error
@@ -1096,6 +1098,7 @@ defmodule Pixir.Subagents.Manager do
             elapsed_ms: nil,
             timeout_reason: nil,
             next_actions: [],
+            cancellation_evidence: nil,
             updated_at: now()
         }
 
@@ -1114,22 +1117,18 @@ defmodule Pixir.Subagents.Manager do
   defp restart_agent(_agent, _prompt, _opts, _state),
     do: {:error, Tool.error(:invalid_args, "prompt is required", %{})}
 
+  # Warm children already carry this Event in the atomic seed Log immediately
+  # after their runtime boundary. Appending it again after Session start would
+  # split construction authority and let the earlier validation snapshot drift
+  # from the lineage resolved by WarmStart's own fold.
+  defp persist_child_permission_posture(%{warm_start: %{"warm_started" => true}}, _child_sid),
+    do: :ok
+
   defp persist_child_permission_posture(agent, child_sid) do
-    data = %{
-      "event" => "permission_posture",
-      "scope" => "session",
-      "lineage" => "child",
-      "source" => "subagent_spawn",
-      "subagent_id" => agent.id,
-      "parent_session_id" => agent.parent_session_id,
-      "permission_mode" => permission_mode_string(agent.permission_mode),
-      "write_policy" => WritePolicy.metadata(agent.write_policy),
-      "workspace_mode" => agent.workspace_mode,
-      "workspace" => agent.child_workspace,
-      # Warm-start lineage is evidence, never policy input: this record is written
-      # AFTER the seeded prefix and is the only posture that governs the child.
-      "warm_start" => WarmStart.envelope_projection(Map.get(agent, :warm_start))
-    }
+    data =
+      agent
+      |> child_permission_posture_request(agent.child_workspace)
+      |> Subagents.child_permission_posture(nil)
 
     case Session.record(child_sid, Event.subagent_event(child_sid, data)) do
       {:ok, _event} -> :ok
@@ -1137,7 +1136,18 @@ defmodule Pixir.Subagents.Manager do
     end
   end
 
-  # Terminal cancellation statement on the CHILD's own Log (issue #444).
+  defp child_permission_posture_request(agent, child_workspace) do
+    %{
+      subagent_id: agent.id,
+      parent_session_id: agent.parent_session_id,
+      permission_mode: agent.permission_mode,
+      write_policy: agent.write_policy,
+      workspace_mode: agent.workspace_mode,
+      workspace: child_workspace
+    }
+  end
+
+  # Turn-scoped cancellation statement on the CHILD's own Log (issue #444/#491).
   #
   # Reuses the `:subagent_event` seam already used for the child's permission
   # posture at spawn, and the existing `cancelled_by_parent` vocabulary: a reader
@@ -1151,7 +1161,7 @@ defmodule Pixir.Subagents.Manager do
     data =
       %{
         "event" => "cancelled_by_parent",
-        "scope" => "session",
+        "scope" => "turn",
         "lineage" => "child",
         "source" => "subagent_close",
         "status" => "cancelled",
@@ -1656,24 +1666,37 @@ defmodule Pixir.Subagents.Manager do
   defp ensure_closeable(%{status: "detached"}), do: {:error, :detached}
   defp ensure_closeable(_agent), do: :ok
 
-  # A late timeout or cancel can race a child Session that already terminated
-  # (its test/app tore down, or it finished between deadline firing and handling).
-  # Interrupting a dead child must not crash the Manager: the timeout/cancel
-  # evidence below is still the honest record either way.
+  # A late timeout or cancel can race a child Session that already terminated. Return a
+  # bounded evidence classification rather than leaking or discarding the raw call result:
+  # the Manager may still fence its local running authority when the child is absent, while
+  # honestly projecting that the Session-owned interruption evidence is incomplete.
   defp safe_interrupt(session_id) do
-    Session.interrupt(session_id)
+    case Session.interrupt(session_id) do
+      :ok -> :complete
+      {:error, :no_turn} -> :complete
+      {:error, _error} -> :partial
+    end
   catch
-    :exit, _ -> :ok
+    :exit, _reason -> :partial
   end
 
   defp close_or_cancel_agent(%{status: "running"} = agent, opts) do
-    _ = safe_interrupt(agent.child_session_id)
+    interrupt_evidence = safe_interrupt(agent.child_session_id)
 
-    # The child Log must be self-sufficient evidence of its own cancellation, so
-    # the terminal statement lands AFTER the interrupt tore down the Turn and its
-    # orphan_tool_call reconciliation wrote its repairs: a fold of the child Log
-    # ends on the cancellation, not on a dangling tool_call/tool_result pair.
-    _ = persist_child_cancellation(agent, opts)
+    # This follows the synchronous interrupt result, but it is not promised physically
+    # list-last: an unlinked declaration producer may survive the logical Turn fence and
+    # append a later C6-classified straggler under its original compound identity.
+    child_event_evidence =
+      case persist_child_cancellation(agent, opts) do
+        :ok -> :complete
+        {:error, _error} -> :partial
+      end
+
+    cancellation_evidence =
+      Subagents.cancellation_evidence(
+        interrupt_evidence == :complete,
+        child_event_evidence == :complete
+      )
 
     {%{
        agent
@@ -1682,6 +1705,7 @@ defmodule Pixir.Subagents.Manager do
          elapsed_ms: elapsed_ms(agent),
          timeout_reason: "cancelled_by_parent",
          next_actions: interrupted_next_actions(agent),
+         cancellation_evidence: cancellation_evidence,
          updated_at: now()
      }, "cancelled"}
   end
@@ -1797,6 +1821,8 @@ defmodule Pixir.Subagents.Manager do
       elapsed_ms: terminal.elapsed_ms || data["elapsed_ms"],
       timeout_reason: terminal.reason || data["reason"],
       next_actions: terminal.next_actions || data["next_actions"] || [],
+      cancellation_evidence:
+        Subagents.normalize_cancellation_evidence(data["cancellation_evidence"]),
       last_seen_child_event_seq: nil,
       last_seen_child_event_type: nil,
       last_seen_child_event_ts: nil,
@@ -1913,6 +1939,8 @@ defmodule Pixir.Subagents.Manager do
           parent_log_path: live.parent_log_path || restored.parent_log_path,
           child_log_path: live.child_log_path || restored.child_log_path,
           deadline_at: live.deadline_at || restored.deadline_at,
+          cancellation_evidence:
+            restored.cancellation_evidence || Map.get(live, :cancellation_evidence),
           updated_at: now()
       }
     else
@@ -2470,6 +2498,7 @@ defmodule Pixir.Subagents.Manager do
     agent
     |> public_agent_base()
     |> maybe_put_retry_lineage(agent)
+    |> maybe_put_public("cancellation_evidence", Map.get(agent, :cancellation_evidence))
     |> maybe_put_public("virtual_diff", Map.get(agent, :virtual_diff))
     |> maybe_put_public("virtual_diff_ref", Map.get(agent, :virtual_diff_ref))
   end
@@ -2665,6 +2694,7 @@ defmodule Pixir.Subagents.Manager do
     agent
     |> terminal_event_fields_base()
     |> maybe_put_retry_lineage(agent)
+    |> maybe_put_event("cancellation_evidence", Map.get(agent, :cancellation_evidence))
     |> maybe_put_event("virtual_diff_ref", Map.get(agent, :virtual_diff_ref))
   end
 
