@@ -15,7 +15,17 @@ defmodule Pixir.Config do
   Legacy keys (`model`, `models`, `context_windows`) remain supported alongside the
   expanded surface (`permission_default`, `reasoning.effort`, `text.verbosity`,
   `bash_timeout_ms`, `bash_timeout_max_ms`, `host_commands`, `max_retries`,
-  `stream_idle_timeout_ms`, `compaction.tail_events`).
+  `stream_idle_timeout_ms`, `presenter_idle_timeout_ms`, `skills.user_scope`,
+  `compaction.tail_events`).
+
+  Pixir has three independent clocks: `stream_idle_timeout_ms` bounds silence within a
+  Provider transport stream; `presenter_idle_timeout_ms` bounds silence between Session
+  events in the CLI one-shot/resume `Conversation.await` path (ACP does not read this key);
+  and `bash_timeout_ms` caps each bash tool call. The presenter default deliberately exceeds
+  the bash default plus cleanup grace so a timed-out tool can return its recoverable result
+  before the presenter gives up. Agents may raise a bash call's `timeout_ms` as high as
+  `bash_timeout_max_ms` (600 seconds by default), above the presenter default; the
+  extension-during-tools step, rather than this default ordering, closes that race.
 
   `bash_timeout_max_ms` is an override cap, not a way to shorten the configured
   default. The effective cap is never lower than `bash_timeout_ms`; when config asks
@@ -39,6 +49,8 @@ defmodule Pixir.Config do
   @default_host_command_queue_timeout_ms 5_000
   @default_max_retries 2
   @default_stream_idle_timeout_ms 180_000
+  @default_presenter_idle_timeout_ms 300_000
+  @receive_after_max_ms 0xFFFFFFFF
   @default_tail_events 40
 
   @valid_reasoning_efforts ~w(low medium high xhigh)
@@ -190,6 +202,27 @@ defmodule Pixir.Config do
   @spec stream_idle_timeout_ms(keyword()) :: non_neg_integer()
   def stream_idle_timeout_ms(opts \\ []),
     do: get_in(load(opts), ["effective", "stream_idle_timeout_ms"])
+
+  @doc """
+  Resolved presenter idle timeout in milliseconds.
+
+  Pixir has three independent clocks: `stream_idle_timeout_ms` bounds silence within a
+  Provider transport stream; this key is the idle deadline between Session events in the
+  CLI one-shot/resume `Conversation.await` path (ACP does not read it); and
+  `bash_timeout_ms` caps each bash tool call. The 300-second default deliberately exceeds
+  the bash default plus cleanup grace so a timed-out tool returns before the CLI gives up.
+  Agents may raise a bash call's `timeout_ms` as high as `bash_timeout_max_ms` (600 seconds
+  by default), above this default; the extension-during-tools step, rather than this
+  ordering, closes that race.
+  """
+  @spec presenter_idle_timeout_ms(keyword()) :: pos_integer()
+  def presenter_idle_timeout_ms(opts \\ []),
+    do: get_in(load(opts), ["effective", "presenter_idle_timeout_ms"])
+
+  @doc "Whether Skills discovery includes the user scope (default `true`)."
+  @spec skills_user_scope(keyword()) :: boolean()
+  def skills_user_scope(opts \\ []),
+    do: get_in(load(opts), ["effective", "skills", "user_scope"])
 
   @spec compaction_tail_events(keyword()) :: pos_integer()
   def compaction_tail_events(opts \\ []),
@@ -689,6 +722,8 @@ defmodule Pixir.Config do
       },
       "max_retries" => resolve_max_retries(raw, ignored),
       "stream_idle_timeout_ms" => resolve_stream_idle_timeout_ms(raw, ignored),
+      "presenter_idle_timeout_ms" => resolve_presenter_idle_timeout_ms(raw, ignored),
+      "skills" => %{"user_scope" => resolve_skills_user_scope(raw, ignored)},
       "web_search" => resolve_web_search(raw, ignored),
       "compaction" => %{
         "tail_events" => resolve_tail_events(raw, ignored),
@@ -827,6 +862,43 @@ defmodule Pixir.Config do
       @default_stream_idle_timeout_ms,
       MapSet.member?(ignored, "stream_idle_timeout_ms")
     )
+  end
+
+  defp resolve_presenter_idle_timeout_ms(raw, ignored) do
+    resolved =
+      resolve_positive_int(
+        Application.get_env(:pixir, :presenter_idle_timeout_ms),
+        Map.get(raw, "presenter_idle_timeout_ms"),
+        @default_presenter_idle_timeout_ms,
+        MapSet.member?(ignored, "presenter_idle_timeout_ms")
+      )
+
+    if resolved <= @receive_after_max_ms, do: resolved, else: @default_presenter_idle_timeout_ms
+  end
+
+  defp resolve_skills_user_scope(raw, ignored) do
+    app = Application.get_env(:pixir, :skills_user_scope)
+
+    cond do
+      is_boolean(app) ->
+        app
+
+      MapSet.member?(ignored, "skills") ||
+          MapSet.member?(ignored, "skills.user_scope") ->
+        true
+
+      true ->
+        case Map.get(raw, "skills") do
+          skills when is_map(skills) and not is_struct(skills) ->
+            case normalized_config_value(skills, "user_scope") do
+              value when is_boolean(value) -> value
+              _ -> true
+            end
+
+          _ ->
+            true
+        end
+    end
   end
 
   defp resolve_web_search(raw, ignored) when is_struct(ignored, MapSet) do
@@ -1085,6 +1157,12 @@ defmodule Pixir.Config do
       "stream_idle_timeout_ms",
       Map.get(raw, "stream_idle_timeout_ms")
     )
+    |> maybe_warn_positive_int(
+      "presenter_idle_timeout_ms",
+      Map.get(raw, "presenter_idle_timeout_ms")
+    )
+    |> maybe_warn_presenter_idle_timeout_max(raw)
+    |> maybe_warn_skills(raw)
     |> maybe_warn_web_search(raw)
     |> maybe_warn_tail_events(raw)
     |> maybe_warn_model_assisted(raw)
@@ -1158,6 +1236,31 @@ defmodule Pixir.Config do
     end
   end
 
+  defp maybe_warn_skills(warnings, raw) do
+    case Map.get(raw, "skills") do
+      nil ->
+        warnings
+
+      skills when is_map(skills) and not is_struct(skills) ->
+        case fetch_normalized_config_value(skills, "user_scope") do
+          {:ok, value} when is_boolean(value) ->
+            warnings
+
+          {:ok, _value} ->
+            [warning("skills.user_scope", "must be a boolean; ignoring") | warnings]
+
+          :error ->
+            warnings
+
+          :collision ->
+            [warning("skills.user_scope", "must be a boolean; ignoring") | warnings]
+        end
+
+      _invalid_parent ->
+        [warning("skills", "must be an object; ignoring user_scope") | warnings]
+    end
+  end
+
   defp maybe_warn_web_search(warnings, raw) do
     case Map.get(raw, "web_search") do
       nil ->
@@ -1204,6 +1307,22 @@ defmodule Pixir.Config do
       is_nil(value) -> warnings
       is_integer(value) and value > 0 -> warnings
       true -> [warning(field, "must be a positive integer; ignoring") | warnings]
+    end
+  end
+
+  defp maybe_warn_presenter_idle_timeout_max(warnings, raw) do
+    case Map.get(raw, "presenter_idle_timeout_ms") do
+      value when is_integer(value) and value > @receive_after_max_ms ->
+        [
+          warning(
+            "presenter_idle_timeout_ms",
+            "exceeds the maximum receive-after timeout; ignoring"
+          )
+          | warnings
+        ]
+
+      _ ->
+        warnings
     end
   end
 

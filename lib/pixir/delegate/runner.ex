@@ -1577,7 +1577,7 @@ defmodule Pixir.Delegate.Runner do
       "handle" => handle,
       "workspace" => runtime.workspace,
       "children" => children,
-      "summary" => delegate_summary(status, outcome),
+      "summary" => delegate_summary(status, outcome) |> maybe_append_directive(children),
       "artifacts" => [],
       "diagnostics" => diagnostics(parent_session_id, runtime.workspace),
       "timeout_diagnostics" => timeout_diagnostics,
@@ -1673,7 +1673,7 @@ defmodule Pixir.Delegate.Runner do
       "usable_checkpoints" => result["usable_checkpoints"] || [],
       "safe_next_actions" => result["safe_next_actions"] || [],
       "workflow" => workflow_projection(result),
-      "summary" => workflow_delegate_summary(status, result),
+      "summary" => workflow_delegate_summary(status, result) |> maybe_append_directive(children),
       "artifacts" => [],
       "diagnostics" => workflow_diagnostics(parent_session_id, runtime.workspace),
       "limits" => %{
@@ -2159,6 +2159,18 @@ defmodule Pixir.Delegate.Runner do
   end
 
   defp delegate_status(_outcome), do: "partial"
+
+  @doc false
+  def presentation_summary_for_test(summary, children),
+    do: maybe_append_directive(summary, children)
+
+  defp maybe_append_directive(summary, children) do
+    if Subagents.potentially_integrable?(children) do
+      summary <> "\n\n" <> Subagents.reverification_directive()
+    else
+      summary
+    end
+  end
 
   defp delegate_summary("completed", outcome), do: outcome["summary"] || "delegate completed."
 

@@ -293,6 +293,31 @@ defmodule Pixir.TurnTest do
     refute Enum.any?(off["tools"] || [], &(&1["type"] == "web_search"))
   end
 
+  test "skills.user_scope false removes implicit user skills from the Turn system prompt", %{
+    ctx: ctx,
+    ws: ws
+  } do
+    user_home = Path.join(ws, "home")
+    pixir_home = Path.join(ws, "pixir-home")
+
+    write_turn_skill(Path.join(ws, ".agents/skills"), "repo-only", "Repo skill")
+    write_turn_skill(Path.join(user_home, ".agents/skills"), "user-only", "User skill")
+    write_turn_skill(Path.join(pixir_home, "skills"), "global-only", "Global skill")
+
+    assert {:ok, "ok"} =
+             Turn.run(ctx, "skills config",
+               provider: RequestCaptureProvider,
+               provider_opts: [test_pid: self()],
+               skills_opts: [user_home: user_home, pixir_home: pixir_home],
+               config_opts: [raw_config: %{"skills" => %{"user_scope" => false}}]
+             )
+
+    assert_received {:provider_request, request}
+    assert request.system_prompt =~ "<name>repo-only</name>"
+    assert request.system_prompt =~ "<name>global-only</name>"
+    refute request.system_prompt =~ "user-only"
+  end
+
   test "custom Provider runtime opts omit consumed Config ingress seams", %{ctx: ctx} do
     assert {:ok, "ok"} =
              Turn.run(ctx, "capture runtime opts",
@@ -461,7 +486,7 @@ defmodule Pixir.TurnTest do
     refute usage.data["prompt_cache_key"] =~ "hello"
   end
 
-  test "cache metadata seam relabels Anthropic runs pa1 and drops prompt_cache_key" do
+  test "cache metadata seam relabels Anthropic runs pa4 and drops prompt_cache_key" do
     metadata = %{
       "prompt_cache_key" => "px3:m_x:r_build:s_fam:t_tools:k_skills",
       "prompt_contract_version" => "px3",
@@ -471,7 +496,7 @@ defmodule Pixir.TurnTest do
     }
 
     anthropic = Turn.provider_cache_metadata(metadata, Pixir.Providers.Anthropic)
-    assert anthropic["prompt_contract_version"] == "pa1"
+    assert anthropic["prompt_contract_version"] == "pa4"
     refute Map.has_key?(anthropic, "prompt_cache_key")
     assert anthropic["toolset_hash"] == "t"
     assert anthropic["session_family_hash"] == "s"
@@ -2453,7 +2478,7 @@ defmodule Pixir.TurnTest do
     end
   end
 
-  describe "px3 prompt contract (ADR 0020)" do
+  describe "px7 prompt contract (ADR 0020)" do
     test "Layer 0 instructions are byte-identical across workspaces", %{ws: ws} do
       other = ws <> "-other-workspace"
       File.mkdir_p!(other)
@@ -2574,6 +2599,29 @@ defmodule Pixir.TurnTest do
       assert request.developer_context =~ "OS-boundary fanout carefully bounded"
     end
 
+    test "delegation context rendering matches the pre-branch bytes", %{ctx: ctx} do
+      rendered =
+        Turn.developer_context(
+          ctx,
+          :build,
+          :auto,
+          nil,
+          %{"subagent_id" => "sub_demo"}
+        )
+
+      assert rendered ==
+               ~s(Developer context: the workspace root is "#{ctx.workspace}".\nSubagent delegation context:\n- "subagent_id": "sub_demo")
+
+      refute rendered =~ "Re-verify all integrated results from delegated children"
+    end
+
+    test "nil and empty delegation contexts preserve the developer-context bytes", %{ctx: ctx} do
+      expected = ~s(Developer context: the workspace root is "#{ctx.workspace}".)
+
+      assert Turn.developer_context(ctx, :build, :auto, nil, nil) == expected
+      assert Turn.developer_context(ctx, :build, :auto, nil, %{}) == expected
+    end
+
     test "developer context is byte-stable across plan/build flips (continuation)", %{
       ctx: ctx
     } do
@@ -2604,7 +2652,7 @@ defmodule Pixir.TurnTest do
       assert request.developer_context =~ "read-only"
     end
 
-    test "provider_usage carries the prompt-contract version and px3 key", %{
+    test "provider_usage carries the prompt-contract version and px7 key", %{
       ctx: ctx,
       sid: sid,
       ws: ws
@@ -2613,45 +2661,53 @@ defmodule Pixir.TurnTest do
 
       assert {:ok, history} = Log.fold(sid, workspace: ws)
       usage = Enum.find(history, &(&1.type == :provider_usage))
-      assert usage.data["prompt_contract_version"] == "px4"
-      assert String.starts_with?(usage.data["prompt_cache_key"], "px4:")
+      assert usage.data["prompt_contract_version"] == "px7"
+      assert String.starts_with?(usage.data["prompt_cache_key"], "px7:")
     end
 
-    test "Layer 0/1 and developer-context bytes are pinned to the prompt-contract version" do
+    test "build and plan Layer 0 bytes are pinned independently to the prompt-contract version" do
       # The prompt-contract segment exists so an intentional prefix change is attributable in
-      # provider_usage evidence. This pin makes the coupling mechanical: ANY byte
-      # change to the stable prompt layers or the developer-context template must
-      # arrive together with a version bump in Pixir.Provider.Cache and a re-pin here
-      # — otherwise the fleet takes an unexplained cold-cache wave while evidence
-      # still claims the old contract.
+      # provider_usage evidence. Separate build/plan pins make mode isolation mechanical:
+      # changing build bytes must not silently perturb plan bytes. Any intentional stable
+      # prompt change must arrive with a version bump in Pixir.Provider.Cache and a re-pin.
       ws = Path.join(System.tmp_dir!(), "pixir-pin-#{:erlang.unique_integer([:positive])}")
       File.mkdir_p!(ws)
       on_exit(fn -> File.rm_rf!(ws) end)
       ctx = %{session_id: "pin", workspace: ws, role: :build}
 
-      template_ctx = %{
-        session_id: "pin",
-        workspace: "/__pixir_prompt_contract_workspace__",
-        role: :build
+      template_ctx = %{ctx | workspace: "/workspace"}
+
+      hashes = %{
+        build:
+          Turn.system_prompt(ctx, :build, roots: [])
+          |> then(&:crypto.hash(:sha256, &1))
+          |> Base.encode16(case: :lower),
+        plan:
+          Turn.system_prompt(ctx, :plan, roots: [])
+          |> then(&:crypto.hash(:sha256, &1))
+          |> Base.encode16(case: :lower),
+        developer_context: %{
+          auto:
+            Turn.developer_context(template_ctx, :build, :auto)
+            |> then(&:crypto.hash(:sha256, &1))
+            |> Base.encode16(case: :lower),
+          read_only:
+            Turn.developer_context(template_ctx, :build, :read_only)
+            |> then(&:crypto.hash(:sha256, &1))
+            |> Base.encode16(case: :lower)
+        }
       }
 
-      combined =
-        Turn.system_prompt(ctx, :build, roots: []) <>
-          "\n--\n" <>
-          Turn.system_prompt(ctx, :plan, roots: []) <>
-          "\n--\n" <>
-          Turn.developer_context(template_ctx, :build, :auto) <>
-          "\n--\n" <>
-          Turn.developer_context(template_ctx, :build, :read_only)
-
-      pinned_hash = :crypto.hash(:sha256, combined) |> Base.encode16(case: :lower)
-
-      assert {Pixir.Provider.Cache.prompt_contract_version(), pinned_hash} ==
-               {"px4", "86afcfd20e269b552c511b4d5e45d00ae69584eaea2fcc0b8b660cd2614ab2db"},
-             "Stable prompt layers changed. If intentional: bump " <>
-               "Pixir.Provider.Cache.prompt_contract_version, re-pin this " <>
-               "hash, and note the contract change. Never ship prompt-byte changes " <>
-               "under an unchanged contract version."
+      assert {Pixir.Provider.Cache.prompt_contract_version(), hashes} ==
+               {"px7",
+                %{
+                  build: "9ee215f6efda1e32e56fca5073e88431c6aac34c201b726c886345caadde6c70",
+                  plan: "e41ecfd81ddca318884d30bc43bd536bfc1371d66dc832eeeb091757bfac7c83",
+                  developer_context: %{
+                    auto: "d0480c2787c7ece937e1d9ebd3d42c0b95de353ced0839896d31c7b831098ca4",
+                    read_only: "67710509e838d88dd3a270685f51a89c76a4a572edf3106092654e6da0428e29"
+                  }
+                }}
     end
 
     test "fork-root in ctx routes the cache key to the root family", %{ws: ws} do
@@ -2948,6 +3004,10 @@ defmodule Pixir.TurnTest do
 
       assert Compaction.compact_threshold() == 200_000
     end
+  end
+
+  defp write_turn_skill(root, name, description) do
+    write_skill(Path.join(root, name), name, description, "#{name} body")
   end
 
   defp sse_completed(text) do

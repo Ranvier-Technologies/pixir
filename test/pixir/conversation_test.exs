@@ -1,7 +1,7 @@
 defmodule Pixir.ConversationTest do
   use ExUnit.Case, async: false
 
-  alias Pixir.{Conversation, Event, Log, Paths}
+  alias Pixir.{Conversation, Event, Log, Paths, Subagents}
 
   # Minimal provider stub: pops scripted results, streams text deltas (like TurnTest's).
   defmodule StubProvider do
@@ -198,6 +198,80 @@ defmodule Pixir.ConversationTest do
              Conversation.start(id: "badsess", workspace: ws)
 
     assert kind in [:corrupt_log_line, :session_start_failed]
+  end
+
+  test "await drains a terminal event queued during a false expiry presence check", %{ws: ws} do
+    {:ok, sid} = Conversation.start(workspace: ws)
+    :ok = Conversation.subscribe(sid)
+
+    liveness_check = fn checked_sid ->
+      send(self(), {:pixir_event, Event.status(checked_sid, "done")})
+      false
+    end
+
+    assert :done =
+             Conversation.await(sid,
+               idle_timeout: 10,
+               subagent_liveness_check: liveness_check
+             )
+  end
+
+  test "idle_timeout zero never consults or extends for subagent presence", %{ws: ws} do
+    {:ok, sid} = Conversation.start(workspace: ws)
+    :ok = Conversation.subscribe(sid)
+    test_pid = self()
+
+    liveness_check = fn _sid ->
+      send(test_pid, :zero_timeout_presence_check)
+      true
+    end
+
+    assert :timeout =
+             Conversation.await(sid,
+               idle_timeout: 0,
+               subagent_liveness_check: liveness_check
+             )
+
+    refute_received :zero_timeout_presence_check
+  end
+
+  test "a timed-out child stops extending the parent idle deadline", %{ws: ws} do
+    {:ok, sid} = Conversation.start(workspace: ws)
+    :ok = Conversation.subscribe(sid)
+
+    assert {:ok, agent} =
+             Subagents.spawn_agent(
+               sid,
+               %{
+                 "task" => "block until child timeout",
+                 "workspace_mode" => "shared",
+                 "timeout_ms" => 120
+               },
+               workspace: ws,
+               provider: BlockingProvider,
+               permission_mode: :read_only
+             )
+
+    on_exit(fn ->
+      try do
+        _ = Subagents.close(sid, agent["id"], workspace: ws)
+        _ = Pixir.SessionSupervisor.stop_session(agent["child_session_id"])
+      catch
+        :exit, _reason -> :ok
+      end
+    end)
+
+    started_at = System.monotonic_time(:millisecond)
+    assert :timeout = Conversation.await(sid, idle_timeout: 40, cleanup_timeout: 0)
+    elapsed_ms = System.monotonic_time(:millisecond) - started_at
+
+    assert elapsed_ms >= 120
+    assert elapsed_ms < 500
+    assert {:ok, history} = Conversation.history(sid)
+
+    assert Enum.any?(history, fn event ->
+             event.type == :subagent_event and event.data["event"] == "timed_out"
+           end)
   end
 
   test "await treats an interrupted turn as terminal (ADR 0008)", %{ws: ws} do

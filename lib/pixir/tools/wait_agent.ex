@@ -46,9 +46,14 @@ defmodule Pixir.Tools.WaitAgent do
            Subagents.wait_outcome(context.session_id, ids, timeout_ms,
              workspace: context.workspace
            ) do
+      output =
+        outcome
+        |> Subagents.summarize_wait_outcome()
+        |> maybe_append_reverification_directive(outcome)
+
       {:ok,
        %{
-         "output" => Subagents.summarize_wait_outcome(outcome),
+         "output" => output,
          "subagents" => outcome["subagents"],
          "outcome" => outcome
        }}
@@ -71,6 +76,19 @@ defmodule Pixir.Tools.WaitAgent do
 
   def dry_run(_args, _context),
     do: {:error, Tool.error(:invalid_args, "arguments must be an object", %{})}
+
+  @doc false
+  def append_reverification_directive_for_test(output, outcome),
+    do: maybe_append_reverification_directive(output, outcome)
+
+  defp maybe_append_reverification_directive(output, outcome) do
+    if outcome["status"] in ["completed", "partial"] and
+         Subagents.potentially_integrable?(outcome["subagents"] || []) do
+      output <> "\n\n" <> Subagents.reverification_directive()
+    else
+      output
+    end
+  end
 
   defp validate(timeout_ms, ids)
        when is_integer(timeout_ms) and timeout_ms >= 0 and is_list(ids),

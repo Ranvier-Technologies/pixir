@@ -1,7 +1,7 @@
 defmodule Pixir.ToolsTest do
   use ExUnit.Case, async: true
 
-  alias Pixir.{Log, Permissions.WritePolicy, SessionSupervisor}
+  alias Pixir.{Log, Permissions.WritePolicy, SessionSupervisor, Subagents}
   alias Pixir.Support.ToolContract
   alias Pixir.Test.WorkspaceFixtures
 
@@ -239,6 +239,27 @@ defmodule Pixir.ToolsTest do
   end
 
   describe "bash" do
+    test "schema exposes the byte-pinned optional timeout in both provider dialects" do
+      description =
+        "Kill the command after this many milliseconds. Default 120000; requests are clamped to the operator's bash_timeout_max_ms (600000 unless configured). Raise it for legitimately long commands like test suites or installs."
+
+      schema = Bash.__tool__().parameters
+
+      assert schema["properties"]["timeout_ms"] == %{
+               "type" => "integer",
+               "minimum" => 1,
+               "description" => description
+             }
+
+      assert schema["required"] == ["command"]
+
+      responses_bash = Enum.find(Registry.responses_specs(), &(&1["name"] == "bash"))
+      anthropic_bash = Enum.find(Registry.anthropic_specs(), &(&1["name"] == "bash"))
+
+      assert responses_bash["parameters"] == schema
+      assert anthropic_bash["input_schema"] == schema
+    end
+
     test "runs a command in the workspace and captures output", %{ctx: ctx, ws: ws} do
       File.write!(Path.join(ws, "marker"), "")
       boundary = start_boundary()
@@ -263,6 +284,10 @@ defmodule Pixir.ToolsTest do
       assert timeout["effective_ms"] == 120_000
       assert timeout["source"] == "config"
       assert timeout["capped"] == false
+
+      assert Map.keys(timeout) |> Enum.sort() ==
+               ~w(capped configured_ms effective_ms max_ms requested_ms source)
+
       assert host_command["boundary"] == "host_command"
       assert host_command["tool"] == "bash"
     end
@@ -341,6 +366,26 @@ defmodule Pixir.ToolsTest do
 
       refute File.exists?(Path.join(ws, "should_not_exist"))
       assert {:ok, %{"active_count" => 0, "queue_depth" => 0}} = boundary_snapshot(boundary)
+    end
+
+    test "reports a structured error when perl is unavailable", %{ctx: ctx} do
+      ctx = Map.put(ctx, :bash_executable_resolver, fn "perl" -> nil end)
+
+      assert {:error,
+              %{
+                error: %{
+                  kind: :command_failed,
+                  message: "required bash dependency is unavailable",
+                  details: %{
+                    "dependency" => "perl",
+                    "required_for" => "process-group kill",
+                    "next_actions" => next_actions
+                  }
+                }
+              }} = Bash.execute(%{"command" => "echo no"}, ctx)
+
+      assert is_list(next_actions)
+      assert Enum.any?(next_actions, &String.contains?(&1, "install perl"))
     end
 
     test "rejects parent-directory path references before host execution", %{ctx: ctx} do
@@ -444,7 +489,69 @@ defmodule Pixir.ToolsTest do
       assert {:ok, %{"active_count" => 0, "queue_depth" => 0}} = boundary_snapshot(boundary)
     end
 
-    test "kills a command that exceeds the timeout", %{ctx: ctx} do
+    test "agent timeout is honored and confesses pid plus kill escalation", %{ctx: ctx} do
+      boundary = start_boundary()
+
+      ctx =
+        ctx
+        |> Map.put(:host_command_boundary, boundary)
+        |> Map.put(:host_command_limits, host_command_limits())
+
+      assert {:error,
+              %{
+                error: %{
+                  kind: :timeout,
+                  message: "command timed out after 300ms and was killed",
+                  details: %{
+                    "host_command" => %{"boundary" => "host_command"},
+                    "milliseconds" => 300,
+                    "timeout" => timeout
+                  }
+                }
+              }} =
+               Bash.execute(%{"command" => "sleep 5", "timeout_ms" => 300}, ctx)
+
+      assert timeout["requested_ms"] == 300
+      assert timeout["effective_ms"] == 300
+      assert timeout["clamped"] == false
+      assert timeout["source"] == "model"
+      assert is_integer(timeout["os_pid"])
+      assert timeout["kill_escalation"] in ["sigterm", "sigkill"]
+      assert {:ok, %{"active_count" => 0, "queue_depth" => 0}} = boundary_snapshot(boundary)
+    end
+
+    test "agent timeout is clamped to the operator maximum and confessed", %{ctx: ctx} do
+      boundary = start_boundary()
+      cap = Pixir.Config.bash_timeout_max_ms()
+      requested = cap + 1
+
+      ctx =
+        ctx
+        |> Map.put(:host_command_boundary, boundary)
+        |> Map.put(:host_command_limits, host_command_limits())
+
+      assert {:ok, %{"timeout" => timeout}} =
+               Bash.execute(%{"command" => "echo ok", "timeout_ms" => requested}, ctx)
+
+      assert timeout["requested_ms"] == requested
+      assert timeout["effective_ms"] == cap
+      assert timeout["max_ms"] == cap
+      assert timeout["clamped"] == true
+      assert timeout["capped"] == true
+      assert timeout["source"] == "model"
+    end
+
+    test "rejects non-positive and non-integer agent timeouts", %{ctx: ctx} do
+      for bad <- [0, -1, 1.5, "300", nil] do
+        assert {:error, %{error: %{kind: :invalid_args}}} =
+                 Bash.execute(%{"command" => "echo no", "timeout_ms" => bad}, ctx)
+
+        assert {:error, %{error: %{kind: :invalid_args}}} =
+                 Bash.dry_run(%{"command" => "echo no", "timeout_ms" => bad}, ctx)
+      end
+    end
+
+    test "context timeout remains the fallback when the agent omits timeout_ms", %{ctx: ctx} do
       boundary = start_boundary()
 
       ctx =
@@ -453,24 +560,135 @@ defmodule Pixir.ToolsTest do
         |> Map.put(:host_command_boundary, boundary)
         |> Map.put(:host_command_limits, host_command_limits())
 
-      assert {:error,
-              %{
-                error: %{
-                  kind: :timeout,
-                  details: %{
-                    "host_command" => %{"boundary" => "host_command"},
-                    "seconds" => 0,
-                    "timeout" => %{
-                      "requested_ms" => 150,
-                      "effective_ms" => 150,
-                      "source" => "context"
-                    }
-                  }
-                }
-              }} =
+      assert {:error, %{error: %{kind: :timeout, details: %{"timeout" => timeout}}}} =
                Bash.execute(%{"command" => "sleep 5"}, ctx)
 
+      assert timeout["requested_ms"] == nil
+      assert timeout["effective_ms"] == 150
+      assert timeout["clamped"] == false
+      assert timeout["source"] == "context"
+      assert is_integer(timeout["os_pid"])
+      assert timeout["kill_escalation"] in ["sigterm", "sigkill"]
       assert {:ok, %{"active_count" => 0, "queue_depth" => 0}} = boundary_snapshot(boundary)
+    end
+
+    test "timeout kills the confessed spawned pid", %{ctx: ctx} do
+      boundary = start_boundary()
+
+      ctx =
+        ctx
+        |> Map.put(:host_command_boundary, boundary)
+        |> Map.put(:host_command_limits, host_command_limits())
+
+      assert {:error, %{error: %{kind: :timeout, details: %{"timeout" => timeout}}}} =
+               Bash.execute(%{"command" => "bash -c 'sleep 30'", "timeout_ms" => 300}, ctx)
+
+      assert :ok = wait_until(fn -> not os_process_alive?(timeout["os_pid"]) end, 1_000)
+    end
+
+    test "caller death reaper kills the spawned process group", %{ctx: ctx, ws: ws} do
+      boundary = start_boundary()
+
+      ctx =
+        ctx
+        |> Map.put(:host_command_boundary, boundary)
+        |> Map.put(:host_command_limits, host_command_limits())
+
+      command = ~S|echo $$ > leader.pid; bash -c 'sleep 46' & echo $! > child.pid; wait|
+      caller = spawn(fn -> Bash.execute(%{"command" => command}, ctx) end)
+      caller_ref = Process.monitor(caller)
+
+      assert :ok =
+               wait_until(
+                 fn ->
+                   pid_file_ready?(ws, "leader.pid") and pid_file_ready?(ws, "child.pid")
+                 end,
+                 1_000
+               )
+
+      leader_pid = read_pid!(ws, "leader.pid")
+      child_pid = read_pid!(ws, "child.pid")
+
+      Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^caller_ref, :process, ^caller, :killed}, 1_000
+
+      assert :ok = wait_until(fn -> not os_process_alive?(leader_pid) end, 1_000)
+      assert :ok = wait_until(fn -> not os_process_alive?(child_pid) end, 1_000)
+      refute non_zombie_process_group_alive?(leader_pid)
+    end
+
+    test "timeout kills sequential nested shells without exec flattening", %{ctx: ctx} do
+      boundary = start_boundary()
+
+      ctx =
+        ctx
+        |> Map.put(:host_command_boundary, boundary)
+        |> Map.put(:host_command_limits, host_command_limits())
+
+      assert {:error, %{error: %{kind: :timeout, details: %{"timeout" => timeout}}}} =
+               Bash.execute(
+                 %{"command" => ~S(bash -c 'true; bash -c "sleep 30"'), "timeout_ms" => 300},
+                 ctx
+               )
+
+      assert :ok =
+               wait_until(fn -> not non_zombie_process_group_alive?(timeout["os_pid"]) end, 1_000)
+    end
+
+    test "timeout kills command-substitution children", %{ctx: ctx} do
+      boundary = start_boundary()
+
+      ctx =
+        ctx
+        |> Map.put(:host_command_boundary, boundary)
+        |> Map.put(:host_command_limits, host_command_limits())
+
+      assert {:error, %{error: %{kind: :timeout, details: %{"timeout" => timeout}}}} =
+               Bash.execute(
+                 %{"command" => ~S|bash -c 'echo $(sleep 30)'|, "timeout_ms" => 300},
+                 ctx
+               )
+
+      assert :ok =
+               wait_until(fn -> not non_zombie_process_group_alive?(timeout["os_pid"]) end, 1_000)
+    end
+
+    test "timeout SIGKILL reaches a child that ignores SIGTERM", %{ctx: ctx} do
+      boundary = start_boundary()
+
+      ctx =
+        ctx
+        |> Map.put(:host_command_boundary, boundary)
+        |> Map.put(:host_command_limits, host_command_limits())
+
+      command =
+        ~S|bash -c "echo start; perl -e '| <>
+          <<92, 36>> <> ~S|SIG{TERM}=q(IGNORE); sleep 30'"|
+
+      assert {:error, %{error: %{kind: :timeout, details: %{"timeout" => timeout}}}} =
+               Bash.execute(%{"command" => command, "timeout_ms" => 300}, ctx)
+
+      assert timeout["kill_escalation"] == "sigkill"
+
+      assert :ok =
+               wait_until(fn -> not non_zombie_process_group_alive?(timeout["os_pid"]) end, 1_000)
+    end
+
+    test "timeout drains pending port messages from the caller mailbox", %{ctx: ctx} do
+      boundary = start_boundary()
+
+      ctx =
+        ctx
+        |> Map.put(:host_command_boundary, boundary)
+        |> Map.put(:host_command_limits, host_command_limits())
+
+      task =
+        Task.async(fn ->
+          result = Bash.execute(%{"command" => "echo ready; sleep 30", "timeout_ms" => 300}, ctx)
+          {result, Process.info(self(), :messages)}
+        end)
+
+      assert {{:error, %{error: %{kind: :timeout}}}, {:messages, []}} = Task.await(task, 2_000)
     end
 
     test "reports structured backpressure without running or logging raw command", %{ctx: ctx} do
@@ -740,6 +958,18 @@ defmodule Pixir.ToolsTest do
       assert schema["properties"]["template"]["description"] =~ "paired with skill"
     end
 
+    test "output append is byte-pinned for completed and absent for non-integrable steps" do
+      base = "rendered workflow"
+
+      assert RunWorkflow.append_reverification_directive_for_test(base, %{
+               "steps" => [%{"status" => "completed"}]
+             }) == base <> "\n\n" <> Subagents.reverification_directive()
+
+      assert RunWorkflow.append_reverification_directive_for_test(base, %{
+               "steps" => [%{"status" => "failed"}]
+             }) == base
+    end
+
     test "dry_run expands a Skill-backed Workflow Template", %{ctx: ctx, ws: ws} do
       skill_dir =
         write_skill(Path.join(ws, ".agents/skills/planner"), "planner", "Planner skill", "body")
@@ -825,6 +1055,39 @@ defmodule Pixir.ToolsTest do
       assert [%{"id" => "held"}] = workflow["held_steps"]
       assert output =~ "partial"
       refute output =~ "completed"
+      assert String.ends_with?(output, Subagents.reverification_directive())
+    end
+
+    test "output remains byte-identical to the renderer without an integrable step", %{ws: ws} do
+      {:ok, sid, pid} = SessionSupervisor.start_session(workspace: ws, role: :build)
+
+      on_exit(fn ->
+        if Process.alive?(pid), do: DynamicSupervisor.terminate_child(SessionSupervisor, pid)
+      end)
+
+      ctx = %{
+        session_id: sid,
+        workspace: ws,
+        call_id: "c1",
+        provider: PartialWorkflowProvider
+      }
+
+      assert {:ok, %{"workflow" => workflow, "output" => output}} =
+               RunWorkflow.execute(
+                 %{"id" => "failed_only", "steps" => [%{"id" => "fail", "task" => "fail"}]},
+                 ctx
+               )
+
+      summary = workflow["summary"]
+
+      assert output ==
+               "Workflow failed_only partial: " <>
+                 "#{summary["checkpoint_ready_steps"]} checkpoint-ready, " <>
+                 "#{summary["failed_steps"]} failed, #{summary["held_steps"]} held, " <>
+                 "#{summary["partial_steps"]} partial, " <>
+                 "#{summary["needs_orchestrator_steps"]} needing orchestrator."
+
+      refute output =~ Subagents.reverification_directive()
     end
 
     test "execute returns not-applied virtual_diff for virtual_overlay steps", %{ctx: ctx, ws: ws} do
@@ -935,6 +1198,52 @@ defmodule Pixir.ToolsTest do
       "queue_limit" => Keyword.get(overrides, :queue_limit, 1),
       "queue_timeout_ms" => Keyword.get(overrides, :queue_timeout_ms, 500)
     }
+  end
+
+  defp pid_file_ready?(workspace, filename) do
+    case File.read(Path.join(workspace, filename)) do
+      {:ok, value} -> match?({_pid, ""}, Integer.parse(String.trim(value)))
+      {:error, _reason} -> false
+    end
+  end
+
+  defp read_pid!(workspace, filename) do
+    workspace
+    |> Path.join(filename)
+    |> File.read!()
+    |> String.trim()
+    |> String.to_integer()
+  end
+
+  defp os_process_alive?(os_pid) do
+    executable = System.find_executable("kill") || "/bin/kill"
+
+    match?(
+      {_output, 0},
+      System.cmd(executable, ["-0", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    )
+  end
+
+  defp non_zombie_process_group_alive?(os_pid) do
+    executable = System.find_executable("ps") || "/bin/ps"
+
+    case System.cmd(executable, ["-axo", "pgid=,state="], stderr_to_stdout: true) do
+      {output, 0} ->
+        Enum.any?(String.split(output, "\n", trim: true), fn line ->
+          case String.split(String.trim(line), ~r/\s+/, parts: 2) do
+            [pgid, state] ->
+              pgid == Integer.to_string(os_pid) and not String.starts_with?(state, "Z")
+
+            _other ->
+              false
+          end
+        end)
+
+      {_output, _exit_code} ->
+        true
+    end
+  rescue
+    _error -> true
   end
 
   defp wait_until(fun, timeout_ms) do

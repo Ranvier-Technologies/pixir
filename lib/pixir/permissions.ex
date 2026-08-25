@@ -263,6 +263,9 @@ defmodule Pixir.Permissions do
       token == "" ->
         false
 
+      token == "/dev/null" ->
+        false
+
       parent_directory_token?(token) ->
         true
 

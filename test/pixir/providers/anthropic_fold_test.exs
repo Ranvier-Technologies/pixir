@@ -577,7 +577,7 @@ defmodule Pixir.Providers.AnthropicTurnProofTest do
     assert latest_user_text =~ "Subagent role instructions:\nKeep the subagent scoped."
   end
 
-  test "text-only Turn.run records pa1 usage without prompt_cache_key", %{
+  test "text-only Turn.run records pa4 usage without prompt_cache_key", %{
     ctx: ctx,
     sid: sid,
     ws: ws
@@ -598,7 +598,7 @@ defmodule Pixir.Providers.AnthropicTurnProofTest do
 
     assert {:ok, history} = Log.fold(sid, workspace: ws)
     usage = Enum.find(history, &(&1.type == :provider_usage))
-    assert usage.data["prompt_contract_version"] == "pa1"
+    assert usage.data["prompt_contract_version"] == "pa4"
     refute Map.has_key?(usage.data, "prompt_cache_key")
   end
 
@@ -621,7 +621,7 @@ defmodule Pixir.Providers.AnthropicTurnProofTest do
 
     assert {:ok, history} = Log.fold(sid, workspace: ws)
     usage = Enum.find(history, &(&1.type == :provider_usage))
-    assert usage.data["prompt_contract_version"] == "pa1"
+    assert usage.data["prompt_contract_version"] == "pa4"
     refute Map.has_key?(usage.data, "prompt_cache_key")
   end
 

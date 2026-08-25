@@ -1404,6 +1404,45 @@ defmodule Pixir.SubagentsTest do
     assert {:ok, []} = Subagents.list(sid, workspace: ws)
   end
 
+  test "re-verification directive is byte-pinned at its single source" do
+    assert Subagents.reverification_directive() ==
+             "Re-verify all integrated results from delegated children before committing or declaring the work done. Run the workspace's own verification, including typechecks, tests, and any commands named in the work brief."
+  end
+
+  test "potentially integrable statuses include completed, timed_out, and closed only" do
+    for status <- ~w(completed timed_out closed) do
+      assert Subagents.potentially_integrable?([%{"status" => status}])
+    end
+
+    refute Subagents.potentially_integrable?([
+             %{"status" => "failed"},
+             %{"status" => "cancelled"}
+           ])
+  end
+
+  test "wait_agent terminal gating appends for timed_out and closed but not incomplete polls" do
+    directive = "\n\n" <> Subagents.reverification_directive()
+
+    for status <- ~w(timed_out closed) do
+      outcome = %{"status" => "partial", "subagents" => [%{"status" => status}]}
+
+      assert WaitAgent.append_reverification_directive_for_test("summary", outcome) ==
+               "summary" <> directive
+    end
+
+    completed = %{"status" => "completed", "subagents" => [%{"status" => "completed"}]}
+
+    assert WaitAgent.append_reverification_directive_for_test("done", completed) ==
+             "done" <> directive
+
+    incomplete = %{
+      "status" => "incomplete",
+      "subagents" => [%{"status" => "completed"}, %{"status" => "running"}]
+    }
+
+    assert WaitAgent.append_reverification_directive_for_test("poll", incomplete) == "poll"
+  end
+
   test "wait_agent reports mixed fanout as a structured partial outcome", %{sid: sid, ws: ws} do
     {:ok, completed_agent} =
       Subagents.spawn_agent(
@@ -1428,6 +1467,11 @@ defmodule Pixir.SubagentsTest do
 
     assert {:ok, result} = WaitAgent.execute(%{"ids" => ids, "timeout_ms" => 1_000}, ctx)
     assert result["output"] =~ "wait_agent partial"
+
+    assert String.ends_with?(
+             result["output"],
+             "Re-verify all integrated results from delegated children before committing or declaring the work done. Run the workspace's own verification, including typechecks, tests, and any commands named in the work brief."
+           )
 
     outcome = result["outcome"]
     assert outcome["status"] == "partial"
@@ -1460,6 +1504,8 @@ defmodule Pixir.SubagentsTest do
              WaitAgent.execute(%{"ids" => [agent["id"]], "timeout_ms" => 0}, ctx)
 
     assert result["output"] =~ "wait_agent incomplete"
+    assert result["output"] == Subagents.summarize_wait_outcome(result["outcome"])
+    refute result["output"] =~ "Re-verify all integrated results from delegated children"
     assert result["outcome"]["status"] == "incomplete"
     assert result["outcome"]["observed_at"]
     assert result["outcome"]["counts"]["incomplete"] == 1

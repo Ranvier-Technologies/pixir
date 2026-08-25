@@ -11,7 +11,7 @@ defmodule Mix.Tasks.Pixir.Cache.Reconcile do
       mix pixir.cache.reconcile --sessions-dir .pixir/sessions
       mix pixir.cache.reconcile --help
 
-  The task is offline-only. `below_minimum_count` records expected Anthropic pa1 calls
+  The task is offline-only. `below_minimum_count` records expected Anthropic calls
   where a cache plan existed but both creation and read counters were zero (for
   example, below the 512-token minimum cacheable prefix).
   """
@@ -127,7 +127,7 @@ defmodule Mix.Tasks.Pixir.Cache.Reconcile do
     Map.put(acc, key, family)
   end
 
-  defp below_minimum(%{"prompt_contract_version" => "pa1"}, 0, 0), do: 1
+  defp below_minimum(%{"prompt_contract_version" => <<"pa", _::binary>>}, 0, 0), do: 1
   defp below_minimum(_metadata, _creation, _reads), do: 0
 
   defp finalize_family(family) do

@@ -25,19 +25,21 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
           <h2>One runtime vs. a herd of processes</h2>
           <p class="section-lead">
             The same question at three scales: what does it cost to run N coding-agent
-            workers in parallel over one OpenAI quota? Pixir <code>delegate</code> — N
-            supervised Subagent Sessions inside one BEAM runtime — against the common
+            workers in parallel over one OpenAI quota? Pixir <code>delegate</code> (N
+            supervised Subagent Sessions inside one BEAM runtime) against the common
             pattern today: one OS process per worker via <code>codex exec</code>.
             Measured, not projected, up to <strong>64 concurrent workers</strong>;
             synthetic load first, then real work. Pixir does not manufacture extra
-            quota or capacity — it reduces process, token, and reconciliation overhead
-            for the same account. The runtime speaks the OpenAI Responses dialect — the
-            same wire contract the <a href="https://www.openresponses.org/specification">Open
-            Responses</a> standard now formalizes. Since v0.1.12 that contract is a
-            shipped mode, not a tracked direction: point the provider at any Open
-            Responses endpoint, hosted or local, with no OpenAI account required.
-            Compatibility is observed live against a local open-source server, and
-            every protocol deviation is confessed in the run's evidence rather than
+            quota or capacity: it reduces process, token, and reconciliation overhead
+            for the same account. The runtime speaks the OpenAI Responses dialect,
+            the same wire contract the <a href="https://www.openresponses.org/specification">Open
+            Responses</a> standard now formalizes. Since v0.1.11 that contract is a
+            shipped mode, not a tracked direction: the provider accepts configured
+            non-OpenAI endpoints, hosted or local, with no OpenAI account required,
+            subject to the conservative profile. Compatibility was observed live
+            against a local open-source server during the v0.1.12 cycle; the claim
+            is observed endpoint compatibility, not universal coverage, and every
+            protocol deviation is confessed in the run's evidence rather than
             papered over.
           </p>
 
@@ -64,7 +66,7 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
             <article class="proof">
               <code>64/64 · both runtimes</code>
               <h3>Full completion, valid contracts</h3>
-              <p>Every worker returned schema-valid strict JSON on both sides, with mutually consistent findings — cross-validation, not just throughput.</p>
+              <p>Every worker returned schema-valid strict JSON on both sides, with mutually consistent findings: cross-validation, not just throughput.</p>
             </article>
             <article class="proof">
               <code>31/673 calls</code>
@@ -95,12 +97,12 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
               <div class="mrow"><span class="mn">per-proc</span><div class="mtrack"><div class="mbar cx" style="width:35.6%"></div></div><span class="mv">4,265 MB · 309 procs</span></div>
             </div>
             <div class="meter-grp">
-              <p class="meter-l">N=64 · real work — a 64-module documentation audit</p>
+              <p class="meter-l">N=64 · real work · a 64-module documentation audit</p>
               <div class="mrow"><span class="mn">pixir</span><div class="mtrack"><div class="mbar px" style="width:3.7%"></div></div><span class="mv">441 MB · 1 VM</span></div>
               <div class="mrow"><span class="mn">per-proc</span><div class="mtrack"><div class="mbar cx" style="width:100%"></div></div><span class="mv">11,981 MB · 91 procs</span></div>
             </div>
             <div class="meter-grp">
-              <p class="meter-l">Projection · N=150 on this 32 GB machine — not measured</p>
+              <p class="meter-l">Projection · N=150 on this 32 GB machine · not measured</p>
               <div class="mrow"><span class="mn">pixir</span><div class="mtrack"><div class="mbar px proj" style="width:6%"></div></div><span class="mv">~1 GB proj.</span></div>
               <div class="mrow"><span class="mn">per-proc</span><div class="mtrack"><div class="mbar cx proj" style="width:100%"></div></div><span class="mv">≳28 GB → swap proj.</span></div>
             </div>
@@ -109,7 +111,7 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
               (11,981 MB across 64 processes ≈ 187 MB each; 441 MB for the shared
               VM) linearly to N=150: on 32 GB, the process-per-worker pattern is
               deep into swap around N≈150 while the shared runtime stays near a
-              gigabyte. "Hundreds of agents" remains unmeasured —
+              gigabyte. "Hundreds of agents" remains unmeasured,
               which is why the public claim is <strong>measured up to 64 concurrent
               workers</strong>, and nothing more.
             </p>
@@ -222,7 +224,7 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
       <section class="section alt">
         <div class="section-inner">
           <p class="section-kicker">scale.wall</p>
-          <h2>The crossover appeared on synthetic load — and reversed on real work</h2>
+          <h2>The crossover appeared on synthetic load, and reversed on real work</h2>
           <p class="section-lead">
             Two workloads that must not be compared to each other: a synthetic ladder
             (trivial one-answer children) and the real audit (children reading whole
@@ -236,20 +238,20 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
               <div class="mrow"><span class="mn">per-proc</span><div class="mtrack"><div class="mbar cx" style="width:10.6%"></div></div><span class="mv">21.4 s</span></div>
             </div>
             <div class="meter-grp">
-              <p class="meter-l">synthetic · N=32 — crossover toward the shared runtime</p>
+              <p class="meter-l">synthetic · N=32 · crossover toward the shared runtime</p>
               <div class="mrow"><span class="mn">pixir</span><div class="mtrack"><div class="mbar px" style="width:12.4%"></div></div><span class="mv">25.0 s</span></div>
               <div class="mrow"><span class="mn">per-proc</span><div class="mtrack"><div class="mbar cx" style="width:18.9%"></div></div><span class="mv">38.2 s</span></div>
             </div>
             <div class="meter-grp">
-              <p class="meter-l">real work · N=64 — it reverses</p>
+              <p class="meter-l">real work · N=64 · it reverses</p>
               <div class="mrow"><span class="mn">pixir</span><div class="mtrack"><div class="mbar px" style="width:100%"></div></div><span class="mv">202 s</span></div>
               <div class="mrow"><span class="mn">per-proc</span><div class="mtrack"><div class="mbar cx" style="width:47.5%"></div></div><span class="mv">~96 s †</span></div>
             </div>
             <p class="meter-f">
-              † max child; per-process timings are clean — the harness's total clock was
+              † max child; per-process timings are clean: the harness's total clock was
               contaminated by an orchestrator-side bug (ours, not the baseline's). Why
-              the reversal? Pixir children worked deeper — 673 provider calls, ~10.5 per
-              child, 65% more output than the baseline — and absorbed WebSocket pressure
+              the reversal? Pixir children worked deeper (673 provider calls, ~10.5 per
+              child, 65% more output than the baseline) and absorbed WebSocket pressure
               with retries. Raw speed was never the claim; the number is reported anyway.
             </p>
           </div>
@@ -260,7 +262,7 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
               The N=32 wall-clock crossover did not generalize to real work at N=64. Any
               public scale claim carries that nuance or is not made. Pixir's stable
               advantages are memory, process footprint, durable evidence, and
-              backpressure — not raw per-run speed.
+              backpressure, not raw per-run speed.
             </p>
           </div>
         </div>
@@ -278,8 +280,8 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
               </thead>
               <tbody>
                 <tr><td>N=8 · synthetic</td><td>16</td><td>1 (one rep)</td><td>unattributed · per-call reasons are not in the published ladder rows</td><td class="hl">0</td></tr>
-                <tr><td>N=16</td><td>32</td><td>0</td><td>—</td><td class="hl">0</td></tr>
-                <tr><td>N=32</td><td>68</td><td>0</td><td>—</td><td class="hl">0</td></tr>
+                <tr><td>N=16</td><td>32</td><td>0</td><td>none</td><td class="hl">0</td></tr>
+                <tr><td>N=32</td><td>68</td><td>0</td><td>none</td><td class="hl">0</td></tr>
                 <tr><td><strong>N=64 · real</strong></td><td>673</td><td><strong>31 · 4.6%</strong></td><td>handshake_failed 17 · degraded 13 · closed 1</td><td class="hl">0</td></tr>
               </tbody>
             </table>
@@ -297,8 +299,8 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
           </div>
 
           <p class="section-lead" style="margin-top: 18px;">
-            The <code>auto</code> transport policy — WebSocket preferred, SSE as a
-            pre-output-safe fallback — earned its existence exactly where it should:
+            The <code>auto</code> transport policy (WebSocket preferred, SSE as a
+            pre-output-safe fallback) earned its existence exactly where it should:
             under real pressure it degraded 31 calls and lost none. The transport
             evidence behind this, per-child transport counts and fallback-reason
             tallies, ships in
@@ -314,7 +316,7 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
           <h2>The 64 runs produced real work, not benchmark theater</h2>
           <p class="section-lead">
             The N=64 workload was a documentation audit of this repository's 64 largest
-            modules — the exact chore a freshly opened project needs. Each module was
+            modules: the exact chore a freshly opened project needs. Each module was
             audited independently by both runtimes under the same strict JSON contract.
           </p>
 
@@ -327,7 +329,7 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
                 <tr><td>schema-valid JSON contracts</td><td class="hl">64/64</td><td>64/64</td></tr>
                 <tr><td>modules with major doc drift</td><td>7</td><td>8</td></tr>
                 <tr><td>minor / clean</td><td>32 / 25</td><td>36 / 20</td></tr>
-                <tr><td>consensus majors (both agree)</td><td colspan="2"><strong>4</strong> — independently double-evidenced findings</td></tr>
+                <tr><td>consensus majors (both agree)</td><td colspan="2"><strong>4</strong> · independently double-evidenced findings</td></tr>
                 <tr><td>uncached input tokens</td><td>1.47M</td><td>1.81M</td></tr>
                 <tr><td>output produced</td><td>121k tok · ≈10.5 calls/child</td><td>73k tok · 1 turn/process</td></tr>
               </tbody>
@@ -336,7 +338,7 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
 
           <p class="section-lead" style="margin-top: 18px;">
             Severity agreement between two mutually blind runtimes turns the four
-            consensus findings into high-confidence, actionable results —
+            consensus findings into high-confidence, actionable results:
             parallelization as a <strong>verification method</strong>, not just
             throughput.
           </p>
@@ -353,14 +355,14 @@ const fallbackJson = `{"type":"provider_usage","data":{"active_transport":"http_
             and personal config from the comparison. RSS figures are sampled process-tree peaks (500 ms poll
             for the ladder, ~1 s for the N=64 samples), not
             OS-exact accounting. The synthetic ladder ran 3 repetitions; the 16/32/64
-            scale points ran once each — directional, stated as such. Delegate fan-outs
+            scale points ran once each: directional, stated as such. Delegate fan-outs
             require <code>subagents.max_threads: N</code> in the spec or children queue
             at the default.
           </p>
           <p class="section-lead">
             Pixir is a developer preview. These are dogfood scale notes from one
             machine (macOS, 32 GB), published with their caveats attached. Primary
-            evidence is machine-local by design — Pixir's evidence model keeps
+            evidence is machine-local by design: Pixir's evidence model keeps
             append-only session logs (with per-call <code>provider_usage</code> token
             and transport data) on the machine that ran them, so the numbers above
             are our runs, not a public dataset. Two redacted evidence bundles ship

@@ -1,14 +1,14 @@
 defmodule Pixir.Providers.Anthropic.Prompt do
   @moduledoc """
-  Provider-private pa1 prompt builder for Anthropic Messages requests.
+  Provider-private pa4 prompt builder for Anthropic Messages requests.
 
-  pa1 mirrors the px4 prompt contract in doctrine, not bytes. Layer 0 is a
+  pa4 mirrors the px7 prompt contract in doctrine, not bytes. Layer 0 is a
   byte-stable system text block selected by mode, Layer 1 is the deterministic
   Skills index when present, and volatile late context is inserted as the leading
   text content block of the latest user message because Anthropic has no developer
   role on the target model.
 
-  cache_control planning is fixed for pa1:
+  cache_control planning is fixed for pa4:
 
     * B1 is placed on the last system block.
     * B2 is placed on the content block at `prev_turn_boundary`, using a 1-based
@@ -24,17 +24,19 @@ defmodule Pixir.Providers.Anthropic.Prompt do
 
   Verified Anthropic prompt-caching documentation on 2026-07-08 says thinking,
   redacted_thinking, and empty text blocks cannot be marked directly with
-  cache_control; pa1 treats those blocks as non-cacheable.
+  cache_control; pa4 treats those blocks as non-cacheable.
 
-  pa1 never emits more than three breakpoints. The fourth Anthropic breakpoint is
-  reserved by ADR 0037 and adding a planned use for it requires a pa1 to pa2
-  prompt contract bump. Any future layout or fence-token change is also a pa1 to
-  pa2 bump.
+  pa4 never emits more than three breakpoints. The fourth Anthropic breakpoint is
+  reserved by ADR 0037 and adding a planned use for it requires a pa4 to pa5
+  prompt contract bump. Any future layout or fence-token change is also a pa4 to
+  pa5 bump. pa4 drops the code-style reviewability sentence after the N=3 A/B
+  verdict (refs #570), a pa3 to pa4 prompt contract bump. It continues to expose
+  the bash `timeout_ms` tool-schema field added in pa3 (refs #575).
   """
 
   alias Pixir.Tool
 
-  @prompt_contract_version "pa1"
+  @prompt_contract_version "pa4"
   @cache_control %{"type" => "ephemeral"}
   @hash_bytes 8
   @b3_threshold 15
@@ -92,11 +94,11 @@ defmodule Pixir.Providers.Anthropic.Prompt do
           required(:prev_turn_boundary) => non_neg_integer() | nil
         }
 
-  @doc "The pa1 prompt contract label, mirrored into neutral cache metadata (ADR 0037 D7)."
+  @doc "The pa4 prompt contract label, mirrored into neutral cache metadata (ADR 0037 D7)."
   @spec prompt_contract_version() :: String.t()
   def prompt_contract_version, do: @prompt_contract_version
 
-  @doc "Build Anthropic-native system and messages with the pa1 cache plan."
+  @doc "Build Anthropic-native system and messages with the pa4 cache plan."
   @spec build(input()) :: {:ok, map()} | {:error, map()}
   def build(input) when is_map(input) do
     with {:ok, mode} <- mode(Map.get(input, :mode) || Map.get(input, "mode")),

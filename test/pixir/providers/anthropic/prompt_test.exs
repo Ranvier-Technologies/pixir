@@ -234,10 +234,33 @@ defmodule Pixir.Providers.Anthropic.PromptTest do
     assert Enum.all?(rest, &(not Map.has_key?(&1, "cache_control")))
   end
 
-  test "contract includes pa1 label and layer0_hash" do
+  test "build and plan Layer 0 bytes are pinned independently" do
+    assert {:ok, build} = Prompt.build(input(%{mode: :build}))
+    assert {:ok, plan} = Prompt.build(input(%{mode: :plan}))
+
+    build_layer0 = hd(build.system)["text"]
+    plan_layer0 = hd(plan.system)["text"]
+
+    refute build_layer0 =~ "reviewable beats compact"
+    refute plan_layer0 =~ "reviewable beats compact"
+
+    hashes = %{
+      build: :crypto.hash(:sha256, build_layer0) |> Base.encode16(case: :lower),
+      plan: :crypto.hash(:sha256, plan_layer0) |> Base.encode16(case: :lower)
+    }
+
+    assert {Prompt.prompt_contract_version(), hashes} ==
+             {"pa4",
+              %{
+                build: "b761c6bbcd0ddcdb825ae4d3628a568f17c5d8b238c0cb4f1a38e334b0151dbc",
+                plan: "da2e394660b00dfd46bab88e6386f38e7a8fd8fe1cba0db4b4f5cffb1b8c020f"
+              }}
+  end
+
+  test "contract includes pa4 label and layer0_hash" do
     assert {:ok, result} = Prompt.build(input())
 
-    assert result.contract["prompt_contract_version"] == "pa1"
+    assert result.contract["prompt_contract_version"] == "pa4"
     assert is_binary(result.contract["layer0_hash"])
     assert byte_size(result.contract["layer0_hash"]) == 16
   end

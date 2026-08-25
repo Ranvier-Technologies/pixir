@@ -220,6 +220,26 @@ defmodule Pixir.PermissionsTest do
                Permissions.outside_workspace_shell_token("cat /etc/passwd", ws)
     end
 
+    test "allows only /dev/null as an absolute non-path sink", %{ws: ws} do
+      assert {:ok, nil} =
+               Permissions.outside_workspace_shell_token("mix test 2>/dev/null", ws)
+
+      assert {:ok, nil} = Permissions.outside_workspace_shell_token("echo /dev/null", ws)
+
+      assert {:ok, "/dev/urandom"} =
+               Permissions.outside_workspace_shell_token("cat /dev/urandom", ws)
+
+      assert {:ok, "/dev/stdin"} =
+               Permissions.outside_workspace_shell_token("cat /dev/stdin", ws)
+
+      # Near-miss pin: the exception is the exact token, never a prefix class.
+      assert {:ok, "/dev/nullish"} =
+               Permissions.outside_workspace_shell_token("cat /dev/nullish", ws)
+
+      assert {:ok, "/etc/passwd"} =
+               Permissions.outside_workspace_shell_token("cat /etc/passwd", ws)
+    end
+
     test "denies invoking an outside-workspace binary by absolute path", %{ws: ws} do
       # The leading-assignment exemption never extends to the command word
       # itself: an absolute outside binary is a host-boundary crossing.

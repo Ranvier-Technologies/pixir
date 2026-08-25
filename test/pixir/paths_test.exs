@@ -23,6 +23,68 @@ defmodule Pixir.PathsTest do
 
     assert {:ok, ^sessions} = Paths.ensure_state_dir(ws, sessions)
     assert File.dir?(sessions)
+    assert File.read!(Path.join(Paths.project_root(ws), ".gitignore")) == "*\n"
+  end
+
+  test "preserves an existing project .gitignore", %{workspace: ws} do
+    File.mkdir_p!(Paths.project_root(ws))
+    gitignore = Path.join(Paths.project_root(ws), ".gitignore")
+    File.write!(gitignore, "sessions/\n!sessions/keep.ndjson\n")
+
+    assert {:ok, _sessions} = Paths.ensure_state_dir(ws, Paths.sessions_dir(ws))
+    assert File.read!(gitignore) == "sessions/\n!sessions/keep.ndjson\n"
+  end
+
+  test "a project .gitignore creation failure does not block state creation", %{workspace: ws} do
+    File.mkdir_p!(Path.join(Paths.project_root(ws), ".gitignore"))
+
+    assert {:ok, sessions} = Paths.ensure_state_dir(ws, Paths.sessions_dir(ws))
+    assert File.dir?(sessions)
+    assert File.dir?(Path.join(Paths.project_root(ws), ".gitignore"))
+  end
+
+  test "project .gitignore excludes Session state from git", %{workspace: ws} do
+    assert {_, 0} = System.cmd("git", ["init", "--quiet"], cd: ws, stderr_to_stdout: true)
+    assert {:ok, sessions} = Paths.ensure_state_dir(ws, Paths.sessions_dir(ws))
+    ignored = Path.join(sessions, "example.ndjson")
+    File.write!(ignored, "{}\n")
+
+    assert {output, 0} =
+             System.cmd("git", ["check-ignore", ".pixir/sessions/example.ndjson"],
+               cd: ws,
+               stderr_to_stdout: true
+             )
+
+    assert output == ".pixir/sessions/example.ndjson\n"
+  end
+
+  test "nested isolated workspace keeps its own project gitignore", %{
+    workspace: parent
+  } do
+    assert {_, 0} = System.cmd("git", ["init", "--quiet"], cd: parent, stderr_to_stdout: true)
+
+    child_workspace =
+      Path.join([parent, ".pixir", "subagents", "child-123", "workspace"])
+
+    File.mkdir_p!(child_workspace)
+    child_log = Paths.session_log("child-session", child_workspace)
+
+    assert {:ok, _sessions} =
+             Paths.ensure_state_dir(child_workspace, Paths.sessions_dir(child_workspace))
+
+    child_gitignore = Path.join(Paths.project_root(child_workspace), ".gitignore")
+    assert File.read!(child_gitignore) == "*\n"
+
+    File.write!(child_log, "{}\n")
+    relative_log = Path.relative_to(child_log, parent)
+
+    assert {output, 0} =
+             System.cmd("git", ["check-ignore", relative_log],
+               cd: parent,
+               stderr_to_stdout: true
+             )
+
+    assert output == relative_log <> "\n"
   end
 
   test "trusts a deliberate symlink alias used as the Workspace root", %{

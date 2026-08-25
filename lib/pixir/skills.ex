@@ -293,7 +293,11 @@ defmodule Pixir.Skills do
   defp roots(workspace, opts) do
     case Keyword.get(opts, :roots) do
       roots when is_list(roots) ->
-        Enum.map(roots, &normalize_root/1)
+        # Explicit roots are already a complete operator-supplied registry. The
+        # config flag only controls Pixir's implicit user root; explicit roots win.
+        roots
+        |> Enum.map(&normalize_root/1)
+        |> Enum.uniq_by(&{&1.scope, &1.path})
 
       _ ->
         [
@@ -301,10 +305,23 @@ defmodule Pixir.Skills do
           %{scope: "user", path: Path.join(user_home(opts), ".agents/skills")},
           %{scope: "pixir-global", path: global_skills_dir(opts)}
         ]
+        |> maybe_reject_user_scope(opts)
         |> Enum.map(&normalize_root/1)
         |> Enum.uniq_by(&{&1.scope, &1.path})
     end
   end
+
+  defp maybe_reject_user_scope(roots, opts) do
+    if Keyword.get(opts, :user_scope, true) do
+      roots
+    else
+      Enum.reject(roots, &(root_scope(&1) == "user"))
+    end
+  end
+
+  defp root_scope(%{scope: scope}), do: to_string(scope)
+  defp root_scope({scope, _path}), do: to_string(scope)
+  defp root_scope(_root), do: nil
 
   defp normalize_root(%{scope: scope, path: path}) when is_binary(scope) and is_binary(path) do
     %{

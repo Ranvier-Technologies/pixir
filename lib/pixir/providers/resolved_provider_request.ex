@@ -7,6 +7,7 @@ defmodule Pixir.Providers.ResolvedProviderRequest do
   accessors and `attach_to_provider_opts/2`.
   """
 
+  alias Pixir.Providers.Anthropic.Prompt
   alias Pixir.Providers.ResponsesBackend
   alias Pixir.Provider.HostedTools
 
@@ -79,7 +80,7 @@ defmodule Pixir.Providers.ResolvedProviderRequest do
     capabilities == %{
       reasoning_dialect: "anthropic",
       prompt_cache: :cache_control,
-      prompt_contract_version: "pa1",
+      prompt_contract_version: Prompt.prompt_contract_version(),
       tool_dialect: :anthropic,
       hosted_tools: false
     }

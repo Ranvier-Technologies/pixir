@@ -63,6 +63,179 @@ defmodule Pixir.CLITest do
     end
   end
 
+  defmodule SubagentPresenceProvider do
+    def stream(%{history: history}, opts) do
+      prompt =
+        history
+        |> Enum.reverse()
+        |> Enum.find(&(&1.type == :user_message))
+        |> then(&((&1 && &1.data["text"]) || ""))
+
+      if prompt == "block beyond root idle deadline" do
+        Process.sleep(350)
+
+        {:ok,
+         %{
+           text: "child completed",
+           reasoning: "",
+           function_calls: [],
+           finish_reason: :stop
+         }}
+      else
+        root_step(opts)
+      end
+    end
+
+    defp root_step(opts) do
+      state = Keyword.fetch!(opts, :liveness_state)
+      sid = Keyword.fetch!(opts, :session_id)
+
+      step =
+        Agent.get_and_update(
+          state,
+          &{Map.get(&1, sid, 0) + 1, Map.update(&1, sid, 1, fn n -> n + 1 end)}
+        )
+
+      case step do
+        1 ->
+          tool_calls([
+            %{
+              call_id: "spawn_liveness_child",
+              name: "spawn_agent",
+              args: %{
+                "task" => "block beyond root idle deadline",
+                "workspace_mode" => "shared",
+                "max_threads" => 1,
+                "max_depth" => 1,
+                "timeout_ms" => 2_000
+              }
+            }
+          ])
+
+        2 ->
+          tool_calls([
+            %{
+              call_id: "wait_liveness_child",
+              name: "wait_agent",
+              args: %{"ids" => [], "timeout_ms" => 2_000}
+            }
+          ])
+
+        _ ->
+          {:ok,
+           %{
+             text: "root completed after child",
+             reasoning: "",
+             function_calls: [],
+             finish_reason: :stop
+           }}
+      end
+    end
+
+    defp tool_calls(calls) do
+      {:ok, %{text: "", reasoning: "", function_calls: calls, finish_reason: :tool_calls}}
+    end
+  end
+
+  defmodule SubagentRetryPresenceProvider do
+    def stream(%{history: history}, opts) do
+      prompt =
+        history
+        |> Enum.reverse()
+        |> Enum.find(&(&1.type == :user_message))
+        |> then(&((&1 && &1.data["text"]) || ""))
+
+      if prompt == "retry after transport failure" do
+        child_step(opts)
+      else
+        root_step(opts)
+      end
+    end
+
+    defp child_step(opts) do
+      state = Keyword.fetch!(opts, :liveness_state)
+
+      attempt =
+        Agent.get_and_update(state, fn state ->
+          attempt = Map.get(state, :child_attempt, 0) + 1
+          {attempt, Map.put(state, :child_attempt, attempt)}
+        end)
+
+      if attempt == 1 do
+        {:error,
+         %{
+           ok: false,
+           error: %{
+             kind: :provider_http_error,
+             message: "retry after jitter",
+             details: %{retryable: true, type: "service_unavailable_error"}
+           }
+         }}
+      else
+        {:ok,
+         %{
+           text: "child completed after retry",
+           reasoning: "",
+           function_calls: [],
+           finish_reason: :stop
+         }}
+      end
+    end
+
+    defp root_step(opts) do
+      state = Keyword.fetch!(opts, :liveness_state)
+      sid = Keyword.fetch!(opts, :session_id)
+
+      step =
+        Agent.get_and_update(state, fn state ->
+          step = Map.get(state, sid, 0) + 1
+          {step, Map.put(state, sid, step)}
+        end)
+
+      case step do
+        1 ->
+          tool_calls([
+            %{
+              call_id: "spawn_retry_child",
+              name: "spawn_agent",
+              args: %{
+                "task" => "retry after transport failure",
+                "agent" => "explorer",
+                "workspace_mode" => "shared",
+                "max_threads" => 1,
+                "max_depth" => 1,
+                "timeout_ms" => 2_000,
+                "retry_attempts" => 1,
+                "retry_jitter_ms" => 250
+              }
+            }
+          ])
+
+        2 ->
+          tool_calls([
+            %{
+              call_id: "wait_retry_child",
+              name: "wait_agent",
+              args: %{"ids" => [], "timeout_ms" => 2_000}
+            }
+          ])
+
+        _ ->
+          {:ok,
+           %{
+             text: "root completed after child retry",
+             reasoning: "",
+             function_calls: [],
+             finish_reason: :stop
+           }}
+      end
+    end
+
+    defp tool_calls(calls) do
+      {:ok, %{text: "", reasoning: "", function_calls: calls, finish_reason: :tool_calls}}
+    end
+  end
+
   defmodule AttachmentCaptureProvider do
     def stream(_request, opts) do
       send(Keyword.fetch!(opts, :test_pid), {:attachments, Keyword.get(opts, :attachments, [])})
@@ -3784,6 +3957,170 @@ defmodule Pixir.CLITest do
         assert err =~ "pixir diagnose session #{sid} --json"
         assert err =~ "resume with: pixir resume #{sid}"
       end)
+    end)
+  end
+
+  test "one-shot running child keeps a waiting root alive beyond the idle deadline" do
+    {:ok, liveness_state} = Agent.start_link(fn -> %{} end)
+
+    with_cli_turn_opts(
+      [
+        provider: SubagentPresenceProvider,
+        provider_opts: [liveness_state: liveness_state],
+        skip_auth?: true,
+        idle_timeout: 100
+      ],
+      fn ->
+        in_tmp_workspace("pixir-cli-child-liveness", fn ws ->
+          out = capture_io(fn -> assert :ok = CLI.route(["--json", "delegate and wait"]) end)
+          payload = Jason.decode!(out)
+
+          assert payload["output"] == "root completed after child"
+          assert {:ok, history} = Log.fold(payload["session_id"], workspace: ws)
+
+          lifecycle_events =
+            history
+            |> Enum.filter(&(&1.type == :subagent_event))
+            |> Enum.map(& &1.data["event"])
+
+          assert "started" in lifecycle_events
+          assert "finished" in lifecycle_events
+          refute "progress" in lifecycle_events
+          refute "output" in lifecycle_events
+        end)
+      end
+    )
+  end
+
+  test "retry-queued child keeps a waiting root alive through retry jitter" do
+    {:ok, liveness_state} = Agent.start_link(fn -> %{} end)
+
+    with_cli_turn_opts(
+      [
+        provider: SubagentRetryPresenceProvider,
+        provider_opts: [liveness_state: liveness_state],
+        skip_auth?: true,
+        idle_timeout: 80
+      ],
+      fn ->
+        in_tmp_workspace("pixir-cli-child-retry-liveness", fn ws ->
+          out =
+            capture_io(fn ->
+              assert :ok = CLI.route(["--json", "delegate and retry"])
+            end)
+
+          payload = Jason.decode!(out)
+
+          assert payload["output"] == "root completed after child retry"
+          assert {:ok, history} = Log.fold(payload["session_id"], workspace: ws)
+
+          assert Enum.any?(history, fn event ->
+                   event.type == :subagent_event and event.data["event"] == "retrying"
+                 end)
+        end)
+      end
+    )
+  end
+
+  test "disabling running-child presence reproduces the presenter idle timeout red proof" do
+    {:ok, liveness_state} = Agent.start_link(fn -> %{} end)
+
+    with_cli_turn_opts(
+      [
+        provider: SubagentPresenceProvider,
+        provider_opts: [liveness_state: liveness_state],
+        skip_auth?: true,
+        idle_timeout: 100,
+        subagent_liveness?: false
+      ],
+      fn ->
+        in_tmp_workspace("pixir-cli-child-liveness-disabled", fn _ws ->
+          out =
+            capture_io(fn ->
+              assert {:error, 124} = CLI.route(["--json", "delegate and wait"])
+            end)
+
+          assert %{
+                   "status" => "timed_out",
+                   "exit_code" => 124,
+                   "recovery" => %{"classification" => "presenter_idle_timeout"}
+                 } = Jason.decode!(out)
+
+          Process.sleep(600)
+        end)
+      end
+    )
+  end
+
+  test "CLI await uses presenter_idle_timeout_ms when the idle_timeout seam is absent" do
+    with_pixir_home("pixir-cli-presenter-timeout-config", fn home ->
+      File.write!(
+        Path.join(home, "config.json"),
+        Jason.encode!(%{"presenter_idle_timeout_ms" => 40})
+      )
+
+      with_cli_provider([{:sleep, 150, stop("late answer")}], fn ->
+        in_tmp_workspace("pixir-cli-presenter-timeout-config", fn _ws ->
+          out = capture_io(fn -> assert {:error, 124} = CLI.route(["--json", "hello"]) end)
+
+          assert %{
+                   "status" => "timed_out",
+                   "exit_code" => 124,
+                   "recovery" => %{"classification" => "presenter_idle_timeout"}
+                 } = Jason.decode!(out)
+
+          Process.sleep(200)
+        end)
+      end)
+    end)
+  end
+
+  test "resume await uses presenter_idle_timeout_ms when the idle_timeout seam is absent" do
+    with_pixir_home("pixir-cli-resume-presenter-timeout-config", fn home ->
+      File.write!(
+        Path.join(home, "config.json"),
+        Jason.encode!(%{"presenter_idle_timeout_ms" => 40})
+      )
+
+      with_cli_provider([{:sleep, 150, stop("late resumed answer")}], fn ->
+        in_tmp_workspace("pixir-cli-resume-presenter-timeout-config", fn ws ->
+          sid = "cli-resume-presenter-timeout-config"
+          write_raw_log(ws, sid, [raw_event(sid, 0, "user_message", %{"text" => "old"})])
+
+          out =
+            capture_io(fn ->
+              assert {:error, 124} = CLI.route(["--json", "resume", sid, "continue"])
+            end)
+
+          assert %{
+                   "status" => "timed_out",
+                   "exit_code" => 124,
+                   "recovery" => %{"classification" => "presenter_idle_timeout"}
+                 } = Jason.decode!(out)
+
+          Process.sleep(200)
+        end)
+      end)
+    end)
+  end
+
+  test "explicit idle_timeout seam wins over presenter_idle_timeout_ms" do
+    with_pixir_home("pixir-cli-presenter-timeout-override", fn home ->
+      File.write!(
+        Path.join(home, "config.json"),
+        Jason.encode!(%{"presenter_idle_timeout_ms" => 20})
+      )
+
+      with_cli_provider(
+        [{:sleep, 60, stop("answer before explicit deadline")}],
+        fn ->
+          in_tmp_workspace("pixir-cli-presenter-timeout-override", fn _ws ->
+            out = capture_io(fn -> assert :ok = CLI.route(["--json", "hello"]) end)
+            assert Jason.decode!(out)["output"] == "answer before explicit deadline"
+          end)
+        end,
+        idle_timeout: 200
+      )
     end)
   end
 

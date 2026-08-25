@@ -133,6 +133,61 @@ defmodule Pixir.DoctorTest do
     assert config_check["details"]["effective"]["permission_default"] == "ask"
   end
 
+  test "warns when presenter idle timeout can race the bash timeout and passes when ordered" do
+    workspace = tmp_dir("doctor-timeout-ordering")
+    binary = Path.join(workspace, "pixir")
+    config_path = Path.join(workspace, "config.json")
+    File.write!(binary, "#!/bin/sh\n")
+    File.chmod!(binary, 0o755)
+
+    File.write!(
+      config_path,
+      Jason.encode!(%{
+        "bash_timeout_ms" => 120_000,
+        "presenter_idle_timeout_ms" => 120_000
+      })
+    )
+
+    misordered =
+      Doctor.run(
+        workspace: workspace,
+        binary_path: binary,
+        config_path: config_path,
+        auth_status: %{authenticated?: true, kind: :api_key},
+        model: "gpt-5.5"
+      )
+
+    ordering = check(misordered, "presenter_bash_timeout_ordering")
+    assert ordering["status"] == "warning"
+    assert ordering["message"] =~ "race"
+    assert ordering["details"]["presenter_idle_timeout_ms"] == 120_000
+    assert ordering["details"]["bash_timeout_ms"] == 120_000
+    assert misordered["status"] == "ready_with_warnings"
+    assert misordered["proceed"] == "judge"
+    assert misordered["judge_checks"] == ["presenter_bash_timeout_ordering"]
+
+    File.write!(
+      config_path,
+      Jason.encode!(%{
+        "bash_timeout_ms" => 120_000,
+        "presenter_idle_timeout_ms" => 300_000
+      })
+    )
+
+    ordered =
+      Doctor.run(
+        workspace: workspace,
+        binary_path: binary,
+        config_path: config_path,
+        auth_status: %{authenticated?: true, kind: :api_key},
+        model: "gpt-5.5"
+      )
+
+    assert check(ordered, "presenter_bash_timeout_ordering")["status"] == "passed"
+    assert ordered["status"] == "ready"
+    assert ordered["proceed"] == "true"
+  end
+
   test "invalid config json blocks readiness with structured details" do
     workspace = tmp_dir("doctor-invalid-config")
     config_path = Path.join(workspace, "config.json")
@@ -325,5 +380,16 @@ defmodule Pixir.DoctorTest do
     dir = Path.join(System.tmp_dir!(), "pixir-#{name}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     dir
+  end
+
+  test "bash_dependencies passes with perl present and warns to judge without it" do
+    present = Pixir.Doctor.bash_dependencies_check()
+    assert present["status"] == "passed"
+    assert is_binary(present["details"]["perl"])
+
+    absent = Pixir.Doctor.bash_dependencies_check(fn "perl" -> nil end)
+    assert absent["status"] == "warning"
+    assert absent["details"]["dependency"] == "perl"
+    assert "install perl" in absent["details"]["next_actions"]
   end
 end

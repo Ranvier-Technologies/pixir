@@ -58,6 +58,25 @@ pixir login
 Follow the printed device-code instructions. The subscription credential is stored under
 `~/.pixir/auth.json` with local file permissions. As a fallback, set `OPENAI_API_KEY`.
 
+### Skills User Scope
+
+Skills discovery includes repository Skills (`.agents/skills`), user Skills
+(`~/.agents/skills`), and Pixir-global Skills (`$PIXIR_HOME/skills`) by default. To
+keep personal user Skills out of discovery and the fixed Turn prompt index, set the
+extensible `skills` object in `~/.pixir/config.json`:
+
+```json
+{
+  "skills": {
+    "user_scope": false
+  }
+}
+```
+
+Omitting `skills` or `skills.user_scope` preserves the default user-scope behavior.
+Invalid values are ignored with a configuration warning and also preserve the default.
+Repository and Pixir-global Skills remain enabled.
+
 ### Open Responses Profile (Experimental)
 
 Pixir's default remains the `chatgpt_codex` Responses backend. Source-checkout users may
@@ -196,6 +215,8 @@ honest contract is operational but narrow:
   evidence;
 - `wait_agent` can return structured partial outcomes when only some children complete;
 - completed Subagents and Workflow steps may produce useful checkpoint bundles;
+- delegation trades tokens for wall-clock parallelism, and landing the children's
+  work into the shared checkout remains the delegating session's responsibility;
 - partial Workflow outcomes are not success;
 - timed-out, failed, cancelled, or detached children must be reported honestly with
   child ids, task-position `children[].index` when spawned from delegate `tasks[]`,
@@ -206,8 +227,8 @@ honest contract is operational but narrow:
   client UX surface, especially in ACP clients that choose their own presentation model.
 
 Use `mix pixir.bench.fanout_gauntlet --dry-run --json` from a source checkout when you
-need reproducible evidence for those claims. The gauntlet is a correctness and honesty
-gate, not a performance benchmark.
+need reproducible evidence for the child-lifecycle claims above. The gauntlet is a
+correctness and honesty gate, not a performance benchmark.
 
 For a copyable Codex/Claude Code style delegate call, see
 `docs/examples/delegate-cli-live/`. Its dry-run path is local-only; running without

@@ -1,7 +1,7 @@
 defmodule Pixir.SkillsTest do
   use ExUnit.Case, async: true
 
-  alias Pixir.Skills
+  alias Pixir.{Config, Skills}
 
   setup do
     root =
@@ -187,6 +187,71 @@ defmodule Pixir.SkillsTest do
     refute index =~ "Warning: duplicate Skill"
     refute index =~ "hidden"
     refute index =~ "workflow"
+  end
+
+  test "render_index excludes user-scope entries when config disables the scope", %{root: root} do
+    workspace = Path.join(root, "workspace")
+    user_home = Path.join(root, "home")
+    pixir_home = Path.join(root, "pixir-home")
+    File.mkdir_p!(Path.join(workspace, ".git"))
+
+    write_skill(Path.join(workspace, ".agents/skills"), "repo-only", "Repo skill", "repo body")
+    write_skill(Path.join(user_home, ".agents/skills"), "user-only", "User skill", "user body")
+    write_skill(Path.join(pixir_home, "skills"), "global-only", "Global skill", "global body")
+
+    user_scope = Config.skills_user_scope(raw_config: %{"skills" => %{"user_scope" => false}})
+
+    index =
+      Skills.render_index(workspace,
+        user_home: user_home,
+        pixir_home: pixir_home,
+        user_scope: user_scope
+      )
+
+    assert index =~ "<name>repo-only</name>"
+    assert index =~ "<name>global-only</name>"
+    refute index =~ "user-only"
+    refute index =~ "user:user-only/SKILL.md"
+  end
+
+  test "explicit roots win over skills.user_scope false", %{roots: roots, opts: opts} do
+    write_skill(Enum.at(roots, 0).path, "repo-only", "Repo skill", "repo body")
+    write_skill(Enum.at(roots, 1).path, "user-only", "User skill", "user body")
+    write_skill(Enum.at(roots, 2).path, "global-only", "Global skill", "global body")
+
+    assert {:ok, %{skills: skills}} =
+             Skills.discover(File.cwd!(), Keyword.put(opts, :user_scope, false))
+
+    assert Enum.map(skills, & &1.name) == ["global-only", "repo-only", "user-only"]
+  end
+
+  test "duplicate explicit roots discover each skill once without warnings", %{roots: roots} do
+    repo_root = Enum.at(roots, 0)
+    write_skill(repo_root.path, "once", "One skill", "one body")
+
+    assert {:ok, %{skills: [skill], warnings: []}} =
+             Skills.discover(File.cwd!(), roots: [repo_root, repo_root])
+
+    assert skill.name == "once"
+    assert skill.scope == "repo"
+  end
+
+  test "render_index is byte-identical when skills.user_scope is absent", %{
+    roots: roots,
+    opts: opts
+  } do
+    write_skill(Enum.at(roots, 0).path, "repo-only", "Repo skill", "repo body")
+    write_skill(Enum.at(roots, 1).path, "user-only", "User skill", "user body")
+    write_skill(Enum.at(roots, 2).path, "global-only", "Global skill", "global body")
+
+    current_index = Skills.render_index(File.cwd!(), opts)
+    user_scope = Config.skills_user_scope(raw_config: %{})
+
+    assert Skills.render_index(File.cwd!(), Keyword.put(opts, :user_scope, user_scope)) ==
+             current_index
+
+    assert current_index =~ "<name>user-only</name>"
+    assert current_index =~ "<location>user:user-only/SKILL.md</location>"
   end
 
   test "render_index orders visible skills deterministically", %{roots: roots, opts: opts} do

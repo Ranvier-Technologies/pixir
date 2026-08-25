@@ -3,7 +3,7 @@ defmodule Pixir.Tools.RunWorkflow do
 
   use Pixir.Tool
 
-  alias Pixir.{Tool, Workflows}
+  alias Pixir.{Subagents, Tool, Workflows}
 
   @impl Pixir.Tool
   @doc """
@@ -135,7 +135,8 @@ defmodule Pixir.Tools.RunWorkflow do
     args = strip_step_operator_knobs(args)
 
     with {:ok, result} <- Workflows.run(context.session_id, args, workflow_opts(context)) do
-      {:ok, %{"output" => render(result), "workflow" => result}}
+      {:ok,
+       %{"output" => result |> render() |> maybe_append_directive(result), "workflow" => result}}
     end
   end
 
@@ -221,6 +222,18 @@ defmodule Pixir.Tools.RunWorkflow do
           "#{summary["failed_steps"]} failed, #{summary["held_steps"]} held, " <>
           "#{summary["partial_steps"]} partial, " <>
           "#{summary["needs_orchestrator_steps"]} needing orchestrator."
+    end
+  end
+
+  @doc false
+  def append_reverification_directive_for_test(output, result),
+    do: maybe_append_directive(output, result)
+
+  defp maybe_append_directive(output, result) do
+    if Subagents.potentially_integrable?(result["steps"] || []) do
+      output <> "\n\n" <> Subagents.reverification_directive()
+    else
+      output
     end
   end
 

@@ -74,6 +74,8 @@ through `apply_virtual_diff`. The specific rule survives in `matched_rule`
 the kind is what lets the strike counter and the confession classify exactly the
 same events without enumerating rules or tool names.
 
+Every other absolute shell path remains fail-closed; the single deliberate exception is the exact token `/dev/null`, a sink that cannot exfiltrate or mutate workspace state.
+
 The strike counter is **Turn-scoped**. It resets when a new Turn starts,
 including a resumed Turn — history is never recounted — and it is never shared
 across sibling child Sessions.
