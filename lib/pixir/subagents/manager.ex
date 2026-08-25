@@ -116,9 +116,15 @@ defmodule Pixir.Subagents.Manager do
     end
   end
 
+  @diagnostics_timeout_ms 30_000
+
   def diagnostics(parent_session_id, opts \\ []) do
     with :ok <- SessionId.validate(parent_session_id) do
-      GenServer.call(@server, {:diagnostics, parent_session_id, opts})
+      GenServer.call(
+        @server,
+        {:diagnostics, parent_session_id, opts},
+        @diagnostics_timeout_ms
+      )
     end
   catch
     :exit, {:noproc, _} ->
@@ -346,8 +352,9 @@ defmodule Pixir.Subagents.Manager do
     {:reply, {:ok, agents}, state}
   end
 
-  def handle_call({:diagnostics, parent_sid, _opts}, _from, state)
+  def handle_call({:diagnostics, parent_sid, opts}, _from, state)
       when is_binary(parent_sid) do
+    state = restore_parent(state, parent_sid, opts)
     agents = parent_agents(state, parent_sid)
     {:reply, {:ok, manager_diagnostics(parent_sid, agents, state)}, state}
   end
@@ -1738,7 +1745,7 @@ defmodule Pixir.Subagents.Manager do
   # ── state helpers ───────────────────────────────────────────────────────
 
   defp restore_parent(state, parent_sid, opts) do
-    workspace = Keyword.get(opts, :workspace)
+    workspace = Keyword.get(opts, :workspace) || live_parent_workspace(parent_sid)
     state = ensure_parent(state, parent_sid)
     parent = Map.fetch!(state.parents, parent_sid)
 
@@ -1747,7 +1754,7 @@ defmodule Pixir.Subagents.Manager do
     else
       case parent_history(parent_sid, workspace) do
         {:ok, []} ->
-          state
+          mark_parent_restored(state, parent_sid)
 
         {:ok, history} ->
           history
@@ -1762,6 +1769,15 @@ defmodule Pixir.Subagents.Manager do
           state
       end
     end
+  end
+
+  defp live_parent_workspace(parent_sid) do
+    case Session.info(parent_sid) do
+      %{workspace: workspace} when is_binary(workspace) and workspace != "" -> workspace
+      _other -> nil
+    end
+  catch
+    :exit, _reason -> nil
   end
 
   defp parent_history(parent_sid, workspace) do
@@ -1826,7 +1842,7 @@ defmodule Pixir.Subagents.Manager do
       last_seen_child_event_seq: nil,
       last_seen_child_event_type: nil,
       last_seen_child_event_ts: nil,
-      workspace: workspace || data["workspace"] || File.cwd!(),
+      workspace: workspace || File.cwd!(),
       child_workspace: data["workspace"],
       workspace_mode: data["workspace_mode"] || "isolated",
       workspace_snapshot: data["workspace_snapshot"],
@@ -2108,6 +2124,7 @@ defmodule Pixir.Subagents.Manager do
     status_counts = agents |> Enum.frequencies_by(& &1.status) |> Enum.into(%{})
     child_index_entries = child_index_entries_for_parent(state, parent_sid)
     waiters = waiters_for_parent(state, parent_sid)
+    presenter_liveness_count = Enum.count(agents, &presenter_liveness?(&1, waiters))
     runtime_gaps = runtime_gaps(parent_sid, agents, state)
 
     %{
@@ -2121,6 +2138,7 @@ defmodule Pixir.Subagents.Manager do
       "terminal_count" => Enum.count(agents, &Subagents.terminal?(&1.status)),
       "child_index_count" => length(child_index_entries),
       "active_waiter_count" => length(waiters),
+      "presenter_liveness_count" => presenter_liveness_count,
       "active_waiters" => Enum.map(waiters, &public_waiter/1),
       "subagents" => Enum.map(agents, &runtime_agent_summary(&1, state)),
       "runtime_gaps" => runtime_gaps,
@@ -2145,6 +2163,25 @@ defmodule Pixir.Subagents.Manager do
     state.waiters
     |> Enum.filter(fn {_ref, waiter} -> waiter.parent_sid == parent_sid end)
     |> Enum.map(fn {_ref, waiter} -> waiter end)
+  end
+
+  defp presenter_liveness?(%{status: "running"} = agent, _waiters),
+    do: active_agent_hang_cap?(agent)
+
+  defp presenter_liveness?(%{status: "queued"} = agent, waiters) do
+    retry_attempt_index(agent) > 0 and Enum.any?(waiters, &active_waiter_for?(&1, agent.id))
+  end
+
+  defp presenter_liveness?(_agent, _waiters), do: false
+
+  defp active_agent_hang_cap?(agent) do
+    is_integer(agent.timeout_ms) and agent.timeout_ms > 0 and
+      is_binary(agent.deadline_at) and is_reference(agent.timer_ref)
+  end
+
+  defp active_waiter_for?(waiter, id) do
+    is_integer(waiter.timeout_ms) and waiter.timeout_ms > 0 and
+      is_reference(waiter.timer_ref) and id in waiter.ids
   end
 
   defp public_waiter(waiter) do

@@ -432,7 +432,7 @@ defmodule Pixir.Providers.AnthropicGauntletTest do
           Enum.any?(message["content"] || [], &(&1["type"] == "tool_result"))
       end)
 
-    # pa1 anchors volatile late context on the LATEST user-role message,
+    # pa4 anchors volatile late context on the LATEST user-role message,
     # whatever it is (P3 contract) — mid-tool-loop that is the tool_result
     # group, so the fence leads and the grouped result follows.
     assert [
@@ -451,7 +451,7 @@ defmodule Pixir.Providers.AnthropicGauntletTest do
     assert fence_text =~ "<<<PIXIR_PA1_LATE_CONTEXT:AUTHORITY>>>"
   end
 
-  test "pin 5 cache evidence: provider_usage records Anthropic cache tokens and pa1 prompt contract metadata",
+  test "pin 5 cache evidence: provider_usage records Anthropic cache tokens and pa4 prompt contract metadata",
        %{ctx: ctx, sid: sid, ws: ws, skills_opts: skills_opts} do
     assert {:ok, "cache ok"} =
              Turn.run(ctx, "cache evidence",
@@ -471,13 +471,13 @@ defmodule Pixir.Providers.AnthropicGauntletTest do
 
     assert usage.data["usage_summary"]["cache"]["creation_tokens"] == 200
     assert usage.data["usage_summary"]["cache"]["read_tokens"] == 700
-    assert usage.data["prompt_contract_version"] == "pa1"
+    assert usage.data["prompt_contract_version"] == "pa4"
     refute Map.has_key?(usage.data, "prompt_cache_key")
 
     # Turn merges the provider result's provider_metadata FLAT into the event
     # data (the P4 reconcile lesson): prompt_contract sits at the top level.
     assert contract = usage.data["prompt_contract"]
-    assert contract["prompt_contract_version"] == "pa1"
+    assert contract["prompt_contract_version"] == "pa4"
     assert "B1" in contract["breakpoints"]
     assert is_binary(contract["layer0_hash"])
   end

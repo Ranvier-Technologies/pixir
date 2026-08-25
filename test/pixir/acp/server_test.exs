@@ -237,6 +237,21 @@ defmodule Pixir.ACP.ServerTest do
     poll_lines(out, n, deadline)
   end
 
+  # Poll until the response with the requested JSON-RPC `id` arrives.
+  # This deliberately does not flush: notifications may race both before and after it.
+  defp await_response(out, id, timeout \\ 2_000), do: await_id(out, id, timeout)
+
+  defp await_session_update(out, session_update, timeout \\ 2_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    poll_find(
+      out,
+      &(get_in(&1, ["params", "update", "sessionUpdate"]) == session_update),
+      "session update #{session_update}",
+      deadline
+    )
+  end
+
   # Poll until a written line with the given JSON-RPC `method` appears; return it.
   # (Does not flush, so subsequent await_lines still sees later lines.)
   defp await_method(out, method, timeout \\ 2_000) do
@@ -306,8 +321,10 @@ defmodule Pixir.ACP.ServerTest do
 
     cond do
       length(lines) >= n ->
-        StringIO.flush(out)
-        written |> decode_lines()
+        out
+        |> StringIO.flush()
+        |> decode_lines()
+        |> Enum.take(n)
 
       System.monotonic_time(:millisecond) > deadline ->
         flunk("timed out waiting for #{n} lines; got #{length(lines)}: #{inspect(lines)}")
@@ -1022,6 +1039,31 @@ defmodule Pixir.ACP.ServerTest do
       assert alpha["input"]["hint"] == "Use Alpha for focused review"
     end
 
+    test "session/new excludes user-scope Skills when config disables the scope", %{
+      out: out,
+      ws: ws
+    } do
+      write_acp_skill(ws, "repo-only", "Visible repo Skill")
+      write_acp_skill(System.fetch_env!("HOME"), "user-only", "Hidden user Skill")
+
+      File.write!(
+        Path.join(System.fetch_env!("PIXIR_HOME"), "config.json"),
+        Jason.encode!(%{"skills" => %{"user_scope" => false}})
+      )
+
+      server = start_server(out)
+      Server.feed(server, request(1102, "session/new", %{"cwd" => ws, "mcpServers" => []}))
+      sid = await_id(out, 1102)["result"]["sessionId"]
+
+      commands =
+        out
+        |> await_available_commands(sid)
+        |> get_in(["params", "update", "availableCommands"])
+
+      assert Enum.map(commands, & &1["name"]) == ["compact", "repo-only"]
+      refute Enum.any?(commands, &(&1["name"] == "user-only"))
+    end
+
     test "session/load and session/resume advertise available commands", %{ws: ws} do
       write_acp_skill(ws, "alpha", "Use Alpha after reattaching")
 
@@ -1198,17 +1240,20 @@ defmodule Pixir.ACP.ServerTest do
     sid = new_resp["result"]["sessionId"]
 
     Server.feed(server, request(5, "session/set_mode", %{"sessionId" => sid, "modeId" => "plan"}))
-    lines = await_lines(out, 2)
+    response = await_response(out, 5)
 
     # The request gets an empty result…
-    assert Enum.find(lines, &(&1["id"] == 5))["result"] == %{}
+    assert response["result"] == %{}
     # …and a current_mode_update notification confirms the switch.
-    update = Enum.find(lines, &(&1["method"] == "session/update"))
+    update = await_session_update(out, "current_mode_update")
+
     assert update["params"]["update"]["sessionUpdate"] == "current_mode_update"
     assert update["params"]["update"]["currentModeId"] == "plan"
 
     # Client-driven set_mode stays on the existing wire: no config_option_update.
-    refute Enum.any?(lines, &config_update?/1)
+    Server.feed(server, request(50, "initialize", %{"protocolVersion" => 1}))
+    assert await_response(out, 50)["result"]["protocolVersion"] == 1
+    refute Enum.any?(written_lines(out), &config_update?/1)
   end
 
   test "session/set_config_option {configId: mode} switches mode (D.2)", %{out: out, ws: ws} do
@@ -1226,10 +1271,10 @@ defmodule Pixir.ACP.ServerTest do
       })
     )
 
-    lines = await_lines(out, 2)
+    response = await_response(out, 6)
     # set_config_option's response must carry the full configOptions list (ACP
     # SetSessionConfigOptionResponse requires it), with the mode reflecting plan.
-    result = Enum.find(lines, &(&1["id"] == 6))["result"]
+    result = response["result"]
 
     assert Enum.map(result["configOptions"], & &1["id"]) ==
              ["mode", "model", "reasoning_effort", "web_search"]
@@ -1240,7 +1285,8 @@ defmodule Pixir.ACP.ServerTest do
     assert Enum.find(result["configOptions"], &(&1["id"] == "model"))["currentValue"] ==
              default_model_id()
 
-    update = Enum.find(lines, &(&1["method"] == "session/update"))
+    update = await_session_update(out, "current_mode_update")
+
     assert update["params"]["update"]["currentModeId"] == "plan"
   end
 
@@ -1288,8 +1334,8 @@ defmodule Pixir.ACP.ServerTest do
       })
     )
 
-    lines = await_lines(out, 2)
-    assert Enum.find(lines, &(&1["id"] == 6))["result"]["configOptions"]
+    response = await_response(out, 6)
+    assert response["result"]["configOptions"]
 
     # …then Pixir ITSELF flips plan→build with no client call in between.
     assert {:ok, :queued} = Server.runtime_config_change(server, sid, %{"mode" => "build"})
@@ -1313,11 +1359,18 @@ defmodule Pixir.ACP.ServerTest do
     assert Enum.count(written_lines(out), &config_update?/1) == 1
 
     # Additive parity with set_mode: current_mode_update still rides along.
+    deadline = System.monotonic_time(:millisecond) + 2_000
+
     mode_update =
-      Enum.find(written_lines(out), fn l ->
-        l["method"] == "session/update" and
-          get_in(l, ["params", "update", "sessionUpdate"]) == "current_mode_update"
-      end)
+      poll_find(
+        out,
+        fn line ->
+          get_in(line, ["params", "update", "sessionUpdate"]) == "current_mode_update" and
+            get_in(line, ["params", "update", "currentModeId"]) == "build"
+        end,
+        "build current_mode_update",
+        deadline
+      )
 
     assert mode_update["params"]["sessionId"] == sid
     assert mode_update["params"]["update"]["currentModeId"] == "build"
@@ -1461,9 +1514,12 @@ defmodule Pixir.ACP.ServerTest do
       })
     )
 
-    lines = await_lines(out, 2)
-    assert Enum.find(lines, &(&1["id"] == 6))["result"]["configOptions"]
-    refute Enum.any?(lines, &config_update?/1)
+    response = await_response(out, 6)
+    assert response["result"]["configOptions"]
+    _mode_update = await_session_update(out, "current_mode_update")
+    Server.feed(server, request(60, "initialize", %{"protocolVersion" => 1}))
+    assert await_response(out, 60)["result"]["protocolVersion"] == 1
+    refute Enum.any?(written_lines(out), &config_update?/1)
 
     Server.feed(
       server,
@@ -1576,7 +1632,7 @@ defmodule Pixir.ACP.ServerTest do
       request(6, "session/set_mode", %{"sessionId" => sid, "modeId" => "plan"})
     )
 
-    _ = await_lines(out, 2)
+    _response = await_response(out, 6)
 
     Server.feed(
       server,
@@ -1616,7 +1672,7 @@ defmodule Pixir.ACP.ServerTest do
       })
     )
 
-    [set_resp] = await_lines(out, 1)
+    set_resp = await_response(out, 6)
 
     assert Enum.map(set_resp["result"]["configOptions"], & &1["id"]) ==
              ["mode", "model", "reasoning_effort", "web_search"]
@@ -2168,7 +2224,7 @@ defmodule Pixir.ACP.ServerTest do
       })
     )
 
-    [error_resp] = await_lines(out, 1)
+    error_resp = await_response(out, 6)
     assert error_resp["error"]["code"] == Protocol.invalid_params()
     assert error_resp["error"]["message"] == "unknown config option value"
 
@@ -2201,7 +2257,7 @@ defmodule Pixir.ACP.ServerTest do
       })
     )
 
-    [set_resp] = await_lines(out, 1)
+    set_resp = await_response(out, 6)
 
     assert Enum.map(set_resp["result"]["configOptions"], & &1["id"]) ==
              ["mode", "model", "reasoning_effort", "web_search"]
@@ -2288,7 +2344,7 @@ defmodule Pixir.ACP.ServerTest do
       })
     )
 
-    [resp] = await_lines(out, 1)
+    resp = await_response(out, 6)
     assert resp["id"] == 6
     assert resp["error"]["code"] == -32_602
     assert resp["error"]["data"]["configId"] == "does-not-exist"
@@ -2305,7 +2361,7 @@ defmodule Pixir.ACP.ServerTest do
       request(7, "session/set_mode", %{"sessionId" => sid, "modeId" => "bogus"})
     )
 
-    [resp] = await_lines(out, 1)
+    resp = await_response(out, 7)
 
     assert resp["id"] == 7
     assert resp["error"]["code"] == -32_602
@@ -2367,7 +2423,7 @@ defmodule Pixir.ACP.ServerTest do
       request(5, "session/set_model", %{"sessionId" => sid, "modelId" => sticky})
     )
 
-    [set_resp] = await_lines(out, 1)
+    set_resp = await_response(out, 5)
     # SetSessionModelResponse is empty.
     assert set_resp["id"] == 5
     assert set_resp["result"] == %{}
@@ -2402,7 +2458,7 @@ defmodule Pixir.ACP.ServerTest do
       request(5, "session/set_model", %{"sessionId" => sid, "modelId" => model_a})
     )
 
-    [_set_resp] = await_lines(out, 1)
+    _set_resp = await_response(out, 5)
 
     Server.feed(
       server,
@@ -2429,7 +2485,7 @@ defmodule Pixir.ACP.ServerTest do
       request(7, "session/set_model", %{"sessionId" => sid, "modelId" => "bogus-model"})
     )
 
-    [resp] = await_lines(out, 1)
+    resp = await_response(out, 7)
     assert resp["id"] == 7
     assert resp["error"]["code"] == -32_602
     assert resp["error"]["data"]["model"] == "bogus-model"
@@ -2499,7 +2555,7 @@ defmodule Pixir.ACP.ServerTest do
       })
     )
 
-    await_lines(out, 2)
+    _prompt_resp = await_response(out, 3)
 
     # Second (fresh) server: load that session id from the same workspace.
     {:ok, out2} = StringIO.open("")
@@ -2782,7 +2838,7 @@ defmodule Pixir.ACP.ServerTest do
     [new_resp] = await_lines(out, 1)
     sid = new_resp["result"]["sessionId"]
     Server.feed(s1, request(3, "session/prompt", %{"sessionId" => sid, "prompt" => []}))
-    await_lines(out, 1)
+    _prompt_resp = await_response(out, 3)
 
     {:ok, out2} = StringIO.open("")
     s2 = start_server(out2, id: :s2)
@@ -2974,14 +3030,14 @@ defmodule Pixir.ACP.ServerTest do
       })
     )
 
-    lines = await_lines(out, 2)
+    prompt_resp = await_response(out, 3)
     # The streamed text -> agent_message_chunk; then the PromptResponse.
-    chunk = Enum.find(lines, &(&1["method"] == "session/update"))
+    chunk = await_session_update(out, "agent_message_chunk")
+
     assert chunk["params"]["sessionId"] == sid
     assert chunk["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
     assert chunk["params"]["update"]["content"]["text"] == "Hi there!"
 
-    prompt_resp = Enum.find(lines, &(&1["id"] == 3))
     assert prompt_resp["result"]["stopReason"] == "end_turn"
   end
 
@@ -3116,16 +3172,18 @@ defmodule Pixir.ACP.ServerTest do
       })
     )
 
-    lines = await_lines(out, 2)
+    prompt_resp = await_response(out, 3)
 
     chunks =
-      Enum.filter(lines, fn line ->
+      written_lines(out)
+      |> Enum.filter(fn line ->
         line["method"] == "session/update" and
+          line["params"]["sessionId"] == sid and
           line["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
       end)
 
-    assert [%{"params" => %{"update" => %{"content" => %{"text" => "Useful partial answer."}}}}] =
-             chunks
+    assert [chunk] = chunks
+    assert get_in(chunk, ["params", "update", "content", "text"]) == "Useful partial answer."
 
     refute Enum.any?(
              chunks,
@@ -3133,7 +3191,6 @@ defmodule Pixir.ACP.ServerTest do
                  "Provider stream process exited.")
            )
 
-    prompt_resp = Enum.find(lines, &(&1["id"] == 3))
     assert prompt_resp["result"]["stopReason"] == "end_turn"
   end
 
@@ -3366,7 +3423,7 @@ defmodule Pixir.ACP.ServerTest do
     entries = [%{"content" => "do x", "priority" => "high", "status" => "pending"}]
     Pixir.Session.emit(sid, Pixir.Event.plan(sid, entries))
 
-    [line] = await_lines(out, 1)
+    line = await_session_update(out, "plan")
     assert line["method"] == "session/update"
     assert line["params"]["update"]["sessionUpdate"] == "plan"
     assert line["params"]["update"]["entries"] == entries
@@ -3414,7 +3471,13 @@ defmodule Pixir.ACP.ServerTest do
       })
     )
 
-    [first, second] = await_lines(out, 2)
+    second = await_session_update(out, "tool_call_update")
+
+    first =
+      Enum.find(written_lines(out), fn line ->
+        get_in(line, ["params", "update", "sessionUpdate"]) == "tool_call"
+      end)
+
     first_update = first["params"]["update"]
     second_update = second["params"]["update"]
 
@@ -3443,16 +3506,13 @@ defmodule Pixir.ACP.ServerTest do
       })
     )
 
-    lines = await_lines(out, 2)
+    prompt_resp = await_response(out, 3)
     # The error text streamed as an agent_message_chunk (not an empty turn)…
-    chunk =
-      Enum.find(lines, fn l ->
-        get_in(l, ["params", "update", "sessionUpdate"]) == "agent_message_chunk"
-      end)
+    chunk = await_session_update(out, "agent_message_chunk")
 
     assert get_in(chunk, ["params", "update", "content", "text"]) == "boom"
     # …and the turn resolves end_turn (a failed turn is content, not a protocol error)…
-    result = Enum.find(lines, &(&1["id"] == 3))["result"]
+    result = prompt_resp["result"]
     assert result["stopReason"] == "end_turn"
 
     # …AND the result carries the machine-readable failure facts (#465, ADR 0009 §5
@@ -3688,7 +3748,7 @@ defmodule Pixir.ACP.ServerTest do
       })
     )
 
-    [resp] = await_lines(out, 1)
+    resp = await_response(out, 3)
     assert resp["id"] == 3
     assert resp["error"]["code"] == -32_602
     assert resp["error"]["data"]["model"] == "not-a-real-model"
@@ -4091,8 +4151,7 @@ defmodule Pixir.ACP.ServerTest do
     Process.sleep(150)
     Server.feed(server, notification("session/cancel", %{"sessionId" => sid}))
 
-    lines = await_lines(out, 1)
-    prompt_resp = Enum.find(lines, &(&1["id"] == 3))
+    prompt_resp = await_response(out, 3)
     assert prompt_resp["result"]["stopReason"] == "cancelled"
   end
 
@@ -4185,7 +4244,7 @@ defmodule Pixir.ACP.ServerTest do
     # Second concurrent prompt while the first turn is still running.
     Server.feed(server, request(4, "session/prompt", prompt))
 
-    [rejected] = await_lines(out, 1)
+    rejected = await_response(out, 4)
     assert rejected["id"] == 4
     # A client/state error, not an internal fault.
     assert rejected["error"]["code"] == -32_602
@@ -4194,7 +4253,7 @@ defmodule Pixir.ACP.ServerTest do
     # Cleanly cancel the blocked turn and wait for it to resolve, so the supervised Task
     # exits via interrupt rather than being killed at teardown (which logs a crash report).
     Server.feed(server, notification("session/cancel", %{"sessionId" => sid}))
-    [resolved] = await_lines(out, 1)
+    resolved = await_response(out, 3)
     assert resolved["id"] == 3
     assert resolved["result"]["stopReason"] == "cancelled"
   end

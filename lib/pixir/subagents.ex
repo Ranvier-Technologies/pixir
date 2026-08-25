@@ -24,6 +24,12 @@ defmodule Pixir.Subagents do
 
   @statuses ~w(queued running completed failed timed_out cancelled detached closed)
   @terminal_statuses ~w(completed failed cancelled timed_out closed detached)
+  @potentially_integrable_statuses ~w(completed timed_out closed)
+
+  @reverification_directive "Re-verify all integrated results from delegated children " <>
+                              "before committing or declaring the work done. Run the " <>
+                              "workspace's own verification, including typechecks, tests, " <>
+                              "and any commands named in the work brief."
 
   @cancellation_steps [
     {:session_interrupt_evidence, "session_interrupt_evidence"},
@@ -62,6 +68,21 @@ defmodule Pixir.Subagents do
       retry_jitter_ms: Keyword.get(config, :retry_jitter_ms, 250)
     }
   end
+
+  @doc false
+  def reverification_directive, do: @reverification_directive
+
+  @doc false
+  def potentially_integrable?(items) when is_list(items) do
+    Enum.any?(items, fn item ->
+      status =
+        item["status"] || item[:status] || item["subagent_status"] || item[:subagent_status]
+
+      status in @potentially_integrable_statuses
+    end)
+  end
+
+  def potentially_integrable?(_items), do: false
 
   @doc "Spawn or queue a Subagent."
   def spawn_agent(parent_session_id, args, opts \\ []),
@@ -156,10 +177,14 @@ defmodule Pixir.Subagents do
   def list(parent_session_id, opts \\ []), do: Manager.list(parent_session_id, opts)
 
   @doc """
-  Return a read-only snapshot of the Subagent Manager runtime for one parent Session.
+  Return a runtime diagnostics projection for one parent Session.
 
-  This is volatile process health evidence, not durable history. Use the Session Log
-  and Session tree for canonical lifecycle facts.
+  Diagnostics idempotently hydrates restorable parent state from durable evidence before
+  projecting the snapshot. Hydration may reattach live children: it subscribes to child
+  event buses through `Pixir.Events` and rearms child timeout timers. It may also fold the
+  parent Log after a Manager restart, but it does not write canonical events. The returned
+  data remains volatile process-health evidence; use the Session Log and Session tree for
+  canonical lifecycle facts.
   """
   def diagnostics(parent_session_id, opts \\ []), do: Manager.diagnostics(parent_session_id, opts)
 

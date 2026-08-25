@@ -1440,7 +1440,7 @@ defmodule Pixir.CLI do
     turn_opts =
       turn_opts
       |> fold_web_search_flag()
-      |> Keyword.drop([:skip_auth?, :idle_timeout, :json?])
+      |> Keyword.drop([:skip_auth?, :idle_timeout, :subagent_liveness?, :json?])
       |> Keyword.merge(permission_mode: mode, asker: asker)
 
     {:ok, _ref} = Conversation.send(session_id, prompt, turn_opts)
@@ -1499,13 +1499,27 @@ defmodule Pixir.CLI do
     end
   end
 
-  # Only the timeout knob is a CLI/await concern; everything else in cli_turn_opts
-  # belongs to the Turn.
+  # The presenter timeout is a CLI/await concern; an explicit test-seam value wins,
+  # otherwise the operator-facing config supplies the default. Everything else in
+  # cli_turn_opts belongs to the Turn.
   defp await_opts(turn_opts) do
-    case Keyword.get(turn_opts, :idle_timeout) do
-      timeout when is_integer(timeout) and timeout > 0 -> [idle_timeout: timeout]
-      _ -> []
-    end
+    idle_timeout =
+      case Keyword.fetch(turn_opts, :idle_timeout) do
+        {:ok, timeout} when is_integer(timeout) and timeout > 0 -> timeout
+        _ -> Config.presenter_idle_timeout_ms()
+      end
+
+    []
+    |> Keyword.put(:idle_timeout, idle_timeout)
+    |> maybe_put_await_opt(
+      :subagent_liveness?,
+      Keyword.get(turn_opts, :subagent_liveness?),
+      &is_boolean/1
+    )
+  end
+
+  defp maybe_put_await_opt(opts, key, value, valid?) do
+    if valid?.(value), do: Keyword.put(opts, key, value), else: opts
   end
 
   # Each provider call starts at a status "thinking", so the streamed accumulator

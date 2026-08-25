@@ -278,6 +278,52 @@ defmodule Pixir.Subagents.ManagerTest do
     %{session_id: session_id, workspace: workspace}
   end
 
+  test "diagnostics restores a live durable child after the manager restarts", %{
+    session_id: session_id,
+    workspace: workspace
+  } do
+    assert {:ok, agent} =
+             Subagents.spawn_agent(
+               session_id,
+               %{
+                 "task" => "remain running across manager restart",
+                 "timeout_ms" => 5_000
+               },
+               workspace: workspace,
+               provider: BlockingProvider,
+               permission_mode: :read_only
+             )
+
+    on_exit(fn ->
+      try do
+        _ = Subagents.close(session_id, agent["id"], workspace: workspace)
+        _ = SessionSupervisor.stop_session(agent["child_session_id"])
+      catch
+        :exit, _reason -> :ok
+      end
+    end)
+
+    old_manager = Process.whereis(Manager)
+    assert is_pid(old_manager)
+    :ok = GenServer.stop(old_manager, :shutdown)
+    new_manager = await_manager_restart(old_manager)
+    assert is_pid(new_manager)
+
+    assert {:ok, diagnostics} = Subagents.diagnostics(session_id)
+    assert diagnostics["known_subagent_count"] == 1
+    assert diagnostics["running_count"] == 1
+    assert diagnostics["presenter_liveness_count"] == 1
+
+    assert [%{"id" => restored_id, "status" => "running"}] = diagnostics["subagents"]
+    assert restored_id == agent["id"]
+
+    manager_state = :sys.get_state(Manager)
+    restored = get_in(manager_state, [:parents, session_id, :agents, agent["id"]])
+    assert restored.workspace == Path.expand(workspace)
+    refute restored.child_workspace == restored.workspace
+    assert restored.workspace_mode == "isolated"
+  end
+
   describe "virtual_overlay retry evidence gate" do
     test "retries a transport failure before durable model or virtual tool evidence", %{
       session_id: session_id,
@@ -801,6 +847,21 @@ defmodule Pixir.Subagents.ManagerTest do
       state = :sys.get_state(Manager)
       internal = get_in(state, [:parents, session_id, :agents, "sub_cold_restore"])
       assert internal.output_latest_warning_order_key == {70, "evt_final_cold"}
+    end
+  end
+
+  defp await_manager_restart(old_manager, attempts \\ 100)
+
+  defp await_manager_restart(_old_manager, 0), do: nil
+
+  defp await_manager_restart(old_manager, attempts) do
+    case Process.whereis(Manager) do
+      pid when is_pid(pid) and pid != old_manager ->
+        pid
+
+      _other ->
+        Process.sleep(10)
+        await_manager_restart(old_manager, attempts - 1)
     end
   end
 

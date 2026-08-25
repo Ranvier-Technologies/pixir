@@ -18,7 +18,7 @@ defmodule Mix.Tasks.Pixir.Smoke.Skills do
 
   use Mix.Task
 
-  alias Pixir.{Auth, Log, Provider, SessionSupervisor, Skills}
+  alias Pixir.{Auth, Config, Log, Provider, SessionSupervisor, Skills}
   alias Pixir.Tools.{Executor, Read}
 
   @impl Mix.Task
@@ -64,7 +64,9 @@ defmodule Mix.Tasks.Pixir.Smoke.Skills do
   end
 
   defp prove_discovery(workspace) do
-    {:ok, %{skills: skills, warnings: warnings}} = Skills.discover(workspace)
+    {:ok, %{skills: skills, warnings: warnings}} =
+      Skills.discover(workspace, user_scope: Config.skills_user_scope())
+
     selected = Enum.find(skills, &(&1.name == "collision"))
 
     cond do

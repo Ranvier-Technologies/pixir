@@ -9,6 +9,80 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-08-24
+
+### Added
+- New `presenter_idle_timeout_ms` config key (default `300_000`) controls the CLI
+  one-shot/resume `Conversation.await` idle deadline between Session events; ACP has its
+  own loop and does not honor this key. Pixir's three clocks are transport
+  (`stream_idle_timeout_ms`, silence within one Provider stream), that CLI await deadline,
+  and bash hang cap (`bash_timeout_ms`, per tool call). The presenter default deliberately
+  exceeds the bash default plus cleanup grace so a timed-out tool can return before the
+  CLI gives up. Agents may still raise a bash call's `timeout_ms` up to
+  `bash_timeout_max_ms` (600 seconds by default), above the presenter default; the
+  extension-during-tools step, not this ordering, structurally closes that race.
+  `stream_idle_timeout_ms` was never the CLI presenter knob (#575).
+- The `bash` tool schema now accepts an optional positive integer `timeout_ms` so an
+  agent can raise or lower a command's runtime bound; requests remain capped by the
+  operator's `bash_timeout_max_ms` (#575).
+- `config.json` accepts an extensible `skills` object with `user_scope: false`
+  to exclude `~/.agents/skills` from Skills discovery and Turn prompt indexes;
+  omission preserves the existing user-scope behavior (#567).
+
+### Changed
+- Reverted the #570 build-mode style sentence in both prompt families: its measured
+  effect on output quality was negative, so the build bases return to their prior
+  bytes. Plan-mode bytes are unchanged. The OpenAI-family Prompt Contract bumps from
+  `px6` to `px7` and the separate Anthropic lineage from `pa3` to `pa4`, intentionally
+  invalidating each prompt-cache family once with attributable `provider_usage`
+  evidence (#570).
+- Timed-out `bash` commands now confess the spawned OS pid and the SIGTERM/SIGKILL
+  escalation used. Cleanup best-effort terminates direct children with `pkill -P`,
+  signals the spawned pid, waits a short grace period, escalates when needed, and then
+  closes the port; deliberately double-forked daemons remain out of scope (#575).
+- Bash's schema change bumps the OpenAI-family Prompt Contract from `px5` to `px6`
+  and the separate Anthropic lineage from `pa2` to `pa3`. This intentionally
+  invalidates each prompt-cache family once, attributable in `provider_usage`
+  evidence under ADR 0020 and ADR 0037 (#575).
+
+### Fixed
+- The public `/scale` page no longer claims compatibility with "any Open Responses
+  endpoint": the copy now states the ADR 0002 amendment's evidence level (mode
+  shipped in v0.1.11, endpoint compatibility observed live against a local
+  open-source server during the v0.1.12 cycle), completing the half of #500 that
+  the v0.1.14 CHANGELOG overstated as absorbed (#500).
+- Bash timeout kill escalation now uses the POSIX `--` separator when signalling
+  the negative process group, so SIGTERM/SIGKILL delivery and the aliveness check
+  work on procps-ng `kill` as well as BSD `kill`; previously on Linux the signals
+  never landed on exec-flattened childless commands even when the escalation
+  confessed `sigkill` (#592). BusyBox `kill` remains unsupported for the
+  group alive-check (#594).
+- The bounded-write outside-workspace shell scanner now permits the exact `/dev/null`
+  sink token while continuing to reject every other outside-workspace absolute path
+  (#579).
+- Integrator re-verification guidance now comes from one shared source and reaches
+  terminal `wait_agent`, `run_workflow`, and `pixir delegate` presentation surfaces
+  whenever completed, timed-out, or closed children may have left integrable work;
+  incomplete polls and failed/cancelled-only outcomes remain unchanged (#577).
+- Workspace-local `.pixir/` roots now seed an exclusive, best-effort `.gitignore`
+  containing `*`, preventing agent `git add .` operations from committing Session state
+  while preserving any operator-managed ignore file (#580).
+- ACP server tests now poll for the response matching each JSON-RPC request id without
+  flushing output, then independently await expected `sessionUpdate` notifications by
+  predicate so early and late asynchronous updates cannot hide prompt responses (#571).
+- `wait_agent` results now guide the integrating parent to re-verify completed child
+  results with the workspace's own typechecks, tests, and work-brief verification
+  commands before committing or declaring the work done. This is guidance, not
+  enforcement (#569).
+- One-shot presenter idle timeouts now consult bounded in-memory Subagent presence only
+  when a positive idle deadline expires. Running children require a live child timeout;
+  retry-queued children require the active bounded `wait_agent` waiter. Diagnostics
+  idempotently hydrates restarted Manager state using the live parent Session workspace,
+  with a fold-tolerant call timeout, so isolated child paths cannot corrupt restored
+  parent roots. The expiry path drains a just-queued terminal parent event before
+  selecting exit 124, while genuinely idle trees retain the existing
+  `presenter_idle_timeout` recovery envelope (#568).
+
 ## [0.1.14] - 2026-08-22
 
 ### Added

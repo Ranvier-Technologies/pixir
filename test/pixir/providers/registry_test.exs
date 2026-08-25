@@ -1,7 +1,8 @@
 defmodule Pixir.Providers.RegistryTest do
   use ExUnit.Case, async: false
 
-  alias Pixir.Providers.Registry
+  alias Pixir.Providers.Anthropic.Prompt
+  alias Pixir.Providers.{Registry, ResolvedProviderRequest}
 
   defmodule UnknownProvider do
   end
@@ -119,9 +120,26 @@ defmodule Pixir.Providers.RegistryTest do
 
     assert anthropic.capabilities.reasoning_dialect == "anthropic"
     assert anthropic.capabilities.prompt_cache == :cache_control
-    assert anthropic.capabilities.prompt_contract_version == "pa1"
+    assert anthropic.capabilities.prompt_contract_version == "pa4"
     assert anthropic.capabilities.tool_dialect == :anthropic
     assert anthropic.capabilities.hosted_tools == false
+  end
+
+  test "resolved Anthropic capabilities track the prompt contract producer" do
+    assert {:ok, resolved} =
+             Registry.resolve_request(
+               %{
+                 provider_intent: :auto,
+                 request: %{model: "claude-fable-5"},
+                 provider_opts: []
+               },
+               raw_config: %{}
+             )
+
+    assert ResolvedProviderRequest.capabilities_valid?(resolved)
+
+    assert ResolvedProviderRequest.safe_summary(resolved).capabilities.prompt_contract_version ==
+             Prompt.prompt_contract_version()
   end
 
   test "auth metadata is provider-specific" do

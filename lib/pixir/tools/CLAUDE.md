@@ -11,8 +11,9 @@ central `Executor` that confines, gates, and records every call.
 - `executor.ex` — the enforcement point: validates args, confines paths to the Workspace,
   applies the permission policy, records `tool_call`/`tool_result`, honors `dry_run` centrally.
 - `read.ex` / `write.ex` / `edit.ex` / `bash.ex` — the four file/shell tools. `edit` is
-  exact-match, unique-unless-`replace_all`. `bash` runs via a `Port`, killed on
-  `bash_timeout_ms` (120s).
+  exact-match, unique-unless-`replace_all`. `bash` runs via a `Port`; the agent may
+  request `timeout_ms` (default `bash_timeout_ms`, 120s), clamped to
+  `bash_timeout_max_ms` with the clamp confessed in the result.
 - `skills_list.ex` / `skill_view.ex` — progressive Skill disclosure. `skills_list` lists
   bounded Skill metadata only; supporting resources such as Workflow Templates are loaded
   explicitly through `skill_view`.

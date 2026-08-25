@@ -85,8 +85,10 @@ defmodule Pixir.Doctor do
       workspace_check(workspace),
       auth_check(opts, entry, model),
       config_check(opts, config, entry, model),
+      timeout_ordering_check(config),
       catalog_check(config, opts),
-      acp_check()
+      acp_check(),
+      bash_dependencies_check()
     ]
   end
 
@@ -303,6 +305,34 @@ defmodule Pixir.Doctor do
     end
   end
 
+  defp timeout_ordering_check(config) do
+    effective = config["effective"] || %{}
+    presenter_timeout_ms = effective["presenter_idle_timeout_ms"]
+    bash_timeout_ms = effective["bash_timeout_ms"]
+
+    details = %{
+      "presenter_idle_timeout_ms" => presenter_timeout_ms,
+      "bash_timeout_ms" => bash_timeout_ms
+    }
+
+    if is_integer(presenter_timeout_ms) and is_integer(bash_timeout_ms) and
+         presenter_timeout_ms <= bash_timeout_ms do
+      warning(
+        "presenter_bash_timeout_ordering",
+        "Presenter idle timeout can race the bash hang cap, making a recoverable tool timeout session-fatal.",
+        Map.put(details, "next_actions", [
+          "set presenter_idle_timeout_ms greater than bash_timeout_ms with cleanup grace"
+        ])
+      )
+    else
+      passed(
+        "presenter_bash_timeout_ordering",
+        "Presenter idle timeout exceeds the bash hang cap.",
+        details
+      )
+    end
+  end
+
   defp catalog_check(config, opts) do
     effective = config["effective"] || %{}
     refreshed_at = effective["models_refreshed_at"]
@@ -350,6 +380,30 @@ defmodule Pixir.Doctor do
       "command" => "./pixir acp",
       "next_actions" => ["use ./pixir acp from an ACP client after building the escript"]
     })
+  end
+
+  @doc false
+  def bash_dependencies_check(find \\ &System.find_executable/1) do
+    case find.("perl") do
+      path when is_binary(path) ->
+        passed("bash_dependencies", "perl is available for bash process-group kill.", %{
+          "perl" => path
+        })
+
+      nil ->
+        # A warning, not a failure: doctor must not flip to "block" over a
+        # missing optional-until-first-bash dependency; "judge" carries the
+        # operator decision while next_actions name the remedy.
+        warning(
+          "bash_dependencies",
+          "perl was not found on PATH; the bash tool cannot spawn commands.",
+          %{
+            "dependency" => "perl",
+            "required_for" => "process-group kill (bash tool spawn wrapper)",
+            "next_actions" => ["install perl", "ensure PATH includes the perl binary"]
+          }
+        )
+    end
   end
 
   defp executable?(path) do

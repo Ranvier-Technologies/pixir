@@ -33,6 +33,7 @@ defmodule Pixir.Turn do
 
   alias Pixir.{
     Compaction,
+    Config,
     Event,
     RecoveryCommands,
     Session,
@@ -121,7 +122,12 @@ defmodule Pixir.Turn do
   @spec run(ctx(), String.t(), keyword()) :: {:ok, String.t()} | {:error, map()}
   def run(ctx, user_text, opts \\ []) do
     sid = ctx.session_id
-    skills_opts = Keyword.get(opts, :skills_opts, [])
+    config_opts = Keyword.get(opts, :config_opts, [])
+
+    skills_opts =
+      opts
+      |> Keyword.get(:skills_opts, [])
+      |> Keyword.put(:user_scope, Config.skills_user_scope(config_opts))
 
     {:ok, pre_turn_history} = Session.history(sid)
     previous_turn_boundary_seq = previous_turn_boundary_seq(pre_turn_history)

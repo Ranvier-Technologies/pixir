@@ -16,7 +16,7 @@ defmodule Pixir.Provider.CacheTest do
 
     key = metadata["prompt_cache_key"]
     assert byte_size(key) <= 96
-    assert key =~ "px4:"
+    assert key =~ "px7:"
     assert key =~ "m_gpt-5.5"
     assert key =~ "r_build"
     refute key =~ "/Users"
@@ -37,7 +37,7 @@ defmodule Pixir.Provider.CacheTest do
              })
 
     version = Cache.prompt_contract_version()
-    assert version == "px4"
+    assert version == "px7"
     assert metadata["prompt_contract_version"] == version
     assert String.starts_with?(metadata["prompt_cache_key"], version <> ":")
   end

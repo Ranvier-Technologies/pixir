@@ -27,7 +27,7 @@ defmodule Pixir.Conversation do
   socket).
   """
 
-  alias Pixir.{Event, Events, Log, Session, SessionId, SessionSupervisor, Turn}
+  alias Pixir.{Event, Events, Log, Session, SessionId, SessionSupervisor, Subagents, Turn}
   alias Pixir.Permissions.WritePolicy
 
   @type session_id :: String.t()
@@ -177,32 +177,178 @@ defmodule Pixir.Conversation do
   safely send the next prompt without seeing a transient `:busy`.
 
   Options: `:on_event` (a 1-arity callback invoked per event, for in-process rendering),
-  `:idle_timeout` (ms, default 120_000), and `:cleanup_timeout` (ms, default 1_000).
+  `:idle_timeout` (ms, default 120_000), `:subagent_liveness?` (default `true`; an
+  internal red-proof seam), and `:cleanup_timeout` (ms, default 1_000). When a
+  positive idle deadline expires, an attached non-terminal Subagent with a live
+  timeout cap extends the deadline. Retry-queued children may instead rely on the
+  active `wait_agent` timer that is already bounding their parent wait.
   """
   @spec await(session_id(), keyword()) :: :done | :error | :interrupted | :timeout
   def await(session_id, opts \\ []) do
     on_event = Keyword.get(opts, :on_event, fn _ -> :ok end)
     timeout = Keyword.get(opts, :idle_timeout, 120_000)
+    subagent_liveness? = Keyword.get(opts, :subagent_liveness?, true)
+    liveness_check = Keyword.get(opts, :subagent_liveness_check, &presenter_liveness?/1)
     cleanup_timeout = Keyword.get(opts, :cleanup_timeout, 1_000)
 
-    case consume(on_event, timeout) do
+    case consume(session_id, on_event, timeout, subagent_liveness?, liveness_check) do
       :timeout -> :timeout
       outcome -> await_turn_cleanup(session_id, outcome, cleanup_timeout)
     end
   end
 
-  defp consume(on_event, timeout) do
+  defp consume(session_id, on_event, timeout, subagent_liveness?, liveness_check) do
+    deadline = idle_deadline(timeout)
+
+    consume_until(
+      session_id,
+      on_event,
+      timeout,
+      deadline,
+      subagent_liveness?,
+      liveness_check
+    )
+  end
+
+  defp consume_until(
+         session_id,
+         on_event,
+         timeout,
+         deadline,
+         subagent_liveness?,
+         liveness_check
+       ) do
     receive do
       {:pixir_event, event} ->
-        on_event.(event)
-
-        case terminal(event) do
-          nil -> consume(on_event, timeout)
-          outcome -> outcome
-        end
+        handle_await_event(
+          event,
+          session_id,
+          on_event,
+          timeout,
+          subagent_liveness?,
+          liveness_check
+        )
     after
-      timeout -> :timeout
+      remaining_timeout(deadline) ->
+        handle_idle_expiry(
+          session_id,
+          on_event,
+          timeout,
+          subagent_liveness?,
+          liveness_check
+        )
     end
+  end
+
+  defp handle_await_event(
+         event,
+         session_id,
+         on_event,
+         timeout,
+         subagent_liveness?,
+         liveness_check
+       ) do
+    on_event.(event)
+
+    case terminal(event) do
+      nil ->
+        consume_until(
+          session_id,
+          on_event,
+          timeout,
+          idle_deadline(timeout),
+          subagent_liveness?,
+          liveness_check
+        )
+
+      outcome ->
+        outcome
+    end
+  end
+
+  defp handle_idle_expiry(
+         _session_id,
+         _on_event,
+         timeout,
+         _subagent_liveness?,
+         _liveness_check
+       )
+       when timeout <= 0,
+       do: :timeout
+
+  defp handle_idle_expiry(
+         session_id,
+         on_event,
+         timeout,
+         subagent_liveness?,
+         liveness_check
+       ) do
+    if subagent_liveness? and liveness_check.(session_id) do
+      consume_until(
+        session_id,
+        on_event,
+        timeout,
+        idle_deadline(timeout),
+        subagent_liveness?,
+        liveness_check
+      )
+    else
+      drain_after_presence_check(
+        session_id,
+        on_event,
+        timeout,
+        subagent_liveness?,
+        liveness_check
+      )
+    end
+  end
+
+  defp drain_after_presence_check(
+         session_id,
+         on_event,
+         timeout,
+         subagent_liveness?,
+         liveness_check
+       ) do
+    receive do
+      {:pixir_event, event} ->
+        handle_await_event(
+          event,
+          session_id,
+          on_event,
+          timeout,
+          subagent_liveness?,
+          liveness_check
+        )
+    after
+      0 -> :timeout
+    end
+  end
+
+  defp idle_deadline(timeout), do: System.monotonic_time(:millisecond) + max(timeout, 0)
+
+  defp remaining_timeout(deadline),
+    do: max(deadline - System.monotonic_time(:millisecond), 0)
+
+  defp presenter_liveness?(session_id) do
+    diagnostics_opts =
+      case Session.info(session_id) do
+        %{workspace: workspace} when is_binary(workspace) and workspace != "" ->
+          [workspace: workspace]
+
+        _other ->
+          []
+      end
+
+    case Subagents.diagnostics(session_id, diagnostics_opts) do
+      {:ok, %{"presenter_liveness_count" => count}} when is_integer(count) and count > 0 ->
+        true
+
+      _other ->
+        false
+    end
+  catch
+    :exit, _reason -> false
   end
 
   defp terminal(%{type: :status, data: %{"status" => "done"}}), do: :done

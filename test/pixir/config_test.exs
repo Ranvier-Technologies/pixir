@@ -23,8 +23,13 @@ defmodule Pixir.ConfigTest do
     previous_app_retries = Application.get_env(:pixir, :max_retries)
     previous_app_bash_timeout = Application.get_env(:pixir, :bash_timeout_ms)
     previous_app_bash_timeout_max = Application.get_env(:pixir, :bash_timeout_max_ms)
+
+    previous_app_presenter_idle_timeout =
+      Application.get_env(:pixir, :presenter_idle_timeout_ms)
+
     previous_app_host_commands = Application.get_env(:pixir, :host_commands)
     previous_app_web_search = Application.get_env(:pixir, :web_search)
+    previous_app_skills_user_scope = Application.get_env(:pixir, :skills_user_scope)
 
     System.put_env("PIXIR_HOME", home)
     System.delete_env("PIXIR_MODEL")
@@ -32,8 +37,10 @@ defmodule Pixir.ConfigTest do
     Application.delete_env(:pixir, :max_retries)
     Application.delete_env(:pixir, :bash_timeout_ms)
     Application.delete_env(:pixir, :bash_timeout_max_ms)
+    Application.delete_env(:pixir, :presenter_idle_timeout_ms)
     Application.delete_env(:pixir, :host_commands)
     Application.delete_env(:pixir, :web_search)
+    Application.delete_env(:pixir, :skills_user_scope)
 
     on_exit(fn ->
       if previous_home,
@@ -60,6 +67,15 @@ defmodule Pixir.ConfigTest do
         do: Application.put_env(:pixir, :bash_timeout_max_ms, previous_app_bash_timeout_max),
         else: Application.delete_env(:pixir, :bash_timeout_max_ms)
 
+      if previous_app_presenter_idle_timeout,
+        do:
+          Application.put_env(
+            :pixir,
+            :presenter_idle_timeout_ms,
+            previous_app_presenter_idle_timeout
+          ),
+        else: Application.delete_env(:pixir, :presenter_idle_timeout_ms)
+
       if previous_app_host_commands,
         do: Application.put_env(:pixir, :host_commands, previous_app_host_commands),
         else: Application.delete_env(:pixir, :host_commands)
@@ -67,6 +83,10 @@ defmodule Pixir.ConfigTest do
       if previous_app_web_search,
         do: Application.put_env(:pixir, :web_search, previous_app_web_search),
         else: Application.delete_env(:pixir, :web_search)
+
+      if is_boolean(previous_app_skills_user_scope),
+        do: Application.put_env(:pixir, :skills_user_scope, previous_app_skills_user_scope),
+        else: Application.delete_env(:pixir, :skills_user_scope)
 
       File.rm_rf!(home)
     end)
@@ -79,6 +99,7 @@ defmodule Pixir.ConfigTest do
 
     assert result["present"] == false
     assert result["warnings"] == []
+    assert Config.presenter_idle_timeout_ms(config_path: config_path) == 300_000
 
     assert result["effective"] == %{
              "permission_default" => "auto",
@@ -93,6 +114,8 @@ defmodule Pixir.ConfigTest do
              },
              "max_retries" => 2,
              "stream_idle_timeout_ms" => 180_000,
+             "presenter_idle_timeout_ms" => 300_000,
+             "skills" => %{"user_scope" => true},
              "web_search" => nil,
              "compaction" => %{"tail_events" => 40, "model_assisted" => false, "native" => nil},
              "model" => "gpt-5.5",
@@ -119,6 +142,8 @@ defmodule Pixir.ConfigTest do
         },
         "max_retries" => 4,
         "stream_idle_timeout_ms" => 60_000,
+        "presenter_idle_timeout_ms" => 240_000,
+        "skills" => %{"user_scope" => false},
         "web_search" => %{
           "enabled" => true,
           "search_context_size" => "medium",
@@ -150,6 +175,8 @@ defmodule Pixir.ConfigTest do
 
     assert result["effective"]["max_retries"] == 4
     assert result["effective"]["stream_idle_timeout_ms"] == 60_000
+    assert result["effective"]["presenter_idle_timeout_ms"] == 240_000
+    assert result["effective"]["skills"]["user_scope"] == false
 
     assert result["effective"]["web_search"] == %{
              "enabled" => true,
@@ -163,6 +190,26 @@ defmodule Pixir.ConfigTest do
     assert result["effective"]["model"] == "gpt-5.3-codex"
     assert result["effective"]["models"] == ["gpt-5.3-codex"]
     assert result["effective"]["context_windows"] == %{"gpt-5.3-codex" => 64_000}
+  end
+
+  test "skills.user_scope defaults on, accepts false, and invalid shapes warn", %{
+    config_path: config_path
+  } do
+    assert Config.skills_user_scope(config_path: config_path)
+
+    File.write!(config_path, Jason.encode!(%{"skills" => %{"user_scope" => false}}))
+    refute Config.skills_user_scope(config_path: config_path)
+
+    for {skills, field} <- [
+          {%{"user_scope" => "false"}, "skills.user_scope"},
+          {false, "skills"}
+        ] do
+      File.write!(config_path, Jason.encode!(%{"skills" => skills}))
+      loaded = Config.load(config_path: config_path)
+
+      assert loaded["effective"]["skills"]["user_scope"] == true
+      assert Enum.any?(loaded["warnings"], &(&1["field"] == field))
+    end
   end
 
   test "compaction.native is nil, true, or false and invalid stays nil", %{
@@ -255,6 +302,8 @@ defmodule Pixir.ConfigTest do
         },
         "max_retries" => -1,
         "stream_idle_timeout_ms" => "forever",
+        "presenter_idle_timeout_ms" => %{"seconds" => 300},
+        "skills" => %{"user_scope" => "no"},
         "web_search" => %{"enabled" => true, "unknown" => true},
         "compaction" => %{"tail_events" => 0, "model_assisted" => "yes", "native" => "yes"},
         "model" => 42,
@@ -276,6 +325,8 @@ defmodule Pixir.ConfigTest do
     assert MapSet.member?(fields, "host_commands.queue_timeout_ms")
     assert MapSet.member?(fields, "max_retries")
     assert MapSet.member?(fields, "stream_idle_timeout_ms")
+    assert MapSet.member?(fields, "presenter_idle_timeout_ms")
+    assert MapSet.member?(fields, "skills.user_scope")
     assert MapSet.member?(fields, "web_search")
     assert MapSet.member?(fields, "compaction.tail_events")
     assert MapSet.member?(fields, "compaction.model_assisted")
@@ -298,6 +349,8 @@ defmodule Pixir.ConfigTest do
 
     assert result["effective"]["max_retries"] == 2
     assert result["effective"]["stream_idle_timeout_ms"] == 180_000
+    assert result["effective"]["presenter_idle_timeout_ms"] == 300_000
+    assert result["effective"]["skills"]["user_scope"] == true
     assert result["effective"]["web_search"] == false
     assert result["effective"]["compaction"]["tail_events"] == 40
     assert result["effective"]["compaction"]["model_assisted"] == false
@@ -307,6 +360,28 @@ defmodule Pixir.ConfigTest do
     assert result["effective"]["context_windows"] == %{}
   end
 
+  test "presenter idle timeout accepts the receive-after ceiling", %{
+    config_path: config_path
+  } do
+    File.write!(config_path, Jason.encode!(%{"presenter_idle_timeout_ms" => 0xFFFFFFFF}))
+    result = Config.load(config_path: config_path)
+
+    assert result["effective"]["presenter_idle_timeout_ms"] == 0xFFFFFFFF
+    refute Enum.any?(result["warnings"], &(&1["field"] == "presenter_idle_timeout_ms"))
+  end
+
+  test "presenter idle timeout rejects values outside receive-after bounds", %{
+    config_path: config_path
+  } do
+    for invalid <- [0, -1, 4_294_967_296, 5_000_000_000] do
+      File.write!(config_path, Jason.encode!(%{"presenter_idle_timeout_ms" => invalid}))
+      result = Config.load(config_path: config_path)
+
+      assert result["effective"]["presenter_idle_timeout_ms"] == 300_000
+      assert Enum.any?(result["warnings"], &(&1["field"] == "presenter_idle_timeout_ms"))
+    end
+  end
+
   test "application config overrides file values", %{config_path: config_path} do
     File.write!(
       config_path,
@@ -314,6 +389,7 @@ defmodule Pixir.ConfigTest do
         "max_retries" => 9,
         "bash_timeout_ms" => 1,
         "bash_timeout_max_ms" => 2,
+        "presenter_idle_timeout_ms" => 3,
         "host_commands" => %{
           "max_concurrent" => 9,
           "queue_limit" => 9,
@@ -325,6 +401,7 @@ defmodule Pixir.ConfigTest do
     Application.put_env(:pixir, :max_retries, 1)
     Application.put_env(:pixir, :bash_timeout_ms, 5_000)
     Application.put_env(:pixir, :bash_timeout_max_ms, 10_000)
+    Application.put_env(:pixir, :presenter_idle_timeout_ms, 20_000)
 
     Application.put_env(:pixir, :host_commands,
       max_concurrent: 2,
@@ -335,6 +412,7 @@ defmodule Pixir.ConfigTest do
     assert Config.max_retries(config_path: config_path) == 1
     assert Config.bash_timeout_ms(config_path: config_path) == 5_000
     assert Config.bash_timeout_max_ms(config_path: config_path) == 10_000
+    assert Config.presenter_idle_timeout_ms(config_path: config_path) == 20_000
 
     assert {:ok,
             %{

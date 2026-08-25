@@ -27,6 +27,7 @@ defmodule Pixir.Paths do
 
   @global_dirname ".pixir"
   @project_dirname ".pixir"
+  @project_gitignore "*\n"
 
   @doc "Global root: `~/.pixir` (override with `PIXIR_HOME`)."
   @spec global_root() :: String.t()
@@ -278,6 +279,19 @@ defmodule Pixir.Paths do
     end
   end
 
+  defp ensure_project_gitignore(root, candidate) do
+    if candidate == project_root(root) do
+      gitignore = Path.join(candidate, ".gitignore")
+
+      # Workspace state must not be swept up by agents running `git add .`. The write is
+      # deliberately exclusive so operator-managed content wins, and best-effort so an
+      # unwritable ignore file never prevents Session state from being created.
+      _ = File.write(gitignore, @project_gitignore, [:exclusive])
+    end
+
+    :ok
+  end
+
   defp ensure_components(_root, [], _current, _index), do: :ok
 
   defp ensure_components(root, [component | rest], current, index) do
@@ -291,7 +305,7 @@ defmodule Pixir.Paths do
   defp ensure_directory_component(root, candidate, index) do
     case File.lstat(candidate) do
       {:ok, %{type: :directory}} ->
-        :ok
+        ensure_project_gitignore(root, candidate)
 
       {:ok, %{type: :symlink}} ->
         {:error,
@@ -310,7 +324,9 @@ defmodule Pixir.Paths do
       {:error, :enoent} ->
         case File.mkdir(candidate) do
           :ok ->
-            verify_created_directory(root, candidate, index)
+            with :ok <- verify_created_directory(root, candidate, index) do
+              ensure_project_gitignore(root, candidate)
+            end
 
           {:error, :eexist} ->
             ensure_directory_component(root, candidate, index)

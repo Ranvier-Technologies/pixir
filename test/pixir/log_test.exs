@@ -84,6 +84,7 @@ defmodule Pixir.LogTest do
     a = Event.assistant_message(sid, "hi there") |> Event.with_seq(1)
 
     assert {:ok, [^u, ^a]} = Log.create_session(sid, [u, a], workspace: ws)
+    assert File.read!(Path.join(Paths.project_root(ws), ".gitignore")) == "*\n"
     assert {:ok, [^u, ^a]} = Log.fold(sid, workspace: ws)
 
     assert {:error, %{ok: false, error: %{kind: :already_exists}}} =

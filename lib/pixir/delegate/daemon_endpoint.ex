@@ -8,6 +8,8 @@ defmodule Pixir.Delegate.DaemonEndpoint do
   this file only describes how to reach the resident owner runtime while it is alive.
   """
 
+  alias Pixir.Paths
+
   @relative_path [".pixir", "delegate", "daemon.json"]
   @owner_keys ["token", "port", "pid", "started_at"]
 
@@ -27,7 +29,7 @@ defmodule Pixir.Delegate.DaemonEndpoint do
   @spec write(String.t(), map()) :: {:ok, String.t()} | {:error, map()}
   def write(workspace, endpoint) when is_binary(workspace) and is_map(endpoint) do
     with {:ok, path} <- path(workspace),
-         :ok <- File.mkdir_p(Path.dirname(path)),
+         {:ok, _dir} <- Paths.ensure_state_dir(workspace, Path.dirname(path)),
          :ok <- File.write(path, Jason.encode!(endpoint, pretty: true)),
          :ok <- chmod_private(path) do
       {:ok, path}

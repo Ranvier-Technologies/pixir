@@ -1456,8 +1456,12 @@ defmodule Pixir.ACP.Server do
     end)
   end
 
+  defp skills_discovery_opts do
+    [user_scope: Config.skills_user_scope()]
+  end
+
   defp schedule_available_commands(state, acp_sid, cwd) do
-    {:ok, %{skills: skills}} = Skills.discover(cwd)
+    {:ok, %{skills: skills}} = Skills.discover(cwd, skills_discovery_opts())
     commands = available_commands(skills)
     fingerprint = available_commands_fingerprint(commands)
 
@@ -1474,7 +1478,7 @@ defmodule Pixir.ACP.Server do
   end
 
   defp maybe_emit_available_commands(state, acp_sid, cwd) do
-    {:ok, %{skills: skills}} = Skills.discover(cwd)
+    {:ok, %{skills: skills}} = Skills.discover(cwd, skills_discovery_opts())
     commands = available_commands(skills)
     fingerprint = available_commands_fingerprint(commands)
 

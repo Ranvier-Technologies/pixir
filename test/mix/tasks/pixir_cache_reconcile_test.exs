@@ -31,6 +31,18 @@ defmodule Mix.Tasks.Pixir.Cache.ReconcileTest do
       ),
       provider_usage(
         %{
+          "prompt_contract_version" => "pa2",
+          "toolset_hash" => "tools-pa2",
+          "skill_index_hash" => "skills-pa2",
+          "session_family_hash" => "family-pa2"
+        },
+        %{
+          "input_tokens" => 40,
+          "cache" => %{"creation_tokens" => 0, "read_tokens" => 0}
+        }
+      ),
+      provider_usage(
+        %{
           "prompt_contract_version" => "pa1",
           "toolset_hash" => "tools",
           "skill_index_hash" => "skills",
@@ -55,7 +67,7 @@ defmodule Mix.Tasks.Pixir.Cache.ReconcileTest do
       Mix.Tasks.Pixir.Cache.Reconcile.run(["--sessions-dir", sessions_dir])
       assert_receive {:mix_shell, :info, [json]}
       payload = Jason.decode!(json)
-      [pa1, legacy] = payload["families"]
+      [pa1, pa2, legacy] = payload["families"]
 
       assert pa1["prompt_contract_version"] == "pa1"
       assert pa1["calls"] == 2
@@ -64,6 +76,14 @@ defmodule Mix.Tasks.Pixir.Cache.ReconcileTest do
       assert pa1["read_tokens"] == 20
       assert pa1["hit_rate"] == 20 / 200
       assert pa1["below_minimum_count"] == 1
+
+      assert pa2["prompt_contract_version"] == "pa2"
+      assert pa2["calls"] == 1
+      assert pa2["input_tokens"] == 40
+      assert pa2["creation_tokens"] == 0
+      assert pa2["read_tokens"] == 0
+      assert pa2["hit_rate"] == 0.0
+      assert pa2["below_minimum_count"] == 1
 
       # Pre-cache-map events fold their OpenAI cached_tokens as reads.
       assert legacy["prompt_contract_version"] == "px3"

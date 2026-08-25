@@ -19,7 +19,10 @@ defmodule Pixir.Provider.Cache do
   # Layer 0 (discovery rule + checkpoint contract), late developer context.
   # px3 = Skill index rendered as routing-only metadata with when_to_use fields.
   # px4 = plan Layer 0 records that Pixir switches the session to build (refs #520).
-  @prompt_contract_version "px4"
+  # px5 = build prompt carries the code-style reviewability sentence (refs #570).
+  # px6 = bash schema exposes timeout_ms; refs #575
+  # px7 = build prompt drops the #570 style sentence after the N=3 A/B verdict (refs #570).
+  @prompt_contract_version "px7"
 
   @doc "The current Prompt Contract version segment (leads every cache key)."
   @spec prompt_contract_version() :: String.t()
