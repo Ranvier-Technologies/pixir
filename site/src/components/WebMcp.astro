@@ -1,0 +1,12 @@
+---
+/**
+ * Registers read-only WebMCP tools when document.modelContext exists.
+ * Ordinary browsers without that API are a no-op.
+ */
+---
+
+<script>
+  import { registerPixirWebMcp } from "../lib/webmcp";
+
+  void registerPixirWebMcp(document);
+</script>

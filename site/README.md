@@ -6,9 +6,24 @@ Astro static marketing site for `pixir.dev`.
 
 ```bash
 pnpm install
+pnpm test
+pnpm check
 pnpm build
 pnpm preview
 ```
+
+## WebMCP
+
+The site registers a small read-only tool catalog when `document.modelContext`
+exists (WebMCP draft, page-side `registerTool`). Ordinary browsers without that
+API are a no-op. This is not a backend MCP server and does not change the Pixir
+CLI/ACP runtime.
+
+Tools:
+
+- `pixir.get_started`
+- `pixir.preview_scope`
+- `pixir.operator_primitives`
 
 ## Deployment Stance
 

@@ -1,3 +1,7 @@
+---
+import { PIXIR_HOMEPAGE_DOCTOR_EXAMPLE_VERSION } from "../lib/site-facts";
+---
+
 <div class="terminal" role="group" aria-label="Pixir terminal transcript">
   <div class="terminal-head">
     <span class="window-dots" aria-hidden="true"><span></span><span></span><span></span></span>
@@ -9,7 +13,7 @@
     <div class="ok">Generated escript pixir with MIX_ENV=prod</div>
     <br />
     <div><span class="prompt">$</span> pixir doctor --json</div>
-    <div class="json">{"{"}"ok":true,"status":"ready","version":"0.1.15"{"}"}</div>
+    <div class="json">{"{"}"ok":true,"status":"ready","version":"{PIXIR_HOMEPAGE_DOCTOR_EXAMPLE_VERSION}"{"}"}</div>
     <br />
     <div><span class="prompt">$</span> pixir tree &lt;session-id&gt; --json</div>
     <div class="json">{"{"}"session":"...","children":[],"log":"append-only"{"}"}</div>

@@ -9,6 +9,12 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [Unreleased]
 
+### Added
+- pixir.dev registers a small read-only WebMCP tool catalog in the page when
+  `document.modelContext` exists. Ordinary browsers are a no-op. This is
+  page-side tool registration, not an MCP server, and does not change the
+  CLI/ACP runtime.
+
 ## [0.1.15] - 2026-08-24
 
 ### Added

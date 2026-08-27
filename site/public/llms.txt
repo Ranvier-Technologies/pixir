@@ -4,6 +4,19 @@
 
 Pixir is a developer preview for operators who want a supervised local runtime beneath coding-agent presenters. It is public enough to install and operate, but the public contract is intentionally narrow.
 
+## WebMCP
+
+When a WebMCP-capable browser visits https://pixir.dev, the page registers
+read-only tools via `document.modelContext.registerTool`. Ordinary browsers
+without that API do nothing. This is page-side tool registration on the public
+site. Pixir itself is not an MCP server.
+
+- `pixir.get_started`: Hex install path, first-run commands, and the version
+  shown in the homepage doctor example.
+- `pixir.preview_scope`: what Pixir is and is not, including that this surface
+  is not an MCP server.
+- `pixir.operator_primitives`: public CLI primitives and the CLI contract URL.
+
 ## Canonical Site
 
 - [Pixir](https://pixir.dev/): Product overview, runtime boundary, operator primitives, evidence model, and preview scope.
