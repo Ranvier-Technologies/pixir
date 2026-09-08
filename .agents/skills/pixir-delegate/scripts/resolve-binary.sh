@@ -43,5 +43,10 @@ pixir_resolve_binary() {
 }
 
 pixir_report_binary() {
-  printf 'driving: %s · v%s\n' "$PIXIR_BIN" "$("$PIXIR_BIN" --version)" >&2
+  local pixir_version
+  if ! pixir_version="$("$PIXIR_BIN" --version)"; then
+    printf 'error: Pixir version detection failed: %s; verify or rebuild the selected binary before retrying\n' "$PIXIR_BIN" >&2
+    return 2
+  fi
+  printf 'driving: %s · v%s\n' "$PIXIR_BIN" "$pixir_version" >&2
 }

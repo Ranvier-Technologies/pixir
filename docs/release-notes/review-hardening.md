@@ -1,6 +1,6 @@
 # 0.1.17 review hardening
 
-This candidate fixes three bounded correctness issues without changing the
+This candidate fixes five bounded correctness issues without changing the
 CLI/ACP-only Hex scope, the Log authority boundary, or Monitor's read-only posture.
 
 ## Config admission
@@ -43,6 +43,13 @@ Raw NDJSON regressions cover a partial parent with two complete children and a
 partial parent with a partial child; existing cases cover truly unreadable children.
 
 ## Contract references and release boundary
+
+The final contract pass also stops wrapper execution when the selected binary's
+version probe fails and wraps reasoning-key collision errors consistently at
+Provider stream/preview boundaries. These reject before delegation or network
+activity, with existing successful paths preserved. See
+[review dispositions](review-dispositions.md) for all forty original comments and
+the explicitly retained non-blocking follow-ups.
 
 - [ADR 0005](../adr/0005-agent-ergonomics-dry-run-help-structured-errors-io-discipline.md):
   structured errors and bounded model-channel output.

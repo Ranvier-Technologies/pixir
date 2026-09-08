@@ -15,6 +15,10 @@ This candidate supersedes the source-tagged 0.1.16 candidate, which was not
 published to Hex. The existing 0.1.16 tag remains unchanged.
 
 ### Fixed
+- Delegate wrapper preflight propagates a failed binary version probe before
+  rehearsal, delegation or resume. A printed version does not override a nonzero exit.
+- Provider reasoning-effort key collisions return the same structured error envelope
+  from streaming and body preview, before authentication or transport.
 - Delegate admission rejects unresolvable Provider configuration before dispatch,
   without rereading ambient configuration or invoking a snapshot loader twice.
   Valid model/effort precedence and explicit unsupported-effort refusals remain intact.

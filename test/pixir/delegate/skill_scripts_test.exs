@@ -26,6 +26,7 @@ defmodule Pixir.Delegate.SkillScriptsTest do
     printf '%s\t%s\t%s\n' "$0" "$PWD" "$*" >>"$PIXIR_FAKE_LOG"
     if [[ "${1:-}" == "--version" ]]; then
       echo "fake-resolution"
+      exit "${PIXIR_FAKE_VERSION_EXIT:-0}"
     elif [[ " $* " == *" --dry-run "* ]]; then
       echo '{"status":"planned","would_reject":false,"beam_coordination":{"planned_child_count":1}}'
     elif [[ "${1:-}" == "delegate" ]]; then
@@ -62,6 +63,7 @@ defmodule Pixir.Delegate.SkillScriptsTest do
           {"PIXIR_SKIP_REHEARSAL", "0"},
           {"PIXIR_POSTURE", "--read-only"},
           {"PIXIR_FAKE_LOG", log},
+          {"PIXIR_FAKE_VERSION_EXIT", Integer.to_string(Keyword.get(opts, :version_exit, 0))},
           {"PIXIR_FAKE_REAL_JSON", Jason.encode!(completed_envelope())}
         ],
         stderr_to_stdout: true
@@ -103,6 +105,22 @@ defmodule Pixir.Delegate.SkillScriptsTest do
   end
 
   for script <- [:fanout, :steer] do
+    test "#{script} refuses a failed version probe before rehearsal or execution" do
+      fixture = resolution_fixture!()
+      chosen = resolution_binary!(Path.join(fixture.workspace, "chosen build/custom pixir"))
+
+      for probe_exit <- [1, 7] do
+        result = run_resolution(unquote(script), fixture, chosen, version_exit: probe_exit)
+        assert result.code == 2
+        assert result.output =~ "error: Pixir version detection failed"
+        refute result.output =~ "driving:"
+        assert result.calls == [[chosen, fixture.workspace, "--version"]]
+        refute File.exists?(Path.join(fixture.workspace, "out/plan.json"))
+        refute File.exists?(Path.join(fixture.workspace, "out/envelope.json"))
+        refute File.exists?(Path.join(fixture.workspace, "out.json"))
+      end
+    end
+
     test "#{script} prefers caller-local binary over PATH with unset or empty override" do
       fixture = resolution_fixture!()
       resolution_binary!(Path.join(fixture.path_dir, "pixir"))

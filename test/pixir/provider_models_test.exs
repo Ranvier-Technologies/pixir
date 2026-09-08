@@ -133,13 +133,39 @@ defmodule Pixir.ProviderModelsTest do
 
     assert {:error,
             %{
-              kind: :invalid_args,
-              details: %{"field" => "reasoning_effort", "reason" => "normalized_key_collision"}
+              ok: false,
+              error: %{
+                kind: :invalid_args,
+                details: %{"field" => "reasoning_effort", "reason" => "normalized_key_collision"}
+              }
             }} =
              Provider.stream(collision, auth: auth, transport: transport)
 
     refute_receive :effort_auth_called
     refute_receive {:effort_body, _}
+  end
+
+  test "reasoning key collisions use the same boundary error before auth or transport" do
+    opts = [
+      raw_config: %{},
+      auth: fn -> flunk("collision must reject before auth") end,
+      transport: fn _, _, _ -> flunk("collision must reject before transport") end
+    ]
+
+    for {atom_effort, string_effort} <- [{nil, "max"}, {"high", nil}, {"max", "max"}] do
+      request = %{
+        :model => "gpt-6-astra",
+        :reasoning_effort => atom_effort,
+        "reasoning_effort" => string_effort
+      }
+
+      assert {:error, %{ok: false, error: %{kind: :invalid_args, details: details}} = error} =
+               Provider.stream(request, opts)
+
+      assert details == %{"field" => "reasoning_effort", "reason" => "normalized_key_collision"}
+      assert {:error, ^error} = Provider.request_body_preview(request, opts)
+      assert Jason.encode!(error) =~ "normalized_key_collision"
+    end
   end
 
   test "body preview preserves non-max behavior and explicit omission" do

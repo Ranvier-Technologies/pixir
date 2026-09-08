@@ -935,7 +935,11 @@ defmodule Pixir.Provider do
 
     cond do
       effort == :normalized_key_collision ->
-        invalid_request_field(:reasoning_effort, "normalized_key_collision")
+        {:error,
+         err(:invalid_args, "Provider request body fields must use valid JSON-safe values.", %{
+           "field" => "reasoning_effort",
+           "reason" => "normalized_key_collision"
+         })}
 
       true ->
         with :ok <- validate_max_effort(effort, resolved, opts) do
