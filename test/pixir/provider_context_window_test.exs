@@ -40,7 +40,7 @@ defmodule Pixir.ProviderContextWindowTest do
   end
 
   describe "window_tokens/1 (built-in table)" do
-    test "every built-in catalog model has a conservative window" do
+    test "established input-ceiling entries remain known" do
       for model <- ~w(gpt-5.5 gpt-5.4 gpt-5.4-mini gpt-5.3-codex gpt-5.3-codex-spark gpt-5.2) do
         assert {:ok, tokens} = ContextWindow.window_tokens(model)
         assert is_integer(tokens)
@@ -99,6 +99,28 @@ defmodule Pixir.ProviderContextWindowTest do
       assert {:error, %{error: %{kind: :context_window_unknown}}} =
                ContextWindow.window_tokens("weird-model")
     end
+
+    test "invalid entries do not discard valid sibling overrides", %{home: home} do
+      write_config(home, %{
+        "context_windows" => %{"gpt-5.5" => 50_000, "custom-valid" => 2_000, "bad" => -1}
+      })
+
+      assert {:ok, 50_000} = ContextWindow.window_tokens("gpt-5.5")
+      assert {:ok, 2_000} = ContextWindow.window_tokens("custom-valid")
+
+      assert {:error, %{error: %{kind: :context_window_unknown}}} =
+               ContextWindow.window_tokens("bad")
+
+      assert Enum.any?(Pixir.Config.load()["warnings"], &(&1["field"] == "context_windows"))
+    end
+
+    test "non-map override configuration cannot manufacture a window", %{home: home} do
+      write_config(home, %{"context_windows" => ["custom-valid", 2_000]})
+      assert {:ok, 272_000} = ContextWindow.window_tokens("gpt-5.5")
+
+      assert {:error, %{error: %{kind: :context_window_unknown}}} =
+               ContextWindow.window_tokens("custom-valid")
+    end
   end
 
   describe "assess/2 (pressure tiers, ADR 0020)" do
@@ -156,12 +178,45 @@ defmodule Pixir.ProviderContextWindowTest do
       refute Map.has_key?(assessment, "window_tokens")
     end
 
-    test "a missing or malformed usage summary reads as zero pressure" do
-      assert {:ok, %{"tier" => "none", "input_tokens" => 0}} =
-               ContextWindow.assess(nil, "tier-model")
+    test "Astra remains explicitly unknown until a justified window is supplied" do
+      assert {:ok, %{"available" => false, "reason" => "context_window_unknown"}} =
+               ContextWindow.assess(%{input_tokens: 42_000}, "gpt-6-astra")
+    end
 
-      assert {:ok, %{"tier" => "none", "input_tokens" => 0}} =
-               ContextWindow.assess(%{"input_tokens" => "many"}, "tier-model")
+    test "missing usage is unavailable rather than observed zero" do
+      for summary <- [nil, %{}, %{input_tokens: nil}, %{"input_tokens" => nil}] do
+        assert {:ok, assessment} = ContextWindow.assess(summary, "tier-model")
+        assert assessment["available"] == false
+        assert assessment["tier"] == "unavailable"
+        assert assessment["reason"] == "usage_missing"
+        refute Map.has_key?(assessment, "ratio")
+        refute Map.has_key?(assessment, "input_tokens")
+      end
+    end
+
+    test "invalid usage is unavailable and real zero is still observed" do
+      for summary <- [
+            "bad",
+            [],
+            %{input_tokens: -1},
+            %{input_tokens: 1.5},
+            %{"input_tokens" => "many"},
+            %{"input_tokens" => false}
+          ] do
+        assert {:ok, assessment} = ContextWindow.assess(summary, "tier-model")
+        assert assessment["available"] == false
+        assert assessment["tier"] == "unavailable"
+        assert assessment["reason"] == "usage_invalid"
+        refute Map.has_key?(assessment, "ratio")
+        refute Map.has_key?(assessment, "input_tokens")
+      end
+
+      for summary <- [%{input_tokens: 0}, %{"input_tokens" => 0}] do
+        assert {:ok, %{"available" => true, "tier" => "none", "input_tokens" => 0} = assessment} =
+                 ContextWindow.assess(summary, "tier-model")
+
+        assert assessment["ratio"] == 0.0
+      end
     end
   end
 end

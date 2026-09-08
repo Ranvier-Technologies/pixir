@@ -189,8 +189,12 @@ defmodule PixirMonitor.ProjectionLivenessExternalObservationTest do
                PixirMonitor.Projection.Source.Filesystem.fetch_input(run, workspace: tmp_dir)
 
       assert first_input["inputs"]["activity_evidence"]["durable_evidence"] == "unknown"
+      assert first_input["inputs"]["runtime_diagnostics"] == nil
+      assert first_input["inputs"]["owner_state"]["observation"] == "bounded_log_only"
       assert {:ok, first} = Builder.build(first_input)
       assert first["liveness"]["state"] == "stale_handle"
+      assert first["liveness"]["basis"] == "durable_snapshot"
+      assert Enum.any?(first["evidence"], &String.contains?(&1["description"], "reachability was not checked"))
 
       write_log(sessions, run, [
         log_event(run, 0, "2026-07-31T09:00:00Z", "started", "running", "sub-a"),

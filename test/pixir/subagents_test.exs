@@ -5,7 +5,7 @@ defmodule Pixir.SubagentsTest do
   alias Pixir.Permissions.WritePolicy
   alias Pixir.Subagents.DelegationContext
   alias Pixir.Subagents.WorkspaceSnapshot
-  alias Pixir.Tools.{SpawnAgent, WaitAgent}
+  alias Pixir.Tools.{ApplyVirtualDiff, SpawnAgent, WaitAgent}
 
   defmodule NoOAuth do
     def refresh_skew_ms, do: 60_000
@@ -49,10 +49,93 @@ defmodule Pixir.SubagentsTest do
     end
   end
 
+  defmodule VirtualOverlayProvider do
+    def stream(%{history: history}, _opts) do
+      if Enum.any?(history, &(&1.type == :tool_result)) do
+        {:ok,
+         %{
+           text: "virtual diff ready",
+           reasoning: "",
+           reasoning_items: [],
+           function_calls: [],
+           finish_reason: :stop
+         }}
+      else
+        {:ok,
+         %{
+           text: "",
+           reasoning: "",
+           reasoning_items: [],
+           function_calls: [
+             %{
+               call_id: "virtual_once",
+               name: "run_virtual_commands",
+               args: %{"commands" => ["sed -i 's/parent/child/' source.txt"]}
+             }
+           ],
+           finish_reason: :tool_calls
+         }}
+      end
+    end
+  end
+
+  defmodule DeliveryProvider do
+    def stream(%{history: history}, opts) do
+      # Count only this live script, not replayed seed calls or injected adversarial records.
+      prefix = Keyword.fetch!(opts, :delivery_prefix)
+
+      count =
+        Enum.count(
+          history,
+          &(&1.type == :tool_result and String.starts_with?(&1.data["call_id"] || "", prefix))
+        )
+
+      case Enum.at(Keyword.fetch!(opts, :delivery_calls), count) do
+        nil ->
+          Keyword.get(opts, :after_delivery, fn _ -> :ok end).(history)
+
+          {:ok,
+           %{
+             text: ~s({"deliverable":"arbitrary final prose is not selection"}),
+             reasoning: "",
+             function_calls: [],
+             finish_reason: :stop
+           }}
+
+        args ->
+          {:ok,
+           %{
+             text: "",
+             reasoning: "",
+             function_calls: [
+               %{call_id: "#{prefix}#{count}", name: "run_virtual_commands", args: args}
+             ],
+             finish_reason: :tool_calls
+           }}
+      end
+    end
+  end
+
   defmodule BlockingProvider do
     def stream(_request, _opts) do
       Process.sleep(10_000)
       {:ok, %{text: "late", reasoning: "", function_calls: [], finish_reason: :stop}}
+    end
+  end
+
+  defmodule GatedQueueProvider do
+    def stream(%{history: history}, opts) do
+      test_pid = Keyword.fetch!(opts, :test_pid)
+      prompt = history |> Enum.find(&(&1.type == :user_message)) |> then(& &1.data["text"])
+      send(test_pid, {:queued_provider_started, prompt, self()})
+
+      receive do
+        {:complete_queued_child, ^prompt} ->
+          {:ok,
+           %{text: "completed #{prompt}", reasoning: "", function_calls: [], finish_reason: :stop}}
+      after
+        15_000 -> raise "queued child was not explicitly released by its test"
+      end
     end
   end
 
@@ -271,6 +354,123 @@ defmodule Pixir.SubagentsTest do
     %{ws: ws, sid: sid}
   end
 
+  defp changing_effort_loader(compatible_reads) do
+    counter = start_supervised!({Agent, fn -> 0 end})
+
+    loader = fn _opts ->
+      read = Agent.get_and_update(counter, &{&1 + 1, &1 + 1})
+
+      backend =
+        if read <= compatible_reads,
+          do: %{"mode" => "chatgpt_codex"},
+          else: %{
+            "mode" => "open_responses",
+            "responses_url" => "https://example.invalid/v1/responses",
+            "auth" => %{"policy" => "none"}
+          }
+
+      {:ok,
+       %{
+         present?: true,
+         origin: :file,
+         document: Jason.encode!(%{"responses_backend" => backend})
+       }}
+    end
+
+    {loader, counter}
+  end
+
+  test "queued max precheck rejects changed backend before workspace or child allocation", %{
+    sid: sid,
+    ws: ws
+  } do
+    assert {:ok, blocker} =
+             Subagents.spawn_agent(
+               sid,
+               %{"task" => "block", "max_threads" => 1, "workspace_mode" => "shared"},
+               workspace: ws,
+               provider: GatedQueueProvider,
+               provider_opts: [test_pid: self()],
+               permission_mode: :read_only
+             )
+
+    assert_receive {:queued_provider_started, "block", blocker_pid}
+    {loader, counter} = changing_effort_loader(1)
+
+    assert {:ok, queued} =
+             Subagents.spawn_agent(
+               sid,
+               %{
+                 "task" => "max queued",
+                 "model" => "gpt-6-astra",
+                 "reasoning_effort" => "max",
+                 "max_threads" => 1
+               },
+               workspace: ws,
+               provider: Pixir.Provider,
+               provider_opts: [request_snapshot_loader: loader],
+               permission_mode: :read_only
+             )
+
+    assert queued["status"] == "queued"
+    send(blocker_pid, {:complete_queued_child, "block"})
+    assert {:ok, [failed]} = Subagents.wait(sid, [queued["id"]], 5_000, workspace: ws)
+    assert failed["status"] == "failed"
+    assert failed["child_session_id"] == nil
+    refute File.exists?(Path.join([ws, ".pixir", "subagents", queued["id"]]))
+    assert Agent.get(counter, & &1) == 2
+    assert {:ok, _} = Subagents.close(sid, blocker["id"], workspace: ws)
+  end
+
+  test "late max rejection records child terminal evidence and releases the Session", %{
+    sid: sid,
+    ws: ws
+  } do
+    {loader, _counter} = changing_effort_loader(2)
+
+    assert {:error,
+            %{error: %{kind: :invalid_config, details: %{reason: :unsupported_reasoning_effort}}}} =
+             Subagents.spawn_agent(
+               sid,
+               %{
+                 "task" => "late rejection",
+                 "model" => "gpt-6-astra",
+                 "reasoning_effort" => "max",
+                 "workspace_mode" => "shared"
+               },
+               workspace: ws,
+               provider: Pixir.Provider,
+               provider_opts: [request_snapshot_loader: loader],
+               permission_mode: :read_only
+             )
+
+    assert {:ok, [failed]} = Subagents.list(sid, workspace: ws)
+    child_sid = failed["child_session_id"]
+    assert is_binary(child_sid)
+    assert Registry.lookup(Pixir.Sessions.Registry, child_sid) == []
+    assert {:ok, history} = Log.fold(child_sid, workspace: ws)
+    refute Enum.any?(history, &(&1.type in [:user_message, :assistant_message]))
+
+    assert terminal =
+             Enum.find(history, &(&1.type == :subagent_event and &1.data["status"] == "failed"))
+
+    assert terminal.data["event"] == "child_start_failed"
+    assert terminal.data["scope"] == "session"
+    assert terminal.data["lineage"] == "child"
+    assert terminal.data["error_kind"] == "invalid_config"
+    assert terminal.data["details"]["reason"] == "unsupported_reasoning_effort"
+    assert terminal.data["details"]["field"] == "reasoning_effort"
+    assert {:ok, parent_history} = Log.fold(sid, workspace: ws)
+
+    assert Enum.any?(
+             parent_history,
+             &(&1.type == :subagent_event and &1.data["status"] == "failed")
+           )
+
+    assert {:ok, ^child_sid, _pid} = SessionSupervisor.start_session(id: child_sid, workspace: ws)
+    assert {:ok, :stopped} = SessionSupervisor.stop_session(child_sid)
+  end
+
   test "delegate auto-retry accepts provider_http_error retryable details flag", %{
     sid: sid,
     ws: ws
@@ -483,7 +683,7 @@ defmodule Pixir.SubagentsTest do
              )
 
     assert details["field"] == "reasoning_effort"
-    assert details["accepted_values"] == ["low", "medium", "high", "xhigh"]
+    assert details["accepted_values"] == ["low", "medium", "high", "xhigh", "max"]
   end
 
   test "spawn_agent tool strips caller-authored index before spawning", %{sid: sid, ws: ws} do
@@ -860,7 +1060,7 @@ defmodule Pixir.SubagentsTest do
     assert context["parent_workspace_mutation"] == "none"
   end
 
-  test "Delegation Context can model future virtual_overlay fidelity without runtime exposure" do
+  test "Delegation Context describes operator-enabled virtual_overlay fidelity and invocation lifetime" do
     context =
       DelegationContext.from_agent(%{
         id: "virtual_agent",
@@ -879,6 +1079,12 @@ defmodule Pixir.SubagentsTest do
     assert context["write_semantics"] == "virtual_only_parent_workspace_not_mutated"
     assert context["parent_workspace_mutation"] == "none"
     assert context["output_artifact"] == "virtual_diff"
+
+    assert context["virtual_edit_lifetime"] ==
+             "one_invocation_only_next_call_reimports_host_files"
+
+    assert context["durable_evidence"] == "canonical_logs_and_artifacts_persist_on_disk"
+    assert Enum.any?(context["fidelity_caveats"], &String.contains?(&1, "deliverable: true"))
     assert context["apply_status"] == "not_applied"
     assert context["requires_explicit_apply"] == true
     assert context["virtual_command_boundary"] == "beam_native_virtual_shell_only"
@@ -1180,7 +1386,7 @@ defmodule Pixir.SubagentsTest do
     assert details["workspace_mode"] == "virtual_overlay"
     assert details["supported_modes"] == ["shared", "isolated"]
     assert details["future_modes"] == ["virtual_overlay"]
-    assert details["future_mode_status"] =~ "not runtime-enabled yet"
+    assert details["future_mode_status"] =~ "requires operator-owned read_set context"
 
     assert {:ok, history} = Log.fold(sid, workspace: ws)
     refute Enum.any?(history, &(&1.type == :subagent_event))
@@ -1267,17 +1473,37 @@ defmodule Pixir.SubagentsTest do
     assert started_event.data["delegation_context"]["parent_workspace_mutation"] == "none"
   end
 
+  @tag timeout: 30_000
   test "enforces max_threads with queueing", %{sid: sid, ws: ws} do
+    on_exit(fn ->
+      {:ok, agents} = Subagents.list(sid, workspace: ws)
+
+      # Close queued entries first so cleanup cannot launch another child.
+      for agent <- Enum.sort_by(agents, &(&1["status"] != "queued")) do
+        assert {:ok, _} = Subagents.close(sid, agent["id"], workspace: ws)
+        if agent["child_session_id"], do: cleanup_session(agent["child_session_id"])
+      end
+    end)
+
     ids =
       for i <- 1..3 do
         {:ok, agent} =
           Subagents.spawn_agent(
             sid,
-            %{"task" => "block-#{i}", "max_threads" => 1, "timeout_ms" => 500},
+            %{"task" => "block-#{i}", "max_threads" => 1, "timeout_ms" => 30_000},
             workspace: ws,
-            provider: BlockingProvider,
+            provider: GatedQueueProvider,
+            provider_opts: [test_pid: self()],
             permission_mode: :auto
           )
+
+        if i == 1 do
+          # A queued-child test must tolerate the caller being descheduled
+          # between spawn requests instead of relying on a 500ms child timer.
+          gate = make_ref()
+          Process.send_after(self(), {:resume_queue_spawns, gate}, 550)
+          assert_receive {:resume_queue_spawns, ^gate}, 5_000
+        end
 
         agent["id"]
       end
@@ -1286,8 +1512,35 @@ defmodule Pixir.SubagentsTest do
     assert Enum.count(listed, &(&1["status"] == "running")) == 1
     assert Enum.count(listed, &(&1["status"] == "queued")) == 2
 
-    assert {:ok, waited} = Subagents.wait(sid, ids, 3_000)
-    assert Enum.all?(waited, &(&1["status"] in ["timed_out", "completed"]))
+    for {id, index} <- Enum.with_index(ids, 1) do
+      prompt = "block-#{index}"
+      assert_receive {:queued_provider_started, ^prompt, provider_pid}, 5_000
+      assert {:ok, draining} = Subagents.list(sid, workspace: ws)
+      assert Enum.count(draining, &(&1["status"] == "completed")) == index - 1
+      assert Enum.count(draining, &(&1["status"] == "running")) == 1
+      assert Enum.count(draining, &(&1["status"] == "queued")) == 3 - index
+      assert Enum.find(draining, &(&1["id"] == id))["status"] == "running"
+
+      send(provider_pid, {:complete_queued_child, prompt})
+
+      assert {:ok, [%{"id" => ^id, "status" => "completed"}]} =
+               Subagents.wait(sid, [id], 5_000, workspace: ws)
+    end
+
+    assert {:ok, waited} = Subagents.wait(sid, ids, 0, workspace: ws)
+    assert Enum.all?(waited, &(&1["status"] == "completed"))
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    # Durable ordering proves the active count never exceeded one, not just
+    # that three snapshots happened to catch a serial-looking fanout.
+    lifecycle =
+      for event <- history,
+          event.type == :subagent_event,
+          event.data["subagent_id"] in ids,
+          event.data["event"] in ["started", "finished"],
+          do: {event.data["subagent_id"], event.data["event"]}
+
+    assert lifecycle == Enum.flat_map(ids, &[{&1, "started"}, {&1, "finished"}])
   end
 
   test "diagnostics exposes manager counters, waiters, and child index health", %{
@@ -1407,6 +1660,778 @@ defmodule Pixir.SubagentsTest do
   test "re-verification directive is byte-pinned at its single source" do
     assert Subagents.reverification_directive() ==
              "Re-verify all integrated results from delegated children before committing or declaring the work done. Run the workspace's own verification, including typechecks, tests, and any commands named in the work brief."
+  end
+
+  test "landing manifest byte-pins shared-workspace writes with drift and verify-and-commit action",
+       %{ws: ws} do
+    child_sid = unique_session_id("landing-shared")
+    present_path = "present.txt"
+    missing_path = "missing.txt"
+    File.write!(Path.join(ws, present_path), "present")
+
+    write_raw_history!(child_sid, ws, [
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "write-present",
+          "name" => "write",
+          "args" => %{"path" => present_path, "content" => "present"}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{"call_id" => "write-present", "ok" => true, "output" => "written"}
+      },
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "edit-missing",
+          "name" => "edit",
+          "args" => %{
+            "path" => missing_path,
+            "old_string" => "old",
+            "new_string" => "new"
+          }
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{"call_id" => "edit-missing", "ok" => true, "output" => "edited"}
+      }
+    ])
+
+    item = %{
+      "id" => "sub_shared",
+      "child_session_id" => child_sid,
+      "status" => "completed",
+      "workspace" => ws,
+      "workspace_mode" => "shared"
+    }
+
+    assert Subagents.render_landing_manifest(Subagents.landing_manifest([item], ws)) ==
+             "Landing manifest:\n" <>
+               "- sub_shared\n" <>
+               "  workspace: #{ws}\n" <>
+               "  produced: shared-workspace files\n" <>
+               "  changed paths:\n" <>
+               "    - present.txt (exists_in_parent=true, drift=false)\n" <>
+               "    - missing.txt (exists_in_parent=false, drift=true)\n" <>
+               "  next action: verify and commit paths [\"present.txt\",\"missing.txt\"]"
+  end
+
+  test "landing manifest distinguishes non-regular drift from confinement failure", %{ws: ws} do
+    child_sid = unique_session_id("landing-path-honesty")
+    File.mkdir_p!(Path.join(ws, "reported-directory"))
+
+    write_raw_history!(child_sid, ws, [
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "write-directory",
+          "name" => "write",
+          "args" => %{"path" => "reported-directory", "content" => "not actually a file"}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{"call_id" => "write-directory", "ok" => true, "output" => "written"}
+      },
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "write-escape",
+          "name" => "write",
+          "args" => %{"path" => "../escape.txt", "content" => "escaped"}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{"call_id" => "write-escape", "ok" => true, "output" => "written"}
+      }
+    ])
+
+    item = %{
+      "id" => "path_honesty",
+      "child_session_id" => child_sid,
+      "status" => "completed",
+      "workspace" => ws,
+      "workspace_mode" => "shared"
+    }
+
+    assert Subagents.render_landing_manifest(Subagents.landing_manifest([item], ws)) ==
+             "Landing manifest:\n" <>
+               "- path_honesty\n" <>
+               "  workspace: #{ws}\n" <>
+               "  produced: shared-workspace files\n" <>
+               "  changed paths:\n" <>
+               "    - reported-directory (exists_in_parent=false, drift=true)\n" <>
+               "    - ../escape.txt (unresolvable=outside_workspace)\n" <>
+               "  next action: verify and commit paths [\"reported-directory\"]"
+  end
+
+  test "landing manifest byte-pins a ready apply_virtual_diff action", %{ws: ws} do
+    child_sid = unique_session_id("landing-virtual-diff")
+
+    content = "hello from overlay\n"
+
+    artifact = %{
+      "kind" => "virtual_diff",
+      "version" => 1,
+      "changes" => [
+        %{
+          "path" => "lib/example.ex",
+          "operation" => "add",
+          "after" => %{
+            "content" => content,
+            "sha256" => :crypto.hash(:sha256, content) |> Base.encode16(case: :lower)
+          },
+          "diff" => %{
+            "truncated" => false,
+            "text" => "--- /dev/null\n+++ b/lib/example.ex\n+hello from overlay\n"
+          }
+        }
+      ],
+      "apply" => %{"status" => "not_applied"}
+    }
+
+    write_raw_history!(child_sid, ws, [
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "virtual-run",
+          "name" => "run_virtual_commands",
+          "args" => %{}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{
+          "call_id" => "virtual-run",
+          "ok" => true,
+          "virtual_diff" => artifact
+        }
+      }
+    ])
+
+    virtual_diff_ref = virtual_diff_ref_fixture(artifact, 1)
+
+    item = %{
+      "id" => "scratch",
+      "child_session_id" => child_sid,
+      "status" => "completed",
+      "workspace" => ws,
+      "workspace_mode" => "virtual_overlay",
+      "virtual_diff_ref" => virtual_diff_ref
+    }
+
+    arguments = %{
+      "virtual_diff_ref" => virtual_diff_ref,
+      "child_session_id" => child_sid,
+      "dry_run" => true
+    }
+
+    assert Subagents.render_landing_manifest(Subagents.landing_manifest([item], ws)) ==
+             "Landing manifest:\n" <>
+               "- scratch\n" <>
+               "  workspace: #{ws}\n" <>
+               "  produced: virtual_diff virtual_diff_ref=#{Jason.encode!(virtual_diff_ref)}\n" <>
+               "  next action: apply_virtual_diff #{Jason.encode!(arguments)}"
+
+    assert {:ok,
+            %{
+              "dry_run" => true,
+              "status" => "planned",
+              "files" => [%{"status" => "applicable"}]
+            }} = ApplyVirtualDiff.execute(arguments, %{session_id: "parent", workspace: ws})
+  end
+
+  test "explicit virtual delivery survives later reads, replacements, empty marks and cold restore",
+       %{sid: sid, ws: ws} do
+    write = %{"commands" => ["sed -i 's/parent/child/' source.txt"], "deliverable" => true}
+    read = %{"commands" => ["cat source.txt"]}
+
+    replacement = %{
+      "commands" => ["sed -i 's/parent/replacement/' source.txt"],
+      "deliverable" => true
+    }
+
+    for {calls, selected_index} <- [
+          {[write, read], 0},
+          {[write, replacement, read], 1},
+          {[write, Map.put(read, "deliverable", true), read], 1},
+          {[Map.delete(write, "deliverable"), read], 1},
+          {[Map.put(write, "deliverable", false), read], 1},
+          {[write, %{"commands" => [], "deliverable" => "true"}, read], 0},
+          {[
+             write,
+             %{"commands" => [], "deliverable" => true, "read_set" => ["source.txt"]},
+             read
+           ], 0}
+        ] do
+      {agent, selected, history} = run_delivery_child(sid, ws, calls)
+      results = Enum.filter(history, &(&1.type == :tool_result))
+      expected = Enum.at(results, selected_index)
+      assert selected["virtual_diff"] == expected.data["virtual_diff"]
+
+      assert selected["virtual_diff_ref"] ==
+               virtual_diff_ref_fixture(expected.data["virtual_diff"], expected.seq)
+
+      assert File.read!(Path.join(ws, "source.txt")) == "parent source"
+      cleanup_session(agent["child_session_id"])
+      restart_subagents_manager()
+      assert {:ok, restored} = Subagents.list(sid, workspace: ws)
+      restored = Enum.find(restored, &(&1["id"] == agent["id"]))
+      assert restored["virtual_diff_ref"] == selected["virtual_diff_ref"]
+
+      assert {:ok, %{"dry_run" => true, "artifact" => %{"sha256" => resolved_hash}}} =
+               ApplyVirtualDiff.execute(
+                 %{
+                   "child_session_id" => agent["child_session_id"],
+                   "virtual_diff_ref" => restored["virtual_diff_ref"],
+                   "dry_run" => true
+                 },
+                 %{session_id: sid, workspace: ws}
+               )
+
+      assert resolved_hash == restored["virtual_diff_ref"]["sha256"]
+      assert File.read!(Path.join(ws, "source.txt")) == "parent source"
+    end
+  end
+
+  test "a selected delivery remains explicitly applicable after a later read and cold restore",
+       %{sid: sid, ws: ws} do
+    File.write!(Path.join(ws, "source.txt"), "parent source\n")
+
+    {agent, selected, _history} =
+      run_delivery_child(sid, ws, [
+        %{"commands" => ["sed -i 's/parent/child/' source.txt"], "deliverable" => true},
+        %{"commands" => ["cat source.txt"]}
+      ])
+
+    assert File.read!(Path.join(ws, "source.txt")) == "parent source\n"
+    cleanup_session(agent["child_session_id"])
+    restart_subagents_manager()
+    assert {:ok, restored} = Subagents.list(sid, workspace: ws)
+    restored = Enum.find(restored, &(&1["id"] == agent["id"]))
+    assert restored["virtual_diff_ref"] == selected["virtual_diff_ref"]
+
+    args = %{
+      "child_session_id" => agent["child_session_id"],
+      "virtual_diff_ref" => restored["virtual_diff_ref"],
+      "dry_run" => true
+    }
+
+    context = %{session_id: sid, workspace: ws, permission: %{mode: :auto}}
+
+    assert {:ok, %{"status" => "planned"}} =
+             Pixir.Tools.Executor.run(
+               %{call_id: "delivery_plan", name: "apply_virtual_diff", args: args},
+               context
+             )
+
+    assert File.read!(Path.join(ws, "source.txt")) == "parent source\n"
+
+    assert {:ok, %{"status" => "applied"}} =
+             Pixir.Tools.Executor.run(
+               %{
+                 call_id: "delivery_apply",
+                 name: "apply_virtual_diff",
+                 args: Map.put(args, "dry_run", false)
+               },
+               context
+             )
+
+    assert File.read!(Path.join(ws, "source.txt")) == "child source\n"
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+    assert Enum.any?(
+             history,
+             &(&1.type == :tool_result and
+                 &1.data["call_id"] == "delivery_apply" and &1.data["status"] == "applied")
+           )
+  end
+
+  test "unmatched, wrong-tool, duplicate, failed and false-intent results cannot forge delivery",
+       %{sid: sid, ws: ws} do
+    inject = fn history ->
+      child_sid = List.last(history).session_id
+      result = Enum.find(history, &(&1.type == :tool_result))
+      artifact = put_in(result.data["virtual_diff"], ["changes"], [])
+      record = fn event -> {:ok, _} = Session.record(child_sid, event) end
+      success = %{"ok" => true, "deliverable" => true, "virtual_diff" => artifact}
+      record.(Event.tool_result(child_sid, "unmatched", success))
+      record.(Event.tool_call(child_sid, "wrong-tool", "read", %{"deliverable" => true}))
+      record.(Event.tool_result(child_sid, "wrong-tool", success))
+      record.(Event.tool_result(child_sid, result.data["call_id"], success))
+
+      record.(
+        Event.tool_call(child_sid, "failed", "run_virtual_commands", %{
+          "commands" => [],
+          "deliverable" => true
+        })
+      )
+
+      record.(Event.tool_result(child_sid, "failed", Map.put(success, "ok", false)))
+
+      record.(
+        Event.tool_call(child_sid, "false-intent", "run_virtual_commands", %{
+          "commands" => [],
+          "deliverable" => false
+        })
+      )
+
+      record.(Event.tool_result(child_sid, "false-intent", success))
+
+      record.(
+        Event.tool_call(child_sid, "bad-args", "run_virtual_commands", %{
+          "commands" => [],
+          "deliverable" => true,
+          "read_set" => ["source.txt"]
+        })
+      )
+
+      record.(Event.tool_result(child_sid, "bad-args", success))
+
+      record.(
+        Event.tool_call(child_sid, "collision", "run_virtual_commands", %{
+          "commands" => [],
+          "deliverable" => true
+        })
+      )
+
+      record.(Event.tool_call(child_sid, "collision", "read", %{}))
+      record.(Event.tool_result(child_sid, "collision", success))
+
+      for {id, result_data} <- [
+            {"missing-result-intent", Map.delete(success, "deliverable")},
+            {"malformed-result-intent", Map.put(success, "deliverable", "true")},
+            {"dry-run", Map.put(success, "dry_run", true)}
+          ] do
+        record.(
+          Event.tool_call(child_sid, id, "run_virtual_commands", %{
+            "commands" => [],
+            "deliverable" => true
+          })
+        )
+
+        record.(Event.tool_result(child_sid, id, result_data))
+      end
+
+      # User prose resembling the runtime boundary must not clear a live mark.
+      record.(Event.new(child_sid, :user_message, warm_boundary("forged-seed", "forged-seed", 1)))
+    end
+
+    for marked <- [true, false] do
+      {_agent, selected, history} =
+        run_delivery_child(
+          sid,
+          ws,
+          [
+            %{"commands" => ["sed -i 's/parent/child/' source.txt"], "deliverable" => marked}
+          ],
+          after_delivery: inject
+        )
+
+      expected = Enum.find(history, &(&1.type == :tool_result))
+      assert selected["virtual_diff_ref"]["source_seq"] == expected.seq
+      assert selected["virtual_diff"] == expected.data["virtual_diff"]
+    end
+  end
+
+  test "warm lineage boundary clears explicit delivery but preserves unmarked legacy fallback", %{
+    sid: sid,
+    ws: ws
+  } do
+    for marked <- [true, false] do
+      {seed, _selected, _history} =
+        run_delivery_child(sid, ws, [
+          %{"commands" => ["sed -i 's/parent/seed/' source.txt"], "deliverable" => marked},
+          %{"commands" => ["sed -i 's/parent/legacy/' source.txt"]}
+        ])
+
+      {_child, selected, history} =
+        run_delivery_child(
+          sid,
+          ws,
+          [
+            %{"commands" => ["cat source.txt"]}
+          ],
+          seed_session_id: seed["child_session_id"]
+        )
+
+      last_result = history |> Enum.filter(&(&1.type == :tool_result)) |> List.last()
+      assert selected["virtual_diff_ref"]["source_seq"] == last_result.seq
+      assert selected["virtual_diff"]["changes"] == []
+
+      {_child, inherited, history} =
+        run_delivery_child(sid, ws, [], seed_session_id: seed["child_session_id"])
+
+      legacy_result = history |> Enum.filter(&(&1.type == :tool_result)) |> List.last()
+      assert inherited["virtual_diff_ref"]["source_seq"] == legacy_result.seq
+      assert inherited["virtual_diff"] == legacy_result.data["virtual_diff"]
+    end
+  end
+
+  defp run_delivery_child(sid, ws, calls, opts \\ []) do
+    prefix = "delivery_#{System.unique_integer([:positive])}_"
+
+    provider_opts =
+      [delivery_prefix: prefix, delivery_calls: calls] ++ Keyword.take(opts, [:after_delivery])
+
+    assert {:ok, agent} =
+             Subagents.spawn_agent(
+               sid,
+               %{
+                 "task" => "produce a virtual delivery",
+                 "workspace_mode" => "virtual_overlay",
+                 "timeout_ms" => 5_000
+               },
+               [
+                 workspace: ws,
+                 provider: DeliveryProvider,
+                 provider_opts: provider_opts,
+                 permission_mode: :read_only,
+                 virtual_overlay: %{read_set: ["source.txt"], limits: nil}
+               ] ++ Keyword.take(opts, [:seed_session_id])
+             )
+
+    on_exit(fn -> cleanup_session(agent["child_session_id"]) end)
+
+    assert {:ok, _} =
+             WaitAgent.execute(%{"ids" => [agent["id"]], "timeout_ms" => 10_000}, %{
+               session_id: sid,
+               workspace: ws
+             })
+
+    assert {:ok, agents} = Subagents.list(sid, workspace: ws)
+    selected = Enum.find(agents, &(&1["id"] == agent["id"]))
+    assert selected["status"] == "completed"
+    assert {:ok, history} = Log.fold(agent["child_session_id"], workspace: ws)
+    {agent, selected, history}
+  end
+
+  test "wait_agent preserves the ready virtual_diff apply across Manager restore", %{
+    sid: sid,
+    ws: ws
+  } do
+    assert {:ok, agent} =
+             Subagents.spawn_agent(
+               sid,
+               %{
+                 "task" => "produce a virtual overlay",
+                 "workspace_mode" => "virtual_overlay",
+                 "timeout_ms" => 5_000
+               },
+               workspace: ws,
+               provider: VirtualOverlayProvider,
+               permission_mode: :read_only,
+               virtual_overlay: %{read_set: ["source.txt"], limits: nil}
+             )
+
+    on_exit(fn -> cleanup_session(agent["child_session_id"]) end)
+    context = %{session_id: sid, workspace: ws}
+    args = %{"ids" => [agent["id"]], "timeout_ms" => 10_000}
+
+    assert {:ok, live} = WaitAgent.execute(args, context)
+    assert [live_entry] = live["landing_manifest"]
+    assert [%{"kind" => "virtual_diff", "next_action" => live_action}] = live_entry["produced"]
+
+    assert live_action["arguments"]["child_session_id"] == agent["child_session_id"]
+    assert live_action["arguments"]["dry_run"] == true
+
+    restart_subagents_manager()
+
+    assert {:ok, restored} = WaitAgent.execute(args, context)
+    assert restored["landing_manifest"] == live["landing_manifest"]
+    assert restored["output"] == live["output"]
+  end
+
+  test "landing manifest omits a virtual diff without durable ref evidence or after successful apply",
+       %{sid: sid, ws: ws} do
+    child_sid = unique_session_id("landing-applied-virtual-diff")
+
+    artifact = %{
+      "kind" => "virtual_diff",
+      "version" => 1,
+      "changes" => [],
+      "apply" => %{"status" => "not_applied"}
+    }
+
+    write_raw_history!(child_sid, ws, [
+      %{
+        "type" => "tool_call",
+        "data" => %{
+          "call_id" => "virtual-run",
+          "name" => "run_virtual_commands",
+          "args" => %{}
+        }
+      },
+      %{
+        "type" => "tool_result",
+        "data" => %{
+          "call_id" => "virtual-run",
+          "ok" => true,
+          "virtual_diff" => artifact
+        }
+      }
+    ])
+
+    base_item = %{
+      "id" => "scratch",
+      "child_session_id" => child_sid,
+      "status" => "completed",
+      "workspace" => ws,
+      "workspace_mode" => "virtual_overlay",
+      "virtual_diff" => artifact
+    }
+
+    assert Subagents.landing_manifest([base_item], ws) == []
+
+    virtual_diff_ref = virtual_diff_ref_fixture(artifact, 1)
+    item = Map.put(base_item, "virtual_diff_ref", virtual_diff_ref)
+
+    assert {:ok, _event} =
+             Session.record(
+               sid,
+               Event.tool_call(sid, "apply-landed", "apply_virtual_diff", %{
+                 "virtual_diff_ref" => virtual_diff_ref,
+                 "child_session_id" => child_sid,
+                 "dry_run" => false
+               })
+             )
+
+    assert {:ok, _event} =
+             Session.record(
+               sid,
+               Event.tool_result(sid, "apply-landed", %{"ok" => true, "status" => "applied"})
+             )
+
+    assert Subagents.landing_manifest([item], ws, parent_session_id: sid) == []
+  end
+
+  test "landing manifest adds no bytes when completed children produced no integrable work",
+       %{ws: ws} do
+    today = "summary\n\n" <> Subagents.reverification_directive()
+
+    assert Subagents.append_landing_manifest(
+             today,
+             [
+               %{
+                 "id" => "sub_empty",
+                 "status" => "completed",
+                 "workspace" => ws,
+                 "workspace_mode" => "shared"
+               }
+             ],
+             ws
+           ) == today
+  end
+
+  test "wait_agent result carries and renders a shared-workspace landing manifest", %{
+    sid: sid,
+    ws: ws
+  } do
+    {:ok, agent} =
+      Subagents.spawn_agent(
+        sid,
+        %{
+          "task" => "land shared result",
+          "workspace_mode" => "shared",
+          "timeout_ms" => 5_000
+        },
+        workspace: ws,
+        provider: WritingProvider,
+        permission_mode: :auto
+      )
+
+    context = %{session_id: sid, workspace: ws}
+
+    assert {:ok, result} =
+             WaitAgent.execute(%{"ids" => [agent["id"]], "timeout_ms" => 10_000}, context)
+
+    assert [entry] = result["landing_manifest"]
+    assert entry["child_id"] == agent["id"]
+    assert entry["workspace"] == ws
+
+    assert entry["produced"] == [
+             %{
+               "kind" => "shared_workspace_files",
+               "paths" => [
+                 %{
+                   "path" => "result.txt",
+                   "resolvable" => true,
+                   "exists_in_parent" => true,
+                   "drift" => false
+                 }
+               ],
+               "next_action" => %{"action" => "verify_and_commit", "paths" => ["result.txt"]}
+             }
+           ]
+
+    expected =
+      Subagents.summarize_wait_outcome(result["outcome"]) <>
+        "\n\n" <>
+        Subagents.reverification_directive() <>
+        "\n\nLanding manifest:\n" <>
+        "- #{agent["id"]}\n" <>
+        "  workspace: #{ws}\n" <>
+        "  produced: shared-workspace files\n" <>
+        "  changed paths:\n" <>
+        "    - result.txt (exists_in_parent=true, drift=false)\n" <>
+        "  next action: verify and commit paths [\"result.txt\"]"
+
+    assert result["output"] == expected
+  end
+
+  test "wait_agent output stays byte-identical when a completed child has no integrable work", %{
+    sid: sid,
+    ws: ws
+  } do
+    {:ok, agent} =
+      Subagents.spawn_agent(
+        sid,
+        %{"task" => "read only completion", "timeout_ms" => 5_000},
+        workspace: ws,
+        provider: KnobCaptureProvider,
+        permission_mode: :read_only
+      )
+
+    assert {:ok, result} =
+             WaitAgent.execute(
+               %{"ids" => [agent["id"]], "timeout_ms" => 10_000},
+               %{session_id: sid, workspace: ws}
+             )
+
+    assert result["output"] ==
+             "wait_agent completed: 1 subagents.\n\nRe-verify all integrated results from delegated children before committing or declaring the work done. Run the workspace's own verification, including typechecks, tests, and any commands named in the work brief."
+
+    refute Map.has_key?(result, "landing_manifest")
+  end
+
+  test "landing manifest caps children and confesses the omission", %{ws: ws} do
+    artifact = %{
+      "kind" => "virtual_diff",
+      "version" => 1,
+      "changes" => [],
+      "apply" => %{"status" => "not_applied"}
+    }
+
+    virtual_diff_ref = virtual_diff_ref_fixture(artifact, 1)
+
+    items =
+      for index <- 1..10 do
+        child_sid = unique_session_id("landing-cap-#{index}")
+
+        write_raw_history!(child_sid, ws, [
+          %{
+            "type" => "tool_call",
+            "data" => %{
+              "call_id" => "virtual-run-#{index}",
+              "name" => "run_virtual_commands",
+              "args" => %{}
+            }
+          },
+          %{
+            "type" => "tool_result",
+            "data" => %{
+              "call_id" => "virtual-run-#{index}",
+              "ok" => true,
+              "virtual_diff" => artifact
+            }
+          }
+        ])
+
+        %{
+          "id" => "child_#{index}",
+          "child_session_id" => child_sid,
+          "status" => "completed",
+          "workspace" => ws,
+          "workspace_mode" => "virtual_overlay",
+          "virtual_diff_ref" => virtual_diff_ref
+        }
+      end
+
+    projection = Subagents.landing_manifest_projection(items, ws)
+    manifest = projection["landing_manifest"]
+    assert length(manifest) == 8
+    assert projection["omitted_children"] == 2
+
+    rendered =
+      Subagents.render_landing_manifest(manifest, projection["omitted_children"])
+
+    assert rendered ==
+             "Landing manifest (showing 8 of 10 completed children with integrable work; 2 omitted by cap):\n" <>
+               Enum.map_join(Enum.take(items, 8), "\n", fn item ->
+                 arguments =
+                   Jason.encode!(%{
+                     "virtual_diff_ref" => virtual_diff_ref,
+                     "child_session_id" => item["child_session_id"],
+                     "dry_run" => true
+                   })
+
+                 "- #{item["id"]}\n" <>
+                   "  workspace: #{ws}\n" <>
+                   "  produced: virtual_diff virtual_diff_ref=#{Jason.encode!(virtual_diff_ref)}\n" <>
+                   "  next action: apply_virtual_diff #{arguments}"
+               end)
+  end
+
+  test "landing manifest caps changed paths per child and confesses the omission", %{ws: ws} do
+    child_sid = unique_session_id("landing-path-cap")
+
+    entries =
+      1..22
+      |> Enum.flat_map(fn index ->
+        path = "generated/path-#{index}.txt"
+
+        [
+          %{
+            "type" => "tool_call",
+            "data" => %{
+              "call_id" => "write-#{index}",
+              "name" => "write",
+              "args" => %{"path" => path, "content" => "content"}
+            }
+          },
+          %{
+            "type" => "tool_result",
+            "data" => %{"call_id" => "write-#{index}", "ok" => true, "output" => "written"}
+          }
+        ]
+      end)
+
+    write_raw_history!(child_sid, ws, entries)
+
+    item = %{
+      "id" => "many_paths",
+      "child_session_id" => child_sid,
+      "status" => "completed",
+      "workspace" => ws,
+      "workspace_mode" => "shared"
+    }
+
+    assert [manifest_entry] = Subagents.landing_manifest([item], ws)
+    assert [%{"paths" => structured_paths} = produced] = manifest_entry["produced"]
+    assert length(structured_paths) == 20
+    assert produced["omitted_paths"] == 2
+    assert produced["next_action"]["paths"] == Enum.map(1..20, &"generated/path-#{&1}.txt")
+
+    rendered = Subagents.render_landing_manifest([manifest_entry])
+    shown_paths = Enum.map(1..20, &"generated/path-#{&1}.txt")
+
+    expected_path_lines =
+      Enum.map_join(shown_paths, "\n", fn path ->
+        "    - #{path} (exists_in_parent=false, drift=true)"
+      end)
+
+    assert rendered ==
+             "Landing manifest:\n" <>
+               "- many_paths\n" <>
+               "  workspace: #{ws}\n" <>
+               "  produced: shared-workspace files\n" <>
+               "  changed paths (showing 20 of 22; 2 omitted by per-child cap):\n" <>
+               expected_path_lines <>
+               "\n  next action: verify and commit paths #{Jason.encode!(shown_paths)}"
   end
 
   test "potentially integrable statuses include completed, timed_out, and closed only" do
@@ -3729,6 +4754,21 @@ defmodule Pixir.SubagentsTest do
              Subagents.resume_posture(forged_sid, workspace: ws)
 
     assert details["reason"] == "unbounded_write_policy"
+  end
+
+  defp virtual_diff_ref_fixture(artifact, source_seq) do
+    encoded = Jason.encode!(artifact)
+
+    %{
+      "kind" => artifact["kind"],
+      "version" => artifact["version"],
+      "sha256" => :crypto.hash(:sha256, encoded) |> Base.encode16(case: :lower),
+      "encoded_bytes" => byte_size(encoded),
+      "changed_files" => length(Map.get(artifact, "changes", [])),
+      "diff_bytes" => get_in(artifact, ["summary", "diff_bytes"]),
+      "apply_status" => get_in(artifact, ["apply", "status"]),
+      "source_seq" => source_seq
+    }
   end
 
   defp write_raw_history!(sid, ws, entries) do

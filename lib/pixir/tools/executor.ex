@@ -39,7 +39,7 @@ defmodule Pixir.Tools.Executor do
 
   alias Pixir.{Event, Paths, Permissions, Session, Tool}
   alias Pixir.Permissions.WritePolicy
-  alias Pixir.Tools.{Registry, Workspace}
+  alias Pixir.Tools.{ApplyVirtualDiff, Registry, Workspace}
 
   @type call :: %{call_id: String.t(), name: String.t(), args: map()}
 
@@ -61,12 +61,14 @@ defmodule Pixir.Tools.Executor do
     sid = context.session_id
 
     with {:ok, _} <- Session.record(sid, Event.tool_call(sid, id, name, args)) do
+      authorization_args = authorization_args(name, args, context)
+
       result =
-        case protect_evidence(name, args, context.workspace) do
+        case protect_evidence(name, authorization_args, context.workspace) do
           :ok ->
-            with :allow <- authorize_virtual_overlay(name, args, id, context),
-                 :allow <- authorize_write_policy(name, args, id, context),
-                 :allow <- authorize(name, args, id, context) do
+            with :allow <- authorize_virtual_overlay(name, authorization_args, id, context),
+                 :allow <- authorize_write_policy(name, authorization_args, id, context),
+                 :allow <- authorize(name, authorization_args, id, context) do
               execute_call(%{name: name, args: args}, context)
             else
               {:deny, reason} -> {:error, Tool.error(:permission_denied, reason, %{tool: name})}
@@ -94,6 +96,17 @@ defmodule Pixir.Tools.Executor do
       record_result_or_fallback(sid, id, result)
     end
   end
+
+  # Resolve reference-only virtual_diff calls for permission and evidence guards without
+  # copying the artifact into the durable tool_call args or the model-facing manifest.
+  defp authorization_args("apply_virtual_diff", args, context) when is_map(args) do
+    case ApplyVirtualDiff.resolve_artifact(args, context) do
+      {:ok, artifact} -> Map.put(args, "artifact", artifact)
+      {:error, _error} -> args
+    end
+  end
+
+  defp authorization_args(_name, args, _context), do: args
 
   # ── evidence protection ────────────────────────────────────────────────────
 

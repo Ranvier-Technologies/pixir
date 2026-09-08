@@ -3,7 +3,245 @@ defmodule Pixir.Delegate.RunnerTest do
 
   alias Pixir.Delegate.Runner
 
-  defp tmp_workspace(prefix) do
+  defmodule EffortAuth do
+    use GenServer
+    def start_link(test), do: GenServer.start_link(__MODULE__, test)
+    def init(test), do: {:ok, test}
+
+    def handle_call(:request_headers, _from, test) do
+      send(test, :runtime_effort_auth)
+      {:reply, {:ok, []}, test}
+    end
+  end
+
+  defmodule EffortCustomProvider do
+    def stream(_request, opts) do
+      send(Keyword.fetch!(opts, :test_pid), :runtime_custom_called)
+      {:ok, %{text: "done", reasoning: "", function_calls: [], finish_reason: :stop}}
+    end
+  end
+
+  defp effort_runtime_opts do
+    test = self()
+    auth = start_supervised!({EffortAuth, test})
+
+    transport = fn request, acc, reduce ->
+      send(test, {:runtime_effort_body, Jason.decode!(request.body)})
+      acc = reduce.({:status, 200}, acc)
+
+      event = %{
+        "type" => "response.completed",
+        "response" => %{"status" => "completed", "output" => []}
+      }
+
+      {:ok, reduce.({:data, "data: " <> Jason.encode!(event) <> "\n\n"}, acc)}
+    end
+
+    [
+      auth: auth,
+      transport: transport,
+      transport_mode: :http_sse,
+      web_search: false,
+      native_compaction: false,
+      test_pid: test
+    ]
+  end
+
+  defp effort_runtime_run(path, ws, knobs, provider, provider_opts) do
+    opts = [
+      workspace: ws,
+      provider: provider,
+      provider_opts: provider_opts,
+      permission_mode: :read_only
+    ]
+
+    step =
+      Map.merge(
+        %{
+          "id" => "effort",
+          "task" => "inspect effort",
+          "agent" => "explorer",
+          "workspace_mode" => "shared"
+        },
+        knobs
+      )
+
+    case path do
+      :native ->
+        {:ok, sid, _pid} = Pixir.SessionSupervisor.start_session(workspace: ws)
+        on_exit(fn -> Pixir.SessionSupervisor.stop_session(sid) end)
+
+        case Pixir.Subagents.spawn_agent(sid, step, opts) do
+          {:ok, child} ->
+            assert {:ok, [completed]} =
+                     Pixir.Subagents.wait(sid, [child["id"]], 5_000, workspace: ws)
+
+            assert completed["status"] == "completed"
+            Pixir.Subagents.close(sid, child["id"], workspace: ws)
+            {:ok, completed}
+
+          error ->
+            error
+        end
+
+      :workflow ->
+        {:ok, sid, _pid} = Pixir.SessionSupervisor.start_session(workspace: ws)
+        on_exit(fn -> Pixir.SessionSupervisor.stop_session(sid) end)
+        Pixir.Workflows.run(sid, %{"steps" => [step]}, opts)
+
+      strategy ->
+        spec =
+          if strategy == "subagents" do
+            %{
+              "task" => "inspect effort",
+              "subagents" => Map.put(knobs, "workspace_mode", "shared")
+            }
+          else
+            %{"steps" => [step]}
+          end
+
+        spec = Map.merge(spec, %{"contract_version" => 1, "strategy" => strategy})
+
+        Runner.run(
+          %{workspace: ws},
+          spec,
+          %{"strategy" => strategy, "planned_child_count" => 1},
+          opts
+        )
+    end
+  end
+
+  for path <- [:native, :workflow, "subagents", "workflow"] do
+    @effort_path path
+
+    test "#{inspect(path)} actual runtime transmits explicit and Config Astra max without downgrading" do
+      with_pixir_home("pixir-effort-runtime", fn ->
+        ws = tmp_workspace("pixir-effort-runtime", stop_sessions: true)
+        provider_opts = effort_runtime_opts()
+        config_path = Path.join(System.fetch_env!("PIXIR_HOME"), "config.json")
+
+        for {config, knobs, extra, expected_model, expected_effort} <- [
+              {%{}, %{"model" => "gpt-6-astra", "reasoning_effort" => "max"}, [], "gpt-6-astra",
+               "max"},
+              {%{"model" => "gpt-6-astra", "reasoning" => %{"effort" => "max"}}, %{}, [],
+               "gpt-6-astra", "max"},
+              {%{"model" => "gpt-6-astra", "reasoning" => %{"effort" => "max"}},
+               %{"model" => "gpt-5.5", "reasoning_effort" => "high"}, [], "gpt-5.5", "high"},
+              {%{
+                 "model" => "gpt-5.5",
+                 "reasoning" => %{"effort" => "max"},
+                 "responses_backend" => effort_open_backend()
+               }, %{"model" => "gpt-6-astra"}, [responses_backend: %{"mode" => "chatgpt_codex"}],
+               "gpt-6-astra", "max"}
+            ] do
+          File.write!(config_path, Jason.encode!(config))
+
+          assert {:ok, _} =
+                   effort_runtime_run(
+                     @effort_path,
+                     ws,
+                     knobs,
+                     Pixir.Provider,
+                     extra ++ provider_opts
+                   )
+
+          assert_receive :runtime_effort_auth
+          assert_receive {:runtime_effort_body, body}
+          assert body["model"] == expected_model
+          assert body["reasoning"] == %{"effort" => expected_effort}
+          refute_receive :runtime_custom_called
+        end
+      end)
+    end
+
+    test "#{inspect(path)} runtime refuses incompatible effective max before auth transport or custom callback" do
+      with_pixir_home("pixir-effort-runtime-reject", fn ->
+        ws = tmp_workspace("pixir-effort-runtime-reject", stop_sessions: true)
+        provider_opts = effort_runtime_opts()
+        config_path = Path.join(System.fetch_env!("PIXIR_HOME"), "config.json")
+
+        for {config, knobs, provider, extra} <- [
+              {%{}, %{"model" => "gpt-6-astra", "reasoning_effort" => "max"},
+               EffortCustomProvider, []},
+              {%{"model" => "gpt-6-astra", "reasoning" => %{"effort" => "max"}}, %{},
+               EffortCustomProvider, []},
+              {%{}, %{"model" => "gpt-5.5", "reasoning_effort" => "max"}, Pixir.Provider,
+               [model: "gpt-6-astra"]},
+              {%{"model" => "gpt-6-astra", "reasoning" => %{"effort" => "max"}}, %{},
+               Pixir.Provider, [model: "gpt-5.5"]},
+              {%{}, %{"model" => "gpt-6-astra", "reasoning_effort" => "max"}, Pixir.Provider,
+               [responses_backend: effort_open_backend()]},
+              {%{"model" => "gpt-6-astra", "reasoning" => %{"effort" => "max"}}, %{},
+               Pixir.Provider, [responses_backend: effort_open_backend()]},
+              {%{}, %{"model" => "gpt-6-astra", "reasoning_effort" => "max"}, Pixir.Provider,
+               [base_url: "https://example.invalid"]},
+              {%{}, %{}, EffortCustomProvider, [model: "gpt-6-astra", reasoning_effort: "max"]}
+            ] do
+          File.write!(config_path, Jason.encode!(config))
+
+          assert {:error, error} =
+                   effort_runtime_run(@effort_path, ws, knobs, provider, extra ++ provider_opts)
+
+          kind = get_in(error, [:error, :kind]) || error["kind"]
+
+          assert kind ==
+                   if(@effort_path in [:native, :workflow],
+                     do: :invalid_config,
+                     else: "invalid_config"
+                   )
+
+          refute_receive :runtime_effort_auth
+          refute_receive {:runtime_effort_body, _}
+          refute_receive :runtime_custom_called
+        end
+      end)
+    end
+  end
+
+  test "native follow-up revalidates changed Config max before a custom callback" do
+    with_pixir_home("pixir-effort-followup", fn ->
+      ws = tmp_workspace("pixir-effort-followup", stop_sessions: true)
+      config_path = Path.join(System.fetch_env!("PIXIR_HOME"), "config.json")
+      File.write!(config_path, Jason.encode!(%{"model" => "gpt-6-astra"}))
+      {:ok, sid, _pid} = Pixir.SessionSupervisor.start_session(workspace: ws)
+      on_exit(fn -> Pixir.SessionSupervisor.stop_session(sid) end)
+
+      assert {:ok, child} =
+               Pixir.Subagents.spawn_agent(
+                 sid,
+                 %{"task" => "initial", "agent" => "explorer", "workspace_mode" => "shared"},
+                 workspace: ws,
+                 provider: EffortCustomProvider,
+                 provider_opts: [test_pid: self()]
+               )
+
+      assert {:ok, [%{"status" => "completed"}]} =
+               Pixir.Subagents.wait(sid, [child["id"]], 5_000, workspace: ws)
+
+      assert_receive :runtime_custom_called
+
+      File.write!(
+        config_path,
+        Jason.encode!(%{"model" => "gpt-6-astra", "reasoning" => %{"effort" => "max"}})
+      )
+
+      assert {:error, %{error: %{kind: :invalid_config}}} =
+               Pixir.Subagents.send_input(sid, child["id"], "follow up", workspace: ws)
+
+      refute_receive :runtime_custom_called
+      assert {:ok, _} = Pixir.Subagents.close(sid, child["id"], workspace: ws)
+    end)
+  end
+
+  defp effort_open_backend do
+    %{
+      "mode" => "open_responses",
+      "responses_url" => "https://api.openai.com/v1/responses",
+      "auth" => %{"policy" => "none"}
+    }
+  end
+
+  defp tmp_workspace(prefix, opts \\ []) do
     path =
       Path.join(
         System.tmp_dir!(),
@@ -11,7 +249,30 @@ defmodule Pixir.Delegate.RunnerTest do
       )
 
     File.mkdir_p!(path)
-    on_exit(fn -> File.rm_rf!(path) end)
+
+    on_exit(fn ->
+      if opts[:stop_sessions] do
+        # Runner.run creates durable parents even on spawn refusal. Close their
+        # Manager children and stop the owned Sessions before deleting fixtures;
+        # otherwise lease release can recreate files during File.rm_rf!.
+        ids =
+          Path.wildcard(Path.join([path, ".pixir", "sessions", "*.ndjson"]))
+          |> Enum.map(&Path.basename(&1, ".ndjson"))
+
+        for sid <- ids do
+          assert {:ok, children} = Pixir.Subagents.list(sid, workspace: path)
+
+          for child <- children, child["status"] != "closed" do
+            assert {:ok, _} = Pixir.Subagents.close(sid, child["id"], workspace: path)
+          end
+        end
+
+        for sid <- ids, do: assert({:ok, _} = Pixir.SessionSupervisor.stop_session(sid))
+      end
+
+      File.rm_rf!(path)
+    end)
+
     path
   end
 
@@ -131,6 +392,105 @@ defmodule Pixir.Delegate.RunnerTest do
         "allow_writes" => ["notes/out.md"]
       }
     }
+  end
+
+  test "completed shared writer carries a landing manifest in the delegate result" do
+    with_pixir_home("pixir-delegate-landing-home", fn ->
+      ws = tmp_workspace("pixir-delegate-landing")
+      child_session_id = "20260825T000001-landing"
+      File.mkdir_p!(Path.join(ws, "notes"))
+      File.write!(Path.join(ws, "notes/out.md"), "landed")
+
+      write_raw_session_log(ws, child_session_id, [
+        raw_event(child_session_id, 1, "tool_call", %{
+          "call_id" => "write-landed",
+          "name" => "write",
+          "args" => %{"path" => "notes/out.md", "content" => "landed"}
+        }),
+        raw_event(child_session_id, 2, "tool_result", %{
+          "call_id" => "write-landed",
+          "ok" => true,
+          "output" => "written"
+        })
+      ])
+
+      child = %{
+        "id" => "subagent_landing",
+        "child_session_id" => child_session_id,
+        "agent" => "worker",
+        "status" => "completed",
+        "summary" => "done",
+        "task" => "write notes",
+        "workspace_mode" => "shared",
+        "workspace" => ws,
+        "child_log_path" => Path.join(ws, "landing.ndjson"),
+        "next_actions" => []
+      }
+
+      spawn_agent = fn _parent_session_id, _args, _opts -> {:ok, child} end
+
+      wait_outcome = fn _parent_session_id, _ids, _timeout_ms, _opts ->
+        {:ok,
+         %{
+           "status" => "completed",
+           "complete" => true,
+           "counts" => %{
+             "completed" => 1,
+             "failed" => 0,
+             "timed_out" => 0,
+             "cancelled" => 0,
+             "detached" => 0,
+             "incomplete" => 0
+           },
+           "subagents" => [child],
+           "summary" => "delegate completed."
+         }}
+      end
+
+      assert {:ok, payload} =
+               Runner.run(
+                 %{workspace: ws},
+                 projection_spec("bounded_write"),
+                 %{"strategy" => "subagents", "planned_child_count" => 1},
+                 spawn_agent: spawn_agent,
+                 wait_outcome: wait_outcome
+               )
+
+      assert payload["landing_manifest"] == [
+               %{
+                 "child_id" => "subagent_landing",
+                 "workspace" => ws,
+                 "produced" => [
+                   %{
+                     "kind" => "shared_workspace_files",
+                     "paths" => [
+                       %{
+                         "path" => "notes/out.md",
+                         "resolvable" => true,
+                         "exists_in_parent" => true,
+                         "drift" => false
+                       }
+                     ],
+                     "next_action" => %{
+                       "action" => "verify_and_commit",
+                       "paths" => ["notes/out.md"]
+                     }
+                   }
+                 ]
+               }
+             ]
+
+      assert payload["summary"] ==
+               "delegate completed.\n\n" <>
+                 Pixir.Subagents.reverification_directive() <>
+                 "\n\nLanding manifest:\n" <>
+                 "- subagent_landing\n" <>
+                 "  workspace: #{ws}\n" <>
+                 "  produced: shared-workspace files\n" <>
+                 "  changed paths:\n" <>
+                 "    - notes/out.md (exists_in_parent=true, drift=false)\n" <>
+                 "  next action: verify and commit paths [\"notes/out.md\"]"
+    end)
   end
 
   test "transport-dead writer projects guided resume with write-safe notes" do
@@ -1510,7 +1870,11 @@ defmodule Pixir.Delegate.RunnerTest do
       assert payload.runtime.provider_transport == "websocket"
       assert get_in(payload.payload, ["limits", "transport"]) == "websocket"
       assert_received {:spawn_agent_called, _parent_session_id, _args, opts}
-      assert Keyword.fetch!(opts, :provider_transport) == "websocket"
+
+      assert Keyword.fetch!(Keyword.fetch!(opts, :provider_opts), :provider_transport) ==
+               "websocket"
+
+      refute Keyword.has_key?(opts, :provider_transport)
     end)
   end
 
@@ -2028,7 +2392,7 @@ defmodule Pixir.Delegate.RunnerTest do
     assert {:error, error} = Runner.start(%{workspace: ws}, spec, spec_meta)
     assert error["kind"] == "invalid_spec"
     assert error["details"]["field"] == "subagents.reasoning_effort"
-    assert error["details"]["accepted_values"] == ["low", "medium", "high", "xhigh"]
+    assert error["details"]["accepted_values"] == ["low", "medium", "high", "xhigh", "max"]
   end
 
   test "bounded_write workflow does not infer observed writes from corrupt child log" do

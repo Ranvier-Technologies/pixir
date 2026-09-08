@@ -31,6 +31,10 @@ defmodule Pixir.Subagents do
                               "workspace's own verification, including typechecks, tests, " <>
                               "and any commands named in the work brief."
 
+  @landing_manifest_child_cap 8
+  @landing_manifest_path_cap 20
+  @shared_workspace_file_tools ~w(write edit)
+
   @cancellation_steps [
     {:session_interrupt_evidence, "session_interrupt_evidence"},
     {:child_cancellation_event, "child_cancellation_event"}
@@ -71,6 +75,452 @@ defmodule Pixir.Subagents do
 
   @doc false
   def reverification_directive, do: @reverification_directive
+
+  @doc false
+  def landing_manifest_child_cap, do: @landing_manifest_child_cap
+
+  @doc false
+  def landing_manifest_path_cap, do: @landing_manifest_path_cap
+
+  @doc false
+  def landing_manifest(items, parent_workspace, opts \\ []) do
+    items
+    |> landing_manifest_projection(parent_workspace, opts)
+    |> Map.fetch!("landing_manifest")
+  end
+
+  @doc false
+  def landing_manifest_projection(items, parent_workspace, opts \\ [])
+
+  def landing_manifest_projection(items, parent_workspace, opts)
+      when is_list(items) and is_binary(parent_workspace) and is_list(opts) do
+    parent_history = landing_parent_history(opts[:parent_session_id], parent_workspace)
+
+    entries =
+      items
+      |> Enum.filter(&completed_item?/1)
+      |> Enum.map(&landing_manifest_entry(&1, parent_workspace, parent_history))
+      |> Enum.reject(&is_nil/1)
+
+    shown = Enum.take(entries, @landing_manifest_child_cap)
+    omitted = max(length(entries) - length(shown), 0)
+
+    %{"landing_manifest" => shown}
+    |> maybe_put_manifest_count("omitted_children", omitted)
+  end
+
+  def landing_manifest_projection(_items, _parent_workspace, _opts),
+    do: %{"landing_manifest" => []}
+
+  @doc false
+  def append_landing_manifest(output, items, parent_workspace) when is_binary(output) do
+    projection = landing_manifest_projection(items, parent_workspace)
+
+    case projection["landing_manifest"] do
+      [] ->
+        output
+
+      manifest ->
+        output <>
+          "\n\n" <>
+          render_landing_manifest(manifest, Map.get(projection, "omitted_children", 0))
+    end
+  end
+
+  @doc false
+  def render_landing_manifest(manifest, omitted_children \\ 0)
+
+  def render_landing_manifest(manifest, omitted_children)
+      when is_list(manifest) and is_integer(omitted_children) and omitted_children >= 0 do
+    shown = Enum.take(manifest, @landing_manifest_child_cap)
+    overflow = max(length(manifest) - length(shown), 0)
+    omitted = omitted_children + overflow
+    total = length(shown) + omitted
+
+    heading =
+      if omitted > 0 do
+        "Landing manifest (showing #{length(shown)} of #{total} completed children " <>
+          "with integrable work; #{omitted} omitted by cap):"
+      else
+        "Landing manifest:"
+      end
+
+    heading <> "\n" <> Enum.map_join(shown, "\n", &render_landing_manifest_entry/1)
+  end
+
+  defp completed_item?(item) when is_map(item) do
+    (item["status"] || item[:status] || item["subagent_status"] || item[:subagent_status]) ==
+      "completed"
+  end
+
+  defp completed_item?(_item), do: false
+
+  defp landing_manifest_entry(item, parent_workspace, parent_history) do
+    workspace = item["workspace"] || item[:workspace]
+
+    child_id =
+      item["id"] || item[:id] || item["subagent_id"] || item[:subagent_id] ||
+        item["step_id"] || item[:step_id]
+
+    produced =
+      []
+      |> maybe_add_shared_workspace_files(item, workspace, parent_workspace)
+      |> maybe_add_virtual_diff(item, workspace, parent_history)
+
+    if produced == [] do
+      nil
+    else
+      %{}
+      |> maybe_put_manifest_field("child_id", child_id)
+      |> maybe_put_manifest_field("workspace", workspace)
+      |> Map.put("produced", produced)
+    end
+  end
+
+  defp maybe_add_shared_workspace_files(produced, item, workspace, parent_workspace) do
+    if (item["workspace_mode"] || item[:workspace_mode]) == "shared" and is_binary(workspace) do
+      case shared_workspace_changed_paths(item, workspace) do
+        [] ->
+          produced
+
+        paths ->
+          all_path_entries =
+            Enum.map(paths, &shared_workspace_path_entry(workspace, parent_workspace, &1))
+
+          path_entries = Enum.take(all_path_entries, @landing_manifest_path_cap)
+          omitted_paths = max(length(all_path_entries) - length(path_entries), 0)
+
+          verifiable_paths =
+            for %{"path" => path, "resolvable" => true} <- path_entries, do: path
+
+          next_action =
+            if verifiable_paths == [] do
+              nil
+            else
+              %{
+                "action" => "verify_and_commit",
+                "paths" => verifiable_paths
+              }
+            end
+
+          item =
+            %{
+              "kind" => "shared_workspace_files",
+              "paths" => path_entries
+            }
+            |> maybe_put_manifest_count("omitted_paths", omitted_paths)
+            |> maybe_put_manifest_field("next_action", next_action)
+
+          produced ++ [item]
+      end
+    else
+      produced
+    end
+  end
+
+  defp shared_workspace_changed_paths(item, workspace) do
+    child_session_id = item["child_session_id"] || item[:child_session_id]
+
+    with true <- is_binary(child_session_id) and child_session_id != "",
+         {:ok, history} <- Log.fold(child_session_id, workspace: workspace) do
+      successful_results =
+        history
+        |> Enum.filter(&successful_tool_result?/1)
+        |> Map.new(&{&1.data["call_id"], &1.data})
+
+      history
+      |> Enum.flat_map(&changed_paths_from_call(&1, successful_results))
+      |> Enum.uniq()
+    else
+      _absent_or_unreadable_evidence -> []
+    end
+  end
+
+  defp successful_tool_result?(%{type: :tool_result, data: data}) when is_map(data),
+    do: data["ok"] == true and is_binary(data["call_id"])
+
+  defp successful_tool_result?(_event), do: false
+
+  defp changed_paths_from_call(%{type: :tool_call, data: data}, successful_results)
+       when is_map(data) do
+    case Map.get(successful_results, data["call_id"]) do
+      %{} = result -> changed_paths_for_tool(data["name"], data["args"] || %{}, result)
+      nil -> []
+    end
+  end
+
+  defp changed_paths_from_call(_event, _successful_results), do: []
+
+  defp changed_paths_for_tool(name, %{"path" => path}, _result)
+       when name in @shared_workspace_file_tools and is_binary(path) and path != "",
+       do: [path]
+
+  defp changed_paths_for_tool(
+         "apply_virtual_diff",
+         %{"artifact" => %{"changes" => changes}, "dry_run" => false},
+         %{"status" => "applied"}
+       )
+       when is_list(changes) do
+    changes
+    |> Enum.map(fn
+      %{"path" => path} when is_binary(path) and path != "" -> path
+      _change -> nil
+    end)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp changed_paths_for_tool(_name, _args, _result), do: []
+
+  defp shared_workspace_path_entry(workspace, parent_workspace, path) do
+    with {:ok, child_absolute_path} <- Pixir.Tools.Workspace.confine(workspace, path),
+         relative_path <- Path.relative_to(child_absolute_path, Path.expand(workspace)),
+         {:ok, parent_absolute_path} <-
+           Pixir.Tools.Workspace.confine(parent_workspace, relative_path) do
+      regular? = File.regular?(parent_absolute_path)
+
+      %{
+        "path" => relative_path,
+        "resolvable" => true,
+        "exists_in_parent" => regular?,
+        "drift" => not regular?
+      }
+    else
+      {:error, error} ->
+        %{
+          "path" => path,
+          "resolvable" => false,
+          "unresolvable" => manifest_error_kind(error)
+        }
+    end
+  end
+
+  defp manifest_error_kind(%{error: %{kind: kind}}), do: to_string(kind)
+  defp manifest_error_kind(_error), do: "confinement_failed"
+
+  defp maybe_add_virtual_diff(produced, item, workspace, parent_history) do
+    child_session_id = item["child_session_id"] || item[:child_session_id]
+    durable_ref = item["virtual_diff_ref"] || item[:virtual_diff_ref]
+
+    with true <- is_binary(child_session_id) and child_session_id != "",
+         true <- is_binary(workspace) and workspace != "",
+         %{} <- durable_ref,
+         {:ok, history} <- Log.fold(child_session_id, workspace: workspace),
+         {_call_ids, {%{} = artifact, source_seq}} <- find_last_virtual_diff(history),
+         selected_ref <- virtual_diff_ref(artifact, source_seq),
+         true <- selected_ref == durable_ref,
+         "not_applied" <- selected_ref["apply_status"],
+         false <- virtual_diff_applied?(parent_history, selected_ref, child_session_id) do
+      produced ++
+        [
+          %{
+            "kind" => "virtual_diff",
+            "virtual_diff_ref" => selected_ref,
+            "next_action" => %{
+              "tool" => "apply_virtual_diff",
+              "arguments" => %{
+                "virtual_diff_ref" => selected_ref,
+                "child_session_id" => child_session_id,
+                "dry_run" => true
+              }
+            }
+          }
+        ]
+    else
+      _absent_or_incoherent_evidence -> produced
+    end
+  end
+
+  defp find_last_virtual_diff(history) do
+    Enum.reduce(history, {MapSet.new(), nil}, fn
+      %{type: :tool_call, data: %{"name" => "run_virtual_commands", "call_id" => call_id}},
+      {call_ids, selected}
+      when is_binary(call_id) ->
+        {MapSet.put(call_ids, call_id), selected}
+
+      %{
+        type: :tool_result,
+        seq: source_seq,
+        data: %{
+          "call_id" => call_id,
+          "ok" => true,
+          "virtual_diff" => %{"kind" => "virtual_diff"} = artifact
+        }
+      },
+      {call_ids, selected} ->
+        if MapSet.member?(call_ids, call_id) do
+          {call_ids, {artifact, source_seq}}
+        else
+          {call_ids, selected}
+        end
+
+      _event, acc ->
+        acc
+    end)
+  end
+
+  defp virtual_diff_ref(artifact, source_seq) do
+    encoded = Jason.encode!(artifact)
+
+    %{
+      "kind" => artifact["kind"],
+      "version" => artifact["version"],
+      "sha256" => :crypto.hash(:sha256, encoded) |> Base.encode16(case: :lower),
+      "encoded_bytes" => byte_size(encoded),
+      "changed_files" => length(Map.get(artifact, "changes", [])),
+      "diff_bytes" => get_in(artifact, ["summary", "diff_bytes"]),
+      "apply_status" => get_in(artifact, ["apply", "status"]),
+      "source_seq" => source_seq
+    }
+  end
+
+  defp landing_parent_history(parent_session_id, parent_workspace)
+       when is_binary(parent_session_id) and parent_session_id != "" do
+    case Log.fold(parent_session_id, workspace: parent_workspace) do
+      {:ok, history} -> history
+      {:error, _error} -> []
+    end
+  end
+
+  defp landing_parent_history(_parent_session_id, _parent_workspace), do: []
+
+  defp virtual_diff_applied?([], _virtual_diff_ref, _child_session_id), do: false
+
+  defp virtual_diff_applied?(history, virtual_diff_ref, child_session_id) do
+    successful_apply_ids =
+      history
+      |> Enum.filter(fn
+        %{type: :tool_result, data: %{"call_id" => call_id, "ok" => true, "status" => "applied"}}
+        when is_binary(call_id) ->
+          true
+
+        _event ->
+          false
+      end)
+      |> MapSet.new(& &1.data["call_id"])
+
+    Enum.any?(history, fn
+      %{
+        type: :tool_call,
+        data: %{
+          "call_id" => call_id,
+          "name" => "apply_virtual_diff",
+          "args" => %{
+            "virtual_diff_ref" => %{} = applied_ref,
+            "child_session_id" => applied_child_session_id,
+            "dry_run" => false
+          }
+        }
+      }
+      when is_binary(call_id) and is_binary(applied_child_session_id) ->
+        MapSet.member?(successful_apply_ids, call_id) and
+          applied_child_session_id == child_session_id and applied_ref == virtual_diff_ref
+
+      %{
+        type: :tool_call,
+        data: %{
+          "call_id" => call_id,
+          "name" => "apply_virtual_diff",
+          "args" => %{"artifact" => %{} = artifact, "dry_run" => false}
+        }
+      }
+      when is_binary(call_id) ->
+        MapSet.member?(successful_apply_ids, call_id) and
+          virtual_diff_ref(artifact, virtual_diff_ref["source_seq"])["sha256"] ==
+            virtual_diff_ref["sha256"]
+
+      _event ->
+        false
+    end)
+  end
+
+  defp maybe_put_manifest_count(map, _key, 0), do: map
+
+  defp maybe_put_manifest_count(map, key, value) when is_integer(value) and value > 0,
+    do: Map.put(map, key, value)
+
+  defp maybe_put_manifest_field(map, _key, nil), do: map
+  defp maybe_put_manifest_field(map, _key, ""), do: map
+  defp maybe_put_manifest_field(map, key, value), do: Map.put(map, key, value)
+
+  defp render_landing_manifest_entry(entry) do
+    lines =
+      case {entry["child_id"], entry["workspace"]} do
+        {child_id, workspace} when is_binary(child_id) and child_id != "" ->
+          ["- #{child_id}"]
+          |> maybe_append_manifest_line(workspace, &"  workspace: #{&1}")
+
+        {_absent_child_id, workspace} when is_binary(workspace) and workspace != "" ->
+          ["- workspace: #{workspace}"]
+
+        _absent_identity ->
+          ["-"]
+      end
+
+    lines
+    |> Kernel.++(Enum.flat_map(entry["produced"], &render_landing_manifest_item/1))
+    |> Enum.join("\n")
+  end
+
+  defp render_landing_manifest_item(%{"kind" => "shared_workspace_files"} = item) do
+    paths = item["paths"] || []
+    shown = Enum.take(paths, @landing_manifest_path_cap)
+    overflow = max(length(paths) - length(shown), 0)
+    omitted = Map.get(item, "omitted_paths", 0) + overflow
+    total = length(shown) + omitted
+
+    changed_paths_heading =
+      if omitted > 0 do
+        "  changed paths (showing #{length(shown)} of #{total}; " <>
+          "#{omitted} omitted by per-child cap):"
+      else
+        "  changed paths:"
+      end
+
+    path_lines = Enum.map(shown, &render_landing_manifest_path/1)
+
+    action_lines =
+      case item["next_action"] do
+        %{"paths" => paths} when is_list(paths) and paths != [] ->
+          rendered_paths = Enum.take(paths, @landing_manifest_path_cap)
+          ["  next action: verify and commit paths #{Jason.encode!(rendered_paths)}"]
+
+        _absent_action ->
+          []
+      end
+
+    ["  produced: shared-workspace files", changed_paths_heading] ++ path_lines ++ action_lines
+  end
+
+  defp render_landing_manifest_item(%{"kind" => "virtual_diff"} = item) do
+    virtual_diff_ref = Jason.encode!(item["virtual_diff_ref"])
+    arguments = Jason.encode!(item["next_action"]["arguments"])
+
+    [
+      "  produced: virtual_diff virtual_diff_ref=#{virtual_diff_ref}",
+      "  next action: apply_virtual_diff #{arguments}"
+    ]
+  end
+
+  defp render_landing_manifest_path(%{
+         "path" => path,
+         "resolvable" => true,
+         "exists_in_parent" => exists?,
+         "drift" => drift?
+       }) do
+    "    - #{path} (exists_in_parent=#{exists?}, drift=#{drift?})"
+  end
+
+  defp render_landing_manifest_path(%{
+         "path" => path,
+         "resolvable" => false,
+         "unresolvable" => reason
+       }) do
+    "    - #{path} (unresolvable=#{reason})"
+  end
+
+  defp maybe_append_manifest_line(lines, nil, _formatter), do: lines
+  defp maybe_append_manifest_line(lines, "", _formatter), do: lines
+  defp maybe_append_manifest_line(lines, value, formatter), do: lines ++ [formatter.(value)]
 
   @doc false
   def potentially_integrable?(items) when is_list(items) do

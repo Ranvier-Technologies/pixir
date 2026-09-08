@@ -154,20 +154,56 @@ defmodule Pixir.Tool do
   end
 
   @doc """
-  Token-bound a model-facing string (ADR 0005). Truncates to `max` bytes with an
-  explicit marker so the model knows output was cut.
+  Token-bound a model-facing string (ADR 0005). The integer form preserves the
+  established prefix-byte budget plus an explicit truncation marker.
+
+  Pass `{:total_bytes, max}` when the entire result must fit a byte budget,
+  including its marker. Small total budgets use a shortened marker (or an empty
+  string for zero). Both forms replace invalid UTF-8 and preserve graphemes.
   """
-  @spec truncate(binary(), pos_integer()) :: binary()
-  def truncate(text, max \\ @default_max_output) when is_binary(text) do
+  @spec truncate(binary(), non_neg_integer() | {:total_bytes, non_neg_integer()}) :: binary()
+  def truncate(text, budget \\ @default_max_output)
+
+  def truncate(text, max)
+      when is_binary(text) and is_integer(max) and max >= 0 do
+    text = String.replace_invalid(text)
+
+    if byte_size(text) <= max,
+      do: text,
+      else: take_utf8_prefix(text, max) <> truncation_marker(max, byte_size(text))
+  end
+
+  def truncate(text, {:total_bytes, max})
+      when is_binary(text) and is_integer(max) and max >= 0 do
     text = String.replace_invalid(text)
 
     if byte_size(text) <= max do
       text
     else
-      take_utf8_prefix(text, max) <>
-        "\n…[truncated, showing up to #{max} of #{byte_size(text)} bytes]"
+      total = byte_size(text)
+      short = "\n…[truncated]"
+
+      cond do
+        byte_size(truncation_marker(0, total)) <= max ->
+          # Reserving the marker using max's digit width is conservative even
+          # when the actual prefix budget has fewer digits.
+          prefix_budget = Kernel.max(0, max - byte_size(truncation_marker(max, total)))
+          take_utf8_prefix(text, prefix_budget) <> truncation_marker(prefix_budget, total)
+
+        byte_size(short) <= max ->
+          take_utf8_prefix(text, max - byte_size(short)) <> short
+
+        max >= 3 ->
+          "…"
+
+        true ->
+          String.duplicate(".", max)
+      end
     end
   end
+
+  defp truncation_marker(prefix_bytes, total),
+    do: "\n…[truncated, showing up to #{prefix_bytes} of #{total} bytes]"
 
   defp take_utf8_prefix(text, max), do: do_take_utf8_prefix(text, max, [])
 

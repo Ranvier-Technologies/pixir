@@ -57,7 +57,7 @@ defmodule Pixir.Providers.ResolvedProviderRequest do
       }) do
     map_size(defaults) == 5 and is_integer(max_retries) and max_retries >= 0 and
       is_integer(idle_ms) and idle_ms >= 0 and
-      reasoning_effort in [nil, "low", "medium", "high", "xhigh"] and
+      (is_nil(reasoning_effort) or Pixir.ReasoningEffort.known?(reasoning_effort)) and
       text_verbosity in [nil, "low", "medium", "high"] and
       valid_web_search_default?(web_search)
   end

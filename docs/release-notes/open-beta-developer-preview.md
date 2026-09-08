@@ -6,6 +6,31 @@ Pixir Harness is available as an early developer preview. This note records the 
 preview scope for source installs and the narrow Hex CLI/ACP distribution path. It does
 not define a stable Elixir library contract.
 
+## 0.1.16 Runtime Efficiency And Release Evidence Update
+
+Pixir 0.1.16 retains the CLI/ACP-only Hex distribution contract and the
+developer-preview support boundary:
+
+- Session tree projection folds each selected Log once per query; Anthropic
+  replay uses linear accumulation while preserving request ordering. These are
+  local CPU/I/O improvements, not token reductions or model-quality claims.
+- Model catalogs include Astra; reasoning effort `max` is admitted only for the
+  exact `gpt-6-astra` model on the supported ChatGPT/Codex Responses route.
+  Config, Provider, ACP, Subagents and Workflows share capability checks;
+  account access is not implied by catalog presence.
+- Build identity in diagnostics distinguishes the compiled artifact from the
+  current checkout. File replacement preserves ordinary rwx permissions, and
+  Session tree and timeout tests have stronger lifecycle evidence.
+- Source checkouts provide explicit offline release verification and bounded
+  Monitor parent/child views. Partial views report exact omitted bytes and
+  unknown omitted-event totals without rewriting canonical Logs or inventing
+  complete usage, activity or attempt lineage.
+
+Monitor remains an experimental source-checkout application, not Hex package
+contents or a packaged T3Code integration. Offline
+acceptance does not certify live Provider access, model quality, every OS/client,
+or authorize publication. See the Changelog for the complete release summary.
+
 ## 0.1.4 Runtime Truth And Fanout Honesty Update
 
 Pixir 0.1.4 keeps the same CLI/ACP-only Hex contract and tightens backend
@@ -74,7 +99,7 @@ installation, auth, model, and workflow failures with useful evidence.
 
 ## What Is Supported
 
-- Source install from `https://github.com/Ranvier-Technologies/pixir-harness`.
+- Source install from `https://github.com/Ranvier-Technologies/pixir`.
 - Hex escript installation when the `pixir` package is available, scoped to the same
   CLI/ACP runtime.
 - Terminal CLI through the installed `pixir` escript or a source-built `./pixir`.
@@ -112,8 +137,8 @@ installation, auth, model, and workflow failures with useful evidence.
 The expected first-run proof is:
 
 ```bash
-git clone https://github.com/Ranvier-Technologies/pixir-harness.git
-cd pixir-harness
+git clone https://github.com/Ranvier-Technologies/pixir.git
+cd pixir
 mix deps.get
 mix escript.build
 ./pixir doctor --json

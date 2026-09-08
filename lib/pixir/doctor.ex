@@ -28,8 +28,10 @@ defmodule Pixir.Doctor do
     checks = checks(workspace, opts, config, entry, model)
     failed = Enum.filter(checks, &(&1["status"] == "failed"))
     status = status(checks)
+    {:ok, build_info} = Pixir.BuildInfo.get()
 
     %{
+      "build_info" => build_info,
       "ok" => failed == [],
       "status" => status,
       "proceed" => proceed(status),

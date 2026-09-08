@@ -1,0 +1,3 @@
+{"id":"example-event-1","session_id":"20260906T120000-example","seq":1,"ts":"2026-09-06T12:00:00Z","type":"user_message","data":{"text":"Summarize README.md without editing files."}}
+{"id":"example-event-2","session_id":"20260906T120000-example","seq":2,"ts":"2026-09-06T12:00:01Z","type":"provider_usage","data":{"model":"example-model","usage_available":true,"usage_summary":{"input_tokens":1843,"cached_tokens":1190,"output_tokens":120}}}
+{"id":"example-event-3","session_id":"20260906T120000-example","seq":3,"ts":"2026-09-06T12:00:02Z","type":"assistant_message","data":{"text":"README summary complete."}}

@@ -45,7 +45,7 @@ defmodule Pixir.Tools.RunVirtualCommandsTest do
     assert :ok =
              ToolContract.verify_registered!(
                RunVirtualCommands,
-               %{"commands" => ["mkdir -p contract-should-not-run"]},
+               %{"commands" => ["mkdir -p contract-should-not-run"], "deliverable" => true},
                context
              )
   end
@@ -239,6 +239,121 @@ defmodule Pixir.Tools.RunVirtualCommandsTest do
             }} = run(context, "dry_run", %{"commands" => ["mkdir -p should_not_run"]})
 
     refute File.exists?(Path.join(workspace, "should_not_run"))
+  end
+
+  test "deliverable metadata survives the canonical Log outside the v1 artifact", %{
+    context: context
+  } do
+    for flag <- [true, false] do
+      assert {:ok, result} =
+               run(context, "deliverable_#{flag}", %{
+                 "commands" => ["cp src.txt scratch.txt", "cat scratch.txt"],
+                 "deliverable" => flag
+               })
+
+      assert result["deliverable"] == flag
+      assert result["virtual_diff"]["version"] == 1
+      refute Map.has_key?(result["virtual_diff"], "deliverable")
+      assert Enum.at(result["virtual_diff"]["commands"], 1)["stdout"] == "virtual source\n"
+      assert {:ok, history} = Pixir.Log.fold(context.session_id, workspace: context.workspace)
+
+      event =
+        Enum.find(
+          history,
+          &(&1.type == :tool_result and &1.data["call_id"] == "deliverable_#{flag}")
+        )
+
+      assert event.data["deliverable"] == flag
+      assert event.data["virtual_diff"] == result["virtual_diff"]
+    end
+  end
+
+  test "scratch shares edits within one invocation but the next invocation reimports host files",
+       %{context: context, workspace: workspace} do
+    assert {:ok, first} =
+             run(context, "scratch_write", %{
+               "commands" => [
+                 "sed -i 's/source/changed/' src.txt",
+                 "cp src.txt scratch.txt",
+                 "cat scratch.txt"
+               ]
+             })
+
+    assert List.last(first["virtual_diff"]["commands"])["stdout"] == "virtual changed\n"
+
+    assert {:ok, next} =
+             run(context, "scratch_reset", %{"commands" => ["cat scratch.txt", "cat src.txt"]})
+
+    assert hd(next["virtual_diff"]["commands"])["exit_code"] != 0
+    assert List.last(next["virtual_diff"]["commands"])["stdout"] == "virtual source\n"
+    assert next["virtual_diff"]["changes"] == []
+    assert next["output"] =~ "next call reimports host files"
+    assert next["output"] =~ "Logs/artifacts persist on disk"
+    assert File.read!(Path.join(workspace, "src.txt")) == "virtual source\n"
+    refute File.exists?(Path.join(workspace, "scratch.txt"))
+  end
+
+  test "malformed deliverable flags and model limits are denied in execution and dry run", %{
+    context: context
+  } do
+    for flag <- [nil, "true", 1, [], %{}], dry_run <- [false, true] do
+      assert {:error, %{error: %{kind: :invalid_args}}} =
+               run(Map.put(context, :dry_run, dry_run), "invalid_flag", %{
+                 "commands" => [],
+                 "deliverable" => flag
+               })
+    end
+
+    assert {:error, %{error: %{kind: :invalid_args}}} =
+             run(context, "model_limits", %{"commands" => [], "limits" => %{}})
+  end
+
+  test "large first stdout and display cannot hide later command outcomes", %{
+    context: context,
+    workspace: workspace
+  } do
+    File.write!(Path.join(workspace, "src.txt"), String.duplicate("huge output\n", 3_000))
+
+    assert {:ok, result} =
+             run(context, "large_feedback", %{
+               "commands" => [
+                 "cat src.txt # " <> String.duplicate("long", 5_000),
+                 "cat missing.txt",
+                 "cp src.txt copy.txt"
+               ]
+             })
+
+    output = result["output"]
+    assert byte_size(output) <= 16_000
+    assert output =~ "cmd_1"
+    assert output =~ "cmd_2"
+    assert output =~ "$ cat missing.txt (exit 1)"
+    assert output =~ "cmd_3"
+    assert output =~ "truncated"
+    assert output =~ "…[truncated, showing up to "
+    {status_pos, _} = :binary.match(output, "cmd_3")
+    {stdout_pos, _} = :binary.match(output, "huge output")
+    assert status_pos < stdout_pos
+    assert byte_size(hd(result["virtual_diff"]["commands"])["display"]) > 16_000
+  end
+
+  test "oversized status lists report omitted command and excerpt counts", %{context: context} do
+    context = put_in(context, [:virtual_overlay, :limits], %{"max_virtual_commands" => 300})
+
+    assert {:ok, result} =
+             run(context, "many_statuses", %{"commands" => List.duplicate("echo ok", 300)})
+
+    assert byte_size(result["output"]) <= 16_000
+    assert result["output"] =~ "omitted_commands="
+    assert result["output"] =~ "omitted_excerpts="
+    assert result["output"] =~ "truncated_displays="
+    [_, omitted] = Regex.run(~r/omitted_commands=(\d+)/, result["output"])
+    omitted = String.to_integer(omitted)
+    assert omitted > 0
+    assert length(Regex.scan(~r/^cmd_\d+ \$/m, result["output"])) + omitted == 300
+    [_, omitted_excerpts] = Regex.run(~r/omitted_excerpts=(\d+)/, result["output"])
+    assert String.to_integer(omitted_excerpts) > 0
+    assert length(result["virtual_diff"]["commands"]) == 300
   end
 
   defp run(context, call_id, args) do

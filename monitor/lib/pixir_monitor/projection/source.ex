@@ -12,7 +12,9 @@ defmodule PixirMonitor.Projection.Source do
 
   Detail fetch discovers child Session ids from canonical parent evidence and lazily
   folds only those Logs before invoking the same Presenter projector used by
-  fixtures. Workspace paths are server configuration and are never accepted from
+  fixtures. Selected child Events retain per-child recomputable selection metadata;
+  a readable prefix/tail sample is not a complete or a missing child Log.
+  Workspace paths are server configuration and are never accepted from
   browser ids.
 
   Detail fetch is also the polling caller for liveness purposes: it observes the
@@ -98,12 +100,16 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
   Bounded filesystem and Pixir-API input provider for the runtime Presenter source.
 
   It rejects symlinked/non-regular Logs, confines reads beneath the configured
-  workspace, limits inventory size and bytes, and discovers detail children only from
-  canonical parent `subagent_event` evidence. Inventory rows and lazy detail inputs
-  pass through the same fail-closed parent-evidence validation.
+  workspace, limits inventory size and read bytes, and discovers detail children
+  only from canonical parent `subagent_event` evidence. Oversized parent Logs use
+  complete prefix/tail records, with missing-middle limitations. Inventory rows
+  and lazy detail inputs share gap-aware lifecycle validation: complete-prefix
+  linkage is retained, while the tail begins with unknown linkage and then obeys
+  strict contiguous-segment rules. Unknown-lineage records remain evidence, not
+  attempts with invented starts, ordinals, or predecessors.
   """
 
-  alias PixirMonitor.Projection.{ActivityLedger, Advisory, AttemptStatus, Builder, Gate, Temporal, UnitIdentity, WorkflowGraph}
+  alias PixirMonitor.Projection.{ActivityLedger, Advisory, AttemptStatus, BoundedLog, Builder, Gate, PartialLifecycle, Temporal, UnitIdentity, WorkflowGraph}
 
   require Logger
 
@@ -125,9 +131,9 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
           id = entry.id
 
           case parent_history(id, workspace, opts) do
-            {:ok, history} ->
+            {:ok, history, selection} ->
               if run_parent?(history) do
-                case list_row(id, history, workspace, opts) do
+                case list_row(id, history, selection, workspace, opts) do
                   {:ok, row} -> {[row | rows], dropped, non_parent_logs}
                   {:error, error} -> {rows, [dropped_log(entry, error, opts) | dropped], non_parent_logs}
                 end
@@ -231,12 +237,24 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
   def fetch_input(id, opts) do
     with {:ok, workspace} <- workspace(opts),
          :ok <- safe_id(id),
-         {:ok, parent} <- parent_history(id, workspace, opts),
+         {:ok, parent, selection} <- parent_history(id, workspace, opts),
          true <- run_parent?(parent) || {:error, not_found_or_dropped_parent(id, parent, workspace, opts)},
-         :ok <- validate_parent_projection(parent),
-         {:ok, children, missing?} <- child_histories(parent, workspace, opts) do
-      diagnostics = diagnostics(id, workspace)
-      owner = owner_state(diagnostics)
+         :ok <- validate_parent_projection(parent, selection),
+         {:ok, children, child_selections, missing?} <- child_histories(parent, workspace, opts) do
+      # Manager diagnostics may hydrate full parent AND child Logs. A bounded
+      # selection must never trigger that unbounded secondary read path.
+      partial_children? = Enum.any?(child_selections, fn {_id, selected} -> BoundedLog.incomplete?(selected) end)
+      diagnostics = if BoundedLog.incomplete?(selection) or partial_children? or missing?, do: nil, else: diagnostics(id, workspace)
+
+      owner =
+        if is_nil(diagnostics) and not BoundedLog.incomplete?(selection) and (partial_children? or missing?) do
+          # Describe this request's bounded snapshot capability, not a probe of
+          # another runtime. ActivityLedger can still establish durable growth.
+          %{"state" => "snapshot_only", "reachable" => false, "observation" => "bounded_log_only"}
+        else
+          owner_state(diagnostics)
+        end
+
       parent_events = Enum.map(parent, &portable_event/1)
 
       {:ok,
@@ -248,15 +266,18 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
            "delegate_snapshot" => nil,
            "parent_log" => parent_events,
            "parent_log_origin" => "workspace_log",
+           "parent_log_selection" => selection,
            "child_logs" => children,
+           "child_log_selections" => child_selections,
            "runtime_diagnostics" => diagnostics,
            "owner_state" => owner,
            "activity_evidence" => activity_evidence(workspace, id, parent_events),
            "evidence_mirror" => nil
          },
          "completeness" => %{
-           "parent_log" => "complete_through_observed_at",
-           "child_logs" => if(missing?, do: "explicitly_missing", else: "complete_through_observed_at"),
+           "parent_log" =>
+             if(selection["partial"], do: "partial_prefix_tail", else: if(selection["incomplete_trailing_bytes"] > 0, do: "partial_trailing_append", else: "complete_through_observed_at")),
+           "child_logs" => child_completeness(child_selections, missing? or selection["partial"]),
            "runtime_diagnostics" => if(diagnostics, do: "complete_snapshot", else: "unavailable")
          }
        }}
@@ -381,14 +402,6 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
     end
   end
 
-  defp require_sessions_directory(workspace) do
-    case sessions_directory(workspace) do
-      {:ok, directory} -> {:ok, directory}
-      :absent -> {:error, :enoent}
-      {:error, _} = error -> error
-    end
-  end
-
   defp directory_component(path, component) do
     case File.lstat(path) do
       {:ok, %File.Stat{type: :directory}} ->
@@ -418,55 +431,49 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
   end
 
   defp parent_history(id, workspace, opts) do
+    log_opts = opts |> Keyword.put(:workspace, workspace) |> Keyword.put_new(:max_log_bytes, @default_max_bytes) |> Keyword.put_new(:max_events, @default_max_events)
+
     with :ok <- safe_id(id),
-         {:ok, _directory} <- require_sessions_directory(workspace),
-         {:ok, _path} <- safe_log(id, workspace, opts),
-         {:ok, history} <- Pixir.Log.fold(id, workspace: workspace),
+         {:ok, %{history: history, selection: selection}} <- Pixir.Log.fold_bounded(id, log_opts),
          :ok <- event_limit(history, opts) do
-      {:ok, history}
+      {:ok, history, selection}
     else
-      {:error, :enoent} -> {:error, not_found(id)}
-      {:error, %{kind: _, message: _}} = error -> error
-      {:error, reason} -> error_with_reason("run_log_failed", "Session Log could not be folded", %{run_id: id}, reason)
-    end
-  end
+      {:error, %{error: %{kind: :log_not_found}}} ->
+        {:error, not_found(id)}
 
-  defp safe_log(id, workspace, opts) do
-    path = Pixir.Log.path(id, workspace: workspace) |> Path.expand()
-    root = Path.join([workspace, ".pixir", "sessions"]) |> Path.expand()
+      {:error, %{error: _} = reason} ->
+        BoundedLog.error(reason, id)
 
-    if not String.starts_with?(path, root <> "/") do
-      error("path_escape_rejected", "Session Log path escapes the configured workspace", %{run_id: id})
-    else
-      max_bytes = Keyword.get(opts, :max_log_bytes, @default_max_bytes)
+      {:error, %{kind: _, message: _} = reason} ->
+        {:error, Map.update(reason, :details, %{run_id: id}, &Map.put(&1, :run_id, id))}
 
-      case File.lstat(path) do
-        {:ok, %File.Stat{type: :regular, size: size}} ->
-          if size <= max_bytes,
-            do: {:ok, path},
-            else: error("run_log_limit", "Session Log exceeds the configured byte bound", %{run_id: id, bytes: size})
-
-        {:ok, %File.Stat{type: :symlink}} ->
-          error("symlink_rejected", "Symlinked Session Logs are not readable by the monitor", %{run_id: id})
-
-        {:ok, _} ->
-          error("run_log_invalid", "Session Log is not a regular file", %{run_id: id})
-
-        {:error, reason} ->
-          {:error, reason}
-      end
+      {:error, reason} ->
+        error_with_reason("run_log_failed", "Session Log could not be folded", %{run_id: id}, reason)
     end
   end
 
   defp child_histories(parent, workspace, opts) do
     ids = parent |> Enum.filter(&(&1.type == :subagent_event)) |> Enum.map(& &1.data["child_session_id"]) |> Enum.filter(&is_binary/1) |> Enum.uniq()
 
-    Enum.reduce_while(ids, {:ok, %{}, false}, fn id, {:ok, acc, missing} ->
+    Enum.reduce(ids, {:ok, %{}, %{}, false}, fn id, {:ok, logs, selections, missing} ->
       case parent_history(id, workspace, opts) do
-        {:ok, events} -> {:cont, {:ok, Map.put(acc, id, Enum.map(events, &portable_event/1)), missing}}
-        {:error, _} -> {:cont, {:ok, Map.put(acc, id, nil), true}}
+        {:ok, events, selection} ->
+          {:ok, Map.put(logs, id, Enum.map(events, &portable_event/1)), Map.put(selections, id, selection), missing}
+
+        {:error, _} ->
+          {:ok, Map.put(logs, id, nil), selections, true}
       end
     end)
+  end
+
+  defp child_completeness(_selections, true), do: "explicitly_missing"
+
+  defp child_completeness(selections, false) do
+    cond do
+      Enum.any?(selections, fn {_id, selection} -> selection["partial"] == true end) -> "partial_prefix_tail"
+      Enum.any?(selections, fn {_id, selection} -> BoundedLog.incomplete?(selection) end) -> "partial_trailing_append"
+      true -> "complete_through_observed_at"
+    end
   end
 
   defp diagnostics(id, workspace) do
@@ -502,7 +509,8 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
     %{"state" => if(reachable, do: "live_delegate_owner", else: "snapshot_only"), "reachable" => reachable}
   end
 
-  defp list_row(id, history, workspace, opts) do
+  defp list_row(id, history, selection, workspace, opts) do
+    {:ok, selection_limits} = BoundedLog.limitations(selection)
     events = Enum.map(history, &portable_event/1)
     workflow = Enum.find(events, &(&1["type"] == "workflow_event" and get_in(&1, ["data", "kind"]) == "workflow_started"))
     finish = events |> Enum.filter(&(&1["type"] == "workflow_event" and get_in(&1, ["data", "kind"]) == "workflow_finished")) |> List.last()
@@ -531,6 +539,7 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
         do: list_execution_state(get_in(finish, ["data", "status"])),
         else: list_execution_state(aggregate_subagent_state(latest_subagents))
 
+    state = if selection["partial"] and (is_nil(finish) or finish["seq"] < selection["tail_first_seq"]), do: "unknown", else: state
     terminal = state in ~w(completed partial failed timed_out cancelled detached closed held)
 
     planned =
@@ -571,7 +580,7 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
       "strategy" => if(workflow, do: "workflow", else: "subagents"),
       "execution" => %{"state" => state, "terminal" => terminal},
       "liveness" => list_liveness(terminal),
-      "source" => %{"mode" => "reconstructed", "freshness" => if(terminal, do: "terminal", else: "unknown")},
+      "source" => %{"mode" => "reconstructed", "freshness" => if(terminal and not selection["partial"], do: "terminal", else: "unknown")},
       "counts" => %{"planned_units" => planned, "completed_units" => completed, "attention_units" => attention},
       "attention" => %{
         "basis" => "parent_log_only",
@@ -582,12 +591,22 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
       "mutation" => %{"status" => "unknown", "observed_semantics" => "unknown"},
       "children" => list_children(subs, workflow_index),
       "latest_at" => latest_at,
-      "temporal" => Temporal.row_temporal(workflow, finish, subs, latest_at, all_terminal?),
+      "temporal" => Temporal.row_temporal(workflow, if(selection["partial"] and not terminal, do: nil, else: finish), subs, latest_at, all_terminal? and not selection["partial"]),
       "post_terminal_child_activity" => list_post_terminal_child_activity(events, terminal, workspace, opts)
     }
 
+    row =
+      if selection_limits == [] do
+        row
+      else
+        row
+        |> put_in(["source", "limitations"], selection_limits)
+        |> put_in(["counts", "completed_units"], 0)
+        |> put_in(["post_terminal_child_activity"], %{"state" => "undetermined", "basis" => "child_evidence_unavailable", "event_count" => nil, "latest_event_at" => nil})
+      end
+
     with :ok <- safe_id(id),
-         :ok <- validate_parent_projection(history) do
+         :ok <- validate_parent_projection(history, selection) do
       {:ok, row}
     end
   end
@@ -626,13 +645,16 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
 
     Enum.reduce_while(ids, {[], false}, fn id, {timestamps, _unavailable} ->
       case parent_history(id, workspace, opts) do
-        {:ok, child} ->
+        {:ok, child, %{"partial" => false, "incomplete_trailing_bytes" => 0}} ->
           later =
             child
             |> Enum.map(& &1.ts)
             |> Enum.filter(&(is_binary(&1) and after_boundary?(&1, boundary_at)))
 
           {:cont, {timestamps ++ later, false}}
+
+        {:ok, _child, _partial} ->
+          {:halt, {[], true}}
 
         {:error, _reason} ->
           {:halt, {[], true}}
@@ -680,7 +702,7 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
   defp list_liveness(false = _terminal),
     do: %{"state" => "unobserved", "reachable" => false, "basis" => "parent_log_only"}
 
-  defp validate_parent_projection(history) do
+  defp validate_parent_projection(history, selection) do
     events = Enum.map(history, &portable_event/1)
     workflow = Enum.find(events, &(&1["type"] == "workflow_event" and get_in(&1, ["data", "kind"]) == "workflow_started"))
     subs = Enum.filter(events, &subagent_lifecycle_event?/1)
@@ -693,12 +715,27 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
     with :ok <- validate_parent_workflow_identity(workflow),
          :ok <- validate_parent_graph_steps(planned_steps),
          :ok <- validate_parent_subagent_components(subs),
-         :ok <- validate_parent_lifecycles(subs),
+         :ok <- validate_selected_lifecycles(subs, selection, &get_in(&1, ["data", "subagent_id"]), fn -> validate_parent_lifecycles(subs) end),
          :ok <- validate_parent_constraints(events, raw_advisories, workflow_index),
-         :ok <- validate_parent_unit_lifecycles(subs, workflow_index) do
+         :ok <- validate_selected_lifecycles(subs, selection, &list_unit_id(&1, workflow_index), fn -> validate_parent_unit_lifecycles(subs, workflow_index) end) do
       :ok
     end
   end
+
+  defp validate_selected_lifecycles(events, %{"partial" => true} = selection, identity, _complete) do
+    events
+    |> Enum.group_by(identity)
+    |> Map.delete(nil)
+    |> Map.values()
+    |> Enum.reduce_while(:ok, fn rows, :ok ->
+      case PartialLifecycle.fold(rows, selection) do
+        {:ok, _segments} -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp validate_selected_lifecycles(_events, _selection, _identity, complete), do: complete.()
 
   defp list_advisory(fold, workflow_index) do
     advisory_event = fold.advisory_event || fold.latest
@@ -1321,15 +1358,15 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
   defp stringify(value), do: value
   defp not_found(id), do: %{kind: "run_not_found", message: "Run was not found", details: %{run_id: id}}
 
-  # A child Session Log can fold while its parent was disqualified by the
-  # existing run_log_limit byte bound. That is already-known filesystem
-  # evidence from the child's own Log plus the parent's lstat; it is not a
-  # new inventory policy. Garbage ids and children of projectable parents
-  # stay plain run_not_found so the presenter can split those classes.
+  # A child Session Log can fold while its parent's selected evidence cannot
+  # fit complete records inside the byte budget. Recheck the parent through the
+  # bounded reader, not size alone: an oversized but projectable parent is not
+  # a dropped parent. Selected child declarations resolve through list rows.
+  # This does not add a new inventory policy or an index.
   defp not_found_or_dropped_parent(id, history, workspace, opts) do
     case parent_session_id_from_history(history) do
       parent_id when is_binary(parent_id) and parent_id != id ->
-        case Pixir.SessionId.valid?(parent_id) && safe_log(parent_id, workspace, opts) do
+        case Pixir.SessionId.valid?(parent_id) && parent_history(parent_id, workspace, opts) do
           {:error, %{kind: "run_log_limit"}} ->
             %{
               kind: "run_not_found",

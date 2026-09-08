@@ -80,7 +80,10 @@ defmodule Pixir.DelegateTest do
                wait_outcome: wait_outcome
              )
 
-    assert String.ends_with?(payload["summary"], Subagents.reverification_directive())
+    assert payload["summary"] ==
+             "delegate completed.\n\n" <> Subagents.reverification_directive()
+
+    refute Map.has_key?(payload, "landing_manifest")
     assert [%{"summary" => ^child_summary}] = payload["children"]
     refute hd(payload["children"])["summary"] =~ Subagents.reverification_directive()
   end

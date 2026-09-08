@@ -662,11 +662,11 @@ function checkChildResolution(seam) {
 
   const cases = [
     // Exact match carrying a unit: one candidate, unit preserved verbatim.
-    {name: "resolved_with_unit", id: "child-a", candidates: [{runId: "parent-with-unit", unitId: "step:review"}]},
+    {name: "resolved_with_unit", id: "child-a", candidates: [{runId: "parent-with-unit", unitId: "step:review", childSessionId: "child-a"}]},
     // Exact match with no unit identified in parent evidence: unitId is null.
-    {name: "resolved_without_unit", id: "child-b", candidates: [{runId: "parent-without-unit", unitId: null}]},
+    {name: "resolved_without_unit", id: "child-b", candidates: [{runId: "parent-without-unit", unitId: null, childSessionId: "child-b"}]},
     // Ambiguity: BOTH observers are offered, in held-inventory order, none chosen.
-    {name: "ambiguous", id: "child-shared", candidates: [{runId: "parent-with-unit", unitId: "step:one"}, {runId: "parent-second-observer", unitId: "step:two"}]},
+    {name: "ambiguous", id: "child-shared", candidates: [{runId: "parent-with-unit", unitId: "step:one", childSessionId: "child-shared"}, {runId: "parent-second-observer", unitId: "step:two", childSessionId: "child-shared"}]},
     // Unknown id: no candidates at all — the dead end must stay unchanged.
     {name: "unresolved", id: "child-missing", candidates: []},
     // A parent's OWN run id is not a child observation of itself.
@@ -684,7 +684,7 @@ function checkChildResolution(seam) {
   for (const testCase of cases) {
     const observed = resolve(testCase.id, rows);
     if (!Array.isArray(observed)) throw failure("child_resolution_shape", "resolveParentObservedChild did not return an array", "child_resolution", {case: testCase.name});
-    const simplified = observed.map((candidate) => ({runId: candidate.runId, unitId: candidate.unitId ?? null}));
+    const simplified = observed.map((candidate) => ({runId: candidate.runId, unitId: candidate.unitId ?? null, childSessionId: candidate.childSessionId}));
     if (JSON.stringify(simplified) !== JSON.stringify(testCase.candidates)) {
       throw failure("child_resolution_broken", `resolveParentObservedChild diverged for ${testCase.name}`, "child_resolution", {case: testCase.name, observed: simplified, expected: testCase.candidates});
     }
@@ -978,6 +978,9 @@ function checkRedProof(seam) {
     return rows.flatMap((row) => (Array.isArray(row.children) ? row.children : []).filter((child) => typeof child.session_id === "string" && child.session_id.startsWith(needle)).map((child) => ({runId: row.id, unitId: child.unit_id ?? null, childSessionId: child.session_id})));
   }});
   families += expectRed("child_resolution", "child_resolution_broken", fuzzyResolver, (tampered) => checkChildResolution(tampered));
+  const forgedChildIdentity = Object.freeze({...seam, resolveParentObservedChild: (...args) =>
+    seam.resolveParentObservedChild(...args).map((candidate) => ({...candidate, childSessionId: "wrong-child"}))});
+  families += expectRed("child_resolution_identity", "child_resolution_broken", forgedChildIdentity, (tampered) => checkChildResolution(tampered));
   // The three glossary mutations that survived the source greps, each proven
   // to go red here: undefined-for-null, an alphabetically re-sorted concern
   // order, and a corpus handed back unfrozen.

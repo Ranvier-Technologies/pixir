@@ -16,13 +16,22 @@ file only maps that doctrine onto Codex mechanics.
 Codex has no `!` command preprocessing. Before any delegation, explicitly choose
 and report the Pixir binary you will drive:
 
-1. Resolve the binary as an absolute path. Prefer an intentional repo-local
-   source binary (`./pixir` in the target checkout) over a PATH hit; stale PATH
-   binaries are a known failure mode.
-2. Run `<PIXIR_BIN> --version` and `<PIXIR_BIN> doctor --json`.
+1. Use the shared resolver at
+   `../pixir-delegate/scripts/resolve-binary.sh`. A nonempty `PIXIR_BIN` wins:
+   validate it as an executable file and resolve it to an absolute path
+   (relative paths use the caller workspace; bare names use PATH). An invalid
+   override is an error, never a fallback. Otherwise prefer executable
+   `./pixir` in the **caller workspace**, not the skill checkout. If a local
+   candidate exists but is nonexecutable, a directory, or a dangling symlink,
+   stop. Only when there is no local candidate may PATH `pixir` be used.
+   An empty override behaves like an unset one.
+2. Run `"$PIXIR_BIN" --version` and `"$PIXIR_BIN" doctor --json` using the
+   resolved absolute path. Quote it so paths with spaces work.
 3. In the doctor JSON, find the check with `"id": "source_install_binary"` and
-   report its status plus details path; do not treat a PATH version string as
-   proof that the source checkout binary is current.
+   report its status plus details path. That check reports build **existence**,
+   not build freshness: a passed check or a version string does not prove the
+   binary includes current checkout edits. Establish freshness separately
+   from build evidence; request an intentional rebuild when needed.
 4. Classify readiness exactly as the core says:
    - `ready`: may delegate.
    - `ready_with_warnings`: inspect every non-passed check and judge. A missing
@@ -32,9 +41,27 @@ and report the Pixir binary you will drive:
 5. Record: absolute binary path, version, doctor status, source_install_binary
    check, and readiness classification for the closure report.
 
+Discover the loaded sibling `pixir-delegate` skill directory and set
+`PIXIR_DELEGATE_SKILL_DIR` to its absolute path; do not hardcode a user's
+checkout into tracked instructions. From the caller workspace, the Bash
+preflight is:
+
+```bash
+source "$PIXIR_DELEGATE_SKILL_DIR/scripts/resolve-binary.sh"
+PIXIR_BIN="$(pixir_resolve_binary)" || exit 2
+pixir_report_binary
+"$PIXIR_BIN" doctor --json
+```
+
+`pixir_report_binary` runs version and prints the same absolute-path diagnostic
+as fanout and steer. The resolver does not change CWD or PATH. Never change to
+the skill checkout, auto-build, auto-install, or alter global PATH. Every
+`<PIXIR_BIN>` placeholder below means the quoted resolved executable; keep the
+caller workspace for session lookup and relative artifacts.
+
 Doctor status and the `source_install_binary` check are part of the runtime
 contract (`lib/pixir/doctor.ex`; verify current shapes with
-`pixir doctor --json` rather than line numbers).
+`"$PIXIR_BIN" doctor --json` rather than line numbers).
 
 ## Codex command posture
 

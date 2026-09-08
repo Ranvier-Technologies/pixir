@@ -1,8 +1,10 @@
 defmodule Pixir.Tools.Registry do
   @moduledoc """
-  Compile-time map of tool name → module for the v0.1 built-ins (`read`, `write`,
-  `bash`). The Executor resolves calls through `fetch/1`; the Provider advertises the
-  catalogue via `responses_specs/0`.
+  Compile-time registry mapping tool names to modules. The registry map is the source
+  of truth for the available tool catalogue. The Executor resolves calls through
+  `fetch/1`; Providers advertise the catalogue through the tool-spec functions.
+  Provider-hosted tools (such as web search) execute on the Provider side and are
+  not Registry entries.
   """
 
   alias Pixir.Provider

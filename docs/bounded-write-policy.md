@@ -217,36 +217,20 @@ variable, and no global setting for it; a `spawn_agent` call carrying a
 `write_policy` is denied with `child_policy_override_unsupported`, and narrowing
 a policy to a write set preserves the allowlist rather than widening it.
 
-## Resuming: how two allowlists combine
+## Resuming: the pinned mandate is immutable
 
-A `resume` run may carry its own policy. The restored (durable) policy and the
-requested one are intersected, and the result governs the resumed session.
-
-- `verify` commands intersect by exact membership: a command survives only if
-  both sides listed it. This is the authorization boundary — authorization
-  matches `verify` byte-equal — so a command the durable side alone would have
-  rejected can never become runnable after a resume.
-- `verify_prefixes` intersect by **tokenwise coverage**, not as exact strings.
-  A prefix survives only when it is covered by the durable side: some durable
-  prefix must be a leading run of its tokens, which means it admits a subset of
-  what durable already admitted. The same filter runs against the requested
-  side, so every surviving prefix is covered by both. Durable `mix` against
-  requested `mix format` therefore keeps `mix format`, the narrower of the two;
-  requested `mix` against durable `mix format` also keeps `mix format`, because
-  the bare `mix` is not covered by the durable declaration.
-- When only one side declares an allowlist, that declaration survives: the
-  other side was normalized under the built-in default, and every surviving
-  command was admitted by both.
-- The shell is disabled when the **`verify` intersection is empty** — there is
-  nothing left to authorize. An empty prefix intersection is not the trigger and
-  cannot occur on its own: a command both sides admitted was covered by a prefix
-  on each side, and two prefixes covering the same command are leading runs of
-  it, so one always covers the other.
-
-Coverage is what keeps the restricted policy re-admissible. A restricted policy
-is re-normalized before it takes effect, so surviving prefixes must still cover
-every surviving command; comparing prefixes as exact strings would drop `mix`
-and `mix format` as unrelated and strand a command both sides had authorized.
+A Session's bounded-write mandate is pinned in its Log. Resuming without
+`--write-policy` silently restores that mandate; re-supplying a policy with the same
+canonical hash is also accepted. The comparison covers the canonical policy object, so
+allowlist order, duplicate entries, the policy file's workspace-relative filename, and
+`metadata.id` all participate in the hash: a reordered or renamed but otherwise
+semantically identical file refuses fail-closed, and the honest path is to resume without
+the flag. If the supplied hash differs for any reason, Pixir returns an `invalid_args`
+error naming both hashes: resume again without the flag to use the pinned mandate, or
+start a fresh Session with the new policy. A Session created without a pinned mandate
+may still receive `--write-policy` as a one-Turn bounding overlay; that overlay is not
+persisted, so its next flagless resume returns to the Session's durable unbounded
+posture.
 
 ## Filters that always apply
 

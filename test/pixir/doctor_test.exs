@@ -19,6 +19,11 @@ defmodule Pixir.DoctorTest do
       )
 
     assert result["ok"] == true
+    assert result["build_info"]["version"] == Pixir.version()
+    assert result["build_info"]["os_pid"] == System.pid()
+    assert result["build_info"]["runtime_elixir"] == System.version()
+    assert result["build_info"]["source_dirty"] in [true, false, "unknown"]
+    refute Jason.encode!(result["build_info"]) =~ workspace
     assert result["status"] == "ready_with_warnings"
     assert result["proceed"] == "judge"
     assert result["judge_checks"] == ["auth"]

@@ -54,6 +54,41 @@ Requires Elixir `~> 1.20`. From a source checkout, every `pixir ...` command
 below works as `./pixir ...` from the repo root — or put it on your PATH first
 with `mix escript.install --force`.
 
+## Developer verification (source checkout)
+
+Install `uv` first. Frontend scopes also require the Node.js/pnpm toolchain pinned in
+`.github/workflows/frontend.yml`. After installing each application's dependencies, run the offline gates through
+one scoped entry point:
+
+```sh
+uv run python bin/verify --dry-run --json
+uv run python bin/verify --scope core --scope monitor --scope site --json
+uv run python bin/verify --scope core --quick --json
+uv run python bin/verify --release --dry-run --json
+```
+
+The supported applications are Core, Monitor and site. The default selects all
+present applications; explicitly selecting an absent application fails instead of
+silently skipping. Full mode runs tests and builds; quick mode uses
+stale Elixir tests and omits builds, so it is not full acceptance. Commands have bounded
+timeouts and keep their output plus a JSON manifest under `/tmp/codex-runs/verify-*`.
+The verifier rejects out-of-date frontend dependencies instead of allowing pnpm to
+auto-install them. No dependencies are installed or Provider calls made by the verifier. Live smoke tests
+remain separate and opt-in. Frontend CI uses this same entry point and uploads its logs.
+
+`--release` adds offline acceptance checks for the selected applications, including
+docs, verifier tests, and Monitor's real five-minute SSE lifecycle. Set
+`PIXIR_MONITOR_BROWSER_BIN` to an absolute installed Chrome/Chromium executable when
+selecting Monitor. The manifest distinguishes requested, executed, completed, and
+omitted applications; this is not live-model, cross-platform, or publication approval.
+Frontend release scopes require and report Node 24.x and pnpm 11.5.0 before running
+application commands; mismatches fail explicitly without changing the toolchain.
+
+`doctor --json` exposes compiled `build_info` alongside the serving process's versions
+and PID. ACP initialization and live Delegate daemon status expose the same identity.
+Source revisions may be `unknown` for archive builds; `--version` remains the semantic
+version, and a successful `source_install_binary` check proves existence, not freshness.
+
 ## Authenticate
 
 Use ChatGPT subscription login:
@@ -74,6 +109,28 @@ validated endpoint, then run `mix pixir.smoke.open_responses --dry-run --json` b
 the opt-in live two-call probe. The profile is reasoning-free, does not enable hosted
 tools, preserves `store: false`, and makes only a bounded interoperability claim. See
 [`docs/open-beta-quickstart.md`](docs/open-beta-quickstart.md#open-responses-profile-experimental).
+
+## Model-aware reasoning effort
+
+Reasoning effort is unset by default; `high` and the established
+`low`/`medium`/`high`/`xhigh` behavior are unchanged. Exact `gpt-6-astra` also accepts
+`max` on Pixir's ChatGPT/Codex Responses backend (HTTP/SSE or WebSocket, with the
+existing authentication policy):
+
+```json
+{"model": "gpt-6-astra", "reasoning": {"effort": "max"}}
+```
+
+Use that in `~/.pixir/config.json`. Config preserves `max` intent and warns about
+incompatible model/backend combinations rather than silently dropping it. Effective
+request overrides are checked before authentication or transport. Unknown models,
+custom providers/routes, Anthropic, and the reasoning-free `open_responses` profile
+do not gain `max` support. ACP advertises `max` only for compatible selections and
+rejects an incompatible model switch while `max` is sticky; choose `high` or
+`default` first. `session/set_config_option` remains canonical; `session/set_model`
+is compatibility-only. These are local admission/request-shape guarantees, not a
+claim of live backend acceptance. The source checkout includes the detailed note
+at `docs/release-notes/model-aware-reasoning-effort.md`.
 
 ## First Run
 

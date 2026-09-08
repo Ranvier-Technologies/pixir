@@ -211,6 +211,149 @@ defmodule Pixir.ACP.ServerTest do
     %{ws: ws, out: out}
   end
 
+  test "Astra max selector and sticky model switches agree", %{out: out, ws: ws} do
+    server = start_server(out)
+
+    Server.feed(
+      server,
+      Jason.encode!(%{
+        "jsonrpc" => "2.0",
+        "id" => 610,
+        "method" => "session/new",
+        "params" => %{"cwd" => ws}
+      })
+    )
+
+    sid = await_response(out, 610)["result"]["sessionId"]
+
+    for {id, config, value} <- [{611, "model", "gpt-6-astra"}, {612, "reasoning_effort", "max"}] do
+      Server.feed(
+        server,
+        Jason.encode!(%{
+          "jsonrpc" => "2.0",
+          "id" => id,
+          "method" => "session/set_config_option",
+          "params" => %{"sessionId" => sid, "configId" => config, "value" => value}
+        })
+      )
+
+      response = await_response(out, id)
+      refute response["error"]
+      effort = Enum.find(response["result"]["configOptions"], &(&1["id"] == "reasoning_effort"))
+      assert %{"name" => "max", "value" => "max"} in effort["options"]
+    end
+
+    for {id, method, extra} <- [
+          {613, "session/set_model", %{"modelId" => "gpt-5.5"}},
+          {614, "session/set_config_option", %{"configId" => "model", "value" => "gpt-5.5"}}
+        ] do
+      Server.feed(
+        server,
+        Jason.encode!(%{
+          "jsonrpc" => "2.0",
+          "id" => id,
+          "method" => method,
+          "params" => Map.put(extra, "sessionId", sid)
+        })
+      )
+
+      assert await_response(out, id)["error"]["code"] == -32602
+      state = :sys.get_state(server)
+      assert state.session_models[sid] == "gpt-6-astra"
+      assert state.session_efforts[sid] == "max"
+    end
+  end
+
+  defp effort_rpc(server, out, id, method, params) do
+    Server.feed(
+      server,
+      Jason.encode!(%{"jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params})
+    )
+
+    await_response(out, id)
+  end
+
+  test "max selectors honor effective backend and explicit provider overrides", %{ws: ws} do
+    for {index, opts} <-
+          Enum.with_index([
+            [provider_opts: [model: "gpt-5.5"]],
+            [
+              provider_opts: [
+                model: "gpt-6-astra",
+                responses_backend: official_responses_backend()
+              ]
+            ],
+            [provider_opts: [model: "gpt-6-astra", base_url: "https://example.invalid"]],
+            [provider: CapturingProvider, provider_opts: [model: "gpt-6-astra"]]
+          ])
+          |> Enum.map(fn {opts, index} -> {index, opts} end) do
+      {:ok, out} = StringIO.open("")
+      server = start_server(out, [id: {:effort_backend, index}] ++ opts)
+      response = effort_rpc(server, out, 1, "session/new", %{"cwd" => ws})["result"]
+      effort = Enum.find(response["configOptions"], &(&1["id"] == "reasoning_effort"))
+      refute Enum.any?(effort["options"], &(&1["value"] == "max"))
+
+      result =
+        effort_rpc(server, out, 2, "session/set_config_option", %{
+          "sessionId" => response["sessionId"],
+          "configId" => "reasoning_effort",
+          "value" => "max"
+        })
+
+      assert result["error"]["code"] == -32602
+    end
+  end
+
+  test "metadata and runtime changes cannot bypass sticky max compatibility", %{out: out, ws: ws} do
+    transport = fn _, _, _ -> flunk("incompatible max must not reach transport") end
+    server = start_server(out, provider_opts: [model: "gpt-6-astra", transport: transport])
+    sid = effort_rpc(server, out, 1, "session/new", %{"cwd" => ws})["result"]["sessionId"]
+
+    assert effort_rpc(server, out, 2, "session/set_config_option", %{
+             "sessionId" => sid,
+             "configId" => "reasoning_effort",
+             "value" => "max"
+           })["result"]
+
+    result =
+      effort_rpc(server, out, 3, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [%{"type" => "text", "text" => "do not run"}],
+        "_meta" => %{"model" => "gpt-5.5"}
+      })
+
+    assert result["error"]["code"] == -32602
+    before = :sys.get_state(server)
+    assert {:ok, :queued} = Server.runtime_config_change(server, sid, %{"model" => "gpt-5.5"})
+    after_change = :sys.get_state(server)
+    assert after_change.session_models == before.session_models
+    assert after_change.session_efforts == before.session_efforts
+
+    assert {:ok, :queued} =
+             Server.runtime_config_change(server, sid, %{
+               "model" => "gpt-5.5",
+               "reasoning_effort" => "high"
+             })
+
+    after_change = :sys.get_state(server)
+    assert after_change.session_models[sid] == "gpt-5.5"
+    assert after_change.session_efforts[sid] == "high"
+
+    result =
+      effort_rpc(server, out, 4, "session/prompt", %{
+        "sessionId" => sid,
+        "prompt" => [],
+        "_meta" => %{"reasoning_effort" => "max"}
+      })
+
+    assert result["error"]["code"] == -32602
+
+    assert {:ok, :queued} =
+             Server.runtime_config_change(server, sid, %{"reasoning_effort" => "max"})
+
+    assert :sys.get_state(server).session_efforts[sid] == "high"
+  end
+
   # Start a Server with a capture output device and no stdin reader (lines via feed/2).
   # A unique `:id` lets a single test start more than one Server (e.g. load/resume,
   # which needs a fresh second server).
@@ -294,11 +437,23 @@ defmodule Pixir.ACP.ServerTest do
     |> Enum.map(&Jason.decode!/1)
   end
 
-  defp poll_find(out, pred, label, deadline) do
+  # Capture is append-only during a wait. Keep separate scan/decode offsets so
+  # polling neither reparses old frames nor loses a frame split across writes.
+  defp poll_find(out, pred, label, deadline, cursor \\ {0, 0}) do
     {_in, written} = StringIO.contents(out)
+    size = byte_size(written)
+    {decoded, scanned} = if size < elem(cursor, 1), do: {0, 0}, else: cursor
+    appended = binary_part(written, scanned, size - scanned)
+
+    complete_end =
+      case :binary.matches(appended, "\n") |> List.last() do
+        {index, 1} -> scanned + index + 1
+        nil -> decoded
+      end
 
     found =
       written
+      |> binary_part(decoded, complete_end - decoded)
       |> decode_lines()
       |> Enum.find(pred)
 
@@ -307,11 +462,12 @@ defmodule Pixir.ACP.ServerTest do
         found
 
       System.monotonic_time(:millisecond) > deadline ->
-        flunk("timed out waiting for #{label}; got: #{inspect(written)}")
+        tail = binary_part(written, max(size - 4_096, 0), min(size, 4_096))
+        flunk("timed out waiting for #{label}; captured #{size} bytes; tail: #{inspect(tail)}")
 
       true ->
         Process.sleep(20)
-        poll_find(out, pred, label, deadline)
+        poll_find(out, pred, label, deadline, {complete_end, size})
     end
   end
 
@@ -368,6 +524,13 @@ defmodule Pixir.ACP.ServerTest do
     assert resp["result"]["agentCapabilities"]["sessionCapabilities"]["close"] == %{}
     assert resp["result"]["agentCapabilities"]["sessionCapabilities"]["delete"] == %{}
     assert resp["result"]["agentInfo"]["name"] == "pixir"
+    assert resp["result"]["agentInfo"]["version"] == Pixir.version()
+    build_info = resp["result"]["_meta"]["pixir"]["build_info"]
+    assert build_info["version"] == Pixir.version()
+    assert build_info["os_pid"] == System.pid()
+    assert build_info["runtime_otp"] == System.otp_release()
+    assert is_binary(build_info["compile_elixir"])
+    assert is_binary(build_info["source_revision"])
 
     assert [
              %{
@@ -3039,6 +3202,63 @@ defmodule Pixir.ACP.ServerTest do
     assert chunk["params"]["update"]["content"]["text"] == "Hi there!"
 
     assert prompt_resp["result"]["stopReason"] == "end_turn"
+  end
+
+  test "response polling decodes appended frames once without flushing notifications", %{out: out} do
+    IO.binwrite(out, Jason.encode!(%{"jsonrpc" => "2.0", "id" => 1, "result" => %{}}) <> "\n")
+    parent = self()
+
+    waiter =
+      spawn(fn ->
+        receive do
+          :go ->
+            send(parent, {:incremental_response, await_id(out, 2, 2_000)})
+            receive do: (:stop -> :ok)
+        end
+      end)
+
+    patterns = [{StringIO, :contents, 1}, {Jason, :decode!, 2}]
+    Enum.each(patterns, &:erlang.trace_pattern(&1, true, [:local]))
+    :erlang.trace(waiter, true, [:call])
+
+    try do
+      send(waiter, :go)
+      # Observe repeated polls before appending the target. This is a barrier,
+      # not a sleep-based assumption about how quickly a machine runs the loop.
+      for _ <- 1..4 do
+        assert_receive {:trace, ^waiter, :call, {StringIO, :contents, [^out]}}, 1_000
+      end
+
+      frame = Jason.encode!(%{"jsonrpc" => "2.0", "id" => 2, "result" => %{}}) <> "\n"
+      cut = div(byte_size(frame), 2)
+      IO.binwrite(out, binary_part(frame, 0, cut))
+
+      for _ <- 1..2 do
+        assert_receive {:trace, ^waiter, :call, {StringIO, :contents, [^out]}}, 1_000
+      end
+
+      IO.binwrite(out, binary_part(frame, cut, byte_size(frame) - cut))
+      assert_receive {:incremental_response, %{"id" => 2}}, 1_000
+      ref = :erlang.trace_delivered(waiter)
+      assert_receive {:trace_delivered, ^waiter, ^ref}, 1_000
+      assert count_json_decodes(waiter, 0) == 2
+      assert Enum.map(written_lines(out), & &1["id"]) == [1, 2]
+    after
+      if Process.alive?(waiter) do
+        :erlang.trace(waiter, false, [:call])
+        Process.exit(waiter, :kill)
+      end
+
+      Enum.each(patterns, &:erlang.trace_pattern(&1, false, [:local]))
+    end
+  end
+
+  defp count_json_decodes(waiter, count) do
+    receive do
+      {:trace, ^waiter, :call, {Jason, :decode!, _}} -> count_json_decodes(waiter, count + 1)
+    after
+      0 -> count
+    end
   end
 
   test "ACP live warning projection is ordered and bounded at 255/256/257", %{ws: ws} do

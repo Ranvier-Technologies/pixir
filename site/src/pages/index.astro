@@ -4,6 +4,10 @@ import Header from "../components/Header.astro";
 import Hero from "../components/Hero.astro";
 import PresenterBoundary from "../components/PresenterBoundary.astro";
 import BaseLayout from "../layouts/BaseLayout.astro";
+import FirstRun from "../components/FirstRun.astro";
+import ReleaseUpdate from "../components/ReleaseUpdate.astro";
+import WorkspaceChoices from "../components/WorkspaceChoices.astro";
+import EvidenceLog from "../components/EvidenceLog.astro";
 ---
 
 <BaseLayout>
@@ -12,6 +16,8 @@ import BaseLayout from "../layouts/BaseLayout.astro";
 
     <main id="top">
       <Hero />
+      <FirstRun />
+      <ReleaseUpdate />
 
       <section class="section" id="runtime">
         <div class="section-inner">
@@ -24,7 +30,7 @@ import BaseLayout from "../layouts/BaseLayout.astro";
             state, replay, and auditable evidence.
           </p>
 
-          <div class="proof-grid">
+          <div class="proof-grid runtime-proofs">
             <article class="proof">
               <code>spawn_agent</code>
               <h3>Subagents are Sessions</h3>
@@ -93,6 +99,7 @@ import BaseLayout from "../layouts/BaseLayout.astro";
         </div>
       </section>
 
+      <WorkspaceChoices />
       <section class="section" id="operators">
         <div class="section-inner">
           <p class="section-kicker">Operator Primitives</p>
@@ -148,19 +155,7 @@ import BaseLayout from "../layouts/BaseLayout.astro";
               </p>
             </div>
 
-            <div class="evidence-terminal" role="group" aria-label="Example Pixir event log">
-              <div class="evidence-terminal-head">
-                <code>.pixir/sessions/01HQ...ndjson</code>
-                <span>append-only</span>
-              </div>
-              <pre><span class="log-muted">&#123;"ts":"+0.000","event":"session.start","id":"01HQ...","log":"append-only"&#125;</span>
-<span class="log-muted">&#123;"ts":"+1.204","event":"provider_usage","tokens":1843,"cached_tokens":1190&#125;</span>
-<span class="log-muted">&#123;"ts":"+1.880","event":"subagent.spawned","parent":"01HQ...","id":"01HR..."&#125;</span>
-<span class="log-warn">&#123;"ts":"+4.512","event":"workflow.step.failed","step":"build","retry":true&#125;</span>
-<span class="log-ok">&#123;"ts":"+6.090","event":"workflow.step.ok","step":"build","attempt":2&#125;</span>
-<span class="log-muted">&#123;"ts":"+7.331","event":"compaction.boundary","kept":42,"dropped":260&#125;</span>
-<span class="prompt">$</span> <span class="cursor" aria-hidden="true"></span></pre>
-            </div>
+            <EvidenceLog />
           </div>
 
           <div class="evidence-grid">
@@ -172,7 +167,7 @@ import BaseLayout from "../layouts/BaseLayout.astro";
             <article class="evidence-card">
               <code>provider_usage</code>
               <h3>Cache-aware work is measurable</h3>
-              <p>WebSocket continuation, stable prompt prefixes, and minimal per-turn payloads keep Subagent-heavy work cache-friendly; cached tokens are recorded when the Provider reports them.</p>
+              <p>Inspect the cached tokens reported by your Provider. Stable prefixes and WebSocket continuation are optimizations, not a cache-hit guarantee; missing usage is not evidence of zero cost.</p>
             </article>
             <article class="evidence-card">
               <code>pixir tree</code>
@@ -226,14 +221,14 @@ import BaseLayout from "../layouts/BaseLayout.astro";
               checkout when you are working on Pixir itself.
             </p>
             <div class="hero-actions">
-              <a class="button primary" href="https://hex.pm/packages/pixir">Hex package</a>
+              <a class="button primary" href="#get-started">Follow the first-run guide</a>
               <a class="button secondary" href="https://pixir.hexdocs.pm/readme.html">HexDocs</a>
             </div>
           </div>
-          <div class="install-card" role="group" aria-label="Install Pixir command transcript">
-            <pre><span class="prompt">$</span> mix escript.install hex pixir
-<span class="prompt">$</span> pixir doctor --json
-<span class="prompt">$</span> pixir acp</pre>
+          <div class="install-card">
+            <h3>Bring your operator.</h3>
+            <p>Run the same CLI flow yourself or from another coding agent. Use <code>pixir acp</code> when your client speaks ACP.</p>
+            <a href="https://hex.pm/packages/pixir">Get the published package ↗</a>
           </div>
         </div>
       </section>

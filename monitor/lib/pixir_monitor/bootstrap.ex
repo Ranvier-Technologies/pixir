@@ -16,6 +16,7 @@ defmodule PixirMonitor.Bootstrap do
     case PixirMonitor.WorkspaceSet.mode() do
       {:ok, :single} -> single_shell()
       {:ok, :workspace_set} -> workspace_set_shell()
+      {:error, _} = error -> error
     end
   end
 

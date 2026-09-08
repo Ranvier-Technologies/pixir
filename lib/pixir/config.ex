@@ -2,8 +2,10 @@ defmodule Pixir.Config do
   @moduledoc """
   Loader for `~/.pixir/config.json` (ADR 0005 ergonomics).
 
-  Parses user-global knobs, ignores invalid values with warnings (never hard-fails on
-  a bad field), and resolves effective values with this precedence for each key:
+  Parses user-global knobs, ignores malformed values with warnings (never hard-fails
+  on a bad field), and resolves effective values with this precedence for each key.
+  Known `max` reasoning intent is retained with a compatibility warning when its
+  Config model/backend cannot honor it; runtime validates the final overrides:
 
     1. `config :pixir, :key` (programmatic override)
     2. `~/.pixir/config.json`
@@ -24,8 +26,10 @@ defmodule Pixir.Config do
   and `bash_timeout_ms` caps each bash tool call. The presenter default deliberately exceeds
   the bash default plus cleanup grace so a timed-out tool can return its recoverable result
   before the presenter gives up. Agents may raise a bash call's `timeout_ms` as high as
-  `bash_timeout_max_ms` (600 seconds by default), above the presenter default; the
-  extension-during-tools step, rather than this default ordering, closes that race.
+  `bash_timeout_max_ms` (600 seconds by default), above the presenter default. At an
+  expired CLI deadline, a live registered bash process extends the next wait only by the
+  smaller of the presenter interval and its remaining effective timeout plus
+  kill-escalation grace; dead, closed, and over-cap process entries do not extend it.
 
   `bash_timeout_max_ms` is an override cap, not a way to shorten the configured
   default. The effective cap is never lower than `bash_timeout_ms`; when config asks
@@ -37,7 +41,7 @@ defmodule Pixir.Config do
   cannot force the overlay off.
   """
 
-  alias Pixir.Paths
+  alias Pixir.{Paths, ReasoningEffort}
   alias Pixir.Provider.HostedTools
   alias Pixir.Providers.ResponsesBackend
 
@@ -53,7 +57,6 @@ defmodule Pixir.Config do
   @receive_after_max_ms 0xFFFFFFFF
   @default_tail_events 40
 
-  @valid_reasoning_efforts ~w(low medium high xhigh)
   @valid_text_verbosities ~w(low medium high)
   @type warning :: %{required(String.t()) => String.t()}
   @type load_result :: %{
@@ -94,11 +97,13 @@ defmodule Pixir.Config do
         end
 
       {:missing, _} ->
+        warnings = warnings(%{})
+
         %{
           "path" => Path.expand(path),
           "present" => false,
-          "effective" => effective_map(%{}, []),
-          "warnings" => []
+          "effective" => effective_map(%{}, warnings),
+          "warnings" => warnings
         }
 
       {:error, error} ->
@@ -161,9 +166,12 @@ defmodule Pixir.Config do
     end
   end
 
-  @doc "Accepted reasoning effort ids."
+  @doc "Known reasoning effort intent ids (legacy list API); not a model/backend capability grant."
   @spec valid_reasoning_efforts() :: [String.t()]
-  def valid_reasoning_efforts, do: @valid_reasoning_efforts
+  def valid_reasoning_efforts do
+    {:ok, ids} = ReasoningEffort.known_ids()
+    ids
+  end
 
   @doc "Resolved permission default (`:auto`, `:ask`, or `:read_only`)."
   @spec permission_default(keyword()) :: Permissions.mode()
@@ -212,8 +220,10 @@ defmodule Pixir.Config do
   `bash_timeout_ms` caps each bash tool call. The 300-second default deliberately exceeds
   the bash default plus cleanup grace so a timed-out tool returns before the CLI gives up.
   Agents may raise a bash call's `timeout_ms` as high as `bash_timeout_max_ms` (600 seconds
-  by default), above this default; the extension-during-tools step, rather than this
-  ordering, closes that race.
+  by default), above this default. At each expired presenter deadline, a live registered
+  bash process extends the next wait only by the smaller of the presenter interval and
+  its remaining effective timeout plus kill-escalation grace; a dead, closed, or over-cap
+  process does not extend it.
   """
   @spec presenter_idle_timeout_ms(keyword()) :: pos_integer()
   def presenter_idle_timeout_ms(opts \\ []),
@@ -734,7 +744,7 @@ defmodule Pixir.Config do
       "models" => resolve_models(raw, "models", ignored),
       "anthropic_models" => resolve_models(raw, "anthropic_models", ignored),
       "models_refreshed_at" => resolve_models_refreshed_at(raw),
-      "context_windows" => resolve_context_windows(raw, ignored)
+      "context_windows" => resolve_context_windows(raw)
     }
   end
 
@@ -1125,21 +1135,18 @@ defmodule Pixir.Config do
 
   defp resolve_models_refreshed_at(_raw), do: nil
 
-  defp resolve_context_windows(raw, ignored) do
-    if MapSet.member?(ignored, "context_windows") do
-      %{}
-    else
-      case Map.get(raw, "context_windows") do
-        windows when is_map(windows) and not is_struct(windows) ->
-          windows
-          |> Enum.filter(fn {model, tokens} ->
-            is_binary(model) and String.valid?(model) and is_integer(tokens) and tokens > 0
-          end)
-          |> Map.new()
+  defp resolve_context_windows(raw) do
+    # Entry-level warnings must not discard unrelated, valid overrides.
+    case Map.get(raw, "context_windows") do
+      windows when is_map(windows) and not is_struct(windows) ->
+        windows
+        |> Enum.filter(fn {model, tokens} ->
+          is_binary(model) and String.valid?(model) and is_integer(tokens) and tokens > 0
+        end)
+        |> Map.new()
 
-        _ ->
-          %{}
-      end
+      _ ->
+        %{}
     end
   end
 
@@ -1147,6 +1154,7 @@ defmodule Pixir.Config do
     []
     |> maybe_warn_permission_default(raw)
     |> maybe_warn_reasoning_effort(raw)
+    |> maybe_warn_reasoning_compatibility(raw)
     |> maybe_warn_text_verbosity(raw)
     |> maybe_warn_positive_int("bash_timeout_ms", Map.get(raw, "bash_timeout_ms"))
     |> maybe_warn_positive_int("bash_timeout_max_ms", Map.get(raw, "bash_timeout_max_ms"))
@@ -1196,6 +1204,34 @@ defmodule Pixir.Config do
       "reasoning.effort",
       &normalize_reasoning_effort/1
     )
+  end
+
+  # Compatibility warnings do not mark the effort as ignored: preserve max
+  # intent so late request/model/backend overrides can validate it honestly.
+  defp maybe_warn_reasoning_compatibility(warnings, raw) do
+    effort = resolve_reasoning_effort(raw, MapSet.new(warnings, & &1["field"]))
+
+    backend =
+      case snapshot_backend(raw) do
+        {:ok, :absent} -> ResponsesBackend.default()
+        {:ok, backend} -> backend
+        {:error, _} -> nil
+      end
+
+    if effort == "max" and
+         not ReasoningEffort.max_supported?(resolve_model(raw), Pixir.Provider, backend) do
+      [
+        %{
+          "field" => "reasoning.effort.compatibility",
+          "reason" => "unsupported_reasoning_effort",
+          "message" =>
+            "max intent retained; the effective model/backend is incompatible and runtime will refuse it unless overridden."
+        }
+        | warnings
+      ]
+    else
+      warnings
+    end
   end
 
   defp maybe_warn_text_verbosity(warnings, raw) do
@@ -1549,17 +1585,12 @@ defmodule Pixir.Config do
   defp normalize_permission_mode(_value),
     do: {:error, "invalid value; expected auto, ask, or read_only"}
 
-  defp normalize_reasoning_effort(nil), do: nil
-
-  defp normalize_reasoning_effort(effort) when is_atom(effort) and not is_nil(effort),
-    do: normalize_reasoning_effort(Atom.to_string(effort))
-
-  defp normalize_reasoning_effort(effort) when is_binary(effort) do
-    trimmed = String.trim(effort)
-    if trimmed in @valid_reasoning_efforts, do: trimmed, else: nil
+  defp normalize_reasoning_effort(effort) do
+    case ReasoningEffort.normalize(effort) do
+      {:ok, value} -> value
+      {:error, _} -> nil
+    end
   end
-
-  defp normalize_reasoning_effort(_), do: nil
 
   defp normalize_text_verbosity(nil), do: nil
 

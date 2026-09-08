@@ -1,0 +1,15 @@
+{
+  "contract_version": 1,
+  "strategy": "subagents",
+  "mode": "read_only",
+  "subagents": {
+    "workspace_mode": "shared",
+    "role": "explorer",
+    "max_threads": 1,
+    "max_depth": 1
+  },
+  "tasks": [
+    "Read README.md only and summarize this project in three bullets. Do not edit files, run shell commands, or delegate further."
+  ],
+  "limits": { "timeout_ms": 120000 }
+}

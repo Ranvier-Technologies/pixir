@@ -74,6 +74,7 @@ defmodule Pixir.ACP.Server do
     Conversation,
     Event,
     Paths,
+    ReasoningEffort,
     SessionId,
     SessionSupervisor,
     Skills,
@@ -114,7 +115,6 @@ defmodule Pixir.ACP.Server do
   # `default` means "omit reasoning effort and let the selected provider/model
   # choose". Both built-in providers omit the wire field when effort is unset;
   # neither supplies a Pixir-side effort default.
-  @reasoning_effort_ids ~w(default low medium high xhigh)
   @web_search_ids ~w(on off)
 
   defp meta_web_search(true), do: %{"enabled" => true}
@@ -207,8 +207,9 @@ defmodule Pixir.ACP.Server do
   `current_mode_update`, mirroring the client-driven `session/set_mode` path.
 
   `changes` maps any of `"mode"`, `"model"`, or `"reasoning_effort"` to its new
-  id. Invalid entries are dropped with a stderr warning; unknown sessions are
-  ignored (diagnostics to stderr; stdout stays JSON-RPC only). Returns
+  id. Invalid entries are dropped with a stderr warning; an incompatible proposed
+  model/effort combination is rejected atomically with session state unchanged.
+  Unknown sessions are ignored (diagnostics to stderr; stdout stays JSON-RPC only). Returns
   `{:ok, :queued}` when the change was handed to the Server, or a structured
   `{:error, %{kind: :invalid_args}}` for malformed arguments. Presenter
   plumbing only — the Log remains authoritative. The live plan→build producer
@@ -430,6 +431,7 @@ defmodule Pixir.ACP.Server do
 
   defp handle_request("initialize", params, id, state) do
     log_client_info(params)
+    {:ok, build_info} = Pixir.BuildInfo.get()
 
     result = %{
       "protocolVersion" => @protocol_version,
@@ -454,7 +456,7 @@ defmodule Pixir.ACP.Server do
       # Pixir-specific auth/model metadata remains namespaced in ACP's `_meta`
       # extension slot. Canonical model selection is also exposed through the
       # `configOptions` model selector returned by session setup responses.
-      "_meta" => %{"pixir" => pixir_meta()}
+      "_meta" => %{"pixir" => Map.put(pixir_meta(), "build_info", build_info)}
     }
 
     write(state.out, Protocol.result(id, result))
@@ -636,6 +638,7 @@ defmodule Pixir.ACP.Server do
               %{
                 "configOptions" =>
                   config_options(
+                    state,
                     mode_id,
                     current_model(state, acp_sid),
                     current_effort(state, acp_sid),
@@ -678,6 +681,9 @@ defmodule Pixir.ACP.Server do
 
         state
 
+      not effort_compatible?(state, acp_sid, model_id, current_effort(state, acp_sid)) ->
+        reject_effort_change(state, id)
+
       true ->
         result =
           case reply_kind do
@@ -688,6 +694,7 @@ defmodule Pixir.ACP.Server do
               %{
                 "configOptions" =>
                   config_options(
+                    state,
                     current_mode(state, params),
                     model_id,
                     current_effort(state, acp_sid),
@@ -712,7 +719,7 @@ defmodule Pixir.ACP.Server do
         write(state.out, Protocol.error(id, Protocol.invalid_params(), "unknown session"))
         state
 
-      effort_id not in @reasoning_effort_ids ->
+      effort_id not in reasoning_effort_ids(state, current_model(state, acp_sid)) ->
         write(
           state.out,
           Protocol.error(id, Protocol.invalid_params(), "unknown config option value", %{
@@ -727,6 +734,7 @@ defmodule Pixir.ACP.Server do
         result = %{
           "configOptions" =>
             config_options(
+              state,
               current_mode(state, params),
               current_model(state, acp_sid),
               effort_id,
@@ -793,6 +801,7 @@ defmodule Pixir.ACP.Server do
     result = %{
       "configOptions" =>
         config_options(
+          state,
           Map.get(state.modes, acp_sid, @default_mode),
           current_model(state, acp_sid),
           current_effort(state, acp_sid),
@@ -850,6 +859,13 @@ defmodule Pixir.ACP.Server do
         Logger.warning("acp: runtime config change for unknown session")
         state
 
+      not runtime_effort_compatible?(state, acp_sid, changes) ->
+        Logger.warning(
+          "acp: runtime config change rejected incompatible reasoning effort; state unchanged"
+        )
+
+        state
+
       true ->
         {state, applied, mode_changed?} =
           Enum.reduce(changes, {state, _applied = [], _mode_changed? = false}, fn
@@ -871,10 +887,14 @@ defmodule Pixir.ACP.Server do
                 {st, applied, mode_changed?}
               end
 
-            {"reasoning_effort", effort}, {st, applied, mode_changed?}
-            when effort in @reasoning_effort_ids ->
-              {%{st | session_efforts: Map.put(st.session_efforts, acp_sid, effort)},
-               [:reasoning_effort | applied], mode_changed?}
+            {"reasoning_effort", effort}, {st, applied, mode_changed?} ->
+              if effort == "default" or ReasoningEffort.known?(effort) do
+                {%{st | session_efforts: Map.put(st.session_efforts, acp_sid, effort)},
+                 [:reasoning_effort | applied], mode_changed?}
+              else
+                Logger.warning("acp: ignoring unsupported runtime config change")
+                {st, applied, mode_changed?}
+              end
 
             {_key, _value}, acc ->
               Logger.warning("acp: ignoring unsupported runtime config change")
@@ -897,6 +917,7 @@ defmodule Pixir.ACP.Server do
 
           opts =
             config_options(
+              state,
               Map.get(state.modes, acp_sid, @default_mode),
               current_model(state, acp_sid),
               current_effort(state, acp_sid),
@@ -913,6 +934,19 @@ defmodule Pixir.ACP.Server do
     end
   end
 
+  defp runtime_effort_compatible?(state, acp_sid, changes) do
+    model = Map.get(changes, "model", current_model(state, acp_sid))
+    model = if Registry.model_supported?(model), do: model, else: current_model(state, acp_sid)
+    effort = Map.get(changes, "reasoning_effort", current_effort(state, acp_sid))
+
+    effort =
+      if effort == "default" or ReasoningEffort.known?(effort),
+        do: effort,
+        else: current_effort(state, acp_sid)
+
+    effort_compatible?(state, acp_sid, model, effort)
+  end
+
   # The current mode for the session named in `params` (default `@default_mode`).
   defp current_mode(state, params) do
     Map.get(state.modes, Map.get(params, "sessionId"), @default_mode)
@@ -923,8 +957,20 @@ defmodule Pixir.ACP.Server do
   # the truthful ACP value is the explicit `default` option.
   defp current_effort(state, acp_sid) do
     case Map.fetch(state.session_efforts, acp_sid) do
-      {:ok, effort} -> effort
-      :error -> Config.reasoning_effort() || "default"
+      {:ok, effort} ->
+        effort
+
+      :error ->
+        case resolve_web_search_context(state, acp_sid) do
+          {:ok, resolved} ->
+            resolved
+            |> ResolvedProviderRequest.attach_to_provider_opts(List.wrap(state.provider_opts))
+            |> Keyword.get(:reasoning_effort)
+            |> Kernel.||("default")
+
+          {:error, _} ->
+            Config.reasoning_effort() || "default"
+        end
     end
   end
 
@@ -961,7 +1007,10 @@ defmodule Pixir.ACP.Server do
       provider_opts: state.provider_opts |> List.wrap() |> Keyword.put(:model, model)
     }
 
-    Registry.resolve_request(selection)
+    Registry.resolve_request(
+      selection,
+      Keyword.take(state.provider_opts, [:config_path, :raw_config, :request_snapshot_loader])
+    )
   end
 
   defp effective_web_search_provider_opts(state, acp_sid, opts) do
@@ -1013,11 +1062,11 @@ defmodule Pixir.ACP.Server do
   # The full `configOptions` list (D.2). Selectors are the canonical ACP
   # surfaces for sticky per-session preferences; legacy compatibility fields and
   # methods remain separate from this complete list.
-  defp config_options(current_mode, current_model, current_effort, current_web_search) do
+  defp config_options(state, current_mode, current_model, current_effort, current_web_search) do
     [
       mode_config_option(current_mode),
       model_config_option(current_model),
-      reasoning_effort_config_option(current_effort),
+      reasoning_effort_config_option(state, current_model, current_effort),
       web_search_config_option(current_web_search)
     ]
   end
@@ -1053,7 +1102,43 @@ defmodule Pixir.ACP.Server do
     }
   end
 
-  defp reasoning_effort_config_option(current) do
+  defp reasoning_effort_ids(state, model) do
+    case resolve_web_search_context(state, nil, model: model) do
+      {:ok, resolved} ->
+        {:ok, ids} = ReasoningEffort.choices(resolved, state.provider_opts)
+        ["default" | ids]
+
+      {:error, _} ->
+        {:ok, ids} = ReasoningEffort.legacy_ids()
+        ["default" | ids]
+    end
+  end
+
+  defp effort_compatible?(state, acp_sid, model, effort) do
+    case ReasoningEffort.normalize(effort) do
+      {:ok, "max"} -> "max" in reasoning_effort_ids(state, model || current_model(state, acp_sid))
+      _ -> true
+    end
+  end
+
+  defp reject_effort_change(state, id) do
+    write(
+      state.out,
+      Protocol.error(
+        id,
+        Protocol.invalid_params(),
+        "reasoning effort is incompatible with the selected model/backend",
+        %{
+          "configId" => "reasoning_effort",
+          "reason" => "unsupported_reasoning_effort"
+        }
+      )
+    )
+
+    state
+  end
+
+  defp reasoning_effort_config_option(state, model, current) do
     %{
       "id" => "reasoning_effort",
       "name" => "Reasoning effort",
@@ -1062,7 +1147,7 @@ defmodule Pixir.ACP.Server do
       "type" => "select",
       "currentValue" => current,
       "options" =>
-        Enum.map(@reasoning_effort_ids, fn effort ->
+        Enum.map(reasoning_effort_ids(state, model), fn effort ->
           %{"name" => effort, "value" => effort}
         end)
     }
@@ -1162,6 +1247,7 @@ defmodule Pixir.ACP.Server do
           Protocol.result(
             id,
             session_setup_result(
+              state,
               acp_sid,
               current_model,
               current_effort(state, acp_sid),
@@ -1185,7 +1271,7 @@ defmodule Pixir.ACP.Server do
   # are effective at the setup boundary; sticky selections are retained when
   # the same server reattaches. The `models` field is a legacy Pixir/T3
   # compatibility extension; canonical ACP clients should read `configOptions`.
-  defp session_setup_result(acp_sid, current_model, current_effort, current_web_search) do
+  defp session_setup_result(state, acp_sid, current_model, current_effort, current_web_search) do
     %{
       "sessionId" => acp_sid,
       "modes" => %{
@@ -1194,7 +1280,7 @@ defmodule Pixir.ACP.Server do
       },
       "models" => models_state(current_model),
       "configOptions" =>
-        config_options(@default_mode, current_model, current_effort, current_web_search)
+        config_options(state, @default_mode, current_model, current_effort, current_web_search)
     }
   end
 
@@ -1217,7 +1303,12 @@ defmodule Pixir.ACP.Server do
   defp current_model(state, acp_sid) do
     Map.get(state.session_models, acp_sid) ||
       Keyword.get(List.wrap(state.provider_opts), :model) ||
-      default_model_id()
+      get_in(
+        Config.load(
+          Keyword.take(state.provider_opts, [:config_path, :raw_config, :request_snapshot_loader])
+        ),
+        ["effective", "model"]
+      )
   end
 
   # Pixir's default model id, advertised as `currentModelId` at session/new.
@@ -1579,6 +1670,7 @@ defmodule Pixir.ACP.Server do
           Protocol.result(
             id,
             session_setup_result(
+              state,
               acp_sid,
               current_model,
               current_effort(state, acp_sid),
@@ -1625,6 +1717,7 @@ defmodule Pixir.ACP.Server do
         Protocol.result(
           id,
           session_setup_result(
+            state,
             acp_sid,
             current_model,
             current_effort(state, acp_sid),
@@ -1892,6 +1985,9 @@ defmodule Pixir.ACP.Server do
 
         state
 
+      not prompt_effort_compatible?(state, acp_sid, meta_opts) ->
+        reject_effort_change(state, id)
+
       true ->
         prompt_blocks = Map.get(params, "prompt", [])
         prompt_text = extract_prompt_text(prompt_blocks)
@@ -1926,6 +2022,12 @@ defmodule Pixir.ACP.Server do
           )
         end
     end
+  end
+
+  defp prompt_effort_compatible?(state, acp_sid, meta_opts) do
+    model = Keyword.get(meta_opts, :model, current_model(state, acp_sid))
+    effort = Keyword.get(meta_opts, :reasoning_effort, current_effort(state, acp_sid))
+    effort_compatible?(state, acp_sid, model, effort)
   end
 
   defp compact_prompt?(text) when is_binary(text),

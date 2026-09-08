@@ -818,6 +818,89 @@ defmodule Pixir.SessionDiagnosticsTest do
     assert "inspect_child_session_log" in state["next_actions"]
   end
 
+  test "child permission posture does not add incomplete terminal records" do
+    ws = tmp_ws()
+    sid = "diagnose-permission-posture"
+    on_exit(fn -> File.rm_rf!(ws) end)
+
+    parent_events =
+      for index <- 1..2 do
+        subagent_id = "sub_completed_#{index}"
+        child_sid = "completed-child-#{index}"
+        child_ws = Path.join(ws, child_sid)
+
+        write_raw_log(child_ws, child_sid, [
+          raw_event(child_sid, 0, "subagent_event", %{
+            "event" => "permission_posture",
+            "scope" => "session",
+            "lineage" => "child",
+            "source" => "subagent_spawn",
+            "subagent_id" => subagent_id,
+            "parent_session_id" => sid,
+            "permission_mode" => "read_only",
+            "write_policy" => nil,
+            "workspace_mode" => "isolated",
+            "workspace" => child_ws,
+            "warm_start" => nil
+          }),
+          raw_event(child_sid, 1, "assistant_message", %{"text" => "done"})
+        ])
+
+        raw_event(sid, index, "subagent_event", %{
+          "event" => "finished",
+          "subagent_id" => subagent_id,
+          "child_session_id" => child_sid,
+          "status" => "completed",
+          "workspace" => child_ws,
+          "summary" => "done"
+        })
+      end
+
+    write_raw_log(ws, sid, parent_events)
+    assert {:ok, result} = SessionDiagnostics.run(sid, workspace: ws)
+
+    assert %{"status" => "passed", "details" => %{"states" => states} = details} =
+             Enum.find(result["checks"], &(&1["id"] == "subagent_terminal_states"))
+
+    assert Enum.map(states, & &1["subagent_id"]) == ["sub_completed_1", "sub_completed_2"]
+
+    assert Enum.all?(
+             states,
+             &(&1["classification"] == "completed" and &1["missing_fields"] == [])
+           )
+
+    assert Map.get(details, "incomplete", []) == []
+
+    # Suppressing self-scoped evidence must not hide genuinely incomplete lifecycle.
+    write_raw_log(
+      ws,
+      sid,
+      parent_events ++
+        [
+          raw_event(sid, 3, "subagent_event", %{
+            "event" => "started",
+            "subagent_id" => "sub_incomplete"
+          })
+        ]
+    )
+
+    assert {:ok, result} = SessionDiagnostics.run(sid, workspace: ws)
+
+    assert %{
+             "status" => "warning",
+             "details" => %{
+               "classification" => "subagent_terminal_state_incomplete_evidence",
+               "states" => states,
+               "incomplete" => [incomplete]
+             }
+           } = Enum.find(result["checks"], &(&1["id"] == "subagent_terminal_states"))
+
+    assert length(states) == 3
+    assert incomplete["subagent_id"] == "sub_incomplete"
+    assert incomplete["events"] == ["started"]
+    assert incomplete["missing_fields"] == ["child_session_id", "status"]
+  end
+
   test "warns when running subagent child logs are stale" do
     ws = tmp_ws()
     sid = "diagnose-stale-running-subagent"

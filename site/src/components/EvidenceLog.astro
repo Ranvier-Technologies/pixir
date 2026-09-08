@@ -1,0 +1,14 @@
+---
+import sample from "../../public/examples/session.ndjson?raw";
+const rows = sample.trim().split("\n").map((line) => {
+  const { seq, type, data } = JSON.parse(line);
+  return JSON.stringify({ seq, type, data });
+});
+---
+
+<div class="evidence-terminal" role="group" aria-label="Synthetic canonical Pixir Log example">
+  <div class="evidence-terminal-head"><code>session.ndjson</code><span>canonical format</span></div>
+  <p class="evidence-caption">Synthetic example, not a benchmark. Selected fields below; the download includes IDs and timestamps.</p>
+  <pre tabindex="0" aria-label="Selected canonical Event fields"><code>{rows.join("\n\n")}</code></pre>
+  <a class="evidence-download" href="/examples/session.ndjson" download="session.ndjson">Download the complete NDJSON sample →</a>
+</div>

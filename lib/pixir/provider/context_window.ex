@@ -7,8 +7,8 @@ defmodule Pixir.Provider.ContextWindow do
   `usage_summary` already recorded per Provider call (ADR 0019) — against a
   conservative per-model window. Two rules are load-bearing:
 
-    * **Conservative, justified values only.** The built-in table covers the model
-      catalog (`Pixir.Provider.models/0`) with documented or observed per-SKU
+    * **Conservative, justified values only.** The built-in table contains
+      established entries with documented or observed per-SKU
       bounds. Large GPT-5/Codex-family models use the documented 400K total
       context window with a 272K max-*input* ceiling; `gpt-5.3-codex-spark` is a
       smaller real-time SKU with a documented 128K context window. Pixir gauges
@@ -18,6 +18,8 @@ defmodule Pixir.Provider.ContextWindow do
     * **An unknown model never fakes a threshold.** `window_tokens/1` returns a
       structured `:context_window_unknown` error and `assess/2` degrades to an
       explicit advisory-unavailable result — no tier, no ratio, no advisory.
+    * **Unknown usage is not zero.** Missing or invalid input-token evidence also
+      makes the gauge unavailable; an observed integer zero remains valid.
 
   Values are overrideable via `~/.pixir/config.json`:
 
@@ -63,31 +65,46 @@ defmodule Pixir.Provider.ContextWindow do
   @doc """
   Assess context pressure for one recorded call: `usage_summary` is the
   `Pixir.Provider.usage_summary/1` shape (atom- or string-keyed, as recorded in
-  `provider_usage` evidence).
+  `provider_usage` evidence). Its optional `input_tokens_unavailable_reason`
+  preserves invalid/missing raw evidence despite accounting defaults/coercions;
+  summaries without that marker still require a nonnegative integer observation.
 
   Returns `{:ok, assessment}` where the string-keyed assessment is either
 
     * `"available" => true` with `"tier"` (`"none" | "advisory" | "warning" |
       "critical"`), `"ratio"`, `"input_tokens"`, and `"window_tokens"`, or
     * `"available" => false` with `"tier" => "unavailable"` and a `"reason"` —
-      the unknown-model degradation; callers must fire no advisory from it.
+      unknown capacity, missing usage or invalid usage; callers must fire no
+      advisory from it. Known capacity may still be disclosed without a ratio.
   """
   @spec assess(map() | nil, String.t() | nil) :: {:ok, map()} | {:error, map()}
   def assess(usage_summary, model) do
     case window_tokens(model) do
       {:ok, window_tokens} ->
-        input_tokens = input_tokens(usage_summary)
-        ratio = input_tokens / window_tokens
+        case input_tokens(usage_summary) do
+          {:ok, input_tokens} ->
+            ratio = input_tokens / window_tokens
 
-        {:ok,
-         %{
-           "available" => true,
-           "model" => model,
-           "input_tokens" => input_tokens,
-           "window_tokens" => window_tokens,
-           "ratio" => ratio,
-           "tier" => tier(ratio)
-         }}
+            {:ok,
+             %{
+               "available" => true,
+               "model" => model,
+               "input_tokens" => input_tokens,
+               "window_tokens" => window_tokens,
+               "ratio" => ratio,
+               "tier" => tier(ratio)
+             }}
+
+          {:error, reason} ->
+            {:ok,
+             %{
+               "available" => false,
+               "model" => model,
+               "window_tokens" => window_tokens,
+               "tier" => "unavailable",
+               "reason" => reason
+             }}
+        end
 
       {:error, _unknown} ->
         {:ok,
@@ -106,21 +123,35 @@ defmodule Pixir.Provider.ContextWindow do
   defp tier(_ratio), do: "critical"
 
   defp input_tokens(%{} = summary) do
-    case first_present(summary, [:input_tokens, "input_tokens"]) do
-      tokens when is_integer(tokens) and tokens >= 0 -> tokens
-      _ -> 0
+    # Provider accounting can coerce strings/floats or default missing tokens to
+    # zero. Honor its durable provenance before inspecting that normalized count.
+    case Map.get(
+           summary,
+           :input_tokens_unavailable_reason,
+           Map.get(summary, "input_tokens_unavailable_reason")
+         ) do
+      nil -> observed_input_tokens(summary)
+      reason when reason in ["usage_missing", "usage_invalid"] -> {:error, reason}
+      _ -> {:error, "usage_invalid"}
     end
   end
 
-  defp input_tokens(_summary), do: 0
+  defp input_tokens(nil), do: {:error, "usage_missing"}
+  defp input_tokens(_summary), do: {:error, "usage_invalid"}
 
-  defp first_present(map, keys) do
-    Enum.find_value(keys, fn key ->
-      case Map.fetch(map, key) do
-        {:ok, value} -> value
-        :error -> nil
+  defp observed_input_tokens(summary) do
+    value =
+      case Map.fetch(summary, :input_tokens) do
+        :error -> Map.fetch(summary, "input_tokens")
+        found -> found
       end
-    end)
+
+    case value do
+      {:ok, tokens} when is_integer(tokens) and tokens >= 0 -> {:ok, tokens}
+      {:ok, nil} -> {:error, "usage_missing"}
+      :error -> {:error, "usage_missing"}
+      _ -> {:error, "usage_invalid"}
+    end
   end
 
   # A `"context_windows"` map of model => positive integer from

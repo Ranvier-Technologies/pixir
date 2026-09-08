@@ -51,6 +51,7 @@ defmodule Pixir.Delegate.DaemonServer do
     workspace = opts |> Keyword.fetch!(:workspace) |> Path.expand()
     async = Keyword.get(opts, :async, Async)
     token = Keyword.get_lazy(opts, :token, &random_token/0)
+    {:ok, build_info} = Pixir.BuildInfo.get()
 
     with {:ok, listener} <-
            :gen_tcp.listen(0, [
@@ -76,6 +77,7 @@ defmodule Pixir.Delegate.DaemonServer do
              listener: listener,
              accept_pid: accept_pid,
              endpoint: endpoint,
+             build_info: build_info,
              started_at: endpoint["started_at"],
              follow_heartbeat_ms: Keyword.get(opts, :follow_heartbeat_ms, @follow_heartbeat_ms)
            }}
@@ -417,6 +419,7 @@ defmodule Pixir.Delegate.DaemonServer do
     runtime_residency = runtime_residency(state)
 
     payload
+    |> put_daemon_schema_revision()
     |> Map.put("daemon", public_daemon_metadata(state))
     |> Map.put("runtime_residency", runtime_residency)
     |> put_in(["owner", "runtime_residency"], runtime_residency)
@@ -426,6 +429,7 @@ defmodule Pixir.Delegate.DaemonServer do
   defp annotate_daemon_payload(payload, %{daemon: daemon, runtime_residency: runtime_residency})
        when is_map(payload) do
     payload
+    |> put_daemon_schema_revision()
     |> Map.put("daemon", daemon)
     |> Map.put("runtime_residency", runtime_residency)
     |> put_in(["owner", "runtime_residency"], runtime_residency)
@@ -458,11 +462,22 @@ defmodule Pixir.Delegate.DaemonServer do
     end)
   end
 
+  defp put_daemon_schema_revision(payload) do
+    current = Pixir.Delegate.CLIContract.envelope_schema_version()
+
+    Map.update(payload, "schema_version", current, fn
+      revision when is_integer(revision) -> max(revision, current)
+      _ -> current
+    end)
+  end
+
   defp daemon_payload(status, state) do
     %{
       "ok" => true,
       "status" => status,
       "kind" => "delegate_daemon",
+      "schema_version" => Pixir.Delegate.CLIContract.envelope_schema_version(),
+      "build_info" => state.build_info,
       "workspace" => state.workspace,
       "summary" => daemon_summary(status),
       "daemon" => public_daemon_metadata(state),
@@ -501,6 +516,7 @@ defmodule Pixir.Delegate.DaemonServer do
       "host" => @host_string,
       "port" => state.endpoint["port"],
       "pid" => System.pid(),
+      "build_info" => state.build_info,
       "workspace" => state.workspace,
       "started_at" => state.started_at,
       "endpoint_file" => endpoint_file(state.workspace),

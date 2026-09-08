@@ -10,19 +10,54 @@ Runtime state, hydrated by the harness at invocation. Preprocessing is this
 variant's contract: if the line below reads as a raw placeholder, you are on
 the wrong variant; use `pixir-delegate-codex` (explicit preflight, no
 hydration) instead of working around it here.
-pixir on PATH: !`echo "$(command -v pixir || echo 'not on PATH') · v$(pixir --version 2>/dev/null || echo '?') · $(pixir doctor --json 2>/dev/null | jq -r .status 2>/dev/null || echo 'doctor unavailable')"`
+Caller workspace: !`pwd`
 
-Know WHICH binary you are driving before delegating: if the workspace has a
-local build (`./pixir`), prefer it by explicit path over PATH — versions can
-differ silently. `pixir doctor --json` reports the local build's path under
-the `source_install_binary` check.
+## Binary preflight — preserve the caller workspace
+
+Resolve once before running version, doctor, rehearsal, or a real delegation.
+`scripts/resolve-binary.sh`, `scripts/fanout.sh`, and `scripts/steer.sh` share
+this deterministic rule:
+
+1. A nonempty `PIXIR_BIN` is an explicit override and wins. Validate that it
+   names an executable file and resolve it to an absolute path. Relative paths
+   are relative to the caller workspace; a bare command name is looked up on
+   PATH. An invalid override is an error, never permission to fall back.
+2. Otherwise prefer `./pixir` in the **caller workspace**, not in the skill
+   checkout. If that candidate exists but is not an executable file (including
+   a directory or dangling symlink), stop with an error instead of using PATH.
+3. Only when no local candidate exists, resolve `pixir` from PATH to an
+   absolute executable path. An empty `PIXIR_BIN` behaves like an unset one.
+
+Discover this loaded skill's directory and set `PIXIR_DELEGATE_SKILL_DIR` to
+its absolute path; do not change CWD to find or invoke it. Run the shared
+preflight in Bash from the target workspace (obtain host approval if required):
+
+```bash
+source "$PIXIR_DELEGATE_SKILL_DIR/scripts/resolve-binary.sh"
+PIXIR_BIN="$(pixir_resolve_binary)" || exit 2
+pixir_report_binary
+"$PIXIR_BIN" doctor --json
+```
+
+The report prints the chosen absolute path and version to stderr, identically
+in fanout and steer. Quote `"$PIXIR_BIN"` for invocation so paths with spaces
+work. All `pixir` commands below are shorthand for that selected binary.
+Never auto-build, auto-install, alter global PATH, or change to the skill
+checkout. Use the caller workspace for session lookup and relative artifacts.
+
+Record the doctor status and the `source_install_binary` check's status and
+path. That check reports source-build **existence**, not build freshness:
+neither a passed check nor a version string proves the binary contains the
+current checkout edits. Establish freshness separately from build evidence;
+request an intentional rebuild when needed rather than silently building.
 
 Pixir speaks a machine contract directly: JSON envelopes on stdout, documented
 exit codes, resumable session ids. The CLI is self-describing by design —
 discover contracts from it at runtime instead of trusting any transcript of
-them (including this one). Requirements: `pixir` on PATH, `jq`, authenticated
-(a stored `pixir login` credential or `OPENAI_API_KEY`); verify with
-`pixir doctor --json`.
+them (including this one). Requirements: the resolved executable, `jq`, and
+authentication (a stored `pixir login` credential or `OPENAI_API_KEY`); verify
+with the selected binary's `doctor --json` and classify readiness using
+`references/delegation-core.md` before delegation.
 
 ## Pick the right shape
 

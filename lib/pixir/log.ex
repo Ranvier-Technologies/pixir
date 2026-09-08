@@ -176,6 +176,121 @@ defmodule Pixir.Log do
   def fold_append_order(session_id, opts \\ []),
     do: read_and_decode(session_id, opts, :append_order)
 
+  @doc """
+  Select bounded History from a Session Log without scanning omitted bytes.
+
+  Accepts `:workspace`, `:max_log_bytes` (default 8 MiB), and optional
+  `:max_events` (a nonnegative integer; absent means no event cap). Logs exceeding
+  either bound retain complete prefix/tail records using at most two positional
+  reads. Event selection uses original record byte spans, not reencoded Events.
+  Caps below two permit complete under-limit History but refuse two-ended sampling.
+  The returned
+  `%{history: events, selection: metadata}` reports exact omitted bytes, but omitted
+  event counts remain unknown. A complete JSON record at EOF needs no final LF;
+  unfinished append bytes are explicitly reported, never repaired or persisted.
+
+  Unlike `fold/2`, a missing Log returns `:log_not_found`. Selected records must have
+  a nonnegative integer seq, the requested Session identity, and map data. Complete
+  selections follow normal seq order; partial selections must already be strictly
+  ordered. Duplicate selected seqs fail. These stricter selection checks do not
+  change ordinary fold or append-order replay compatibility.
+  """
+  @spec fold_bounded(String.t(), keyword()) ::
+          {:ok, %{history: history(), selection: map()}} | {:error, map()}
+  def fold_bounded(session_id, opts \\ []) do
+    with :ok <- SessionId.validate(session_id) do
+      workspace = workspace(opts)
+      file = path(session_id, opts)
+      budget = Keyword.get(opts, :max_log_bytes, 8 * 1024 * 1024)
+
+      with {:ok, status} <- Paths.inspect_state_path(workspace, file, expected: :regular) do
+        cond do
+          status.state == :missing ->
+            bounded_error(:log_not_found, session_id, :enoent)
+
+          not (is_integer(budget) and budget > 1) ->
+            bounded_error(:log_read_limit, session_id, :invalid_byte_budget)
+
+          Keyword.has_key?(opts, :max_events) and
+              not (is_integer(opts[:max_events]) and opts[:max_events] >= 0) ->
+            bounded_error(:log_event_limit, session_id, :invalid_event_budget)
+
+          true ->
+            read_bounded_file(file, session_id, budget, Keyword.get(opts, :max_events))
+        end
+      end
+    end
+  end
+
+  defp read_bounded_file(path, session_id, budget, max_events) do
+    case File.open(path, [:read, :binary, :raw]) do
+      {:ok, file} ->
+        try do
+          case :file.position(file, :eof) do
+            {:ok, size} ->
+              Pixir.Log.BoundedReader.read(
+                file,
+                size,
+                budget,
+                &decode_bounded(&1, path, session_id),
+                max_events
+              )
+
+            {:error, reason} ->
+              bounded_error(:log_read_failed, session_id, reason)
+          end
+        after
+          File.close(file)
+        end
+
+      {:error, :enoent} ->
+        bounded_error(:log_not_found, session_id, :enoent)
+
+      {:error, reason} ->
+        bounded_error(:log_read_failed, session_id, reason)
+    end
+  end
+
+  defp decode_bounded(bytes, file, session_id) do
+    bytes
+    |> :binary.split("\n", [:global, :trim_all])
+    |> Enum.reduce_while({:ok, []}, fn line, {:ok, acc} ->
+      case decode_line(line) do
+        {:ok, event} ->
+          cond do
+            not is_map(event.data) ->
+              {:halt, {:error, line_error(:invalid_event_data, file)}}
+
+            not (is_integer(event.seq) and event.seq >= 0 and event.session_id == session_id) ->
+              {:halt,
+               bounded_error(:invalid_log_selection, session_id, "invalid_selected_sequence")}
+
+            true ->
+              {:cont, {:ok, [event | acc]}}
+          end
+
+        {:error, reason} ->
+          {:halt, {:error, line_error(reason, file)}}
+      end
+    end)
+    |> case do
+      {:ok, events} -> {:ok, Enum.reverse(events)}
+      error -> error
+    end
+  end
+
+  defp bounded_error(kind, session_id, reason) do
+    {:error,
+     %{
+       ok: false,
+       error: %{
+         kind: kind,
+         message: "could not safely select bounded session log",
+         details: %{session_id: session_id, reason: reason}
+       }
+     }}
+  end
+
   defp read_and_decode(session_id, opts, order) do
     with :ok <- SessionId.validate(session_id) do
       do_read_and_decode(session_id, opts, order)

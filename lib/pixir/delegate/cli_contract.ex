@@ -47,7 +47,8 @@ defmodule Pixir.Delegate.CLIContract do
       Subagent/Workflow fanout.
   """
 
-  alias Pixir.Agents
+  alias Pixir.{Agents, ReasoningEffort}
+  alias Pixir.Providers.{Registry, ResolvedProviderRequest}
 
   alias Pixir.Delegate.{
     Async,
@@ -109,6 +110,16 @@ defmodule Pixir.Delegate.CLIContract do
       9,
       :warm_start,
       "additive per-child children[].warm_start lineage projection plus the optional seed_session_id spec key (#435)"
+    },
+    {
+      10,
+      :landing_manifest,
+      "additive evidence-gated landing_manifest plus bounded terminal summary rendering for integrable completed-child work (#589)"
+    },
+    {
+      11,
+      :build_identity,
+      "additive compiled build_info in daemon startup/status/stop and daemon metadata (#618)"
     }
   ]
   @envelope_schema_version length(@envelope_schema_registry)
@@ -135,7 +146,6 @@ defmodule Pixir.Delegate.CLIContract do
     reasoning_effort web_search read_set limits
   )
   @virtual_overlay_limit_keys Pixir.VirtualOverlay.limit_keys()
-  @valid_reasoning_efforts Pixir.Config.valid_reasoning_efforts()
   @web_search_config_fields ~w(
     enabled
     include_sources
@@ -236,6 +246,10 @@ defmodule Pixir.Delegate.CLIContract do
         error_result(error, json?)
     end
   end
+
+  @doc false
+  @spec envelope_schema_version() :: pos_integer()
+  def envelope_schema_version, do: @envelope_schema_version
 
   @doc false
   @spec envelope_schema_registry() :: [{pos_integer(), atom(), String.t()}]
@@ -478,7 +492,7 @@ defmodule Pixir.Delegate.CLIContract do
          :ok <- validate_task_entries_for_strict_keys(spec, workspace),
          :ok <- validate_virtual_overlay_contract(spec),
          :ok <- validate_subagent_model(spec),
-         :ok <- validate_subagent_reasoning_effort(spec),
+         :ok <- validate_subagent_reasoning_effort(spec, opts),
          :ok <- validate_subagent_web_search(spec),
          :ok <- validate_bounded_write_read_only_role(spec, workspace, opts) do
       :ok
@@ -1318,26 +1332,115 @@ defmodule Pixir.Delegate.CLIContract do
 
   defp validate_subagent_model(_spec), do: :ok
 
-  defp validate_subagent_reasoning_effort(%{
-         "subagents" => %{"reasoning_effort" => effort}
-       })
-       when effort in @valid_reasoning_efforts,
-       do: :ok
+  defp validate_subagent_reasoning_effort(%{"strategy" => "workflow"} = spec, opts) do
+    case workflow_steps_with_path(spec) do
+      {steps, path} ->
+        steps
+        |> Enum.with_index()
+        |> Enum.reduce_while(:ok, fn
+          {step, index}, :ok when is_map(step) ->
+            if Map.has_key?(step, "apply_from") or
+                 Map.get(step, "workspace_mode") == "virtual_overlay" do
+              {:cont, :ok}
+            else
+              knobs = Map.take(step, ["model", "reasoning_effort"])
 
-  defp validate_subagent_reasoning_effort(%{"subagents" => %{"reasoning_effort" => effort}}) do
+              case validate_subagent_reasoning_effort(%{"subagents" => knobs}, opts) do
+                :ok ->
+                  {:cont, :ok}
+
+                {:error, error} ->
+                  {:halt,
+                   {:error,
+                    merge_error_details(
+                      error,
+                      object_location_details(path ++ [index, "reasoning_effort"])
+                    )}}
+              end
+            end
+
+          _, :ok ->
+            {:cont, :ok}
+        end)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp validate_subagent_reasoning_effort(spec, opts) do
+    subagents = Map.get(spec, "subagents", %{})
+    explicit = Map.get(subagents, "reasoning_effort")
+
+    invalid_explicit? =
+      Map.has_key?(subagents, "reasoning_effort") and not ReasoningEffort.known?(explicit)
+
+    provider_opts = Keyword.get(opts, :provider_opts, [])
+
+    provider_opts =
+      case Map.get(subagents, "model") do
+        nil -> provider_opts
+        model -> Keyword.put(provider_opts, :model, model)
+      end
+
+    provider_opts =
+      if explicit,
+        do: Keyword.put(provider_opts, :reasoning_effort, explicit),
+        else: provider_opts
+
+    provider = Keyword.get(opts, :provider)
+
+    selection = %{
+      provider_intent: if(provider, do: {:explicit, provider}, else: :auto),
+      request: %{},
+      provider_opts: provider_opts
+    }
+
+    case Registry.resolve_request(
+           selection,
+           Keyword.take(provider_opts, [:config_path, :raw_config, :request_snapshot_loader])
+         ) do
+      {:ok, resolved} ->
+        effective_opts =
+          ResolvedProviderRequest.attach_to_provider_opts(resolved, provider_opts)
+
+        effort = Keyword.get(effective_opts, :reasoning_effort)
+        {:ok, ids} = ReasoningEffort.choices(resolved, effective_opts)
+
+        if invalid_explicit? or
+             (ReasoningEffort.normalize(effort) == {:ok, "max"} and "max" not in ids),
+           do: invalid_delegate_effort(if(invalid_explicit?, do: explicit, else: effort), ids),
+           else: :ok
+
+      {:error, _} ->
+        # Do not broaden old admission for unrelated config faults. If max
+        # intent is present, unresolved capability must fail closed.
+        effort =
+          explicit || Keyword.get(provider_opts, :reasoning_effort) ||
+            Pixir.Config.reasoning_effort()
+
+        if invalid_explicit? or ReasoningEffort.normalize(effort) == {:ok, "max"} do
+          {:ok, ids} = ReasoningEffort.legacy_ids()
+          invalid_delegate_effort(if(invalid_explicit?, do: explicit, else: effort), ids)
+        else
+          :ok
+        end
+    end
+  end
+
+  defp invalid_delegate_effort(effort, ids) do
     {:error,
      invalid_spec(
-       "subagents.reasoning_effort has an unsupported value",
+       "subagents.reasoning_effort has an unsupported value for the effective model/backend",
        %{
          "observed" => effort,
-         "accepted_values" => @valid_reasoning_efforts,
-         "next_actions" => ["set_subagents_reasoning_effort_to_low_medium_high_or_xhigh"]
+         "reason" => "unsupported_reasoning_effort",
+         "accepted_values" => ids,
+         "next_actions" => ["choose_a_supported_effort_or_compatible_model_and_backend"]
        }
        |> Map.merge(object_location_details(["subagents", "reasoning_effort"]))
      )}
   end
-
-  defp validate_subagent_reasoning_effort(_spec), do: :ok
 
   defp reject_unknown_keys(map, known_keys, path, misplaced_hints) do
     known = MapSet.new(known_keys)

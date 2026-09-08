@@ -407,7 +407,7 @@ defmodule Pixir.Providers.AnthropicTest do
              )
 
     contract = result.provider_metadata["prompt_contract"]
-    assert contract["prompt_contract_version"] == "pa4"
+    assert contract["prompt_contract_version"] == "pa5"
     assert is_list(contract["breakpoints"])
     assert is_binary(contract["layer0_hash"])
   end

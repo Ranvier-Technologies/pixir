@@ -2,6 +2,199 @@ defmodule Pixir.Delegate.SkillScriptsTest do
   use ExUnit.Case, async: true
 
   @fanout_script Path.expand("../../../.agents/skills/pixir-delegate/scripts/fanout.sh", __DIR__)
+  @steer_script Path.expand("../../../.agents/skills/pixir-delegate/scripts/steer.sh", __DIR__)
+
+  defp resolution_fixture! do
+    root = tmp_dir!("pixir binary resolution")
+    workspace = Path.join(root, "caller workspace")
+    path_dir = Path.join(workspace, "path tools")
+    File.mkdir_p!(path_dir)
+
+    for tool <- ["bash", "jq", "mkdir", "cat", "dirname"] do
+      File.ln_s!(System.find_executable(tool), Path.join(path_dir, tool))
+    end
+
+    %{root: root, workspace: workspace, path_dir: path_dir}
+  end
+
+  defp resolution_binary!(path) do
+    File.mkdir_p!(Path.dirname(path))
+
+    File.write!(path, ~S"""
+    #!/usr/bin/env bash
+    set -euo pipefail
+    printf '%s\t%s\t%s\n' "$0" "$PWD" "$*" >>"$PIXIR_FAKE_LOG"
+    if [[ "${1:-}" == "--version" ]]; then
+      echo "fake-resolution"
+    elif [[ " $* " == *" --dry-run "* ]]; then
+      echo '{"status":"planned","would_reject":false,"beam_coordination":{"planned_child_count":1}}'
+    elif [[ "${1:-}" == "delegate" ]]; then
+      printf '%s\n' "$PIXIR_FAKE_REAL_JSON"
+    else
+      echo '{"output":"steered"}'
+    fi
+    """)
+
+    File.chmod!(path, 0o755)
+    path
+  end
+
+  defp run_resolution(script, fixture, override, opts \\ []) do
+    log = Path.join(fixture.root, "resolution.log")
+    File.rm(log)
+
+    {script_path, args} =
+      case script do
+        :fanout -> {@fanout_script, ["out", "bounded task"]}
+        :steer -> {@steer_script, ["child-0", "follow up", "out.json"]}
+      end
+
+    {output, code} =
+      System.cmd(System.find_executable("bash"), [script_path | args],
+        cd: fixture.workspace,
+        env: [
+          {"PATH", Keyword.get(opts, :path, fixture.path_dir)},
+          {"PWD", fixture.workspace},
+          {"PIXIR_BIN", override},
+          {"PIXIR_ROLE", "explorer"},
+          {"PIXIR_MAX_THREADS", "1"},
+          {"PIXIR_TIMEOUT_MS", "234567"},
+          {"PIXIR_SKIP_REHEARSAL", "0"},
+          {"PIXIR_POSTURE", "--read-only"},
+          {"PIXIR_FAKE_LOG", log},
+          {"PIXIR_FAKE_REAL_JSON", Jason.encode!(completed_envelope())}
+        ],
+        stderr_to_stdout: true
+      )
+
+    calls =
+      case File.read(log) do
+        {:ok, text} ->
+          text |> String.split("\n", trim: true) |> Enum.map(&String.split(&1, "\t"))
+
+        {:error, :enoent} ->
+          []
+      end
+
+    %{code: code, output: output, calls: calls}
+  end
+
+  defp assert_resolution(result, chosen, fixture, script) do
+    assert result.code == 0, result.output
+    assert result.output =~ "driving: #{chosen} · vfake-resolution"
+    assert result.calls != []
+
+    for [binary, cwd, _args] <- result.calls do
+      assert binary == chosen
+      assert cwd == fixture.workspace
+      assert Path.type(binary) == :absolute
+    end
+
+    if script == :fanout do
+      assert [_, [_, _, rehearsal], [_, _, real]] = result.calls
+      assert rehearsal =~ "--dry-run --json --timeout-ms 234567"
+      assert real =~ "--json --timeout-ms 234567"
+      assert File.exists?(Path.join(fixture.workspace, "out/envelope.json"))
+    else
+      assert [_, [_, _, resume]] = result.calls
+      assert resume == "--json --read-only resume child-0 follow up"
+      assert File.read!(Path.join(fixture.workspace, "out.json")) =~ "steered"
+    end
+  end
+
+  for script <- [:fanout, :steer] do
+    test "#{script} prefers caller-local binary over PATH with unset or empty override" do
+      fixture = resolution_fixture!()
+      resolution_binary!(Path.join(fixture.path_dir, "pixir"))
+      local = resolution_binary!(Path.join(fixture.workspace, "pixir"))
+
+      for override <- [nil, ""] do
+        result = run_resolution(unquote(script), fixture, override)
+        assert_resolution(result, local, fixture, unquote(script))
+      end
+    end
+
+    test "#{script} falls back to PATH only without local candidate and absolutizes relative PATH" do
+      fixture = resolution_fixture!()
+      chosen = resolution_binary!(Path.join(fixture.path_dir, "pixir"))
+
+      for path <- [fixture.path_dir, "path tools"] do
+        result = run_resolution(unquote(script), fixture, nil, path: path)
+        assert_resolution(result, chosen, fixture, unquote(script))
+      end
+    end
+
+    test "#{script} explicit override wins over local and PATH including paths with spaces" do
+      fixture = resolution_fixture!()
+      resolution_binary!(Path.join(fixture.path_dir, "pixir"))
+      resolution_binary!(Path.join(fixture.workspace, "pixir"))
+      chosen = resolution_binary!(Path.join(fixture.workspace, "chosen build/custom pixir"))
+      named = resolution_binary!(Path.join(fixture.path_dir, "custom-pixir"))
+
+      for {override, expected} <- [
+            {chosen, chosen},
+            {"chosen build/custom pixir", chosen},
+            {"custom-pixir", named}
+          ] do
+        result = run_resolution(unquote(script), fixture, override)
+        assert_resolution(result, expected, fixture, unquote(script))
+      end
+    end
+
+    test "#{script} invalid explicit override fails closed without invoking local or PATH" do
+      fixture = resolution_fixture!()
+      resolution_binary!(Path.join(fixture.path_dir, "pixir"))
+      resolution_binary!(Path.join(fixture.workspace, "pixir"))
+      nonexec = Path.join(fixture.workspace, "non executable")
+      File.write!(nonexec, "not executable")
+
+      for override <- ["./missing pixir", "missing-pixir", nonexec, fixture.path_dir] do
+        result = run_resolution(unquote(script), fixture, override)
+        assert result.code == 2
+        assert result.output =~ "error: PIXIR_BIN"
+        assert result.calls == []
+      end
+    end
+
+    test "#{script} nonexecutable local candidate fails closed instead of using PATH" do
+      fixture = resolution_fixture!()
+      resolution_binary!(Path.join(fixture.path_dir, "pixir"))
+      local = Path.join(fixture.workspace, "pixir")
+      File.write!(local, "not executable")
+
+      result = run_resolution(unquote(script), fixture, nil)
+      assert result.code == 2
+      assert result.output =~ "error: local pixir"
+      assert result.calls == []
+    end
+
+    test "#{script} local directory and dangling symlink cannot silently select PATH" do
+      fixture = resolution_fixture!()
+      resolution_binary!(Path.join(fixture.path_dir, "pixir"))
+      local = Path.join(fixture.workspace, "pixir")
+      File.mkdir!(local)
+
+      result = run_resolution(unquote(script), fixture, nil)
+      assert result.code == 2
+      assert result.output =~ "error: local pixir"
+      assert result.calls == []
+
+      File.rmdir!(local)
+      File.ln_s!("missing-target", local)
+      result = run_resolution(unquote(script), fixture, nil)
+      assert result.code == 2
+      assert result.output =~ "error: local pixir"
+      assert result.calls == []
+    end
+
+    test "#{script} missing local and PATH binaries returns a resolution error" do
+      fixture = resolution_fixture!()
+      result = run_resolution(unquote(script), fixture, nil)
+      assert result.code == 2
+      assert result.output =~ "error: pixir not found"
+      assert result.calls == []
+    end
+  end
 
   # unique_integer suffixes cannot form the token "child-0" when a prefix
   # ends in "child". Hex suffixes can: fanout.sh always prints

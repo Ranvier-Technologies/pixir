@@ -4,7 +4,7 @@ defmodule Pixir.Tools.Write do
   use Pixir.Tool
 
   alias Pixir.Tool
-  alias Pixir.Tools.Workspace
+  alias Pixir.Tools.{AtomicWrite, Workspace}
 
   @impl Pixir.Tool
   def __tool__ do
@@ -26,19 +26,16 @@ defmodule Pixir.Tools.Write do
   def execute(%{"path" => path, "content" => content}, context) do
     with {:ok, abs} <- Workspace.confine(context.workspace, path) do
       File.mkdir_p!(Path.dirname(abs))
-      tmp = abs <> ".pixir-tmp"
 
-      with :ok <- File.write(tmp, content),
-           :ok <- File.rename(tmp, abs) do
-        {:ok,
-         %{
-           "output" => "wrote #{byte_size(content)} bytes to #{path}",
-           "bytes" => byte_size(content)
-         }}
-      else
+      case AtomicWrite.write(abs, content) do
+        {:ok, nil} ->
+          {:ok,
+           %{
+             "output" => "wrote #{byte_size(content)} bytes to #{path}",
+             "bytes" => byte_size(content)
+           }}
+
         {:error, reason} ->
-          _ = File.rm(tmp)
-
           {:error,
            Tool.error(:write_failed, "could not write file", %{path: path, reason: reason})}
       end

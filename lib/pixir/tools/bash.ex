@@ -36,6 +36,8 @@ defmodule Pixir.Tools.Bash do
   alias Pixir.{Config, Permissions, Tool}
   alias Pixir.Tools.CommandBoundary
 
+  @kill_escalation_grace_ms 200
+
   @impl Pixir.Tool
   def __tool__ do
     %{
@@ -63,7 +65,17 @@ defmodule Pixir.Tools.Bash do
          :ok <- reject_outside_workspace_references(command, context.workspace),
          {:ok, perl} <- perl_executable(context) do
       case CommandBoundary.with_slot("bash", boundary_opts(context), fn lease ->
-             {run(command, context.workspace, timeout.effective_ms, perl), lease.host_command}
+             {
+               run(
+                 command,
+                 context.workspace,
+                 timeout.effective_ms,
+                 perl,
+                 lease,
+                 context.session_id
+               ),
+               lease.host_command
+             }
            end) do
         {{:done, output, exit_code}, host_command} ->
           {:ok,
@@ -107,7 +119,7 @@ defmodule Pixir.Tools.Bash do
 
   # ── internals ─────────────────────────────────────────────────────────────
 
-  defp run(command, workspace, timeout, perl) do
+  defp run(command, workspace, timeout, perl, lease, session_id) do
     port =
       Port.open(
         {:spawn_executable, perl},
@@ -128,9 +140,25 @@ defmodule Pixir.Tools.Bash do
       end
 
     reaper = start_reaper(self(), os_pid)
+
+    register_process_advisory(
+      lease,
+      session_id,
+      port,
+      timeout,
+      @kill_escalation_grace_ms
+    )
+
     result = collect(port, "", timeout, os_pid)
     cancel_reaper(reaper)
     result
+  end
+
+  defp register_process_advisory(lease, session_id, port, timeout_ms, grace_ms) do
+    _ = CommandBoundary.register_process(lease, session_id, port, timeout_ms, grace_ms)
+    :ok
+  catch
+    :exit, _reason -> :ok
   end
 
   defp collect(port, acc, timeout, os_pid) do
@@ -149,11 +177,10 @@ defmodule Pixir.Tools.Bash do
   defp terminate_process_group(os_pid) when is_integer(os_pid) do
     # The "--" separator is load-bearing: BSD kill accepts the bare negative
     # form, while procps-ng 4.x misparses it (exiting 1 refusing delivery, or
-    # 0 without delivering, depending on version). BusyBox kill misparses the
-    # "--" itself, which breaks the alive-check there instead (#594).
+    # 0 without delivering, depending on version).
     group = "-#{os_pid}"
     best_effort_signal("kill", ["-TERM", "--", group])
-    Process.sleep(200)
+    Process.sleep(@kill_escalation_grace_ms)
 
     escalation =
       if os_process_group_alive?(os_pid) do
@@ -216,10 +243,31 @@ defmodule Pixir.Tools.Bash do
         false
 
       executable ->
-        match?(
-          {_output, 0},
-          System.cmd(executable, ["-0", "--", "-#{os_pid}"], stderr_to_stdout: true)
-        )
+        os_process_group_alive?(os_pid, fn args ->
+          System.cmd(executable, args, stderr_to_stdout: true)
+        end)
+    end
+  rescue
+    _error -> false
+  catch
+    _kind, _reason -> false
+  end
+
+  @doc false
+  def os_process_group_alive?(os_pid, command_runner)
+      when is_integer(os_pid) and is_function(command_runner, 1) do
+    group = "-#{os_pid}"
+
+    case command_runner.(["-0", "--", group]) do
+      {_output, 0} ->
+        true
+
+      {output, _exit_code} ->
+        if String.contains?(output, "invalid number '--'") do
+          match?({_output, 0}, command_runner.(["-0", group]))
+        else
+          false
+        end
     end
   rescue
     _error -> false

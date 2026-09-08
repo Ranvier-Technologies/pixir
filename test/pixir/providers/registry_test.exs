@@ -120,7 +120,7 @@ defmodule Pixir.Providers.RegistryTest do
 
     assert anthropic.capabilities.reasoning_dialect == "anthropic"
     assert anthropic.capabilities.prompt_cache == :cache_control
-    assert anthropic.capabilities.prompt_contract_version == "pa4"
+    assert anthropic.capabilities.prompt_contract_version == "pa5"
     assert anthropic.capabilities.tool_dialect == :anthropic
     assert anthropic.capabilities.hosted_tools == false
   end

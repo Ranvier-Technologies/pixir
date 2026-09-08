@@ -1547,7 +1547,7 @@ defmodule Pixir.ProviderTransportPolicyTest do
     assert second.provider_metadata["used_previous_response_id"] == false
   end
 
-  test "explicit connection call timeout kills stale continuation and falls back to full replay",
+  test "explicit connection call timeout kills stale continuation without automatic replay",
        %{auth: auth} do
     {:ok, scripts} =
       Agent.start_link(fn ->
@@ -1581,7 +1581,10 @@ defmodule Pixir.ProviderTransportPolicyTest do
       Event.user_message("s", "second")
     ]
 
-    assert {:ok, second} =
+    [{original_connection, _}] = Registry.lookup(Pixir.Provider.ConnectionRegistry, key)
+    monitor = Process.monitor(original_connection)
+
+    assert {:error, %{error: %{kind: :websocket_call_timeout, details: %{timeout_ms: 25}}}} =
              Provider.stream(
                %{history: continued_history},
                auth: auth,
@@ -1594,22 +1597,14 @@ defmodule Pixir.ProviderTransportPolicyTest do
                max_retries: 0
              )
 
-    assert second.text == "http"
     assert_received {:websocket_payload, attempted_payload}
     assert attempted_payload["previous_response_id"] == "resp_1"
-    assert second.provider_metadata["active_transport"] == "http_sse"
-    assert second.provider_metadata["fallback_reason"] == "websocket_call_timeout"
-    assert second.provider_metadata["continuation_reset_reason"] == "socket_closed"
-    assert second.provider_metadata["used_previous_response_id"] == false
+    refute_received {:http_request, _}
+    assert_receive {:DOWN, ^monitor, :process, ^original_connection, :killed}
 
-    assert_received {:http_request, %{body: body}}
-    delivered = Jason.decode!(body)
-    refute Map.has_key?(delivered, "previous_response_id")
-    assert length(delivered["input"]) == 3
-
-    Process.sleep(20)
-
-    later_history = continued_history ++ [Event.assistant_message("s", "http")]
+    # A separately initiated request may reconnect, but the ambiguous request
+    # above is never silently replayed or recorded as a successful assistant turn.
+    later_history = continued_history ++ [Event.user_message("s", "separate next request")]
 
     assert {:ok, third} =
              Provider.stream(
@@ -1623,6 +1618,8 @@ defmodule Pixir.ProviderTransportPolicyTest do
              )
 
     assert third.text == "third"
+    [{next_connection, _}] = Registry.lookup(Pixir.Provider.ConnectionRegistry, key)
+    refute next_connection == original_connection
     assert_received {:websocket_payload, third_payload}
     refute Map.has_key?(third_payload, "previous_response_id")
     assert length(third_payload["input"]) == 4

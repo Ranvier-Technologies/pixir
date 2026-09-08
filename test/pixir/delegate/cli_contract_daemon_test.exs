@@ -277,6 +277,27 @@ defmodule Pixir.Delegate.CLIContractDaemonTest do
     }
   end
 
+  test "daemon build identity is advertised by additive envelope revision 11", %{ws: ws} do
+    {pid, _token} = start_horizon_admission_daemon(ws)
+
+    assert {:ok, raw_started} = DaemonServer.started_payload(pid)
+    # An older CLI's put_new default must not relabel the new daemon payload.
+    assert Map.put_new(raw_started, "schema_version", 10)["schema_version"] == 11
+
+    for action <- ["--status", "--stop"] do
+      assert {:ok, %{exit_code: 0, payload: payload}} =
+               CLIContract.run(["daemon", action, "--json"], workspace: ws)
+
+      assert payload["schema"] == "pixir.delegate.envelope.v1"
+      assert payload["schema_version"] == 11
+      assert payload["build_info"]["version"] == Pixir.version()
+      assert payload["build_info"]["os_pid"] == payload["daemon"]["pid"]
+    end
+
+    assert {11, :build_identity, _description} =
+             List.last(CLIContract.envelope_schema_registry())
+  end
+
   defp start_horizon_admission_daemon(ws) do
     token = "horizon-admission-token-#{System.unique_integer([:positive])}"
 

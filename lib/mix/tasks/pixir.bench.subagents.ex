@@ -227,11 +227,22 @@ defmodule Mix.Tasks.Pixir.Bench.Subagents do
     File.mkdir_p!(workspace)
     File.write!(Path.join(workspace, "source.txt"), "parent source")
 
-    started_at = DateTime.utc_now()
-    started_native = System.monotonic_time(:millisecond)
+    timing = {DateTime.utc_now(), System.monotonic_time(:millisecond)}
 
-    {:ok, sid, _pid} = SessionSupervisor.start_session(workspace: workspace, role: :build)
+    with_benchmark_session(workspace, fn sid ->
+      measure_spawn_wait(workspace, run_id, n, repetition, scenario, sid, timing)
+    end)
+  end
 
+  defp measure_spawn_wait(
+         workspace,
+         run_id,
+         n,
+         repetition,
+         scenario,
+         sid,
+         {started_at, started_native}
+       ) do
     spawn_started = System.monotonic_time(:millisecond)
 
     agents =
@@ -332,10 +343,14 @@ defmodule Mix.Tasks.Pixir.Bench.Subagents do
     File.mkdir_p!(workspace)
     File.write!(Path.join(workspace, "source.txt"), "parent source")
 
-    started_at = DateTime.utc_now()
-    started_native = System.monotonic_time(:millisecond)
-    {:ok, sid, _pid} = SessionSupervisor.start_session(workspace: workspace, role: :build)
+    timing = {DateTime.utc_now(), System.monotonic_time(:millisecond)}
 
+    with_benchmark_session(workspace, fn sid ->
+      measure_close_mid_fanout(workspace, run_id, scenario, sid, timing)
+    end)
+  end
+
+  defp measure_close_mid_fanout(workspace, run_id, scenario, sid, {started_at, started_native}) do
     agents =
       for i <- 1..5 do
         {:ok, agent} =
@@ -440,8 +455,13 @@ defmodule Mix.Tasks.Pixir.Bench.Subagents do
     File.write!(Path.join(workspace, "source.txt"), "parent source")
 
     started_at = DateTime.utc_now()
-    {:ok, sid, _pid} = SessionSupervisor.start_session(workspace: workspace, role: :build)
 
+    with_benchmark_session(workspace, fn sid ->
+      measure_replay_summary(workspace, run_id, scenario, sid, started_at)
+    end)
+  end
+
+  defp measure_replay_summary(workspace, run_id, scenario, sid, started_at) do
     agents =
       for i <- 1..2 do
         {:ok, agent} =
@@ -497,6 +517,38 @@ defmodule Mix.Tasks.Pixir.Bench.Subagents do
         "replay_excerpt" => String.slice(replay_text, 0, 1_000)
       }
     }
+  end
+
+  defp with_benchmark_session(workspace, measure) do
+    {:ok, sid, _pid} = SessionSupervisor.start_session(workspace: workspace, role: :build)
+
+    try do
+      measure.(sid)
+    after
+      # A terminal Subagent is not a stopped Session: it still owns a writer
+      # lease and heartbeat. Release only this scenario's owners before callers
+      # can remove its output, including when measurement raises.
+      try do
+        {:ok, agents} = Subagents.list(sid, workspace: workspace)
+
+        # Close queued work before running work so cleanup cannot drain it into
+        # new Sessions. Successful terminal evidence remains unchanged.
+        for agent <- Enum.sort_by(agents, &(&1["status"] != "queued")),
+            not Subagents.terminal?(agent["status"]) do
+          {:ok, _closed} = Subagents.close(sid, agent["id"], workspace: workspace)
+        end
+
+        {:ok, agents} = Subagents.list(sid, workspace: workspace)
+
+        for agent <- agents, is_binary(agent["child_session_id"]) do
+          {:ok, _} = SessionSupervisor.stop_session(agent["child_session_id"])
+        end
+      after
+        # stop_session uses the supervisor's bounded, synchronous shutdown;
+        # do not delete files, retry removals, or stop shared runtime managers.
+        {:ok, _} = SessionSupervisor.stop_session(sid)
+      end
+    end
   end
 
   defp capture_replay_text(history) do

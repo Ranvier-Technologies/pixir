@@ -6,6 +6,12 @@ defmodule Pixir.Provider.Cache do
   no raw workspace paths, user text, request ids, timestamps, emails, or secrets. The
   Provider still combines this hint with its own prompt-prefix hash; Pixir treats the key
   as optimization metadata, never as durable state.
+
+  px8 versions the virtual-overlay lifetime/delivery Tool contract (Anthropic: pa5).
+  This intentionally restarts cache warming even though Layer 0 bytes are unchanged.
+  Keep this prompt-contract change in a separate PR and observability window from
+  independent WebSocket fixes; one release may include both verified changes.
+  Do not attribute that cold start to transport.
   """
 
   @max_key_bytes 96
@@ -22,7 +28,10 @@ defmodule Pixir.Provider.Cache do
   # px5 = build prompt carries the code-style reviewability sentence (refs #570).
   # px6 = bash schema exposes timeout_ms; refs #575
   # px7 = build prompt drops the #570 style sentence after the N=3 A/B verdict (refs #570).
-  @prompt_contract_version "px7"
+  # px8 = virtual-overlay invocation lifetime, explicit delivery selection, and bounded feedback.
+  # This intentional tool-schema/prompt break restarts cache warming; measure it in a
+  # separate observability window from independent WebSocket fixes (ADR 0020).
+  @prompt_contract_version "px8"
 
   @doc "The current Prompt Contract version segment (leads every cache key)."
   @spec prompt_contract_version() :: String.t()

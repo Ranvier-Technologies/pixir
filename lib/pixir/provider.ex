@@ -38,7 +38,7 @@ defmodule Pixir.Provider do
   counted as bounded `other` evidence and their payloads remain opaque.
   """
 
-  alias Pixir.{BranchSummary, Compaction, Config, Event, Skills}
+  alias Pixir.{BranchSummary, Compaction, Config, Event, ReasoningEffort, Skills}
   alias Pixir.Providers.{ErrBody, Registry, ResolvedProviderRequest, ResponsesBackend}
 
   alias Pixir.Provider.{
@@ -66,10 +66,11 @@ defmodule Pixir.Provider do
 
   # The built-in model catalog (ADR 0009 / epic A.5). The same OpenAI/Codex
   # family the client may pick from; a `~/.pixir/config.json` `"models"` array
-  # overrides/extends it. The default (the active `default_model/0`) is flagged
+  # replaces it. The default (the active `default_model/0`) is flagged
   # so the client's picker can mark it. Used to advertise the catalog over ACP
   # and to reject an unknown per-turn `_meta.model` early (`-32602`).
   @built_in_models ~w(
+    gpt-6-astra
     gpt-5.6-sol
     gpt-5.6
     gpt-5.5
@@ -226,6 +227,9 @@ defmodule Pixir.Provider do
       {:ok, result} ->
         {:ok, result}
 
+      {:error, error, :replay_unsafe} ->
+        {:error, error}
+
       {:error, error} ->
         if n < max and retryable?(error) do
           sleep.(backoff_ms(n))
@@ -259,7 +263,7 @@ defmodule Pixir.Provider do
     backend_mode = ResponsesBackend.mode(backend)
 
     reasoning_effort =
-      normalize_reasoning_effort(request[:reasoning_effort] || opts[:reasoning_effort])
+      normalize_reasoning_effort(requested_reasoning(request, opts))
 
     text_verbosity =
       normalize_text_verbosity(request[:text_verbosity] || opts[:text_verbosity])
@@ -288,6 +292,9 @@ defmodule Pixir.Provider do
         text: "",
         reasoning: "",
         stream_error: nil,
+        # Internal transport/retry seam, not delivered Provider metadata. False is
+        # sticky once output/callback effects are observed or recovery is spent.
+        replay_safe?: true,
         terminal_evidence: nil,
         provider_metadata: %{},
         # `output_items` holds reasoning items and function calls in SSE arrival order
@@ -313,10 +320,16 @@ defmodule Pixir.Provider do
 
       case run(request, opts, http_request, init) do
         {:ok, acc} ->
-          acc |> finish_sse() |> finalize()
+          acc = finish_sse(acc)
+          guard_websocket_replay(finalize(acc), acc)
 
         {:error, reason, acc} ->
-          {:error, TransportError.project(reason, status: acc.status)}
+          error =
+            if acc.provider_metadata["active_transport"] == "websocket" and acc.stream_error,
+              do: acc.stream_error,
+              else: TransportError.project(reason, status: acc.status)
+
+          guard_websocket_replay({:error, error}, acc)
 
         {:error, reason} ->
           {:error, TransportError.project(reason)}
@@ -329,6 +342,17 @@ defmodule Pixir.Provider do
         error
     end
   end
+
+  # Do not let the outer transient-error loop replay a WebSocket attempt that
+  # already exposed effects or consumed its one clean continuation reset. Keep
+  # the original error and the existing generic retry classification unchanged.
+  defp guard_websocket_replay({:error, error}, %{
+         replay_safe?: false,
+         provider_metadata: %{"active_transport" => "websocket"}
+       }),
+       do: {:error, error, :replay_unsafe}
+
+  defp guard_websocket_replay(result, _acc), do: result
 
   @doc """
   Resolve the model id (open knob) through `Pixir.Config.load/1`'s effective snapshot.
@@ -350,7 +374,7 @@ defmodule Pixir.Provider do
   The model catalog Pixir advertises to a client (epic A.5). A list of
   `%{"id" => slug, "name" => label, "default" => bool}` (string-keyed so it
   rides ACP `_meta` verbatim). Source: the built-in list (`#{@default_model}` &
-  family), extended/overridden by a `~/.pixir/config.json` `"models"` array of
+  family), replaced by a `~/.pixir/config.json` `"models"` array of
   slugs if present. The active `default_model/0` is always included and flagged
   `default: true` (so the client's picker has a default even if config narrows
   the list).
@@ -397,7 +421,7 @@ defmodule Pixir.Provider do
       backend = ResolvedProviderRequest.responses_backend(resolved)
 
       reasoning_effort =
-        normalize_reasoning_effort(request[:reasoning_effort] || opts[:reasoning_effort])
+        normalize_reasoning_effort(requested_reasoning(request, opts))
 
       text_verbosity =
         normalize_text_verbosity(request[:text_verbosity] || opts[:text_verbosity])
@@ -907,7 +931,28 @@ defmodule Pixir.Provider do
 
   defp validate_requested_capabilities(resolved, request, opts) do
     backend = ResolvedProviderRequest.responses_backend(resolved)
-    ResponsesExtensions.validate_request(backend, request, requested_reasoning(request, opts))
+    effort = requested_reasoning(request, opts)
+
+    cond do
+      effort == :normalized_key_collision ->
+        invalid_request_field(:reasoning_effort, "normalized_key_collision")
+
+      true ->
+        with :ok <- validate_max_effort(effort, resolved, opts) do
+          ResponsesExtensions.validate_request(backend, request, effort)
+        end
+    end
+  end
+
+  defp validate_max_effort(effort, resolved, opts) do
+    if normalize_reasoning_effort(effort) == "max" do
+      case ReasoningEffort.validate(effort, resolved, opts) do
+        {:ok, _} -> :ok
+        {:error, _} = error -> error
+      end
+    else
+      :ok
+    end
   end
 
   defp requested_reasoning(request, opts) do
@@ -1078,18 +1123,14 @@ defmodule Pixir.Provider do
        else: body
   end
 
-  # Accept the reasoning efforts these models support; anything else (including
-  # nil) falls through to the model default. Tolerates a string or atom.
-  @valid_reasoning_efforts ~w(low medium high xhigh)
-  defp normalize_reasoning_effort(effort) when is_atom(effort) and not is_nil(effort),
-    do: normalize_reasoning_effort(Atom.to_string(effort))
-
-  defp normalize_reasoning_effort(effort) when is_binary(effort) do
-    trimmed = String.trim(effort)
-    if trimmed in @valid_reasoning_efforts, do: trimmed, else: nil
+  # Preserve established invalid-value omission, but recognize max so validation
+  # above must either admit it for the effective selection or fail before Auth.
+  defp normalize_reasoning_effort(effort) do
+    case ReasoningEffort.normalize(effort) do
+      {:ok, value} -> value
+      {:error, _} -> nil
+    end
   end
-
-  defp normalize_reasoning_effort(_), do: nil
 
   @valid_text_verbosities ~w(low medium high)
   defp normalize_text_verbosity(verbosity) when is_atom(verbosity) and not is_nil(verbosity),
@@ -1607,8 +1648,13 @@ defmodule Pixir.Provider do
   defp handle_chunk({:status, status}, acc), do: %{acc | status: status}
   defp handle_chunk({:headers, _headers}, acc), do: acc
 
-  defp handle_chunk({:metadata, metadata}, acc) when is_map(metadata),
-    do: %{acc | provider_metadata: Map.merge(acc.provider_metadata, metadata)}
+  defp handle_chunk({:metadata, metadata}, acc) when is_map(metadata) do
+    acc = %{acc | provider_metadata: Map.merge(acc.provider_metadata, metadata)}
+
+    if metadata["continuation_reset_reason"] == "previous_response_not_found",
+      do: %{acc | replay_safe?: false},
+      else: acc
+  end
 
   defp handle_chunk({:data, data}, %{status: status} = acc) when status in 200..299,
     do: feed_sse(acc, data)
@@ -1916,32 +1962,51 @@ defmodule Pixir.Provider do
     end
   end
 
-  defp apply_event({:ok, %{"type" => "response.output_text.delta", "delta" => delta}}, acc)
-       when is_binary(delta) do
-    acc.on_delta.({:text_delta, delta})
-    %{acc | text: acc.text <> delta}
+  defp apply_event(event, acc) do
+    reduce_event(event, acc)
+  catch
+    kind, reason ->
+      if acc.provider_metadata["active_transport"] == "websocket" do
+        # A callback may perform its effect and then raise/exit. Carry the last
+        # accumulator and an explicit no-replay outcome across Connection's guard.
+        throw({:provider_stream_callback_failed, kind, reason, %{acc | replay_safe?: false}})
+      else
+        :erlang.raise(kind, reason, __STACKTRACE__)
+      end
   end
 
-  defp apply_event({:ok, %{"type" => "error", "error" => error}}, acc) when is_map(error) do
+  defp reduce_event({:ok, %{"type" => "response.output_text.delta", "delta" => delta}}, acc)
+       when is_binary(delta) do
+    acc.on_delta.({:text_delta, delta})
+    %{acc | text: acc.text <> delta, replay_safe?: false}
+  end
+
+  defp reduce_event({:ok, %{"type" => "error", "error" => error}}, acc) when is_map(error) do
     put_stream_error(acc, "error", error)
   end
 
-  defp apply_event(
-         {:ok, %{"type" => "response.failed", "response" => %{"error" => error}}},
+  defp reduce_event(
+         {:ok, %{"type" => "response.failed", "response" => %{"error" => error} = response}},
          acc
        )
        when is_map(error) do
-    put_stream_error(acc, "response.failed", error)
+    acc
+    |> maybe_put_usage(response["usage"])
+    |> put_stream_error("response.failed", error)
   end
 
-  defp apply_event({:ok, %{"type" => type, "delta" => delta}}, acc)
+  defp reduce_event({:ok, %{"type" => "response.failed"}}, acc) do
+    put_stream_error(acc, "response.failed", %{})
+  end
+
+  defp reduce_event({:ok, %{"type" => type, "delta" => delta}}, acc)
        when type in ["response.reasoning_summary_text.delta", "response.reasoning_text.delta"] and
               is_binary(delta) do
     acc.on_delta.({:reasoning_delta, delta})
-    %{acc | reasoning: acc.reasoning <> delta}
+    %{acc | reasoning: acc.reasoning <> delta, replay_safe?: false}
   end
 
-  defp apply_event(
+  defp reduce_event(
          {:ok,
           %{"type" => "response.output_item.done", "item" => %{"type" => "function_call"} = item}},
          acc
@@ -1954,6 +2019,7 @@ defmodule Pixir.Provider do
         # processes an interrupt can kill. `on_committed_call` hands it to the Session,
         # which survives.
         acc
+        |> Map.put(:replay_safe?, false)
         |> put_committed_call_error(acc.on_committed_call.(call))
         |> Map.update!(:output_items, &[{:function_call, call} | &1])
 
@@ -1962,7 +2028,7 @@ defmodule Pixir.Provider do
     end
   end
 
-  defp apply_event(
+  defp reduce_event(
          {:ok,
           %{
             "type" => "response.output_item.done",
@@ -1973,46 +2039,48 @@ defmodule Pixir.Provider do
     call = compact_web_search_call(item)
 
     acc
+    |> Map.put(:replay_safe?, false)
     |> append_web_search("calls", [call])
     |> append_web_search("sources", web_search_sources(item))
     |> Map.update!(:output_items, &[{:provider_hosted_tool, call} | &1])
   end
 
-  defp apply_event(
+  defp reduce_event(
          {:ok, %{"type" => "response.output_item.done", "item" => %{"type" => "message"} = item}},
          acc
        ) do
-    append_web_search(acc, "annotations", message_annotations(item))
+    append_web_search(%{acc | replay_safe?: false}, "annotations", message_annotations(item))
   end
 
-  defp apply_event({:ok, %{"type" => "response.output_text.done"} = event}, acc) do
-    append_web_search(acc, "annotations", message_annotations(event))
+  defp reduce_event({:ok, %{"type" => "response.output_text.done"} = event}, acc) do
+    append_web_search(%{acc | replay_safe?: false}, "annotations", message_annotations(event))
   end
 
   # Capture the encrypted reasoning item (`rs_…`) opaquely (ADR 0007). The item carries
   # `encrypted_content` and its own id; we store it verbatim and never interpret it.
-  defp apply_event(
+  defp reduce_event(
          {:ok,
           %{"type" => "response.output_item.done", "item" => %{"type" => "reasoning"} = item}},
          acc
        ) do
-    %{acc | output_items: [{:reasoning, item} | acc.output_items]}
+    %{acc | output_items: [{:reasoning, item} | acc.output_items], replay_safe?: false}
   end
 
   # ADR 0040 / #522-D: latest complete `cmp_` item from an ordinary Turn stream.
   # Same-turn output after this item is tail History, not part of `items`.
-  defp apply_event(
+  defp reduce_event(
          {:ok,
           %{"type" => "response.output_item.done", "item" => %{"type" => "compaction"} = item}},
          acc
        ) do
     acc
+    |> Map.put(:replay_safe?, false)
     |> Map.put(:compaction_item, item)
     |> Map.update!(:output_items, &[{:compaction, item} | &1])
     |> put_compaction_item_error(acc.on_compaction_item.(item))
   end
 
-  defp apply_event({:ok, %{"type" => type} = event}, acc)
+  defp reduce_event({:ok, %{"type" => type} = event}, acc)
        when type in ["response.completed", "response.incomplete"] do
     {usage, evidence} =
       case terminal_response(event) do
@@ -2024,20 +2092,38 @@ defmodule Pixir.Provider do
       end
 
     acc
+    |> Map.put(:replay_safe?, false)
     |> Map.put(:terminal_event_type, type)
     |> maybe_put_usage(usage)
     |> put_terminal_evidence(evidence)
   end
 
-  defp apply_event({:ok, %{"type" => type} = event}, acc) when is_binary(type) do
+  # These frames expose output progress before an item is finalized. In particular,
+  # a declared/in-progress hosted call is not a clean request rejection.
+  defp reduce_event({:ok, %{"type" => type}}, acc)
+       when type in [
+              "response.output_item.added",
+              "response.content_part.added",
+              "response.content_part.done",
+              "response.function_call_arguments.delta",
+              "response.function_call_arguments.done",
+              "response.output_text.annotation.added",
+              "response.reasoning_summary_part.added",
+              "response.reasoning_summary_part.done",
+              "response.reasoning_summary_text.done",
+              "response.reasoning_text.done"
+            ],
+       do: %{acc | replay_safe?: false}
+
+  defp reduce_event({:ok, %{"type" => type} = event}, acc) when is_binary(type) do
     if String.starts_with?(type, "response.web_search_call.") do
-      append_web_search(acc, "events", [compact_web_search_event(event)])
+      append_web_search(%{acc | replay_safe?: false}, "events", [compact_web_search_event(event)])
     else
       acc
     end
   end
 
-  defp apply_event(_other, acc), do: acc
+  defp reduce_event(_other, acc), do: acc
 
   defp put_stream_error(%{stream_error: nil, status: status} = acc, event_type, error) do
     message = error["message"] || "Responses stream failed."
@@ -2188,7 +2274,7 @@ defmodule Pixir.Provider do
   end
 
   defp maybe_put_usage(acc, usage) when is_map(usage),
-    do: %{acc | usage: usage, usage_summary: usage_summary(usage)}
+    do: %{acc | usage: usage, usage_summary: usage_summary(usage), replay_safe?: false}
 
   defp maybe_put_usage(acc, _usage), do: acc
 
@@ -2541,7 +2627,9 @@ defmodule Pixir.Provider do
   Normalize OpenAI usage payloads into the fields Pixir records as Provider evidence.
 
   Supports the Responses shape (`input_tokens_details.cached_tokens`) and the legacy
-  prompt/completion naming used by older examples.
+  prompt/completion naming used by older examples. Accounting fields retain their
+  historical coercions; `input_tokens_unavailable_reason`, when present, preserves
+  missing/invalid raw evidence so those coercions cannot create a pressure gauge.
   """
   @spec usage_summary(map() | nil) :: map()
   def usage_summary(nil), do: usage_summary(%{})
@@ -2588,6 +2676,31 @@ defmodule Pixir.Provider do
       cache_hit_rate: cache_hit_rate(cached_tokens, input_tokens),
       cache: %{"creation_tokens" => 0, "read_tokens" => cached_tokens || 0}
     }
+    |> preserve_input_tokens_provenance(usage)
+  end
+
+  # Keep the established Responses/legacy lookup order, including nil fallback,
+  # but do not let false disappear through Enum.find_value/2's truthiness rules.
+  # The optional marker travels inside usage_summary through JSON and Log folding.
+  # Valid integer observations keep the established normalized shape unchanged.
+  defp preserve_input_tokens_provenance(summary, usage) do
+    raw_input =
+      Enum.reduce_while(
+        ["input_tokens", "prompt_tokens", :input_tokens, :prompt_tokens],
+        nil,
+        fn key, _acc ->
+          case Map.get(usage, key) do
+            nil -> {:cont, nil}
+            value -> {:halt, value}
+          end
+        end
+      )
+
+    case raw_input do
+      tokens when is_integer(tokens) and tokens >= 0 -> summary
+      nil -> Map.put(summary, :input_tokens_unavailable_reason, "usage_missing")
+      _ -> Map.put(summary, :input_tokens_unavailable_reason, "usage_invalid")
+    end
   end
 
   defp first(map, keys) do

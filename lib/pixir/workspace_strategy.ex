@@ -3,9 +3,11 @@ defmodule Pixir.WorkspaceStrategy do
   Workspace Strategy vocabulary for Subagents and Workflow steps.
 
   A Workspace Strategy describes how a child sees files and whether writes can mutate
-  the parent workspace. Subagents currently execute `shared` and `isolated`; Workflow
-  steps may also opt in to `virtual_overlay`, which runs explicit virtual commands over
-  an imported read set and returns a `virtual_diff` without mutating the parent.
+  the parent workspace. Subagents execute `shared` and `isolated`, and may opt in to
+  `virtual_overlay` with operator-owned read-set context. Workflow steps also support
+  explicit virtual commands. Each invocation imports host files afresh and returns an
+  unapplied `virtual_diff`; only commands within that invocation share virtual edits.
+  Canonical Logs/artifacts persist on disk; no persistent Session scratch is implied.
   """
 
   alias Pixir.Tool
@@ -64,6 +66,10 @@ defmodule Pixir.WorkspaceStrategy do
            "apply_status" => "not_applied",
            "requires_explicit_apply" => true,
            "virtual_command_boundary" => "beam_native_virtual_shell_only",
+           "virtual_edit_lifetime" => "one_invocation_only_next_call_reimports_host_files",
+           "durable_evidence" => "canonical_logs_and_artifacts_persist_on_disk",
+           "delivery_selection" =>
+             "latest_successful_explicit_mark_else_legacy_latest_successful_artifact",
            "fidelity_caveats" => virtual_overlay_caveats(metadata)
          }}
 
@@ -104,7 +110,7 @@ defmodule Pixir.WorkspaceStrategy do
       Map.put(
         details,
         "future_mode_status",
-        "virtual_overlay is modeled in Delegation Context but is not runtime-enabled yet on this surface"
+        "virtual_overlay requires operator-owned read_set context and is not enabled on this surface without it"
       )
     else
       details
@@ -115,7 +121,10 @@ defmodule Pixir.WorkspaceStrategy do
 
   defp unsupported_mode_next_actions(future_modes) do
     if "virtual_overlay" in future_modes do
-      ["use_workspace_mode_shared_or_isolated", "wait_for_virtual_overlay_runtime_slice_121"]
+      [
+        "use_workspace_mode_shared_or_isolated",
+        "supply_operator_virtual_overlay_read_set_context"
+      ]
     else
       ["use_supported_workspace_mode"]
     end
@@ -124,9 +133,12 @@ defmodule Pixir.WorkspaceStrategy do
   defp virtual_overlay_caveats(_metadata) do
     [
       "Only files imported from read_set are visible.",
+      "Commands within ONE run_virtual_commands call share virtual edits; the next call reimports host files. No persistent Session scratch is retained.",
+      "Canonical Logs/artifacts persist on disk even though virtual edits are in memory.",
       "Virtual writes do not mutate the parent workspace.",
       "Real host binaries are unavailable: mix, git, node, package managers, compilers, tests, /bin/bash, /bin/sh, and arbitrary host commands.",
       "Network and custom host-side commands are unavailable by default.",
+      "Set deliverable: true on the producing call to select its successful artifact; later unmarked reads do not replace it. A later explicit mark replaces it, including an empty diff. Without a mark, the latest successful artifact is selected.",
       "Return changes as a virtual_diff artifact; applying it requires a later explicit apply step."
     ]
   end

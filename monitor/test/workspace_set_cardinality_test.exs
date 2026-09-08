@@ -178,7 +178,7 @@ defmodule PixirMonitor.WorkspaceSetCardinalityTest do
     end
 
     install_set(roots, @max_sources + 1)
-    assert {:error, %{kind: "workspace_set_not_configured"}} = PixirMonitor.WorkspaceSet.configured()
+    assert {:error, %{kind: "workspace_set_configuration_invalid", details: %{reason: "cardinality_out_of_range"}}} = PixirMonitor.WorkspaceSet.configured()
 
     Application.put_env(:pixir_monitor, :workspace_set, [
       %{key: "lane1", path: roots[1]},
@@ -186,7 +186,7 @@ defmodule PixirMonitor.WorkspaceSetCardinalityTest do
       %{key: "lane1", path: roots[3]}
     ])
 
-    assert {:error, %{kind: "workspace_set_not_configured"}} = PixirMonitor.WorkspaceSet.configured()
+    assert {:error, %{kind: "workspace_set_configuration_invalid", details: %{reason: "duplicate_key"}}} = PixirMonitor.WorkspaceSet.configured()
 
     Application.put_env(:pixir_monitor, :workspace_set, [
       %{key: "lane1", path: roots[1]},
@@ -194,7 +194,7 @@ defmodule PixirMonitor.WorkspaceSetCardinalityTest do
       %{key: "$bad", path: roots[3]}
     ])
 
-    assert {:error, %{kind: "workspace_set_not_configured"}} = PixirMonitor.WorkspaceSet.configured()
+    assert {:error, %{kind: "workspace_set_configuration_invalid", details: %{reason: "invalid_key"}}} = PixirMonitor.WorkspaceSet.configured()
   end
 
   test "the shell embeds every declared key in declaration order and validates against the schema", %{roots: roots} do

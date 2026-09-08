@@ -1112,8 +1112,12 @@ defmodule Pixir.Delegate.Runner do
 
   defp with_provider_transport(opts, nil), do: opts
 
-  defp with_provider_transport(opts, transport),
-    do: Keyword.put(opts, :provider_transport, transport)
+  defp with_provider_transport(opts, transport) do
+    # Manager and Workflow children consume provider options, not a top-level
+    # spawning option. Spec intent overrides only this key; preserve all others.
+    provider_opts = Keyword.get(opts, :provider_opts) || []
+    Keyword.put(opts, :provider_opts, Keyword.put(provider_opts, :provider_transport, transport))
+  end
 
   defp normalize_workspace_mode(spec) do
     value =
@@ -1277,6 +1281,7 @@ defmodule Pixir.Delegate.Runner do
     with {:ok, workspace} <- normalize_workspace(spec, request.workspace),
          {:ok, mode} <- normalize_mode(Map.get(spec, "mode")),
          {:ok, write_policy} <- normalize_write_policy(spec, mode),
+         {:ok, provider_transport} <- normalize_provider_transport(spec),
          {:ok, timeouts} <- normalize_timeouts(request, spec),
          {:ok, workflow_spec, effective_timeout_ms, _declared_workflow_timeout_ms,
           _declared_workflow_timeout_explicit} <-
@@ -1286,6 +1291,7 @@ defmodule Pixir.Delegate.Runner do
        %{
          workspace: workspace,
          workflow_spec: workflow_spec,
+         provider_transport: provider_transport,
          mode: mode,
          write_policy: write_policy,
          timeout_ms: timeouts.legacy_timeout_ms,
@@ -1495,6 +1501,7 @@ defmodule Pixir.Delegate.Runner do
       |> Keyword.put(:permission_mode, runtime_permission_mode(runtime))
       |> Keyword.put(:write_policy, runtime.write_policy)
       |> Keyword.put(:timeout_ms, runtime.workflow_timeout_ms)
+      |> with_provider_transport(runtime.provider_transport)
 
     workflow_runner.(parent_session_id, runtime.workflow_spec, workflow_opts)
   end
@@ -1566,6 +1573,16 @@ defmodule Pixir.Delegate.Runner do
 
     timeout_diagnostics = timeout_diagnostics(runtime, outcome, children)
 
+    manifest_items = outcome["subagents"] || agents
+
+    landing =
+      Subagents.landing_manifest_projection(manifest_items, runtime.workspace,
+        parent_session_id: parent_session_id
+      )
+
+    landing_manifest = landing["landing_manifest"]
+    omitted_children = Map.get(landing, "omitted_children", 0)
+
     %{
       "ok" => status == "completed",
       "status" => status,
@@ -1577,7 +1594,10 @@ defmodule Pixir.Delegate.Runner do
       "handle" => handle,
       "workspace" => runtime.workspace,
       "children" => children,
-      "summary" => delegate_summary(status, outcome) |> maybe_append_directive(children),
+      "summary" =>
+        delegate_summary(status, outcome)
+        |> maybe_append_directive(children)
+        |> maybe_append_landing_manifest(landing_manifest, omitted_children),
       "artifacts" => [],
       "diagnostics" => diagnostics(parent_session_id, runtime.workspace),
       "timeout_diagnostics" => timeout_diagnostics,
@@ -1616,6 +1636,8 @@ defmodule Pixir.Delegate.Runner do
       },
       "next_actions" => delegate_next_actions(status, outcome)
     }
+    |> maybe_put("landing_manifest", non_empty_manifest(landing_manifest))
+    |> maybe_put("omitted_children", positive_count(omitted_children))
     |> maybe_put("horizon_override", runtime.horizon_override)
     |> put_write_denials(runtime, Enum.map(children, & &1["write_denials"]))
   end
@@ -1648,6 +1670,14 @@ defmodule Pixir.Delegate.Runner do
         workflow_child_result(step, observed_applied_writes, write_denials)
       end)
 
+    landing =
+      Subagents.landing_manifest_projection(steps, runtime.workspace,
+        parent_session_id: parent_session_id
+      )
+
+    landing_manifest = landing["landing_manifest"]
+    omitted_children = Map.get(landing, "omitted_children", 0)
+
     %{
       "ok" => status == "completed" and result["ok"] == true,
       "status" => status,
@@ -1673,7 +1703,10 @@ defmodule Pixir.Delegate.Runner do
       "usable_checkpoints" => result["usable_checkpoints"] || [],
       "safe_next_actions" => result["safe_next_actions"] || [],
       "workflow" => workflow_projection(result),
-      "summary" => workflow_delegate_summary(status, result) |> maybe_append_directive(children),
+      "summary" =>
+        workflow_delegate_summary(status, result)
+        |> maybe_append_directive(children)
+        |> maybe_append_landing_manifest(landing_manifest, omitted_children),
       "artifacts" => [],
       "diagnostics" => workflow_diagnostics(parent_session_id, runtime.workspace),
       "limits" => %{
@@ -1709,6 +1742,8 @@ defmodule Pixir.Delegate.Runner do
       },
       "next_actions" => workflow_next_actions(status, result)
     }
+    |> maybe_put("landing_manifest", non_empty_manifest(landing_manifest))
+    |> maybe_put("omitted_children", positive_count(omitted_children))
     |> maybe_put("horizon_override", runtime.horizon_override)
     |> put_write_denials(runtime, write_denials_by_step)
   end
@@ -2164,6 +2199,18 @@ defmodule Pixir.Delegate.Runner do
   def presentation_summary_for_test(summary, children),
     do: maybe_append_directive(summary, children)
 
+  @doc false
+  def presentation_summary_for_test(summary, children, parent_workspace) do
+    landing = Subagents.landing_manifest_projection(children, parent_workspace)
+
+    summary
+    |> maybe_append_directive(children)
+    |> maybe_append_landing_manifest(
+      landing["landing_manifest"],
+      Map.get(landing, "omitted_children", 0)
+    )
+  end
+
   defp maybe_append_directive(summary, children) do
     if Subagents.potentially_integrable?(children) do
       summary <> "\n\n" <> Subagents.reverification_directive()
@@ -2171,6 +2218,16 @@ defmodule Pixir.Delegate.Runner do
       summary
     end
   end
+
+  defp maybe_append_landing_manifest(summary, [], _omitted_children), do: summary
+
+  defp maybe_append_landing_manifest(summary, manifest, omitted_children),
+    do: summary <> "\n\n" <> Subagents.render_landing_manifest(manifest, omitted_children)
+
+  defp non_empty_manifest([]), do: nil
+  defp non_empty_manifest(manifest), do: manifest
+  defp positive_count(0), do: nil
+  defp positive_count(count) when is_integer(count) and count > 0, do: count
 
   defp delegate_summary("completed", outcome), do: outcome["summary"] || "delegate completed."
 

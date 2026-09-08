@@ -374,6 +374,8 @@ defmodule Pixir.Workflows do
                  normalize_optional_seed(field(raw, "seed_session_id"), id, workspace),
                :ok <-
                  validate_knobs_apply(workspace_mode, model, reasoning_effort, attachments, id),
+               {:ok, _effective_effort} <-
+                 validate_step_effort(workspace_mode, model, reasoning_effort, opts, id),
                {:ok, write_policy} <-
                  step_write_policy(Keyword.get(opts, :write_policy), write_set, read_only?),
                :ok <-
@@ -667,20 +669,41 @@ defmodule Pixir.Workflows do
 
   defp normalize_optional_reasoning_effort(nil, _id), do: {:ok, nil}
 
-  defp normalize_optional_reasoning_effort(effort, _id) when effort in ~w(low medium high xhigh),
-    do: {:ok, effort}
+  defp normalize_optional_reasoning_effort(effort, id) do
+    case Pixir.ReasoningEffort.normalize(effort) do
+      {:ok, normalized} when not is_nil(normalized) ->
+        {:ok, normalized}
 
-  defp normalize_optional_reasoning_effort(_effort, id) do
-    {:error,
-     Tool.error(
-       :invalid_args,
-       "workflow step reasoning_effort must be one of: low, medium, high, xhigh",
-       %{
-         "id" => id,
-         "field" => "reasoning_effort",
-         "allowed" => ~w(low medium high xhigh)
-       }
-     )}
+      _invalid_or_default ->
+        {:ok, allowed} = Pixir.ReasoningEffort.known_ids()
+
+        {:error,
+         Tool.error(:invalid_args, "workflow step reasoning_effort has an unsupported value", %{
+           "id" => id,
+           "field" => "reasoning_effort",
+           "allowed" => allowed
+         })}
+    end
+  end
+
+  defp validate_step_effort("virtual_overlay", _model, _effort, _opts, _id), do: {:ok, nil}
+
+  defp validate_step_effort(_workspace_mode, model, effort, opts, id) do
+    # Match spawn_step: top-level model/effort opts are deliberately dropped;
+    # only step knobs override inherited Provider options and Config defaults.
+    provider_opts =
+      opts
+      |> Keyword.get(:provider_opts, [])
+      |> keyword_put_if_present(:model, model)
+      |> keyword_put_if_present(:reasoning_effort, effort)
+
+    case Pixir.ReasoningEffort.validate_runtime(
+           Keyword.get(opts, :provider, Pixir.Provider),
+           provider_opts
+         ) do
+      {:ok, _effort} = ok -> ok
+      {:error, error} -> {:error, update_in(error, [:error, :details], &Map.put(&1, "id", id))}
+    end
   end
 
   defp normalize_optional_attachments(nil, _id, _workspace), do: {:ok, []}

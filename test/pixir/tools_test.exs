@@ -196,6 +196,166 @@ defmodule Pixir.ToolsTest do
     end
   end
 
+  describe "atomic replacement permissions and temporary files" do
+    for tool <- [Write, Edit] do
+      for mode <- [0o755, 0o751] do
+        test "#{inspect(tool)} preserves executable mode #{Integer.to_string(mode, 8)}", %{
+          ctx: ctx,
+          ws: ws
+        } do
+          path = Path.join(ws, "script")
+          File.write!(path, "#!/bin/sh\nprintf 'before\\n'\n")
+          File.chmod!(path, unquote(mode))
+
+          assert {:ok, _} =
+                   unquote(tool).execute(replacement_args(unquote(tool), "script"), ctx)
+
+          assert permission_bits(path) == unquote(mode)
+          assert System.cmd(path, []) == {"after\n", 0}
+          assert File.ls!(ws) == ["script"]
+        end
+      end
+
+      test "#{inspect(tool)} preserves private permissions", %{ctx: ctx, ws: ws} do
+        path = Path.join(ws, "private")
+        File.write!(path, "before")
+        File.chmod!(path, 0o640)
+
+        assert {:ok, _} =
+                 unquote(tool).execute(replacement_args(unquote(tool), "private"), ctx)
+
+        assert File.read!(path) =~ "after"
+        assert permission_bits(path) == 0o640
+      end
+
+      test "#{inspect(tool)} dry run leaves content and permissions untouched", %{
+        ctx: ctx,
+        ws: ws
+      } do
+        path = Path.join(ws, "script")
+        File.write!(path, "before")
+        File.chmod!(path, 0o751)
+
+        assert {:ok, %{"dry_run" => true}} =
+                 unquote(tool).dry_run(replacement_args(unquote(tool), "script"), ctx)
+
+        assert File.read!(path) == "before"
+        assert permission_bits(path) == 0o751
+        assert File.ls!(ws) == ["script"]
+      end
+
+      test "#{inspect(tool)} does not carry setuid or setgid onto replacement", %{
+        ctx: ctx,
+        ws: ws
+      } do
+        path = Path.join(ws, "script")
+        File.write!(path, "before")
+        File.chmod!(path, 0o6751)
+
+        assert {:ok, _} =
+                 unquote(tool).execute(replacement_args(unquote(tool), "script"), ctx)
+
+        assert permission_bits(path) == 0o751
+      end
+
+      test "#{inspect(tool)} leaves a preexisting predictable temporary file alone", %{
+        ctx: ctx,
+        ws: ws
+      } do
+        path = Path.join(ws, "script")
+        File.write!(path, "before")
+        File.write!(path <> ".pixir-tmp", "unrelated temporary")
+
+        assert {:ok, _} =
+                 unquote(tool).execute(replacement_args(unquote(tool), "script"), ctx)
+
+        assert File.read!(path) =~ "after"
+        assert File.read!(path <> ".pixir-tmp") == "unrelated temporary"
+        assert Enum.sort(File.ls!(ws)) == ["script", "script.pixir-tmp"]
+      end
+
+      test "#{inspect(tool)} never follows a predictable temporary symlink outside the workspace",
+           %{
+             ctx: ctx,
+             ws: ws
+           } do
+        outside = ws <> "-outside-fixture"
+        File.mkdir_p!(outside)
+        on_exit(fn -> File.rm_rf!(outside) end)
+        sentinel = Path.join(outside, "sentinel")
+        File.write!(sentinel, "outside fixture must stay intact")
+        File.chmod!(sentinel, 0o640)
+        path = Path.join(ws, "script")
+        File.write!(path, "before")
+        File.ln_s!(sentinel, path <> ".pixir-tmp")
+
+        assert {:ok, _} =
+                 unquote(tool).execute(replacement_args(unquote(tool), "script"), ctx)
+
+        assert File.read!(sentinel) == "outside fixture must stay intact"
+        assert permission_bits(sentinel) == 0o640
+        assert File.read_link!(path <> ".pixir-tmp") == sentinel
+        assert File.lstat!(path).type == :regular
+        assert File.read!(path) =~ "after"
+        assert Enum.sort(File.ls!(ws)) == ["script", "script.pixir-tmp"]
+      end
+    end
+
+    test "new writes use ordinary nonexecutable creation permissions", %{ctx: ctx, ws: ws} do
+      ordinary = Path.join(ws, "ordinary")
+      File.write!(ordinary, "control")
+
+      assert {:ok, _} = Write.execute(%{"path" => "new", "content" => "hello"}, ctx)
+      assert permission_bits(Path.join(ws, "new")) == permission_bits(ordinary)
+      assert Bitwise.band(permission_bits(Path.join(ws, "new")), 0o7111) == 0
+    end
+
+    test "failed rename preserves the original directory and removes only its owned temporary", %{
+      ctx: ctx,
+      ws: ws
+    } do
+      path = Path.join(ws, "original")
+      File.mkdir!(path)
+      File.chmod!(path, 0o751)
+      File.write!(Path.join(path, "keep"), "original content")
+      File.write!(path <> ".pixir-tmp", "unrelated temporary")
+
+      assert {:error, %{error: %{kind: :write_failed}}} =
+               Write.execute(%{"path" => "original", "content" => "replacement"}, ctx)
+
+      assert File.read!(Path.join(path, "keep")) == "original content"
+      assert permission_bits(path) == 0o751
+      assert File.read!(path <> ".pixir-tmp") == "unrelated temporary"
+      assert Enum.sort(File.ls!(ws)) == ["original", "original.pixir-tmp"]
+    end
+
+    test "failed edit preserves original content, mode, and unrelated temporary", %{
+      ctx: ctx,
+      ws: ws
+    } do
+      path = Path.join(ws, "script")
+      File.write!(path, "no matching text")
+      File.chmod!(path, 0o751)
+      File.write!(path <> ".pixir-tmp", "unrelated temporary")
+
+      assert {:error, %{error: %{kind: :no_match}}} =
+               Edit.execute(replacement_args(Edit, "script"), ctx)
+
+      assert File.read!(path) == "no matching text"
+      assert permission_bits(path) == 0o751
+      assert File.read!(path <> ".pixir-tmp") == "unrelated temporary"
+      assert Enum.sort(File.ls!(ws)) == ["script", "script.pixir-tmp"]
+    end
+  end
+
+  defp replacement_args(Write, path),
+    do: %{"path" => path, "content" => "#!/bin/sh\nprintf 'after\\n'\n"}
+
+  defp replacement_args(Edit, path),
+    do: %{"path" => path, "old_string" => "before", "new_string" => "after"}
+
+  defp permission_bits(path), do: Bitwise.band(File.stat!(path).mode, 0o7777)
+
   describe "read" do
     test "reads a file in the workspace", %{ctx: ctx, ws: ws} do
       File.write!(Path.join(ws, "a.txt"), "hello")
@@ -258,6 +418,60 @@ defmodule Pixir.ToolsTest do
 
       assert responses_bash["parameters"] == schema
       assert anthropic_bash["input_schema"] == schema
+    end
+
+    test "procps process-group probe accepts the separator while the group is alive" do
+      runner = fn args ->
+        send(self(), {:probe, args})
+        {"", 0}
+      end
+
+      assert Bash.os_process_group_alive?(123, runner)
+      assert_received {:probe, ["-0", "--", "-123"]}
+      refute_received {:probe, _args}
+    end
+
+    test "BusyBox process-group probe retries without the rejected separator" do
+      runner = fn args ->
+        send(self(), {:probe, args})
+
+        case args do
+          ["-0", "--", "-123"] -> {"kill: invalid number '--'\n", 1}
+          ["-0", "-123"] -> {"", 0}
+        end
+      end
+
+      assert Bash.os_process_group_alive?(123, runner)
+      assert_received {:probe, ["-0", "--", "-123"]}
+      assert_received {:probe, ["-0", "-123"]}
+      refute_received {:probe, _args}
+    end
+
+    test "procps dead-group result does not trigger the BusyBox fallback" do
+      runner = fn args ->
+        send(self(), {:probe, args})
+        {"kill: (-123): No such process\n", 1}
+      end
+
+      refute Bash.os_process_group_alive?(123, runner)
+      assert_received {:probe, ["-0", "--", "-123"]}
+      refute_received {:probe, _args}
+    end
+
+    test "BusyBox process-group probe stays false when the bare fallback is dead" do
+      runner = fn args ->
+        send(self(), {:probe, args})
+
+        case args do
+          ["-0", "--", "-123"] -> {"kill: invalid number '--'\n", 1}
+          ["-0", "-123"] -> {"kill: bad pid '-123'\n", 1}
+        end
+      end
+
+      refute Bash.os_process_group_alive?(123, runner)
+      assert_received {:probe, ["-0", "--", "-123"]}
+      assert_received {:probe, ["-0", "-123"]}
+      refute_received {:probe, _args}
     end
 
     test "runs a command in the workspace and captures output", %{ctx: ctx, ws: ws} do
@@ -820,6 +1034,39 @@ defmodule Pixir.ToolsTest do
       assert :holder_done = Task.await(holder)
     end
 
+    test "presenter liveness rejects a leaked closed port before its registered cap" do
+      parent = self()
+      limits = host_command_limits()
+      boundary = start_boundary()
+      bash = System.find_executable("bash") || "/bin/bash"
+
+      holder =
+        Task.async(fn ->
+          CommandBoundary.with_slot("bash", [boundary: boundary, limits: limits], fn lease ->
+            port =
+              Port.open(
+                {:spawn_executable, bash},
+                [:binary, :exit_status, {:args, ["-c", "sleep 1"]}]
+              )
+
+            :ok = CommandBoundary.register_process(lease, "leaked-session", port, 10_000, 1_000)
+            Port.close(port)
+            send(parent, :closed_process_registered)
+
+            receive do
+              :release_holder -> :holder_done
+            end
+          end)
+        end)
+
+      assert_receive :closed_process_registered, 1_000
+      assert :dead = CommandBoundary.presenter_liveness("leaked-session", boundary: boundary)
+      refute CommandBoundary.presenter_liveness?("leaked-session", boundary: boundary)
+
+      send(holder.pid, :release_holder)
+      assert :holder_done = Task.await(holder)
+    end
+
     test "releases a host command lease when the caller raises" do
       limits = host_command_limits()
       boundary = start_boundary()
@@ -1090,7 +1337,10 @@ defmodule Pixir.ToolsTest do
       refute output =~ Subagents.reverification_directive()
     end
 
-    test "execute returns not-applied virtual_diff for virtual_overlay steps", %{ctx: ctx, ws: ws} do
+    test "execute keeps direct virtual_overlay artifacts out of the child landing manifest", %{
+      ctx: ctx,
+      ws: ws
+    } do
       path = Path.join(ws, "source.txt")
       File.write!(path, "workflow source\n")
       original = File.read!(path)
@@ -1108,15 +1358,19 @@ defmodule Pixir.ToolsTest do
         ]
       }
 
-      assert {:ok, %{"workflow" => workflow, "output" => output}} =
+      assert {:ok, %{"workflow" => workflow, "output" => output} = result} =
                RunWorkflow.execute(args, ctx)
 
-      assert output =~ "Workflow virtual_tool completed"
       assert [%{"virtual_diff" => artifact}] = workflow["steps"]
       assert artifact["kind"] == "virtual_diff"
       assert artifact["apply"]["status"] == "not_applied"
       assert artifact["parent_workspace"]["mutation"] == "none"
       assert File.read!(path) == original
+      refute Map.has_key?(result, "landing_manifest")
+
+      assert output ==
+               "Workflow virtual_tool completed: 1 step(s), 1 wave(s).\n\n" <>
+                 Subagents.reverification_directive()
     end
   end
 
