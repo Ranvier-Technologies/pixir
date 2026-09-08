@@ -249,6 +249,42 @@ defmodule Pixir.TurnTest do
     assert_received {:provider_request, %{web_search: %{"enabled" => true}}}
   end
 
+  test "final Turn selection rejects newly introduced max before a custom Provider runs", %{
+    ctx: ctx,
+    sid: sid,
+    ws: ws
+  } do
+    assert {:ok, nil} =
+             Pixir.ReasoningEffort.validate_runtime(OptsCaptureProvider,
+               model: "gpt-6-astra",
+               raw_config: %{}
+             )
+
+    test_pid = self()
+
+    loader = fn _opts ->
+      send(test_pid, :final_effort_snapshot)
+
+      {:ok,
+       %{present?: true, origin: :programmatic, document: %{"reasoning" => %{"effort" => "max"}}}}
+    end
+
+    assert {:error,
+            %{error: %{kind: :invalid_config, details: %{reason: :unsupported_reasoning_effort}}}} =
+             Turn.run(ctx, "new config after admission",
+               provider: OptsCaptureProvider,
+               provider_opts: [test_pid: self(), model: "gpt-6-astra"],
+               config_opts: [request_snapshot_loader: loader]
+             )
+
+    assert_received :final_effort_snapshot
+    refute_received :final_effort_snapshot
+    refute_received {:provider_runtime_opts, _}
+    assert {:ok, history} = Log.fold(sid, workspace: ws)
+    assert Enum.count(history, &(&1.type == :turn_failed)) == 1
+    refute Enum.any?(history, &(&1.type == :assistant_message))
+  end
+
   test "omits web_search provider request field when absent", %{ctx: ctx} do
     assert {:ok, "ok"} =
              Turn.run(ctx, "no search",
@@ -486,7 +522,7 @@ defmodule Pixir.TurnTest do
     refute usage.data["prompt_cache_key"] =~ "hello"
   end
 
-  test "cache metadata seam relabels Anthropic runs pa4 and drops prompt_cache_key" do
+  test "cache metadata seam relabels Anthropic runs pa5 and drops prompt_cache_key" do
     metadata = %{
       "prompt_cache_key" => "px3:m_x:r_build:s_fam:t_tools:k_skills",
       "prompt_contract_version" => "px3",
@@ -496,7 +532,7 @@ defmodule Pixir.TurnTest do
     }
 
     anthropic = Turn.provider_cache_metadata(metadata, Pixir.Providers.Anthropic)
-    assert anthropic["prompt_contract_version"] == "pa4"
+    assert anthropic["prompt_contract_version"] == "pa5"
     refute Map.has_key?(anthropic, "prompt_cache_key")
     assert anthropic["toolset_hash"] == "t"
     assert anthropic["session_family_hash"] == "s"
@@ -526,13 +562,20 @@ defmodule Pixir.TurnTest do
       end
     end
 
-    assert {:ok, "ok"} = Turn.run(ctx, "hello", provider: NakedProvider, provider_opts: [])
+    :ok = Events.subscribe(sid)
+
+    assert {:ok, "ok"} =
+             Turn.run(ctx, "hello", provider: NakedProvider, provider_opts: [model: "gpt-5.5"])
 
     assert {:ok, history} = Log.fold(sid, workspace: ws)
     usage = Enum.find(history, &(&1.type == :provider_usage))
     assert usage.data["usage_summary_missing"] == true
     assert usage.data["usage_available"] == true
     refute Map.has_key?(usage.data["usage_summary"], "cached_tokens")
+    assert usage.data["context_pressure_available"] == false
+    assert usage.data["context_pressure_reason"] == "usage_missing"
+    refute Map.has_key?(usage.data, "context_pressure_ratio")
+    refute_receive {:pixir_event, %{type: :context_pressure}}, 100
   end
 
   test "provider_usage records transport metadata from the provider result", %{
@@ -2478,7 +2521,7 @@ defmodule Pixir.TurnTest do
     end
   end
 
-  describe "px7 prompt contract (ADR 0020)" do
+  describe "px8 prompt contract (ADR 0020)" do
     test "Layer 0 instructions are byte-identical across workspaces", %{ws: ws} do
       other = ws <> "-other-workspace"
       File.mkdir_p!(other)
@@ -2652,7 +2695,7 @@ defmodule Pixir.TurnTest do
       assert request.developer_context =~ "read-only"
     end
 
-    test "provider_usage carries the prompt-contract version and px7 key", %{
+    test "provider_usage carries the prompt-contract version and px8 key", %{
       ctx: ctx,
       sid: sid,
       ws: ws
@@ -2661,8 +2704,8 @@ defmodule Pixir.TurnTest do
 
       assert {:ok, history} = Log.fold(sid, workspace: ws)
       usage = Enum.find(history, &(&1.type == :provider_usage))
-      assert usage.data["prompt_contract_version"] == "px7"
-      assert String.starts_with?(usage.data["prompt_cache_key"], "px7:")
+      assert usage.data["prompt_contract_version"] == "px8"
+      assert String.starts_with?(usage.data["prompt_cache_key"], "px8:")
     end
 
     test "build and plan Layer 0 bytes are pinned independently to the prompt-contract version" do
@@ -2699,7 +2742,7 @@ defmodule Pixir.TurnTest do
       }
 
       assert {Pixir.Provider.Cache.prompt_contract_version(), hashes} ==
-               {"px7",
+               {"px8",
                 %{
                   build: "9ee215f6efda1e32e56fca5073e88431c6aac34c201b726c886345caadde6c70",
                   plan: "e41ecfd81ddca318884d30bc43bd536bfc1371d66dc832eeeb091757bfac7c83",

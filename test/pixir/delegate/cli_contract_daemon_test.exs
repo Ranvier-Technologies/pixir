@@ -5,6 +5,11 @@ defmodule Pixir.Delegate.CLIContractDaemonTest do
 
   alias Pixir.Delegate.{CLIContract, DaemonServer}
 
+  defmodule StubProvider do
+    def stream(_request, _opts),
+      do: raise("the current-runtime seam must not execute the Provider")
+  end
+
   defmodule UnavailableDaemonClient do
     def call(_action, _body, _opts) do
       {:error,
@@ -275,6 +280,27 @@ defmodule Pixir.Delegate.CLIContractDaemonTest do
       "per_wave_budget_ms" => 60_000,
       "wave_budgets_ms" => [60_000, 60_000]
     }
+  end
+
+  test "daemon build identity is advertised by additive envelope revision 11", %{ws: ws} do
+    {pid, _token} = start_horizon_admission_daemon(ws)
+
+    assert {:ok, raw_started} = DaemonServer.started_payload(pid)
+    # An older CLI's put_new default must not relabel the new daemon payload.
+    assert Map.put_new(raw_started, "schema_version", 10)["schema_version"] == 11
+
+    for action <- ["--status", "--stop"] do
+      assert {:ok, %{exit_code: 0, payload: payload}} =
+               CLIContract.run(["daemon", action, "--json"], workspace: ws)
+
+      assert payload["schema"] == "pixir.delegate.envelope.v1"
+      assert payload["schema_version"] == 11
+      assert payload["build_info"]["version"] == Pixir.version()
+      assert payload["build_info"]["os_pid"] == payload["daemon"]["pid"]
+    end
+
+    assert {11, :build_identity, _description} =
+             List.last(CLIContract.envelope_schema_registry())
   end
 
   defp start_horizon_admission_daemon(ws) do

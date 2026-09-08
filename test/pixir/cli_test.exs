@@ -4,8 +4,9 @@ defmodule Pixir.CLITest do
   import ExUnit.CaptureIO
   import Pixir.Test.RawLogHelpers
 
-  alias Pixir.{CLI, Compaction, Event, Log, Paths, Subagents}
+  alias Pixir.{CLI, Compaction, Event, Log, Paths, SessionSupervisor, Subagents}
   alias Pixir.Delegate.Evidence
+  alias Pixir.Permissions.WritePolicy
 
   defmodule StubProvider do
     def stream(request, opts) do
@@ -449,6 +450,17 @@ defmodule Pixir.CLITest do
   defp only_session_id!(ws) do
     [path] = Path.wildcard(Path.join([ws, ".pixir", "sessions", "*.ndjson"]))
     path |> Path.basename() |> String.replace_suffix(".ndjson", "")
+  end
+
+  defp pinned_policy_hash!(history) do
+    posture =
+      Enum.find(history, fn event ->
+        event.type == :subagent_event and
+          event.data["event"] == "permission_posture" and
+          is_map(event.data["write_policy"])
+      end)
+
+    posture.data["write_policy"]["hash"]
   end
 
   defp session_lease_files(ws),
@@ -2005,7 +2017,7 @@ defmodule Pixir.CLITest do
                   "status" => "completed",
                   "kind" => "delegate_result",
                   "contract_version" => 1,
-                  "schema_version" => 9,
+                  "schema_version" => 11,
                   "schema" => "pixir.delegate.envelope.v1",
                   "command_ok" => true,
                   "work_complete" => true,
@@ -2229,7 +2241,7 @@ defmodule Pixir.CLITest do
 
           payload = Jason.decode!(stdout)
           assert payload["status"] == "completed"
-          assert payload["schema_version"] == 9
+          assert payload["schema_version"] == 11
           assert payload["command_ok"] == true
           assert payload["work_complete"] == true
           assert payload["outcome"] == "completed"
@@ -2407,7 +2419,7 @@ defmodule Pixir.CLITest do
                 "ok" => true,
                 "status" => "completed",
                 "kind" => "delegate_status",
-                "schema_version" => 9,
+                "schema_version" => 11,
                 "schema" => "pixir.delegate.envelope.v1",
                 "command_ok" => true,
                 "work_complete" => true,
@@ -2451,7 +2463,7 @@ defmodule Pixir.CLITest do
                "ok" => false,
                "status" => "rejected",
                "kind" => "not_found",
-               "schema_version" => 9,
+               "schema_version" => 11,
                "command_ok" => false,
                "work_complete" => false,
                "outcome" => "rejected",
@@ -2499,7 +2511,7 @@ defmodule Pixir.CLITest do
                 "ok" => true,
                 "status" => "running",
                 "kind" => "delegate_attach",
-                "schema_version" => 9,
+                "schema_version" => 11,
                 "schema" => "pixir.delegate.envelope.v1",
                 "command_ok" => true,
                 "work_complete" => false,
@@ -3295,6 +3307,411 @@ defmodule Pixir.CLITest do
     assert out =~ "continue a persisted Session"
   end
 
+  test "resume rejects a differing --write-policy before advancing the Session (#574)" do
+    with_cli_provider([stop("initial answer"), stop("must not run")], fn ->
+      in_tmp_workspace("pixir-cli-resume-policy-mismatch", fn ws ->
+        policy_path = "policy.json"
+
+        File.write!(
+          policy_path,
+          Jason.encode!(%{
+            "version" => 1,
+            "metadata" => %{"id" => "resume-policy"},
+            "allow_writes" => ["allowed/**"]
+          })
+        )
+
+        initial =
+          capture_io(fn ->
+            assert :ok =
+                     CLI.route(["--json", "--write-policy", policy_path, "start bounded"])
+          end)
+          |> Jason.decode!()
+
+        sid = initial["session_id"]
+        assert {:ok, before_history} = Log.fold(sid, workspace: ws)
+        pinned_hash = pinned_policy_hash!(before_history)
+        assert {:ok, :stopped} = SessionSupervisor.stop_session(sid)
+        assert session_lease_files(ws) == []
+
+        File.write!(
+          policy_path,
+          Jason.encode!(%{
+            "version" => 1,
+            "metadata" => %{"id" => "resume-policy"},
+            "allow_writes" => ["allowed/**", "widened/**"]
+          })
+        )
+
+        assert {:ok, supplied_policy} = WritePolicy.from_file(policy_path, ws)
+        supplied_hash = supplied_policy["hash"]
+        refute supplied_hash == pinned_hash
+
+        output =
+          capture_io(fn ->
+            assert {:error, 2} =
+                     CLI.route([
+                       "--json",
+                       "--write-policy",
+                       policy_path,
+                       "resume",
+                       sid,
+                       "continue"
+                     ])
+          end)
+
+        assert %{
+                 "ok" => false,
+                 "error" => %{
+                   "kind" => "invalid_args",
+                   "message" => message,
+                   "details" => %{
+                     "pinned_policy_hash" => ^pinned_hash,
+                     "supplied_policy_hash" => ^supplied_hash,
+                     "next_actions" => next_actions
+                   }
+                 }
+               } = Jason.decode!(output)
+
+        assert message =~ pinned_hash
+        assert message =~ supplied_hash
+        assert message =~ "mandate is immutable"
+        assert message =~ "Resume without --write-policy"
+        assert message =~ "start a fresh Session"
+
+        assert next_actions == [
+                 "resume_without_--write-policy_to_use_the_pinned_mandate",
+                 "start_a_fresh_session_with_the_new_write_policy"
+               ]
+
+        assert {:ok, after_history} = Log.fold(sid, workspace: ws)
+
+        assert Enum.map(after_history, &{&1.id, &1.type}) ==
+                 Enum.map(before_history, &{&1.id, &1.type})
+
+        assert session_lease_files(ws) == []
+      end)
+    end)
+  end
+
+  test "resume rejects a narrower differing --write-policy instead of intersecting (#574)" do
+    with_cli_provider([stop("initial answer"), stop("must not run")], fn ->
+      in_tmp_workspace("pixir-cli-resume-policy-narrower", fn ws ->
+        policy_path = "policy.json"
+
+        File.write!(
+          policy_path,
+          Jason.encode!(%{
+            "version" => 1,
+            "metadata" => %{"id" => "resume-narrower"},
+            "allow_writes" => ["allowed/**", "other/**"]
+          })
+        )
+
+        initial =
+          capture_io(fn ->
+            assert :ok =
+                     CLI.route(["--json", "--write-policy", policy_path, "start bounded"])
+          end)
+          |> Jason.decode!()
+
+        sid = initial["session_id"]
+        assert {:ok, initial_history} = Log.fold(sid, workspace: ws)
+        pinned_hash = pinned_policy_hash!(initial_history)
+        assert {:ok, :stopped} = SessionSupervisor.stop_session(sid)
+
+        File.write!(
+          policy_path,
+          Jason.encode!(%{
+            "version" => 1,
+            "metadata" => %{"id" => "resume-narrower"},
+            "allow_writes" => ["allowed/**"]
+          })
+        )
+
+        assert {:ok, supplied_policy} = WritePolicy.from_file(policy_path, ws)
+        supplied_hash = supplied_policy["hash"]
+        refute supplied_hash == pinned_hash
+
+        output =
+          capture_io(fn ->
+            assert {:error, 2} =
+                     CLI.route([
+                       "--json",
+                       "--write-policy",
+                       policy_path,
+                       "resume",
+                       sid,
+                       "continue"
+                     ])
+          end)
+
+        assert %{
+                 "ok" => false,
+                 "error" => %{
+                   "kind" => "invalid_args",
+                   "message" => message,
+                   "details" => %{
+                     "pinned_policy_hash" => ^pinned_hash,
+                     "supplied_policy_hash" => ^supplied_hash
+                   }
+                 }
+               } = Jason.decode!(output)
+
+        assert message =~ pinned_hash
+        assert message =~ supplied_hash
+        assert message =~ "mandate is immutable"
+      end)
+    end)
+  end
+
+  test "resume accepts an identical --write-policy and denials keep the pinned hash (#574)" do
+    with_cli_provider(
+      [
+        stop("initial answer"),
+        tool_calls([
+          %{
+            call_id: "resume-identical-denial",
+            name: "write",
+            args: %{"path" => "blocked.txt", "content" => "no"}
+          }
+        ]),
+        stop("adapted after denial")
+      ],
+      fn ->
+        in_tmp_workspace("pixir-cli-resume-policy-identical", fn ws ->
+          policy_path = "policy.json"
+
+          File.write!(
+            policy_path,
+            Jason.encode!(%{
+              "version" => 1,
+              "metadata" => %{"id" => "resume-identical"},
+              "allow_writes" => ["allowed/**"]
+            })
+          )
+
+          initial =
+            capture_io(fn ->
+              assert :ok =
+                       CLI.route(["--json", "--write-policy", policy_path, "start bounded"])
+            end)
+            |> Jason.decode!()
+
+          sid = initial["session_id"]
+          assert {:ok, initial_history} = Log.fold(sid, workspace: ws)
+          pinned_hash = pinned_policy_hash!(initial_history)
+
+          resumed =
+            capture_io(fn ->
+              assert :ok =
+                       CLI.route([
+                         "--json",
+                         "--write-policy",
+                         policy_path,
+                         "resume",
+                         sid,
+                         "continue"
+                       ])
+            end)
+            |> Jason.decode!()
+
+          assert resumed["output"] == "adapted after denial"
+          assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+          denial =
+            Enum.find(history, fn event ->
+              event.type == :permission_decision and
+                event.data["call_id"] == "resume-identical-denial"
+            end)
+
+          assert denial.data["decision"] == "deny"
+          assert denial.data["policy_hash"] == pinned_hash
+          refute File.exists?(Path.join(ws, "blocked.txt"))
+        end)
+      end
+    )
+  end
+
+  test "resume without --write-policy still silently applies the pinned mandate (#574)" do
+    with_cli_provider(
+      [
+        stop("initial answer"),
+        tool_calls([
+          %{
+            call_id: "resume-pinned-denial",
+            name: "write",
+            args: %{"path" => "blocked.txt", "content" => "no"}
+          }
+        ]),
+        stop("adapted under pinned policy")
+      ],
+      fn ->
+        in_tmp_workspace("pixir-cli-resume-policy-implicit", fn ws ->
+          policy_path = "policy.json"
+
+          File.write!(
+            policy_path,
+            Jason.encode!(%{
+              "version" => 1,
+              "metadata" => %{"id" => "resume-implicit"},
+              "allow_writes" => ["allowed/**"]
+            })
+          )
+
+          initial =
+            capture_io(fn ->
+              assert :ok =
+                       CLI.route(["--json", "--write-policy", policy_path, "start bounded"])
+            end)
+            |> Jason.decode!()
+
+          sid = initial["session_id"]
+          assert {:ok, initial_history} = Log.fold(sid, workspace: ws)
+          pinned_hash = pinned_policy_hash!(initial_history)
+
+          resumed =
+            capture_io(fn ->
+              assert :ok = CLI.route(["--json", "resume", sid, "continue"])
+            end)
+            |> Jason.decode!()
+
+          assert resumed["output"] == "adapted under pinned policy"
+          assert {:ok, history} = Log.fold(sid, workspace: ws)
+
+          denial =
+            Enum.find(history, fn event ->
+              event.type == :permission_decision and
+                event.data["call_id"] == "resume-pinned-denial"
+            end)
+
+          assert denial.data["decision"] == "deny"
+          assert denial.data["policy_hash"] == pinned_hash
+          refute File.exists?(Path.join(ws, "blocked.txt"))
+        end)
+      end
+    )
+  end
+
+  test "a supplied policy overlays one resume turn when the Session has no pinned mandate (#574)" do
+    with_cli_provider(
+      [
+        stop("initial unbounded answer"),
+        tool_calls([
+          %{
+            call_id: "resume-overlay-denial",
+            name: "write",
+            args: %{"path" => "blocked.txt", "content" => "bounded"}
+          }
+        ]),
+        stop("adapted under one-turn overlay"),
+        tool_calls([
+          %{
+            call_id: "resume-unbounded-write",
+            name: "write",
+            args: %{"path" => "blocked.txt", "content" => "unbounded again"}
+          }
+        ]),
+        stop("flagless resume is unbounded again")
+      ],
+      fn ->
+        in_tmp_workspace("pixir-cli-resume-policy-overlay", fn ws ->
+          initial =
+            capture_io(fn ->
+              assert :ok = CLI.route(["--json", "start unbounded"])
+            end)
+            |> Jason.decode!()
+
+          sid = initial["session_id"]
+          assert {:ok, initial_history} = Log.fold(sid, workspace: ws)
+
+          root_posture =
+            Enum.find(initial_history, fn event ->
+              event.type == :subagent_event and
+                event.data["event"] == "permission_posture"
+            end)
+
+          assert root_posture.data["permission_mode"] == "auto"
+          assert root_posture.data["write_policy"] == nil
+
+          policy_path = "policy.json"
+
+          File.write!(
+            policy_path,
+            Jason.encode!(%{
+              "version" => 1,
+              "metadata" => %{"id" => "resume-overlay"},
+              "allow_writes" => ["allowed/**"]
+            })
+          )
+
+          assert {:ok, supplied_policy} = WritePolicy.from_file(policy_path, ws)
+
+          overlay_result =
+            capture_io(fn ->
+              assert :ok =
+                       CLI.route([
+                         "--json",
+                         "--write-policy",
+                         policy_path,
+                         "resume",
+                         sid,
+                         "continue bounded"
+                       ])
+            end)
+            |> Jason.decode!()
+
+          assert overlay_result["output"] == "adapted under one-turn overlay"
+          refute File.exists?(Path.join(ws, "blocked.txt"))
+          assert {:ok, overlay_history} = Log.fold(sid, workspace: ws)
+
+          overlay_denial =
+            Enum.find(overlay_history, fn event ->
+              event.type == :permission_decision and
+                event.data["call_id"] == "resume-overlay-denial"
+            end)
+
+          assert overlay_denial.data["decision"] == "deny"
+          assert overlay_denial.data["policy_hash"] == supplied_policy["hash"]
+
+          postures =
+            Enum.filter(overlay_history, fn event ->
+              event.type == :subagent_event and
+                event.data["event"] == "permission_posture"
+            end)
+
+          assert [durable_posture] = postures
+          assert durable_posture.data["permission_mode"] == "auto"
+          assert durable_posture.data["write_policy"] == nil
+
+          flagless_result =
+            capture_io(fn ->
+              assert :ok = CLI.route(["--json", "resume", sid, "continue unbounded"])
+            end)
+            |> Jason.decode!()
+
+          assert flagless_result["output"] == "flagless resume is unbounded again"
+          assert File.read!(Path.join(ws, "blocked.txt")) == "unbounded again"
+          assert {:ok, final_history} = Log.fold(sid, workspace: ws)
+
+          refute Enum.any?(final_history, fn event ->
+                   event.type == :permission_decision and
+                     event.data["call_id"] == "resume-unbounded-write"
+                 end)
+
+          final_postures =
+            Enum.filter(final_history, fn event ->
+              event.type == :subagent_event and
+                event.data["event"] == "permission_posture"
+            end)
+
+          assert [final_posture] = final_postures
+          assert final_posture.data["write_policy"] == nil
+        end)
+      end
+    )
+  end
+
   test "mutation-free legacy resume is read-only and denies a live write" do
     with_cli_provider(
       [
@@ -4019,6 +4436,112 @@ defmodule Pixir.CLITest do
                  end)
         end)
       end
+    )
+  end
+
+  test "disabling subagent presence does not disable live root bash liveness" do
+    # This is the whole CLI path, including startup. Keep a realistic startup
+    # budget while the silent command still crosses two idle intervals; turning
+    # tool liveness off must continue to produce exit 124, not a vacuous success.
+    with_cli_provider(
+      [
+        tool_calls([
+          %{
+            call_id: "call_root_sleep",
+            name: "bash",
+            args: %{"command" => "sleep 5", "timeout_ms" => 15_000}
+          }
+        ]),
+        stop("root bash completed")
+      ],
+      fn ->
+        in_tmp_workspace("pixir-cli-root-tool-liveness", fn _ws ->
+          out = capture_io(fn -> assert :ok = CLI.route(["--json", "run quiet bash"]) end)
+          assert Jason.decode!(out)["output"] == "root bash completed"
+        end)
+      end,
+      idle_timeout: 2_000,
+      subagent_liveness?: false
+    )
+  end
+
+  test "disabling tool presence preserves child hang-cap liveness" do
+    {:ok, liveness_state} = Agent.start_link(fn -> %{} end)
+
+    with_cli_turn_opts(
+      [
+        provider: SubagentPresenceProvider,
+        provider_opts: [liveness_state: liveness_state],
+        skip_auth?: true,
+        idle_timeout: 100,
+        tool_liveness?: false
+      ],
+      fn ->
+        in_tmp_workspace("pixir-cli-child-liveness-tool-disabled", fn _ws ->
+          out = capture_io(fn -> assert :ok = CLI.route(["--json", "delegate and wait"]) end)
+          assert Jason.decode!(out)["output"] == "root completed after child"
+        end)
+      end
+    )
+  end
+
+  test "disabling tool presence reproduces the exact presenter timeout envelope" do
+    with_cli_provider(
+      [
+        tool_calls([
+          %{
+            call_id: "call_disabled_sleep",
+            name: "bash",
+            args: %{"command" => "sleep 0.3", "timeout_ms" => 800}
+          }
+        ]),
+        stop("must arrive after timeout")
+      ],
+      fn ->
+        in_tmp_workspace("pixir-cli-tool-liveness-disabled", fn ws ->
+          out =
+            capture_io(fn ->
+              assert {:error, 124} = CLI.route(["--json", "run quiet bash"])
+            end)
+
+          sid = only_session_id!(ws)
+          diagnose_command = "pixir diagnose session #{sid} --json"
+
+          resume_command =
+            "pixir resume #{sid} \"Continue from the latest incomplete turn. Inspect the Log first, avoid duplicating completed writes, and report what you resumed.\""
+
+          expected = %{
+            "ok" => false,
+            "status" => "timed_out",
+            "kind" => "one_shot_turn",
+            "session_id" => sid,
+            "resume_command" => resume_command,
+            "diagnostics" => %{"diagnose_command" => diagnose_command},
+            "message" => "turn failed before producing a final answer",
+            "recovery" => %{
+              "classification" => "presenter_idle_timeout",
+              "diagnose_command" => diagnose_command,
+              "resume_command" => resume_command,
+              "auto_retry" => %{
+                "safe" => false,
+                "reason" =>
+                  "the presenter stopped waiting before Pixir could prove the Turn completed"
+              },
+              "next_actions" => [
+                "inspect diagnostics before resuming write-capable work",
+                "resume manually with the provided command if the Log shows no unsafe duplicate side effects",
+                "avoid launching a second executor until the previous session state is understood"
+              ]
+            },
+            "exit_code" => 124
+          }
+
+          assert out == Jason.encode!(expected) <> "\n"
+          Process.sleep(500)
+        end)
+      end,
+      idle_timeout: 100,
+      tool_liveness?: false
     )
   end
 

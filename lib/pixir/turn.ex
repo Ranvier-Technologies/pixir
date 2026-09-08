@@ -186,11 +186,11 @@ defmodule Pixir.Turn do
 
     with {:ok, resolved} <-
            ProviderRegistry.resolve_request(selection, Keyword.get(opts, :config_opts, [])),
-         :ok <- activate_resolved_backend(resolved) do
+         :ok <- activate_resolved_backend(resolved),
+         provider_opts = ResolvedProviderRequest.attach_to_provider_opts(resolved, provider_opts),
+         :ok <- validate_final_effort(resolved, provider_opts) do
       provider = ResolvedProviderRequest.provider(resolved)
       capabilities = ResolvedProviderRequest.capabilities(resolved)
-
-      provider_opts = ResolvedProviderRequest.attach_to_provider_opts(resolved, provider_opts)
 
       state = %{
         provider: provider,
@@ -265,6 +265,22 @@ defmodule Pixir.Turn do
     case Keyword.fetch(opts, :provider) do
       :error -> :auto
       {:ok, provider} -> {:explicit, provider}
+    end
+  end
+
+  # Admission and dispatch may observe different Config versions. Validate max
+  # against this Turn's already-frozen selection, including custom Providers;
+  # do not reread Config or rely on an earlier Manager/Presenter check.
+  defp validate_final_effort(resolved, provider_opts) do
+    effort = Keyword.get(provider_opts, :reasoning_effort)
+
+    if Pixir.ReasoningEffort.normalize(effort) == {:ok, "max"} do
+      case Pixir.ReasoningEffort.validate(effort, resolved, provider_opts) do
+        {:ok, _} -> :ok
+        {:error, _} = error -> error
+      end
+    else
+      :ok
     end
   end
 

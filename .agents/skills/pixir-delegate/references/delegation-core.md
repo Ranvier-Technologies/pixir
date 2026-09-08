@@ -142,6 +142,20 @@ parseable on arrival.
 
 ## Closure — evidence-gated, never exit-code-gated
 
+For virtual-overlay children, scratch lifetime is one `run_virtual_commands`
+invocation, not the whole Session. Batch dependent edits/reads within that call.
+Use `deliverable: true` to keep that invocation's artifact selected through later
+unmarked reads; a newer explicit mark replaces it. Selection is not application:
+inspect the returned durable reference and use the separate permissioned apply
+operation explicitly. Logs/artifacts still use disk; avoiding per-child workspace
+copies is the storage benefit, not a promise of zero I/O or faster inference.
+
+For bounded-write verification, `bash.verify` lists exact commands, including flags.
+`verify_prefixes` controls which commands may be declared, not arbitrary runtime
+suffixes. Include the literal approved commands in the child brief. A denied optional
+variant does not authorize broadening policy; an already-approved exact alternative
+can still be used.
+
 A delegation closes when its outcome is reconciled: every child's terminal
 status read, every summary parsed against its declared contract, every
 non-completed child dispositioned — resumed, retried, or reported. Partial

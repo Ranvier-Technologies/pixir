@@ -65,15 +65,15 @@ defmodule Pixir.Provider.Connection do
                       timeout_ms: call_timeout,
                       key: inspect(key),
                       continuation_reset_reason: "caller_timeout",
-                      next_actions: ["retry_turn", "fall_back_to_full_replay"]
+                      next_actions: ["inspect_session_lifecycle"]
                     }
                   )
 
-                {:error, error, acc}
+                {:error, error, call_loss_acc(acc)}
 
               :exit, reason ->
                 if Process.alive?(pid), do: Process.exit(pid, :kill)
-                {:error, TransportError.project({:exit, reason}), acc}
+                {:error, TransportError.project({:exit, reason}), call_loss_acc(acc)}
             end
 
           {:error, error} ->
@@ -88,6 +88,23 @@ defmodule Pixir.Provider.Connection do
           })
 
         {:error, error, acc}
+    end
+  end
+
+  # A lost call returns no authoritative reducer progress. The original caller
+  # accumulator is not evidence that the connection emitted no text or callbacks.
+  # Keep the existing map/keyword Access contract and veto replay conservatively;
+  # pre-admission errors and ordinary connect failures never enter this path.
+  defp call_loss_acc(acc) do
+    acc = put_in(acc[:replay_safe?], false)
+
+    # Provider's outer retry guard also needs the transport identity, which was
+    # otherwise only reduced inside the lost process. Do not emit a callback or
+    # invent response progress to recover it.
+    if is_map(acc[:provider_metadata]) do
+      put_in(acc[:provider_metadata]["active_transport"], "websocket")
+    else
+      acc
     end
   end
 
@@ -204,21 +221,37 @@ defmodule Pixir.Provider.Connection do
               {:reply, {:error, error, acc}, next_state}
           end
 
-        {:continuation_not_found, state} ->
+        {:provider_error, error, acc, state} ->
+          # The transport finished, but the reducer rejected the response. Keep its
+          # original error/partial evidence for Provider.finalize, never continuation.
+          next_state = mark_degraded(state, client, error, opts)
+          {:reply, {:ok, acc}, next_state}
+
+        {:continuation_not_found, rejected_acc, state} ->
           state = reset_continuation(state, "previous_response_not_found")
           retry_client_opts = client_opts_with_remaining_timeout(client_opts, stream_started_ms)
 
-          case stream_wire_payload(
-                 state,
-                 client,
-                 full_payload,
-                 full_payload,
-                 continuation_metadata(false, "previous_response_not_found"),
-                 acc,
-                 fun,
-                 retry_client_opts,
-                 opts
-               ) do
+          retry_result =
+            if retry_client_opts[:timeout_ms] > 0 do
+              stream_wire_payload(
+                state,
+                client,
+                full_payload,
+                full_payload,
+                continuation_metadata(false, "previous_response_not_found"),
+                acc,
+                fun,
+                retry_client_opts,
+                opts
+              )
+            else
+              # Never grant a fresh deadline to recovery. Preserve the rejection
+              # when the original budget is exhausted, without sending again.
+              {:provider_error, rejected_acc.stream_error,
+               Map.put(rejected_acc, :replay_safe?, false), state}
+            end
+
+          case retry_result do
             {:ok, acc, response, state} ->
               next_state = successful_state(state, full_payload, response, opts)
 
@@ -235,16 +268,9 @@ defmodule Pixir.Provider.Connection do
               next_state = mark_degraded(state, client, error, opts)
               {:reply, {:error, error, acc}, next_state}
 
-            {:continuation_not_found, state} ->
-              error =
-                Tool.error(
-                  :provider_http_error,
-                  "Provider rejected previous_response_id even after full replay retry.",
-                  %{reason: "previous_response_not_found"}
-                )
-
+            {:provider_error, error, acc, state} ->
               next_state = mark_degraded(state, client, error, opts)
-              {:reply, {:error, error, acc}, next_state}
+              {:reply, {:ok, acc}, next_state}
           end
 
         {:error, error, acc, state} ->
@@ -296,11 +322,19 @@ defmodule Pixir.Provider.Connection do
              client_opts
            ) do
         {:ok, acc, response} ->
-          if Map.has_key?(wire_payload, "previous_response_id") and
-               previous_response_not_found?(acc) do
-            {:continuation_not_found, %{state | initial_buffer: ""}}
-          else
-            {:ok, acc, response, %{state | initial_buffer: ""}}
+          state = %{state | initial_buffer: ""}
+
+          cond do
+            Map.has_key?(wire_payload, "previous_response_id") and
+              previous_response_not_found?(acc) and
+                Pixir.Provider.TransportPolicy.replay_safe?(acc) ->
+              {:continuation_not_found, acc, state}
+
+            is_map(acc) and not is_nil(acc[:stream_error]) ->
+              {:provider_error, acc.stream_error, acc, state}
+
+            true ->
+              {:ok, acc, response, state}
           end
 
         {:error, error, acc} ->
@@ -340,6 +374,9 @@ defmodule Pixir.Provider.Connection do
       try do
         fun.(chunk, acc)
       catch
+        :throw, {:provider_stream_callback_failed, kind, reason, failed_acc} ->
+          throw({@callback_failure_tag, stream_callback_error(kind, reason), failed_acc})
+
         kind, reason ->
           throw({@callback_failure_tag, stream_callback_error(kind, reason), acc})
       end
@@ -538,40 +575,25 @@ defmodule Pixir.Provider.Connection do
     }
   end
 
-  defp previous_response_not_found?(%{stream_error: %{error: error}}) when is_map(error) do
-    details =
-      case Map.get(error, :details) || Map.get(error, "details") do
-        details when is_map(details) -> details
-        _ -> %{}
-      end
-
-    [
-      error[:code],
-      error["code"],
-      error[:type],
-      error["type"],
-      error[:message],
-      error["message"],
-      details[:code],
-      details["code"],
-      details[:type],
-      details["type"]
-    ]
-    |> Enum.any?(fn
-      value when is_binary(value) ->
-        value =~ ~r/previous[ _-]?response.*not[ _-]?found/i
-
-      _ ->
-        false
-    end)
-  end
+  # Only the reducer's structured code authorizes recovery. Message/type substring
+  # matches can turn unrelated provider rejections into unintended requests.
+  defp previous_response_not_found?(%{
+         stream_error: %{
+           error: %{
+             kind: :provider_http_error,
+             details: %{code: "previous_response_not_found", event_type: event_type}
+           }
+         }
+       })
+       when event_type in ["error", "response.failed"],
+       do: true
 
   defp previous_response_not_found?(_acc), do: false
 
   defp client_opts_with_remaining_timeout(client_opts, started_ms) do
     timeout_ms = Keyword.get(client_opts, :timeout_ms, @default_timeout_ms)
     elapsed_ms = max(0, monotonic_ms() - started_ms)
-    remaining_ms = max(1, timeout_ms - elapsed_ms)
+    remaining_ms = max(0, timeout_ms - elapsed_ms)
     Keyword.put(client_opts, :timeout_ms, remaining_ms)
   end
 

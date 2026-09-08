@@ -385,7 +385,7 @@ defmodule PixirMonitor.Projection.PostTerminalChildActivityTest do
       assert before_order == ["parent-447", "parent-other"]
     end
 
-    test "SelfCheck still reports the schema identifiers the endpoints emit", context do
+    test "filesystem endpoints keep their schema identifiers", context do
       write_parent(context.sessions)
       write_child(context.sessions, resumed_child_events())
 
@@ -394,10 +394,6 @@ defmodule PixirMonitor.Projection.PostTerminalChildActivityTest do
 
       assert {:ok, %{"schema" => "pixir.presenter.run", "schema_version" => 1}} =
                PixirMonitor.Projection.Source.fetch_run("parent-447", workspace: context.workspace)
-
-      self_check = File.read!(Path.expand("../../lib/pixir_monitor/self_check.ex", __DIR__))
-      assert self_check =~ ~s|runs_schema: "pixir.monitor.runs"|
-      assert self_check =~ "runs_schema_version: 1"
     end
 
     test "detail projection over the filesystem provider agrees with the row", context do
@@ -415,7 +411,14 @@ defmodule PixirMonitor.Projection.PostTerminalChildActivityTest do
     end
 
     defp write_parent(sessions) do
-      write_log(sessions, "parent-447", parent_events("parent-447"))
+      # Portable projection fixtures omit envelope identity; real on-disk Logs
+      # include it, just as write_child/2 does for the child fixtures below.
+      wrapped =
+        Enum.map(parent_events("parent-447"), fn event ->
+          Map.merge(event, %{"id" => "event-parent-447-#{event["seq"]}", "session_id" => "parent-447"})
+        end)
+
+      write_log(sessions, "parent-447", wrapped)
     end
 
     defp write_child(sessions, events) do

@@ -135,8 +135,26 @@ defmodule Pixir.Tools.RunWorkflow do
     args = strip_step_operator_knobs(args)
 
     with {:ok, result} <- Workflows.run(context.session_id, args, workflow_opts(context)) do
-      {:ok,
-       %{"output" => result |> render() |> maybe_append_directive(result), "workflow" => result}}
+      landing =
+        Subagents.landing_manifest_projection(result["steps"] || [], context.workspace,
+          parent_session_id: context.session_id
+        )
+
+      landing_manifest = landing["landing_manifest"]
+      omitted_children = Map.get(landing, "omitted_children", 0)
+
+      output =
+        result
+        |> render()
+        |> maybe_append_directive(result)
+        |> maybe_append_landing_manifest(landing_manifest, omitted_children)
+
+      response =
+        %{"output" => output, "workflow" => result}
+        |> maybe_put_landing_manifest(landing_manifest)
+        |> maybe_put_omitted_children(omitted_children)
+
+      {:ok, response}
     end
   end
 
@@ -236,6 +254,21 @@ defmodule Pixir.Tools.RunWorkflow do
       output
     end
   end
+
+  defp maybe_append_landing_manifest(output, [], _omitted_children), do: output
+
+  defp maybe_append_landing_manifest(output, manifest, omitted_children),
+    do: output <> "\n\n" <> Subagents.render_landing_manifest(manifest, omitted_children)
+
+  defp maybe_put_landing_manifest(response, []), do: response
+
+  defp maybe_put_landing_manifest(response, manifest),
+    do: Map.put(response, "landing_manifest", manifest)
+
+  defp maybe_put_omitted_children(response, 0), do: response
+
+  defp maybe_put_omitted_children(response, omitted_children),
+    do: Map.put(response, "omitted_children", omitted_children)
 
   defp render_dry_run(result) do
     template =

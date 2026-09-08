@@ -105,7 +105,11 @@ defmodule Pixir.ModelsRefresh do
       %{authenticated?: true} ->
         %{
           "status" => "skipped",
-          "reason" => "auth_kind_unsupported_for_models_endpoint"
+          "reason" => "auth_kind_unsupported_for_models_endpoint",
+          "next_actions" => [
+            "After checking model availability for your account, maintain the \"models\" list in config.json; it replaces the built-in catalog.",
+            "After checking model availability for your account, use an explicit model override such as PIXIR_MODEL=gpt-6-astra; OAuth refresh leaves the OpenAI catalog unchanged."
+          ]
         }
 
       _ ->

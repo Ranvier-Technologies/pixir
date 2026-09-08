@@ -6,13 +6,16 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  elixir:
-    name: Elixir checks
+  core:
+    name: Core checks
     # This file is synced verbatim to the public mirror (Ranvier-Technologies/pixir),
     # where Blacksmith is not installed. The condition names ONLY the public repo
     # (the sync verifier rejects private-name mentions): the mirror gets free
@@ -66,6 +69,48 @@ jobs:
 
       - name: Run WebSocket smoke
         run: mix pixir.smoke.websocket --dry-run --json
+
+      - name: Build docs with warnings as errors
+        run: mix docs --warnings-as-errors
+
+  monitor:
+    name: Monitor checks
+    # Independent of core so browser/OS dependency failures can be retried alone.
+    runs-on: ${{ github.repository == 'Ranvier-Technologies/pixir' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - name: Set up Erlang/OTP and Elixir
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93
+        with:
+          otp-version: "29"
+          elixir-version: "1.20.2"
+
+      - name: Install Hex and Rebar
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+
+      - name: Prepare core dependency and fixture CLI
+        run: |
+          mix deps.get
+          mix escript.build
+
+      - name: Refresh Ubuntu repositories over HTTPS
+        # The runner's HTTP mirror connections can stall before Chrome's
+        # dependency installation. Keep the same Ubuntu repositories and signing
+        # keys, but use HTTPS and refresh indexes with bounded network waits.
+        timeout-minutes: 3
+        run: |
+          for apt_source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            test -f "$apt_source" || continue
+            sudo sed -i -E 's@http://(archive\.ubuntu\.com|us\.archive\.ubuntu\.com|security\.ubuntu\.com)/ubuntu@https://\1/ubuntu@g' "$apt_source"
+          done
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
 
       - name: Set up Chrome for Pixir Monitor browser suites
         # ACTION pinned by commit (browser-actions/setup-chrome v2.1.2); the
@@ -133,5 +178,19 @@ jobs:
         working-directory: monitor
         run: ./pixir-monitor serve --dry-run --json
 
-      - name: Build docs with warnings as errors
-        run: mix docs --warnings-as-errors
+  elixir:
+    name: Elixir checks
+    # Preserve the existing required-check name; skipped/cancelled jobs are not green.
+    if: ${{ always() }}
+    needs: [core, monitor]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Require both verification jobs
+        env:
+          CORE_RESULT: ${{ needs.core.result }}
+          MONITOR_RESULT: ${{ needs.monitor.result }}
+        run: |
+          printf 'Core: %s; Monitor: %s\n' "$CORE_RESULT" "$MONITOR_RESULT"
+          test "$CORE_RESULT" = success
+          test "$MONITOR_RESULT" = success

@@ -3,7 +3,9 @@ defmodule Pixir.Provider.TransportPolicy do
   Runtime Provider transport policy.
 
   `:auto` prefers a per-key WebSocket connection and falls back to HTTP/SSE for
-  transport failures. The fallback reuses the same HTTP request body, so safe
+  replay-safe transport failures. Ambiguous connection call loss is not proof of a
+  clean stream and therefore vetoes fallback. The fallback reuses the same HTTP
+  request body, so safe
   `prompt_cache_key` metadata survives across transports. `previous_response_id` lives
   only inside the WebSocket connection process and is discarded on fallback.
   """
@@ -111,8 +113,16 @@ defmodule Pixir.Provider.TransportPolicy do
 
   defp websocket_transport_error?(_error), do: false
 
-  defp fallback_safe?(acc) do
-    acc[:text] in [nil, ""] and acc[:reasoning] in [nil, ""] and
+  defp fallback_safe?(acc), do: replay_safe?(acc) and is_nil(acc[:stream_error])
+
+  @doc false
+  # The reducer explicitly disallows replay after observable progress (including
+  # callback effects), spending the one continuation-reset attempt, or losing the
+  # connection call before its progress can be returned. Retain the
+  # field checks for callers that supply their own transport accumulator.
+  def replay_safe?(acc) do
+    acc[:replay_safe?] != false and
+      acc[:text] in [nil, ""] and acc[:reasoning] in [nil, ""] and
       Enum.empty?(acc[:output_items] || []) and is_nil(acc[:usage])
   end
 

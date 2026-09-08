@@ -2,6 +2,70 @@ unless Code.ensure_loaded?(PixirMonitor.InventoryFixture) do
   Code.require_file("support/inventory_fixture.ex", __DIR__)
 end
 
+defmodule PixirMonitor.InvalidWorkspaceSetTest do
+  use ExUnit.Case, async: false
+  import Plug.Test
+  alias PixirMonitor.{Bootstrap, InvalidationHub, LogWatcher, Router, WorkspaceSet}
+
+  setup do
+    previous = for key <- [:workspace_set, :active_port], into: %{}, do: {key, Application.fetch_env(:pixir_monitor, key)}
+    Application.put_env(:pixir_monitor, :active_port, 41981)
+
+    on_exit(fn ->
+      Enum.each(previous, fn
+        {key, {:ok, value}} -> Application.put_env(:pixir_monitor, key, value)
+        {key, :error} -> Application.delete_env(:pixir_monitor, key)
+      end)
+    end)
+
+    :ok
+  end
+
+  test "absent configuration is single; valid ordered sources stay unchanged" do
+    Application.delete_env(:pixir_monitor, :workspace_set)
+    assert {:ok, :single} = WorkspaceSet.mode()
+    sources = [%{key: "second", path: "/fixture/b"}, %{key: "first", path: "/fixture/a"}]
+    Application.put_env(:pixir_monitor, :workspace_set, sources)
+    assert {:ok, ^sources} = WorkspaceSet.configured()
+    assert {:ok, :workspace_set} = WorkspaceSet.mode()
+  end
+
+  test "every invalid class fails closed before shell, routing, publication or watcher work" do
+    valid = %{key: "same", path: "/private/must-not-be-disclosed"}
+
+    cases = [
+      {nil, "malformed_source"},
+      {:invalid, "malformed_source"},
+      {[], "cardinality_out_of_range"},
+      {[valid], "cardinality_out_of_range"},
+      {List.duplicate(valid, 9), "cardinality_out_of_range"},
+      {[valid, valid], "duplicate_key"},
+      {[valid, %{key: "bad/key", path: valid.path}], "invalid_key"},
+      {[valid, %{key: "other", path: 42}], "malformed_source"},
+      {[valid, %{key: "other", path: ""}], "malformed_source"},
+      {[valid | :improper], "malformed_source"}
+    ]
+
+    for {value, reason} <- cases do
+      Application.put_env(:pixir_monitor, :workspace_set, value)
+      assert {:error, %{kind: "workspace_set_configuration_invalid", details: %{reason: ^reason}} = error} = WorkspaceSet.configured()
+      assert {:error, ^error} = WorkspaceSet.mode()
+      assert {:error, ^error} = Bootstrap.shell()
+      assert {:error, ^error} = InvalidationHub.projection_changed("run")
+      assert {:error, ^error} = InvalidationHub.projection_changed("same", "run")
+      assert {:error, ^error} = LogWatcher.refresh()
+
+      for route <- ["/", "/api/runs", "/api/runs/run", "/api/workspaces/same/runs", "/events"] do
+        conn = conn(:get, "http://127.0.0.1:41981" <> route) |> Router.call(Router.init([]))
+        assert conn.status == 503
+        assert Jason.decode!(conn.resp_body)["error"]["kind"] == "workspace_set_configuration_invalid"
+        assert Jason.decode!(conn.resp_body)["error"]["details"]["reason"] == reason
+        refute conn.resp_body =~ valid.path
+      end
+    end
+  end
+end
+
 defmodule PixirMonitor.WorkspaceSetContractSource do
   @moduledoc false
 
@@ -190,8 +254,8 @@ defmodule PixirMonitor.WorkspaceSetContractTest do
 
     Enum.each(invalid_sets, fn sources ->
       Application.put_env(:pixir_monitor, :workspace_set, sources)
-      assert {:error, %{kind: "workspace_set_not_configured"}} = PixirMonitor.WorkspaceSet.configured()
-      assert {:ok, :single} = PixirMonitor.WorkspaceSet.mode()
+      assert {:error, %{kind: "workspace_set_configuration_invalid"} = error} = PixirMonitor.WorkspaceSet.configured()
+      assert {:error, ^error} = PixirMonitor.WorkspaceSet.mode()
     end)
   end
 

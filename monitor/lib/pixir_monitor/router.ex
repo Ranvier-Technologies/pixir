@@ -15,12 +15,15 @@ defmodule PixirMonitor.Router do
   @sse_keepalive_ms 1_000
 
   plug(PixirMonitor.Security)
+  plug(:valid_configuration)
   plug(:match)
   plug(:dispatch)
 
   get "/" do
-    {:ok, shell} = PixirMonitor.Bootstrap.shell()
-    send_text(conn, 200, "text/html; charset=utf-8", shell)
+    case PixirMonitor.Bootstrap.shell() do
+      {:ok, shell} -> send_text(conn, 200, "text/html; charset=utf-8", shell)
+      {:error, error} -> send_json(conn, 503, %{error: error})
+    end
   end
 
   post "/bootstrap" do
@@ -50,6 +53,9 @@ defmodule PixirMonitor.Router do
   get "/api/runs" do
     with_api(conn, fn conn ->
       case PixirMonitor.WorkspaceSet.mode() do
+        {:error, error} ->
+          send_json(conn, 503, %{error: error})
+
         {:ok, :workspace_set} ->
           set_error(conn, 404, "unscoped_route_unavailable", "Use a workspace-scoped Runs route")
 
@@ -65,6 +71,9 @@ defmodule PixirMonitor.Router do
   get "/api/runs/:id" do
     with_api(conn, fn conn ->
       case PixirMonitor.WorkspaceSet.mode() do
+        {:error, error} ->
+          send_json(conn, 503, %{error: error})
+
         {:ok, :workspace_set} ->
           set_error(conn, 404, "unscoped_route_unavailable", "Use a workspace-scoped Run Detail route")
 
@@ -92,6 +101,7 @@ defmodule PixirMonitor.Router do
 
   defp scoped_runs(conn, key) do
     case PixirMonitor.WorkspaceSet.mode() do
+      {:error, error} -> send_json(conn, 503, %{error: error})
       {:ok, :single} -> PixirMonitor.Security.reject(conn, 405, "method_not_allowed", "The read-only monitor does not expose this route or method")
       {:ok, :workspace_set} -> scoped_result(conn, key, nil)
     end
@@ -99,6 +109,7 @@ defmodule PixirMonitor.Router do
 
   defp scoped_run(conn, key, id) do
     case PixirMonitor.WorkspaceSet.mode() do
+      {:error, error} -> send_json(conn, 503, %{error: error})
       {:ok, :single} -> PixirMonitor.Security.reject(conn, 405, "method_not_allowed", "The read-only monitor does not expose this route or method")
       {:ok, :workspace_set} -> scoped_result(conn, key, id)
     end
@@ -207,6 +218,13 @@ defmodule PixirMonitor.Router do
     |> send_resp(status, bytes)
   end
 
+  defp valid_configuration(conn, _opts) do
+    case PixirMonitor.WorkspaceSet.mode() do
+      {:ok, _} -> conn
+      {:error, error} -> conn |> send_json(503, %{error: error}) |> halt()
+    end
+  end
+
   defp send_text(conn, status, content_type, bytes) do
     conn |> put_resp_content_type(content_type, nil) |> send_resp(status, bytes)
   end
@@ -249,13 +267,18 @@ defmodule PixirMonitor.Router do
 
         frame =
           case {PixirMonitor.WorkspaceSet.mode(), workspace} do
+            {{:error, _}, _} -> nil
             {{:ok, :workspace_set}, key} when is_binary(key) -> PixirMonitor.InvalidationHub.frame(sequence, key, projection_id)
             _ -> PixirMonitor.InvalidationHub.frame(sequence, projection_id)
           end
 
-        case chunk(conn, frame) do
-          {:ok, conn} -> stream_loop(conn, count + 1)
-          {:error, _} -> conn
+        if is_nil(frame) do
+          conn
+        else
+          case chunk(conn, frame) do
+            {:ok, conn} -> stream_loop(conn, count + 1)
+            {:error, _} -> conn
+          end
         end
 
       :pixir_sse_close ->

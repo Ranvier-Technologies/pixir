@@ -35,6 +35,33 @@ defmodule Pixir.Providers.ResolvedProviderRequestTest do
     :ok
   end
 
+  test "max is frozen known intent independently of the eventual capability or override" do
+    for model <- ["gpt-6-astra", "gpt-5.5"] do
+      assert {:ok, resolved} = resolve(%{"model" => model, "reasoning" => %{"effort" => "max"}})
+      assert ResolvedProviderRequest.provider_defaults_valid?(resolved)
+      assert resolved.provider_defaults.reasoning_effort == "max"
+
+      attached =
+        ResolvedProviderRequest.attach_to_provider_opts(resolved, reasoning_effort: "high")
+
+      assert attached[:reasoning_effort] == "high"
+      assert attached[:resolved_provider_request] == resolved
+      assert resolved.provider_defaults.reasoning_effort == "max"
+
+      for malformed <- ["ultra", :max, " max ", 123] do
+        invalid = %{
+          resolved
+          | provider_defaults: %{resolved.provider_defaults | reasoning_effort: malformed}
+        }
+
+        refute ResolvedProviderRequest.provider_defaults_valid?(invalid)
+
+        assert {:error, %{error: %{kind: :invalid_config}}} =
+                 Pixir.Provider.request_body_preview(%{}, resolved_provider_request: invalid)
+      end
+    end
+  end
+
   test "default and Claude selections are atomic and backend-applicable only to Responses" do
     assert {:ok, gpt} = resolve(%{"model" => "gpt-5.5"})
     assert ResolvedProviderRequest.provider(gpt) == Pixir.Provider

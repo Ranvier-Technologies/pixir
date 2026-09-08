@@ -250,17 +250,17 @@ defmodule Pixir.Providers.Anthropic.PromptTest do
     }
 
     assert {Prompt.prompt_contract_version(), hashes} ==
-             {"pa4",
+             {"pa5",
               %{
                 build: "b761c6bbcd0ddcdb825ae4d3628a568f17c5d8b238c0cb4f1a38e334b0151dbc",
                 plan: "da2e394660b00dfd46bab88e6386f38e7a8fd8fe1cba0db4b4f5cffb1b8c020f"
               }}
   end
 
-  test "contract includes pa4 label and layer0_hash" do
+  test "contract includes pa5 label and layer0_hash" do
     assert {:ok, result} = Prompt.build(input())
 
-    assert result.contract["prompt_contract_version"] == "pa4"
+    assert result.contract["prompt_contract_version"] == "pa5"
     assert is_binary(result.contract["layer0_hash"])
     assert byte_size(result.contract["layer0_hash"]) == 16
   end

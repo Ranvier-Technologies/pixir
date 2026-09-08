@@ -102,15 +102,68 @@ defmodule Pixir.ModelsRefreshTest do
                http: http
              )
 
-    assert result["providers"]["openai"] == %{
+    assert %{
              "status" => "skipped",
-             "reason" => "auth_kind_unsupported_for_models_endpoint"
-           }
+             "reason" => "auth_kind_unsupported_for_models_endpoint",
+             "next_actions" => actions
+           } = result["providers"]["openai"]
+
+    assert is_list(actions)
 
     written = path |> File.read!() |> Jason.decode!()
     assert written["models"] == original["models"]
     assert written["anthropic_models"] == ["claude-fable-5", "claude-refreshed"]
     assert written["foreign"] == 7
+  end
+
+  test "oauth skip gives bounded manual guidance without HTTP or config mutation", %{
+    dir: dir,
+    config_path: path
+  } do
+    original =
+      Jason.encode!(
+        %{
+          "model" => "gpt-5.5",
+          "models" => ["gpt-existing"],
+          "models_refreshed_at" => "2026-01-02T03:04:05Z",
+          "foreign" => %{"keep" => true}
+        },
+        pretty: true
+      )
+
+    File.write!(path, original)
+    caller = self()
+    request_marker = make_ref()
+
+    assert {:ok, result} =
+             ModelsRefresh.refresh(
+               config_path: path,
+               auth: start_subscription_auth(dir),
+               env: fn _ -> nil end,
+               http: fn _ ->
+                 send(caller, request_marker)
+                 {:error, :unexpected_http_request}
+               end
+             )
+
+    refute_received ^request_marker
+    assert result["wrote_config"] == false
+    assert File.read!(path) == original
+
+    assert %{
+             "status" => "skipped",
+             "reason" => "auth_kind_unsupported_for_models_endpoint",
+             "next_actions" => actions
+           } = result["providers"]["openai"]
+
+    assert length(actions) == 2
+    assert Enum.all?(actions, &(is_binary(&1) and byte_size(&1) <= 256))
+    assert Enum.all?(actions, &String.contains?(&1, "availability"))
+    assert Enum.any?(actions, &String.contains?(&1, "config.json"))
+    assert Enum.any?(actions, &String.contains?(&1, "\"models\""))
+    assert Enum.any?(actions, &String.contains?(&1, "replaces"))
+    assert Enum.any?(actions, &String.contains?(&1, "explicit model override"))
+    assert Enum.any?(actions, &String.contains?(&1, "PIXIR_MODEL"))
   end
 
   test "non-200 is bounded and fail-closed with config byte-identical", %{
@@ -338,6 +391,7 @@ defmodule Pixir.ModelsRefreshTest do
     assert {:ok, catalog} = ModelsRefresh.catalog(config_path: path)
     assert catalog["providers"]["openai"]["source"] == "built_in"
     assert "gpt-5.6-sol" in catalog["providers"]["openai"]["models"]
+    assert "gpt-6-astra" in catalog["providers"]["openai"]["models"]
     assert catalog["providers"]["anthropic"]["source"] == "config_override"
     assert "claude-refreshed" in catalog["providers"]["anthropic"]["models"]
     assert catalog["models_refreshed_at"] == "2026-01-02T03:04:05Z"

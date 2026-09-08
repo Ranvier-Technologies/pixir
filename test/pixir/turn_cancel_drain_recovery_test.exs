@@ -357,6 +357,12 @@ defmodule Pixir.TurnCancelDrainRecoveryTest do
         # dead Session before the restart below can win the race.
         assert_receive {:committed_on_the_wire, "call_orphaned"}, 5_000
 
+        # Exercise a descheduled owner between observing the declaration and
+        # restarting its Session. The stream must await the explicit restart.
+        restart_gate = make_ref()
+        Process.send_after(self(), {:restart_gate, restart_gate}, 550)
+        assert_receive {:restart_gate, ^restart_gate}, 5_000
+
         # The stream RUNS TO COMPLETION over the dead Session and the Turn comes back with
         # a value. Pre-fix the declare's `GenServer.call` exited `{:noproc, …}` from inside
         # the reducer; StreamIdle caught it and turned the whole stream into a
@@ -375,6 +381,8 @@ defmodule Pixir.TurnCancelDrainRecoveryTest do
           if Process.alive?(restarted_pid),
             do: DynamicSupervisor.terminate_child(SessionSupervisor, restarted_pid)
         end)
+
+        send(stream_pid, :session_restarted)
 
         result = Task.await(turn, 15_000)
 
@@ -1546,6 +1554,15 @@ defmodule Pixir.TurnCancelDrainRecoveryTest do
 
         # AFTER the reducer returned, so the declare has already been attempted.
         send(test_pid, {:committed_on_the_wire, call_id})
+
+        # The declaration must see the dead Session, but subsequent Tool
+        # execution must see the explicitly restarted Session. Without this
+        # acknowledgement those two requirements race on a loaded runner.
+        receive do
+          :session_restarted -> :ok
+        after
+          10_000 -> flunk("the test never acknowledged the restarted Session")
+        end
 
         {:ok, fun.({:data, sse(%{type: "response.completed"})}, acc)}
       else

@@ -48,6 +48,7 @@ a:hover {
 
 a:focus-visible,
 button:focus-visible,
+summary:focus-visible,
 [tabindex]:focus-visible {
   outline: 2px solid var(--beam-cyan);
   outline-offset: 3px;
@@ -878,6 +879,34 @@ h2 {
   background: var(--terminal);
 }
 
+/* First-run content reuses the site's typography, cards and terminal palette. */
+.hero-release { display: flex; flex-wrap: wrap; gap: 8px 20px; margin: -14px 0 -14px; font-size: 14px; }
+.hero-release span { color: var(--muted); }
+.hero-release a { font-weight: 600; }
+.release-section { background: var(--surface); }
+.release-badge { display: inline-block; margin-left: 12px; border: 1px solid #bae6fd; border-radius: 999px; padding: 6px 10px; color: #075985; background: #f0f9ff; text-transform: none; }
+.release-note { max-width: 850px; margin: 24px 0 0; color: var(--muted); font-size: 15px; line-height: 1.7; }
+.section-links { display: flex; flex-wrap: wrap; gap: 14px 24px; margin-top: 24px; font-size: 14px; font-weight: 600; }
+.first-run-steps { list-style: none; margin: 34px 0 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+.setup-step { min-width: 0; padding: 26px; border: 1px solid var(--line); border-radius: 8px; background: var(--canvas); }
+.step-heading { display: flex; align-items: baseline; gap: 14px; }
+.step-heading h3 { margin: 0; font-size: 20px; line-height: 1.35; }
+.step-number { font: 13px var(--mono); color: #0369a1; }
+.setup-step p { font-size: 15px; line-height: 1.65; color: var(--muted); }
+.setup-step .step-note { font-size: 13px; }
+.command-block { margin: 18px 0; padding: 16px; border-radius: 6px; background: var(--terminal); color: #e2e8f0; font-size: 13px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
+.spec-details summary { cursor: pointer; padding: 10px 0; font-size: 14px; font-weight: 600; }
+.terminal-command { margin: 0; font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; color: #e2e8f0; }
+.terminal-body a { color: #7dd3fc; }
+.evidence-caption { padding: 0 20px; font-size: 12px; line-height: 1.6; color: #94a3b8; }
+.evidence-terminal pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #e2e8f0; }
+.evidence-download { display: block; margin: 0 20px 20px; font-size: 13px; color: #7dd3fc; }
+.install-card h3 { margin-top: 0; }
+.install-card a { color: #7dd3fc; }
+section[id] { scroll-margin-top: 20px; }
+@media (max-width: 860px) { .first-run-steps { grid-template-columns: 1fr; } }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
 .footer-inner {
   display: flex;
   width: min(1120px, calc(100% - 32px));
@@ -886,6 +915,50 @@ h2 {
   gap: 16px;
   margin: 0 auto;
   font-size: 13px;
+}
+
+/* Alternate reading surfaces and emphasis; keep the hero and scope light. */
+.section.tone-mist {
+  background: #eaf2fb;
+  border-color: #d7e4f3;
+}
+
+.section.tone-navy {
+  --ink: #f8fafc;
+  --muted: #c5d2e4;
+  --subtle: #a3b5cd;
+  --line: #2a3b54;
+  --canvas: #112039;
+  --surface: #15263e;
+  --data-accent: #7dd3fc;
+  color: var(--ink);
+  background: var(--terminal);
+  border-color: var(--line);
+}
+
+.tone-navy .section-kicker,
+.tone-navy .proof code,
+.tone-navy a {
+  color: #7dd3fc;
+}
+
+.tone-navy a:hover {
+  color: #ffffff;
+}
+
+.tone-navy .proof {
+  background: #112039;
+  border-color: #2a3b54;
+}
+
+.tone-navy .release-badge {
+  color: #b4e4ff;
+  background: #16334d;
+  border-color: #335e7e;
+}
+
+.runtime-proofs {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 @media (max-width: 860px) {

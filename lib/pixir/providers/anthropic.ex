@@ -685,6 +685,8 @@ defmodule Pixir.Providers.Anthropic do
   # thinking blocks re-inject verbatim, model- and dialect-guarded (ADR 0037 D5),
   # positioned exactly as captured next to their tool_use blocks.
   defp fold_history(history, model) do
+    # All ordered accumulators are reversed while folding. Restore wire order
+    # only at flush boundaries instead of copying a growing prefix per Event.
     history
     |> Enum.reduce(
       %{
@@ -700,6 +702,7 @@ defmodule Pixir.Providers.Anthropic do
     |> then(fn state ->
       flush_pending(state.messages, state.assistant_items, state.results, model)
     end)
+    |> Enum.reverse()
   end
 
   defp fold_history_event(event, state, model) do
@@ -718,7 +721,7 @@ defmodule Pixir.Providers.Anthropic do
         case pending_skill_view_call_id(event, state.pending_calls) do
           {:ok, call_id} ->
             Map.update!(state, :deferred_skill_activations, fn deferred ->
-              Map.update(deferred, call_id, [event], &(&1 ++ [event]))
+              Map.update(deferred, call_id, [event], &[event | &1])
             end)
 
           :error ->
@@ -762,7 +765,7 @@ defmodule Pixir.Providers.Anthropic do
         %{
           state
           | messages: flush_results(state.messages, state.results),
-            assistant_items: state.assistant_items ++ [normalize_event(event, :tool_call)],
+            assistant_items: [normalize_event(event, :tool_call) | state.assistant_items],
             results: [],
             pending_calls: Map.put(state.pending_calls, call_id, event)
         }
@@ -773,7 +776,7 @@ defmodule Pixir.Providers.Anthropic do
         %{
           state
           | messages: flush_results(state.messages, state.results),
-            assistant_items: state.assistant_items ++ [normalize_event(event, :reasoning)],
+            assistant_items: [normalize_event(event, :reasoning) | state.assistant_items],
             results: []
         }
 
@@ -793,7 +796,7 @@ defmodule Pixir.Providers.Anthropic do
 
     if Map.has_key?(state.deferred_skill_activations, call_id) do
       messages = flush_assistant_items(state.messages, state.assistant_items, model)
-      messages = flush_results(messages, state.results ++ [tool_result_block(event)])
+      messages = flush_results(messages, [tool_result_block(event) | state.results])
 
       messages =
         append_activation_messages(
@@ -821,7 +824,7 @@ defmodule Pixir.Providers.Anthropic do
       state
       | messages: flush_assistant_items(state.messages, state.assistant_items, model),
         assistant_items: [],
-        results: state.results ++ [tool_result_block(event)],
+        results: [tool_result_block(event) | state.results],
         pending_calls: Map.delete(state.pending_calls, call_id)
     }
   end
@@ -831,9 +834,10 @@ defmodule Pixir.Providers.Anthropic do
 
     %{
       state
-      | messages:
-          flush_pending(state.messages, state.assistant_items, state.results, model) ++
-            [text_message(role, text)],
+      | messages: [
+          text_message(role, text)
+          | flush_pending(state.messages, state.assistant_items, state.results, model)
+        ],
         assistant_items: [],
         results: [],
         pending_calls: %{},
@@ -885,6 +889,7 @@ defmodule Pixir.Providers.Anthropic do
       state.pending_calls
       |> Enum.sort_by(fn {call_id, _call} -> call_id end)
       |> Enum.map(fn {call_id, call} -> orphan_tool_result_block(call_id, call) end)
+      |> Enum.reverse()
 
     %{
       state
@@ -915,10 +920,9 @@ defmodule Pixir.Providers.Anthropic do
   end
 
   defp append_activation_messages(messages, activations) do
-    messages ++
-      Enum.map(activations, fn activation ->
-        text_message("user", Pixir.Skills.render_activation(event_data(activation)))
-      end)
+    Enum.map(activations, fn activation ->
+      text_message("user", Pixir.Skills.render_activation(event_data(activation)))
+    end) ++ messages
   end
 
   defp pending_skill_view_call_id(event, pending_calls) do
@@ -962,16 +966,16 @@ defmodule Pixir.Providers.Anthropic do
   defp flush_assistant_items(messages, [], _model), do: messages
 
   defp flush_assistant_items(messages, assistant_items, model) do
-    case Replay.assistant_content(assistant_items, model, &tool_use_block/1) do
+    case Replay.assistant_content(Enum.reverse(assistant_items), model, &tool_use_block/1) do
       [] -> messages
-      content -> messages ++ [%{"role" => "assistant", "content" => content}]
+      content -> [%{"role" => "assistant", "content" => content} | messages]
     end
   end
 
   defp flush_results(messages, []), do: messages
 
   defp flush_results(messages, results),
-    do: messages ++ [%{"role" => "user", "content" => results}]
+    do: [%{"role" => "user", "content" => Enum.reverse(results)} | messages]
 
   defp text_message(role, text),
     do: %{"role" => role, "content" => [%{"type" => "text", "text" => text || ""}]}
@@ -1690,7 +1694,7 @@ defmodule Pixir.Providers.Anthropic do
       |> maybe_put_cache_ttl(usage, "ephemeral_5m_input_tokens")
       |> maybe_put_cache_ttl(usage, "ephemeral_1h_input_tokens")
 
-    %{
+    summary = %{
       "input_tokens" => input_tokens,
       "output_tokens" => output_tokens,
       "total_tokens" => total_tokens,
@@ -1700,6 +1704,14 @@ defmodule Pixir.Providers.Anthropic do
       "cache_hit_rate" =>
         cache_hit_rate(read_tokens, input_tokens + creation_tokens + read_tokens)
     }
+
+    # Keep accounting coercions compatible, but do not turn an unknown input
+    # count into observed pressure. The shared gauge honors this durable marker.
+    case usage["input_tokens"] do
+      tokens when is_integer(tokens) and tokens >= 0 -> summary
+      nil -> Map.put(summary, "input_tokens_unavailable_reason", "usage_missing")
+      _ -> Map.put(summary, "input_tokens_unavailable_reason", "usage_invalid")
+    end
   end
 
   defp int(value, default \\ 0)

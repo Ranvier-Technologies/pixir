@@ -5,8 +5,8 @@
 #   fanout.sh <out_dir> "<task 1>" ["<task 2>" ...]
 #
 # Environment:
-#   PIXIR_BIN          pixir binary (default: pixir on PATH — prefer an
-#                      explicit local build; versions can differ silently)
+#   PIXIR_BIN          explicit executable override; otherwise caller ./pixir,
+#                      then PATH pixir only when no local candidate exists
 #   PIXIR_ROLE         subagent role (default: explorer, read-only)
 #   PIXIR_MAX_THREADS  concurrency (default: task count)
 #   PIXIR_TIMEOUT_MS   delegate timeout (default: 600000; must cover all
@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-PIXIR_BIN="${PIXIR_BIN:-pixir}"
+source "$(dirname -- "${BASH_SOURCE[0]}")/resolve-binary.sh"
 PIXIR_ROLE="${PIXIR_ROLE:-explorer}"
 PIXIR_TIMEOUT_MS="${PIXIR_TIMEOUT_MS:-600000}"
 PIXIR_SKIP_REHEARSAL="${PIXIR_SKIP_REHEARSAL:-0}"
@@ -36,10 +36,10 @@ out_dir="$1"
 shift
 mkdir -p "$out_dir"
 
-command -v "$PIXIR_BIN" >/dev/null || { echo "error: '$PIXIR_BIN' not found" >&2; exit 2; }
+PIXIR_BIN="$(pixir_resolve_binary)" || exit 2
 command -v jq >/dev/null || { echo "error: jq required" >&2; exit 2; }
 
-echo "driving: $(command -v "$PIXIR_BIN") · v$("$PIXIR_BIN" --version)" >&2
+pixir_report_binary
 
 max_threads="${PIXIR_MAX_THREADS:-$#}"
 

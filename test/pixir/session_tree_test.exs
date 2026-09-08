@@ -90,6 +90,248 @@ defmodule Pixir.SessionTreeTest do
     assert subagent["session"]["event_count"] == 2
   end
 
+  test "a child's own start failure is counted without inventing a descendant", %{
+    ws: ws,
+    child_sid: child_sid
+  } do
+    append!(
+      ws,
+      Event.subagent_event(
+        child_sid,
+        %{
+          "event" => "child_start_failed",
+          "lineage" => "child",
+          "scope" => "session",
+          "source" => "subagent_start",
+          "status" => "failed",
+          "subagent_id" => "sub_1",
+          "parent_session_id" => "root",
+          "child_session_id" => child_sid
+        },
+        seq: 0
+      )
+    )
+
+    assert {:ok, tree} = SessionTree.project(child_sid, workspace: ws)
+    assert tree["event_count"] == 1
+    assert tree["subagents"] == []
+  end
+
+  test "permission posture stays counted without creating phantom descendants", %{
+    ws: ws,
+    child_ws: child_ws,
+    sid: sid,
+    child_sid: child_sid
+  } do
+    parent_events = [
+      raw_event(sid, 0, "subagent_event", permission_posture("sub_parent", "upstream", ws)),
+      raw_event(sid, 1, "subagent_event", %{
+        "event" => "started",
+        "subagent_id" => "sub_1",
+        "child_session_id" => child_sid,
+        "status" => "running",
+        "workspace" => child_ws
+      }),
+      raw_event(sid, 2, "subagent_event", %{
+        "event" => "finished",
+        "subagent_id" => "sub_1",
+        "child_session_id" => child_sid,
+        "status" => "completed",
+        "workspace" => child_ws
+      })
+    ]
+
+    child_events = [
+      raw_event(child_sid, 0, "subagent_event", permission_posture("sub_1", sid, child_ws)),
+      raw_event(child_sid, 1, "assistant_message", %{"text" => "done"})
+    ]
+
+    parent_body = write_raw_log(ws, sid, parent_events)
+    child_body = write_raw_log(child_ws, child_sid, child_events)
+
+    assert {:ok, tree} = SessionTree.project(sid, workspace: ws)
+    assert [%{"subagent_id" => "sub_1"} = child] = tree["subagents"]
+    assert child["events"] == ["started", "finished"]
+    assert child["status"] == "completed"
+    assert child["session"]["subagents"] == []
+    assert tree["event_count"] == 3
+    assert tree["event_counts"] == %{"subagent_event" => 3}
+    assert child["session"]["event_count"] == 2
+    assert child["session"]["event_counts"] == %{"subagent_event" => 1, "assistant_message" => 1}
+    assert File.read!(Log.path(sid, workspace: ws)) == parent_body
+    assert File.read!(Log.path(child_sid, workspace: child_ws)) == child_body
+
+    # A later projection must still see a genuine nested lifecycle, even when
+    # its parent and child Logs also contain their own permission posture.
+    grandchild_sid = "grandchild"
+    grandchild_ws = Path.join(child_ws, "nested")
+
+    write_raw_log(
+      child_ws,
+      child_sid,
+      child_events ++
+        [
+          raw_event(child_sid, 2, "subagent_event", %{
+            "event" => "started",
+            "subagent_id" => "sub_nested",
+            "child_session_id" => grandchild_sid,
+            "status" => "running",
+            "workspace" => grandchild_ws
+          })
+        ]
+    )
+
+    write_raw_log(grandchild_ws, grandchild_sid, [
+      raw_event(
+        grandchild_sid,
+        0,
+        "subagent_event",
+        permission_posture("sub_nested", child_sid, grandchild_ws)
+      )
+    ])
+
+    assert {:ok, updated} = SessionTree.project(sid, workspace: ws)
+    assert [child] = updated["subagents"]
+    assert [grandchild] = child["session"]["subagents"]
+    assert grandchild["subagent_id"] == "sub_nested"
+    assert grandchild["child_session_id"] == grandchild_sid
+    assert grandchild["status"] == "running"
+    assert grandchild["session"]["log_exists"] == true
+    assert grandchild["session"]["subagents"] == []
+    assert grandchild["session"]["event_counts"] == %{"subagent_event" => 1}
+  end
+
+  test "child cancellation evidence does not project a self-descendant cycle", %{
+    ws: ws,
+    child_ws: child_ws,
+    sid: sid,
+    child_sid: child_sid
+  } do
+    parent_body =
+      write_raw_log(ws, sid, [
+        raw_event(sid, 0, "subagent_event", %{
+          "event" => "cancelled",
+          "subagent_id" => "sub_1",
+          "child_session_id" => child_sid,
+          "status" => "cancelled",
+          "workspace" => child_ws
+        })
+      ])
+
+    child_body =
+      write_raw_log(child_ws, child_sid, [
+        raw_event(child_sid, 0, "subagent_event", %{
+          "event" => "cancelled_by_parent",
+          "lineage" => "child",
+          "subagent_id" => "sub_1",
+          "child_session_id" => child_sid,
+          "parent_session_id" => sid,
+          "status" => "cancelled",
+          "workspace" => child_ws
+        })
+      ])
+
+    assert {:ok, tree} = SessionTree.project(sid, workspace: ws)
+    assert [child] = tree["subagents"]
+    assert child["subagent_id"] == "sub_1"
+    assert child["events"] == ["cancelled"]
+    assert child["status"] == "cancelled"
+    assert child["session"]["subagents"] == []
+    refute child["session"]["cycle"]
+    assert child["session"]["event_count"] == 1
+    assert child["session"]["event_counts"] == %{"subagent_event" => 1}
+    assert File.read!(Log.path(sid, workspace: ws)) == parent_body
+    assert File.read!(Log.path(child_sid, workspace: child_ws)) == child_body
+  end
+
+  test "horizon override metadata stays counted without creating a child", %{ws: ws, sid: sid} do
+    body =
+      write_raw_log(ws, sid, [
+        raw_event(sid, 0, "subagent_event", %{
+          "event" => "horizon_override",
+          "subagent_id" => "sub_self",
+          "workspace" => ws
+        })
+      ])
+
+    assert {:ok, tree} = SessionTree.project(sid, workspace: ws)
+    assert tree["subagents"] == []
+    assert tree["event_count"] == 1
+    assert tree["event_counts"] == %{"subagent_event" => 1}
+    assert File.read!(Log.path(sid, workspace: ws)) == body
+  end
+
+  test "non-child cancellation and unknown child-lineage events remain visible", %{
+    ws: ws,
+    sid: sid
+  } do
+    write_raw_log(ws, sid, [
+      raw_event(sid, 0, "subagent_event", %{
+        "event" => "cancelled_by_parent",
+        "lineage" => "parent",
+        "subagent_id" => "sub_parent_lineage"
+      }),
+      raw_event(sid, 1, "subagent_event", %{
+        "event" => "cancelled_by_parent",
+        "subagent_id" => "sub_absent_lineage"
+      }),
+      raw_event(sid, 2, "subagent_event", %{
+        "event" => "cancelled_by_parent",
+        "lineage" => nil,
+        "subagent_id" => "sub_null_lineage"
+      }),
+      raw_event(sid, 3, "subagent_event", %{
+        "event" => "future_event",
+        "lineage" => "child",
+        "subagent_id" => "sub_unknown"
+      })
+    ])
+
+    assert {:ok, tree} = SessionTree.project(sid, workspace: ws)
+
+    assert Enum.map(tree["subagents"], &{&1["subagent_id"], &1["events"]}) == [
+             {"sub_parent_lineage", ["cancelled_by_parent"]},
+             {"sub_absent_lineage", ["cancelled_by_parent"]},
+             {"sub_null_lineage", ["cancelled_by_parent"]},
+             {"sub_unknown", ["future_event"]}
+           ]
+
+    assert Enum.all?(tree["subagents"], &is_nil(&1["session"]))
+  end
+
+  test "keeps queued, incomplete started, and unknown events without child Session ids", %{
+    ws: ws,
+    sid: sid
+  } do
+    write_raw_log(ws, sid, [
+      raw_event(sid, 0, "subagent_event", %{
+        "event" => "queued",
+        "subagent_id" => "sub_queued",
+        "status" => "queued"
+      }),
+      raw_event(sid, 1, "subagent_event", %{
+        "event" => "started",
+        "subagent_id" => "sub_incomplete"
+      }),
+      raw_event(sid, 2, "subagent_event", %{
+        "event" => "future_event",
+        "scope" => "session",
+        "subagent_id" => "sub_unknown"
+      })
+    ])
+
+    assert {:ok, tree} = SessionTree.project(sid, workspace: ws)
+    assert [queued, incomplete, unknown] = tree["subagents"]
+    assert queued["subagent_id"] == "sub_queued"
+    assert queued["events"] == ["queued"]
+    assert queued["status"] == "queued"
+    assert incomplete["subagent_id"] == "sub_incomplete"
+    assert incomplete["events"] == ["started"]
+    assert unknown["subagent_id"] == "sub_unknown"
+    assert unknown["events"] == ["future_event"]
+    assert Enum.all?(tree["subagents"], &is_nil(&1["session"]))
+  end
+
   test "represents missing child logs honestly without failing the root projection", %{
     ws: ws,
     child_ws: child_ws,
@@ -254,6 +496,41 @@ defmodule Pixir.SessionTreeTest do
     assert text =~ "child_session: child-1"
     assert text =~ "index: 2"
     assert text =~ "task: inspect logs"
+  end
+
+  defp permission_posture(subagent_id, parent_session_id, workspace) do
+    %{
+      "event" => "permission_posture",
+      "scope" => "session",
+      "lineage" => "child",
+      "source" => "subagent_spawn",
+      "subagent_id" => subagent_id,
+      "parent_session_id" => parent_session_id,
+      "permission_mode" => "read_only",
+      "write_policy" => nil,
+      "workspace_mode" => "isolated",
+      "workspace" => workspace,
+      "warm_start" => nil
+    }
+  end
+
+  defp write_raw_log(workspace, sid, events) do
+    path = Log.path(sid, workspace: workspace)
+    File.mkdir_p!(Path.dirname(path))
+    body = Enum.map_join(events, "", &(Jason.encode!(&1) <> "\n"))
+    File.write!(path, body)
+    body
+  end
+
+  defp raw_event(sid, seq, type, data) do
+    %{
+      "id" => "#{sid}-#{seq}",
+      "session_id" => sid,
+      "seq" => seq,
+      "ts" => "2026-09-05T00:00:00Z",
+      "type" => type,
+      "data" => data
+    }
   end
 
   defp append!(workspace, event) do

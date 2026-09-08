@@ -8,7 +8,7 @@ defmodule Pixir.Tools.Edit do
   use Pixir.Tool
 
   alias Pixir.Tool
-  alias Pixir.Tools.Workspace
+  alias Pixir.Tools.{AtomicWrite, Workspace}
 
   @impl Pixir.Tool
   def __tool__ do
@@ -100,14 +100,11 @@ defmodule Pixir.Tools.Edit do
   defp occurrences(content, old), do: length(String.split(content, old)) - 1
 
   defp write(abs, content, path, count) do
-    tmp = abs <> ".pixir-tmp"
+    case AtomicWrite.write(abs, content) do
+      {:ok, nil} ->
+        {:ok, %{"output" => "edited #{path} (#{count} replacement(s))", "replacements" => count}}
 
-    with :ok <- File.write(tmp, content),
-         :ok <- File.rename(tmp, abs) do
-      {:ok, %{"output" => "edited #{path} (#{count} replacement(s))", "replacements" => count}}
-    else
       {:error, reason} ->
-        _ = File.rm(tmp)
         {:error, Tool.error(:write_failed, "could not write file", %{path: path, reason: reason})}
     end
   end

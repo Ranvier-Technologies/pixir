@@ -32,6 +32,7 @@ defmodule PixirMonitor.InvalidationHub do
     case PixirMonitor.WorkspaceSet.mode() do
       {:ok, :single} -> GenServer.call(__MODULE__, {:publish, nil, id})
       {:ok, :workspace_set} -> {:error, %{kind: "workspace_required", message: "Workspace-set invalidations require a workspace key"}}
+      {:error, _} = error -> error
     end
   end
 
@@ -41,9 +42,9 @@ defmodule PixirMonitor.InvalidationHub do
   @spec projection_changed(String.t(), String.t()) :: :ok | {:error, map()}
   def projection_changed(workspace, id)
       when is_binary(workspace) and is_binary(id) and byte_size(id) <= @max_projection_id_bytes do
-    case PixirMonitor.WorkspaceSet.validate_key(workspace) do
-      :ok -> GenServer.call(__MODULE__, {:publish, workspace, id})
-      {:error, _} = error -> error
+    with {:ok, _mode} <- PixirMonitor.WorkspaceSet.mode(),
+         :ok <- PixirMonitor.WorkspaceSet.validate_key(workspace) do
+      GenServer.call(__MODULE__, {:publish, workspace, id})
     end
   end
 

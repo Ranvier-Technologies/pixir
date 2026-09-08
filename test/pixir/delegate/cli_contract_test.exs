@@ -127,6 +127,119 @@ defmodule Pixir.Delegate.CLIContractTest do
     assert details["step_index"] == step_index
   end
 
+  test "unknown effort advertises choices for the effective model and backend" do
+    workspace = tmp_workspace("cli-unknown-effort")
+
+    for {model, includes_max?} <- [{"gpt-6-astra", true}, {"gpt-5.5", false}] do
+      spec = %{
+        "strategy" => "subagents",
+        "task" => "inspect",
+        "subagents" => %{"model" => model, "reasoning_effort" => "ultra"}
+      }
+
+      assert {:error, rendered} =
+               CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+                 workspace: workspace,
+                 read_stdin: fn -> Jason.encode!(spec) end
+               )
+
+      assert rendered.payload["kind"] == "invalid_spec"
+      details = rendered.payload["details"]
+      assert details["field"] == "subagents.reasoning_effort"
+      assert "max" in details["accepted_values"] == includes_max?
+    end
+  end
+
+  test "Delegate admits Astra max but refuses max on other models" do
+    workspace = tmp_workspace("cli-effort")
+
+    for {model, expected} <- [{"gpt-6-astra", :ok}, {"gpt-5.5", :error}] do
+      spec = %{
+        "strategy" => "subagents",
+        "task" => "inspect",
+        "subagents" => %{"model" => model, "reasoning_effort" => "max"}
+      }
+
+      result =
+        CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+          workspace: workspace,
+          read_stdin: fn -> Jason.encode!(spec) end
+        )
+
+      assert elem(result, 0) == expected
+
+      if expected == :error do
+        details = elem(result, 1).payload["details"]
+        assert details["reason"] == "unsupported_reasoning_effort"
+        assert details["field"] == "subagents.reasoning_effort"
+      end
+    end
+  end
+
+  test "Delegate max admission follows model/backend overrides before runner dispatch" do
+    workspace = tmp_workspace("cli-effort-overrides")
+
+    backend = %{
+      "mode" => "open_responses",
+      "responses_url" => "https://api.openai.com/v1/responses",
+      "auth" => %{"policy" => "none"}
+    }
+
+    for {subagents, provider_opts} <- [
+          {%{"model" => "gpt-6-astra", "reasoning_effort" => "max"},
+           [responses_backend: backend]},
+          {%{"model" => "gpt-5.5"}, [model: "gpt-6-astra", reasoning_effort: "max"]},
+          {%{"model" => "unlisted", "reasoning_effort" => "max"}, []},
+          {%{"model" => "gpt-6-astra", "reasoning_effort" => "max"},
+           [base_url: "https://example.invalid"]}
+        ] do
+      spec = %{"strategy" => "subagents", "task" => "inspect", "subagents" => subagents}
+
+      for flags <- [["--dry-run"], []] do
+        assert {:error, rendered} =
+                 CLIContract.run(["--spec", "-", "--json"] ++ flags,
+                   workspace: workspace,
+                   read_stdin: fn -> Jason.encode!(spec) end,
+                   runner: HorizonRunner,
+                   runtime_opts: [provider_opts: provider_opts, test_pid: self()]
+                 )
+
+        assert rendered.payload["kind"] == "invalid_spec"
+        assert rendered.payload["details"]["reason"] == "unsupported_reasoning_effort"
+        assert rendered.payload["details"]["field"] == "subagents.reasoning_effort"
+        refute_receive {:runner_called, _, _}
+      end
+    end
+  end
+
+  test "workflow max admission validates each effective step model" do
+    workspace = tmp_workspace("cli-effort-workflow")
+
+    for model <- ["gpt-6-astra", "gpt-5.5"] do
+      spec = %{
+        "strategy" => "workflow",
+        "mode" => "read_only",
+        "steps" => [
+          %{"id" => "inspect", "task" => "inspect", "model" => model, "reasoning_effort" => "max"}
+        ]
+      }
+
+      result =
+        CLIContract.run(["--spec", "-", "--dry-run", "--json"],
+          workspace: workspace,
+          read_stdin: fn -> Jason.encode!(spec) end
+        )
+
+      assert elem(result, 0) == if(model == "gpt-6-astra", do: :ok, else: :error), inspect(result)
+
+      if model != "gpt-6-astra" do
+        details = elem(result, 1).payload["details"]
+        assert details["reason"] == "unsupported_reasoning_effort"
+        assert_step_location(details, "reasoning_effort")
+      end
+    end
+  end
+
   test "envelope schema registry is contiguous and matches emitted schema version" do
     registry = CLIContract.envelope_schema_registry()
     revisions = Enum.map(registry, fn {revision, _feature, _description} -> revision end)
@@ -142,6 +255,7 @@ defmodule Pixir.Delegate.CLIContractTest do
              )
 
     assert revisions == Enum.to_list(1..emitted_schema_version)
+    assert CLIContract.envelope_schema_version() == emitted_schema_version
     assert length(registry) == emitted_schema_version
     assert Enum.all?(features, &is_atom/1)
     assert MapSet.size(MapSet.new(features)) == length(features)
@@ -155,6 +269,17 @@ defmodule Pixir.Delegate.CLIContractTest do
 
     assert {9, :warm_start, _warm_start_description} =
              Enum.find(registry, fn {revision, _feature, _description} -> revision == 9 end)
+
+    assert {10, :landing_manifest, _landing_manifest_description} =
+             Enum.find(registry, fn {revision, _feature, _description} -> revision == 10 end)
+  end
+
+  test "CLI contract document states the emitted Delegate schema revision" do
+    documented = File.read!("docs/cli-contract.md")
+    schema_version = CLIContract.envelope_schema_version()
+
+    assert documented =~
+             "the current value is `#{schema_version}`, meaning eleven additive, backward-compatible revisions"
   end
 
   test "short-horizon dry-runs advise without rejecting for both strategies" do
@@ -181,7 +306,7 @@ defmodule Pixir.Delegate.CLIContractTest do
                  read_stdin: fn -> spec end
                )
 
-      assert payload["schema_version"] == 9
+      assert payload["schema_version"] == 11
       assert payload["summary"] =~ "100000"
       assert payload["summary"] =~ "120000"
       assert "increase_delegate_timeout_to_suggested_timeout_ms" in payload["next_actions"]
@@ -1256,7 +1381,7 @@ defmodule Pixir.Delegate.CLIContractTest do
     assert Enum.map(children, & &1["index"]) == [0, 1, 2]
     assert Enum.map(children, & &1["attachment_count"]) == [0, 2, 0]
     # Additive horizon advisory evidence -> schema revision 6 (family v1 unchanged).
-    assert payload["schema_version"] == 9
+    assert payload["schema_version"] == 11
     assert order_note =~ "unspecified"
     assert order_note =~ "children[].index"
   end
@@ -1311,7 +1436,7 @@ defmodule Pixir.Delegate.CLIContractTest do
                  runtime_opts: [fixture_payload: fixture]
                )
 
-      assert payload["schema_version"] == 9
+      assert payload["schema_version"] == 11
       assert payload["warning_count"] == count
       assert length(payload["warnings"]) == min(count, 256)
       assert payload["warnings_truncated"] == (count == 257)
@@ -1695,7 +1820,7 @@ defmodule Pixir.Delegate.CLIContractTest do
             %{
               payload: %{
                 "status" => "planned",
-                "schema_version" => 9,
+                "schema_version" => 11,
                 "children" => [
                   %{
                     "workspace_mode" => "virtual_overlay",
@@ -2743,7 +2868,7 @@ defmodule Pixir.Delegate.CLIContractTest do
         "contract_version" => 1,
         "strategy" => "subagents",
         "task" => "inspect docs",
-        "subagents" => %{"reasoning_effort" => "ultra"}
+        "subagents" => %{"model" => "gpt-5.5", "reasoning_effort" => "ultra"}
       })
 
     assert {:error,

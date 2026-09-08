@@ -173,7 +173,8 @@ Fields that only exist after a child starts are conditional as noted.
 | --- | --- | --- | --- |
 | `ok` | boolean | High-level result indication. | Do not collapse it with `work_complete`. |
 | `status` | string | Delegate command/work status. | |
-| `schema_version` | integer | Additive revision counter of the Delegate envelope contract. | Consumers gate with `>=`; the current value is `9`, meaning nine additive, backward-compatible revisions within the current envelope family. |
+| `schema_version` | integer | Additive revision counter of the Delegate envelope contract. | Consumers gate with `>=`; the current value is `11`, meaning eleven additive, backward-compatible revisions within the current envelope family. |
+| `build_info` | object | Compiled source/build identity and serving-runtime attribution. | Added in revision 11 for daemon startup/status/stop; also present inside daemon metadata. Does not change request `contract_version: 1`. |
 | `work_complete` | boolean | Whether delegated work reached clean terminal success. | |
 | `children` | array | Child result projections. | Present for Subagent result shapes. Array order is not a task identity. |
 | `children[].index` | integer | Zero-based source `tasks[]` position. | Join by this value, not array position. |
@@ -191,6 +192,15 @@ Fields that only exist after a child starts are conditional as noted.
 | `children[].warm_start.replay_event_count` | integer or null | Replayed Event count in the seeded prefix. | `null` for a cold child. |
 | `children[].warm_start.strategy` | string or null | Replay strategy that produced the seeded prefix. | `null` for a cold child. |
 | `children[].warm_start.boundary_marker_kind` | string or null | Kind of the runtime-authored lineage boundary marker terminating the replayed prefix. | `null` for a cold child. |
+| `landing_manifest` | array | Optional revision-10 landing affordance for completed children with Log-durable integrable work. | Omitted when no completed child has integrable work. Both structured data and text contain at most eight children; when more exist, `omitted_children` carries the omitted count and the rendered heading confesses the same count. Terminal human summaries append no new bytes when the manifest is empty. |
+| `omitted_children` | integer | Number of integrable completed-child manifest entries omitted by the eight-child cap. | Present only when the cap triggers; absent otherwise. |
+| `landing_manifest[].child_id` | string | Child or workflow-step identity carried by durable orchestration evidence. | Omitted when the result has no such identity evidence; renderers do not invent one. |
+| `landing_manifest[].workspace` | string | Child workspace path carried by the result evidence. | Omitted when absent. |
+| `landing_manifest[].produced` | array | Integrable outputs proven from the child Log and durable result envelope. | Current kinds are `shared_workspace_files` and `virtual_diff`. Shared path evidence comes only from successful `write`, `edit`, or `apply_virtual_diff` calls. Bash mutations and isolated writers without a virtual overlay are out of scope. |
+| `landing_manifest[].produced[].paths` | array | Reported shared-workspace paths plus current parent-tree regular-file/drift checks. | Contains at most twenty paths, matching the rendered text and `next_action.paths`. When more durable paths exist, sibling `omitted_paths` carries the omitted count. A confinement failure is marked `resolvable: false` with an `unresolvable` reason; it is not labeled drift. `exists_in_parent` means `File.regular?/1`, not mere filesystem existence. |
+| `landing_manifest[].produced[].omitted_paths` | integer | Number of durable changed-path entries omitted by the per-child twenty-path cap. | Present only when the cap triggers; absent otherwise. |
+| `landing_manifest[].produced[].virtual_diff_ref` | object | Durable reference to a delegated child Session Log `virtual_diff` artifact still recorded as `not_applied`. | The artifact body is not copied into the result. The dry-run `apply_virtual_diff` action carries this value together with `child_session_id`, so the tool can fold that child's Log and resolve the artifact at execution time. The entry is omitted after the parent Log records a successful non-dry apply of the reference. |
+| `landing_manifest[].produced[].next_action` | object | Mechanically ready landing follow-up. | Shared writes name paths to verify and commit. Delegated child virtual diffs name `apply_virtual_diff` with `virtual_diff_ref`, `child_session_id`, and `dry_run: true`; a mutating apply remains an integrator decision. |
 | `write_denials` | object | Mandatory bounded-write denial confession: `count` plus a `denials` array. | Always present on a **terminal** `bounded_write` envelope, including when nothing was denied (`count: 0`) and when the run produced no children at all. Absence is a schema violation, not silence. Counts write denials only: a `bash_disabled` denial is not a boundary probe and is excluded. When a Log exists but could not be read, the shape changes instead of lying: `count` is **absent** and `status: "unavailable"` plus an `error` string take its place, at the child level and — contagiously — on the aggregate. A Session that never wrote a Log is not this case and folds to `count: 0`. |
 | `write_denials.denials[]` | object | One denial: `tool`, `normalized_path` (the AIM of the denied call: the requested path, else the normalized path, else the denied command, else the tool name for the two targetless kinds; symlink/uninspectable confinement denials additionally carry the failing component in `symlink_component` / `uninspectable_component`), `matched_rule`, the policy identity, and `disposition`. | `disposition` is `recovered`, `fatal`, or `unresolved`. A completed run with a non-empty confession is a signal to check the worker's scope, not a defect. `unresolved` means the denial's **own** Turn never reached a terminal event in the Log — a Turn ends at its terminal event or at the `user_message` opening the next Turn, so an interrupted Turn's denial stays `unresolved` and is never closed by a later Turn's `assistant_message`. Read the child's Log rather than assuming it recovered. |
 | `children[].write_denials` | object | The same confession scoped to one child or workflow step. | Same always-present rule under `bounded_write`. |
@@ -198,6 +208,17 @@ Fields that only exist after a child starts are conditional as noted.
 Every additive envelope change appends exactly one registry entry and raises the revision
 by one. Each revision gets its own CHANGELOG line naming its feature. The
 `pixir.delegate.envelope.v1` family name remains reserved for breaking shape changes.
+
+Landing manifests describe **delegated child Sessions**: they are presented by
+`wait_agent`, Delegate results, and child-backed Workflow steps when those surfaces carry
+durable child Log evidence. A Workflow `virtual_overlay` step executed in-process has no
+child Session identity to resolve; it keeps the existing direct `virtual_diff`
+presentation and is intentionally outside landing-manifest scope.
+
+Each rendered manifest block fits within 16,000 bytes, including an explicit
+truncation marker when needed. This bounds the appended block only: the preceding
+summary and re-verification directive are unchanged, and the structured manifest
+retains its existing child/path caps and omission counts.
 
 The confession is a property of **terminal** envelopes: the delegate result and
 the workflow result, and the child or step entries inside them. It is
@@ -217,6 +238,13 @@ Non-`bounded_write` runs have no write policy and therefore no confession; the
 key is absent for them on every surface.
 
 ### Delegate spec-surface admission
+
+Provider configuration must resolve from the caller's Config snapshot before
+dispatch. A resolution failure without a known explicit unsupported effort is
+an `invalid_spec` with reason `provider_configuration_unresolved` and sanitized
+`configuration_error` field/reason details. Admission never rereads ambient
+configuration to guess effort after a failed snapshot. Valid source and explicit
+model/effort precedence remain unchanged.
 
 Delegate specs are admitted once, before dry-run planning, one-shot execution, or
 attached execution starts. Admission is fail-closed for the remaining tolerant nested

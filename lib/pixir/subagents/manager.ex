@@ -635,6 +635,14 @@ defmodule Pixir.Subagents.Manager do
            :ok <- validate_optional_binary("model", provider_model),
            {:ok, web_search} <- validate_optional_web_search(web_search),
            :ok <- validate_optional_reasoning_effort(reasoning_effort),
+           {:ok, _effective_effort} <-
+             Pixir.ReasoningEffort.validate_runtime(
+               Keyword.get(opts, :provider, Pixir.Provider),
+               opts
+               |> Keyword.get(:provider_opts, [])
+               |> put_provider_knob(:model, provider_model)
+               |> put_provider_knob(:reasoning_effort, reasoning_effort)
+             ),
            :ok <- validate_attachments(attachments),
            :ok <- validate_positive_integer("max_threads", max_threads),
            :ok <- validate_non_negative_integer("max_depth", max_depth),
@@ -945,7 +953,9 @@ defmodule Pixir.Subagents.Manager do
        })}
 
   defp start_agent(agent, state) do
-    with {:ok, child_workspace, workspace_snapshot} <- prepare_workspace(agent),
+    with {:ok, _effort} <-
+           Pixir.ReasoningEffort.validate_runtime(agent.provider, child_provider_opts(agent)),
+         {:ok, child_workspace, workspace_snapshot} <- prepare_workspace(agent),
          {:ok, allocated_sid, warm_start} <- allocate_child_session(agent, child_workspace),
          {:ok, child_sid, child_pid} <-
            start_child_session(allocated_sid, child_workspace, warm_start) do
@@ -1004,6 +1014,7 @@ defmodule Pixir.Subagents.Manager do
         # or a write-capable Session survives untracked. This branch also keeps
         # start_agent's contract: callers match 3-tuples only.
         {:error, error} ->
+          _ = persist_child_start_failure(turn_agent, error)
           Events.unsubscribe(child_sid)
           SessionSupervisor.stop_session(child_sid)
 
@@ -1118,6 +1129,9 @@ defmodule Pixir.Subagents.Manager do
 
       {:error, :busy} ->
         {:error, Tool.error(:permission_denied, "subagent is already running", %{id: agent.id})}
+
+      {:error, error} ->
+        {:error, error}
     end
   end
 
@@ -1204,33 +1218,85 @@ defmodule Pixir.Subagents.Manager do
   defp permission_mode_string(mode) when is_atom(mode), do: Atom.to_string(mode)
   defp permission_mode_string(mode) when is_binary(mode), do: mode
 
+  # Like cancellation evidence, setup failure is recorded without inventing a Turn.
+  # A failed Log write must not prevent lease cleanup or the canonical parent failure.
+  defp persist_child_start_failure(agent, error) do
+    failure =
+      case error do
+        %{error: %{kind: kind, message: message, details: details} = failure}
+        when is_atom(kind) and is_binary(message) and is_map(details) ->
+          failure
+
+        _ ->
+          %{}
+      end
+
+    details = Map.get(failure, :details, %{})
+
+    data = %{
+      "event" => "child_start_failed",
+      "scope" => "session",
+      "lineage" => "child",
+      "source" => "subagent_start",
+      "status" => "failed",
+      "reason" => "child_start_failed",
+      "subagent_id" => agent.id,
+      "parent_session_id" => agent.parent_session_id,
+      "child_session_id" => agent.child_session_id,
+      "error_kind" => to_string(Map.get(failure, :kind, :child_start_failed)),
+      "error_message" => Map.get(failure, :message, "Subagent failed before Turn start."),
+      "details" => %{
+        "field" => child_failure_detail(details, :field, ""),
+        "reason" => child_failure_detail(details, :reason, "child_start_failed")
+      }
+    }
+
+    safe_record(agent.child_session_id, Event.subagent_event(agent.child_session_id, data))
+  end
+
+  defp child_failure_detail(details, key, default) do
+    case Map.get(details, key) do
+      value when is_binary(value) -> value
+      value when is_atom(value) and not is_nil(value) -> Atom.to_string(value)
+      _ -> default
+    end
+  end
+
+  defp child_provider_opts(agent) do
+    agent.provider_opts
+    |> List.wrap()
+    |> put_provider_knob(:model, Map.get(agent, :provider_model))
+    |> put_provider_knob(:reasoning_effort, Map.get(agent, :reasoning_effort))
+    |> put_provider_knob(:web_search, Map.get(agent, :web_search))
+  end
+
   defp start_child_turn(agent, child_sid, child_workspace, turn_overrides \\ []) do
     instructions = agent.agent_config.developer_instructions
 
     # The Turn reads model/reasoning_effort from provider_opts (same seam ACP
     # uses for _meta knobs); a spec knob wins over any inherited default.
-    provider_opts =
-      agent.provider_opts
-      |> List.wrap()
-      |> put_provider_knob(:model, Map.get(agent, :provider_model))
-      |> put_provider_knob(:reasoning_effort, Map.get(agent, :reasoning_effort))
-      |> put_provider_knob(:web_search, Map.get(agent, :web_search))
+    provider_opts = child_provider_opts(agent)
 
-    Session.start_turn(child_sid, fn ctx ->
-      Turn.run(%{ctx | workspace: child_workspace}, agent.prompt,
-        provider: agent.provider,
-        provider_opts: provider_opts,
-        permission_mode: agent.permission_mode,
-        attachments: Keyword.get(turn_overrides, :attachments, Map.get(agent, :attachments, [])),
-        write_policy: agent.write_policy,
-        skills_opts: agent.skills_opts,
-        agents_opts: agent.agents_opts,
-        subagent_depth: agent.depth,
-        virtual_overlay: Map.get(agent, :virtual_overlay),
-        agent_instructions: instructions,
-        delegation_context: DelegationContext.from_agent(agent)
-      )
-    end)
+    # Admission is checked again for queued children and follow-up Turns:
+    # defaults may have changed since the original spawn was normalized.
+    with {:ok, _effort} <- Pixir.ReasoningEffort.validate_runtime(agent.provider, provider_opts) do
+      Session.start_turn(child_sid, fn ctx ->
+        Turn.run(%{ctx | workspace: child_workspace}, agent.prompt,
+          provider: agent.provider,
+          provider_opts: provider_opts,
+          permission_mode: agent.permission_mode,
+          attachments:
+            Keyword.get(turn_overrides, :attachments, Map.get(agent, :attachments, [])),
+          write_policy: agent.write_policy,
+          skills_opts: agent.skills_opts,
+          agents_opts: agent.agents_opts,
+          subagent_depth: agent.depth,
+          virtual_overlay: Map.get(agent, :virtual_overlay),
+          agent_instructions: instructions,
+          delegation_context: DelegationContext.from_agent(agent)
+        )
+      end)
+    end
   end
 
   defp put_provider_knob(opts, _key, nil), do: opts
@@ -1588,7 +1654,8 @@ defmodule Pixir.Subagents.Manager do
 
   defp select_virtual_diff(agent) do
     with {:ok, history} <- Log.fold(agent.child_session_id, workspace: agent.child_workspace),
-         {%MapSet{} = _call_ids, {artifact, source_seq}} <- find_last_virtual_diff(history) do
+         {artifact, source_seq} <-
+           find_last_virtual_diff(history, virtual_delivery_boundary(agent)) do
       encoded = Jason.encode!(artifact)
       ref = virtual_diff_ref(artifact, encoded, source_seq)
 
@@ -1602,32 +1669,84 @@ defmodule Pixir.Subagents.Manager do
     end
   end
 
-  defp find_last_virtual_diff(history) do
-    Enum.reduce(history, {MapSet.new(), nil}, fn
-      %{type: :tool_call, data: %{"name" => "run_virtual_commands", "call_id" => call_id}},
-      {call_ids, selected} ->
-        {MapSet.put(call_ids, call_id), selected}
-
-      %{
-        type: :tool_result,
-        seq: source_seq,
-        data: %{
-          "call_id" => call_id,
-          "ok" => true,
-          "virtual_diff" => %{"kind" => "virtual_diff"} = artifact
-        }
-      },
-      {call_ids, selected} ->
-        if MapSet.member?(call_ids, call_id) do
-          {call_ids, {artifact, source_seq}}
-        else
-          {call_ids, selected}
-        end
-
-      _event, acc ->
-        acc
-    end)
+  # Reuse the existing validated runtime lineage proof, rather than treating a
+  # user-authored marker or final prose as authority over delivery selection.
+  defp virtual_delivery_boundary(agent) do
+    case Subagents.warm_lineage_proof(agent.child_session_id, workspace: agent.child_workspace) do
+      {:ok, %{boundary_event: boundary}} -> boundary.id
+      _other -> nil
+    end
   end
+
+  defp find_last_virtual_diff(history, boundary_id) do
+    {_calls, latest, explicit} =
+      Enum.reduce(history, {%{}, nil, nil}, fn event, {calls, latest, explicit} = acc ->
+        cond do
+          not is_nil(boundary_id) and event.id == boundary_id ->
+            # Keep legacy latest-artifact fallback, but never inherit the seed's
+            # explicit delivery intent or pair its calls with live child results.
+            {%{}, latest, nil}
+
+          event.type == :tool_call ->
+            key = {event.session_id, event.data["call_id"]}
+            intent = virtual_call_intent(event.data)
+            intent = if Map.has_key?(calls, key), do: :invalid, else: intent
+            {Map.put(calls, key, intent), latest, explicit}
+
+          event.type == :tool_result ->
+            key = {event.session_id, event.data["call_id"]}
+            {intent, calls} = Map.pop(calls, key, :invalid)
+
+            case virtual_result_candidate(event, intent) do
+              {:ok, artifact, marked} ->
+                selected = {artifact, event.seq}
+                {calls, selected, if(marked, do: selected, else: explicit)}
+
+              :invalid ->
+                {calls, latest, explicit}
+            end
+
+          true ->
+            acc
+        end
+      end)
+
+    explicit || latest
+  end
+
+  defp virtual_call_intent(%{"name" => "run_virtual_commands", "call_id" => id, "args" => args})
+       when is_binary(id) and is_map(args) do
+    flag = Map.get(args, "deliverable", false)
+    commands = Map.get(args, "commands", [])
+
+    if is_boolean(flag) and is_list(commands) and Enum.all?(commands, &is_binary/1) and
+         Map.keys(args) -- ["commands", "deliverable"] == [] and
+         (not flag or Map.has_key?(args, "commands")) do
+      flag
+    else
+      :invalid
+    end
+  end
+
+  defp virtual_call_intent(_data), do: :invalid
+
+  defp virtual_result_candidate(
+         %{
+           data: %{"ok" => true, "virtual_diff" => %{"kind" => "virtual_diff"} = artifact} = data
+         },
+         intent
+       )
+       when is_boolean(intent) do
+    # A marker alone is not authority: both the genuine call and its one matching
+    # successful result must carry true intent. Reject mismatches even as fallback.
+    if Map.get(data, "deliverable", false) === intent and data["dry_run"] != true do
+      {:ok, artifact, intent}
+    else
+      :invalid
+    end
+  end
+
+  defp virtual_result_candidate(_event, _intent), do: :invalid
 
   defp virtual_diff_ref(artifact, encoded, source_seq) do
     %{

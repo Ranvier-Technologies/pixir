@@ -38,6 +38,12 @@ shape, and ACP command availability. It may create `.pixir/sessions` and remove 
 temporary probe file. It does not prove that the Provider accepts your selected model;
 use a smoke task for that.
 
+Its `build_info` identifies the compiled source revision/fingerprint and the current
+serving process. ACP `initialize._meta.pixir.build_info` and live Delegate daemon
+status report that same artifact identity. Missing Git/source metadata is explicitly
+`unknown`; a version string or an existing `./pixir` alone is not proof of freshness.
+Rebuilding a binary does not update an already-running ACP or Delegate process.
+
 After a Session exists, use local replay diagnostics when another agent, ACP client, or
 operator needs evidence about replay continuity. Use `pixir` for package installs and
 `./pixir` for source checkouts:
@@ -247,6 +253,12 @@ For a source checkout, maintainers can run the broader local gate:
 ```bash
 mix check
 ```
+
+For explicit offline release acceptance of source-checkout applications, inspect
+`uv run python bin/verify --release --dry-run --json`, then run with `--release --json`.
+Monitor requires an absolute `PIXIR_MONITOR_BROWSER_BIN` and includes its real
+five-minute SSE lifecycle. Coverage is scoped and does not certify live Providers,
+other operating systems, or publication readiness.
 
 Networked smoke tasks are manual/opt-in and belong to source-checkout verification, not
 normal package use.

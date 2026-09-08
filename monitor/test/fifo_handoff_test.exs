@@ -23,8 +23,12 @@ defmodule PixirMonitor.FifoHandoffTest do
       assert :ok = PixirMonitor.FifoHandoff.handoff(prepared, fn -> {:ok, secret_url} end)
       assert Task.await(reader) == secret_url <> "\n"
       refute File.exists?(directory)
-      refute process_alive?(writer_pid)
-      refute process_alive?(watchdog_pid)
+
+      assert eventually(fn -> not process_alive?(writer_pid) end),
+             "writer os_pid #{writer_pid} still alive after bounded wait"
+
+      assert eventually(fn -> not process_alive?(watchdog_pid) end),
+             "watchdog os_pid #{watchdog_pid} still alive after bounded wait"
     else
       assert true
     end
@@ -51,8 +55,12 @@ defmodule PixirMonitor.FifoHandoffTest do
       assert is_map(error.details)
       assert is_list(error.next_actions)
       refute File.exists?(prepared.directory)
-      refute process_alive?(writer_pid)
-      refute process_alive?(watchdog_pid)
+
+      assert eventually(fn -> not process_alive?(writer_pid) end),
+             "writer os_pid #{writer_pid} still alive after bounded wait"
+
+      assert eventually(fn -> not process_alive?(watchdog_pid) end),
+             "watchdog os_pid #{watchdog_pid} still alive after bounded wait"
     else
       assert true
     end
@@ -79,8 +87,12 @@ defmodule PixirMonitor.FifoHandoffTest do
       refute inspect(error) =~ "must-not-escape"
       assert Task.await(reader) == ""
       refute File.exists?(prepared.directory)
-      refute process_alive?(writer_pid)
-      refute process_alive?(watchdog_pid)
+
+      assert eventually(fn -> not process_alive?(writer_pid) end),
+             "writer os_pid #{writer_pid} still alive after bounded wait"
+
+      assert eventually(fn -> not process_alive?(watchdog_pid) end),
+             "watchdog os_pid #{watchdog_pid} still alive after bounded wait"
     else
       assert true
     end

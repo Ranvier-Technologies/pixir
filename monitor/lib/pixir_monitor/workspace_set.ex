@@ -4,8 +4,7 @@ defmodule PixirMonitor.WorkspaceSet do
 
   The set holds between `min_sources/0` and `max_sources/0` explicitly declared
   sources. The bound is a real bound: a configured list outside it is not
-  configured at all, never a truncation and never a silent drop of trailing
-  declarations.
+  valid configuration, never a truncation or a silent fallback to single mode.
 
   Roots remain process-local configuration. Public values expose only operator keys.
   """
@@ -27,35 +26,54 @@ defmodule PixirMonitor.WorkspaceSet do
 
   @spec configured() :: {:ok, [source()]} | {:error, map()}
   def configured do
-    case Application.get_env(:pixir_monitor, :workspace_set) do
-      sources when is_list(sources) ->
-        if length(sources) in @min_sources..@max_sources and Enum.all?(sources, &valid_source?/1) and
-             unique_keys?(sources),
-           do: {:ok, sources},
-           else: not_configured()
-
-      _ ->
-        not_configured()
+    case Application.fetch_env(:pixir_monitor, :workspace_set) do
+      :error -> not_configured()
+      {:ok, sources} -> validate_sources(sources)
     end
   end
+
+  defp validate_sources(sources) do
+    case source_count(sources, 0) do
+      :malformed ->
+        invalid_configuration("malformed_source")
+
+      count when count < @min_sources or count > @max_sources ->
+        invalid_configuration("cardinality_out_of_range")
+
+      _ ->
+        cond do
+          not Enum.all?(sources, &source_shape?/1) -> invalid_configuration("malformed_source")
+          not Enum.all?(sources, &valid_key?(&1.key)) -> invalid_configuration("invalid_key")
+          not unique_keys?(sources) -> invalid_configuration("duplicate_key")
+          true -> {:ok, sources}
+        end
+    end
+  end
+
+  defp source_count([], count), do: count
+  defp source_count([_ | _], count) when count >= @max_sources, do: @max_sources + 1
+  defp source_count([_ | rest], count), do: source_count(rest, count + 1)
+  defp source_count(_, _), do: :malformed
+
+  defp source_shape?(%{key: _, path: path}) when is_binary(path), do: String.trim(path) != ""
+  defp source_shape?(_), do: false
+
+  defp invalid_configuration(reason),
+    do: {:error, %{kind: "workspace_set_configuration_invalid", message: "Workspace set configuration is invalid", details: %{reason: reason}}}
 
   defp unique_keys?(sources) do
     keys = Enum.map(sources, & &1.key)
     length(Enum.uniq(keys)) == length(keys)
   end
 
-  @spec mode() :: {:ok, :single | :workspace_set}
+  @spec mode() :: {:ok, :single | :workspace_set} | {:error, map()}
   def mode do
     case configured() do
       {:ok, _sources} -> {:ok, :workspace_set}
-      {:error, _error} -> {:ok, :single}
+      {:error, %{kind: "workspace_set_not_configured"}} -> {:ok, :single}
+      {:error, _} = error -> error
     end
   end
-
-  defp valid_source?(%{key: key, path: path}) when is_binary(key) and is_binary(path),
-    do: validate_key(key) == :ok
-
-  defp valid_source?(_source), do: false
 
   defp not_configured,
     do: {:error, %{kind: "workspace_set_not_configured", message: "Workspace set is not configured"}}

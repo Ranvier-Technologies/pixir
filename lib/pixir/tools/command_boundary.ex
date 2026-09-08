@@ -15,7 +15,7 @@ defmodule Pixir.Tools.CommandBoundary do
   @server __MODULE__
   @boundary "host_command"
 
-  @type lease :: %{id: reference(), host_command: map()}
+  @type lease :: %{id: reference(), host_command: map(), boundary: GenServer.server()}
   @type limits :: %{
           max_concurrent: pos_integer(),
           queue_limit: non_neg_integer(),
@@ -57,6 +57,8 @@ defmodule Pixir.Tools.CommandBoundary do
 
     with {:ok, limits} <- limits(Keyword.get(opts, :limits)),
          {:ok, lease} <- acquire(boundary, tool, limits) do
+      lease = Map.put(lease, :boundary, boundary)
+
       try do
         run_fun(fun, lease)
       after
@@ -67,6 +69,41 @@ defmodule Pixir.Tools.CommandBoundary do
 
   defp run_fun(fun, lease) when is_function(fun, 1), do: fun.(lease)
   defp run_fun(fun, _lease) when is_function(fun, 0), do: fun.()
+
+  @doc "Register the spawned process backing an active host-command lease."
+  @spec register_process(lease(), String.t(), port(), non_neg_integer(), non_neg_integer()) ::
+          :ok
+  def register_process(
+        %{id: id, boundary: boundary},
+        session_id,
+        port,
+        timeout_ms,
+        grace_ms
+      )
+      when is_binary(session_id) and is_port(port) and is_integer(timeout_ms) and
+             timeout_ms >= 0 and is_integer(grace_ms) and grace_ms >= 0 do
+    GenServer.call(
+      boundary,
+      {:register_process, id, session_id, port, timeout_ms, grace_ms}
+    )
+  end
+
+  @type presenter_liveness :: :dead | {:live, non_neg_integer()}
+
+  @doc "Return live spawned-process presence and milliseconds remaining in its own cap."
+  @spec presenter_liveness(String.t(), keyword()) :: presenter_liveness()
+  def presenter_liveness(session_id, opts \\ []) when is_binary(session_id) do
+    boundary = Keyword.get(opts, :boundary, @server)
+    GenServer.call(boundary, {:presenter_liveness, session_id})
+  catch
+    :exit, _reason -> :dead
+  end
+
+  @doc "Whether a Session has a live spawned process still within its own execution cap."
+  @spec presenter_liveness?(String.t(), keyword()) :: boolean()
+  def presenter_liveness?(session_id, opts \\ []) when is_binary(session_id) do
+    match?({:live, _remaining_ms}, presenter_liveness(session_id, opts))
+  end
 
   @doc "Return a read-only snapshot of host-command pressure."
   @spec snapshot(keyword()) :: {:ok, map()} | {:error, map()}
@@ -139,6 +176,42 @@ defmodule Pixir.Tools.CommandBoundary do
 
   def handle_call({:snapshot, limits}, _from, state) do
     {:reply, {:ok, public_snapshot(state, limits)}, state}
+  end
+
+  def handle_call(
+        {:register_process, id, session_id, port, timeout_ms, grace_ms},
+        _from,
+        state
+      ) do
+    case Map.fetch(state.active, id) do
+      {:ok, active} ->
+        process = %{
+          session_id: session_id,
+          port: port,
+          deadline_ms: monotonic_ms() + timeout_ms + grace_ms
+        }
+
+        state = put_in(state, [:active, id], Map.put(active, :process, process))
+        {:reply, :ok, state}
+
+      :error ->
+        {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:presenter_liveness, session_id}, _from, state) do
+    now_ms = monotonic_ms()
+
+    remaining_ms =
+      Enum.reduce(state.active, nil, fn {_id, active}, longest_remaining_ms ->
+        case live_process_remaining_ms(active[:process], session_id, now_ms) do
+          nil -> longest_remaining_ms
+          remaining -> max(remaining, longest_remaining_ms || 0)
+        end
+      end)
+
+    reply = if is_integer(remaining_ms), do: {:live, remaining_ms}, else: :dead
+    {:reply, reply, state}
   end
 
   @impl true
@@ -369,6 +442,27 @@ defmodule Pixir.Tools.CommandBoundary do
 
   defp active_count(state), do: map_size(state.active)
   defp queue_depth(state), do: map_size(state.waiters)
+
+  defp live_process_remaining_ms(
+         %{session_id: session_id, port: port, deadline_ms: deadline_ms},
+         session_id,
+         now_ms
+       ) do
+    remaining_ms = deadline_ms - now_ms
+
+    if remaining_ms >= 0 and port_open?(port), do: remaining_ms
+  end
+
+  defp live_process_remaining_ms(_process, _session_id, _now_ms), do: nil
+
+  defp port_open?(port) when is_port(port) do
+    Port.info(port) != nil
+  rescue
+    ArgumentError -> false
+  end
+
+  defp port_open?(_port), do: false
+
   defp monotonic_ms, do: System.monotonic_time(:millisecond)
 
   defp positive(raw, key) do

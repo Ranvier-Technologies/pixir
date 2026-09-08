@@ -9,6 +9,120 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-09-08
+
+This candidate supersedes the source-tagged 0.1.16 candidate, which was not
+published to Hex. The existing 0.1.16 tag remains unchanged.
+
+### Fixed
+- Delegate wrapper preflight propagates a failed binary version probe before
+  rehearsal, delegation or resume. A printed version does not override a nonzero exit.
+- Provider reasoning-effort key collisions return the same structured error envelope
+  from streaming and body preview, before authentication or transport.
+- Delegate admission rejects unresolvable Provider configuration before dispatch,
+  without rereading ambient configuration or invoking a snapshot loader twice.
+  Valid model/effort precedence and explicit unsupported-effort refusals remain intact.
+- Rendered landing-manifest blocks are bounded to 16,000 bytes, including the
+  truncation marker. Caller summaries and re-verification directives remain intact;
+  structured manifests retain their existing child/path caps and evidence.
+- Monitor reports child Log completeness independently of parent partiality.
+  Complete or bounded child evidence no longer masquerades as missing child Logs.
+
+## [0.1.16] - 2026-09-06
+
+### Added
+- Virtual-overlay children can explicitly select a successful `deliverable` artifact,
+  so later unmarked reads do not displace it. Selection survives cold projection;
+  applying the artifact remains a separate permissioned operation (#631).
+- Astra catalog support and model/backend-aware `max` reasoning effort across
+  Config, Provider, ACP, Delegate, Subagents and Workflows. Admission is limited
+  to exact `gpt-6-astra` on the supported ChatGPT/Codex Responses route; incompatible
+  combinations fail explicitly, and catalog presence does not grant account access
+  (#616, #617, #622).
+- Compiled build identity in Core/Monitor diagnostics, so operators can distinguish
+  a running artifact's source revision and fingerprint from later checkout changes
+  (#618). Delegate envelopes now use additive schema revision 11.
+- Source-only `bin/verify --release` with explicit application coverage, toolchain
+  gates, bounded commands and durable evidence. Monitor acceptance includes the opt-in
+  real browser lifecycle; offline success does not certify live Providers or publication
+  (#614, #620).
+- Delegation results now optionally include an evidence-gated landing manifest for
+  completed children whose durable Logs report successful shared-workspace `write`,
+  `edit`, or `apply_virtual_diff` paths, or a referenced `virtual_diff` still in
+  `not_applied` state. Entries carry current regular-file drift checks and ready
+  dry-run actions that resolve the artifact from the named child Session Log without
+  embedding it; empty manifests preserve prior output bytes, and matching
+  structured/text child and path caps confess omission counts. Landing manifests
+  cover delegated child Sessions on `wait_agent`, child-backed workflow, and Delegate
+  presentation surfaces; in-process Workflow virtual-overlay steps keep their
+  existing direct `virtual_diff` presentation and are outside this manifest scope.
+  Landing manifests introduced additive envelope revision 10 before the build-identity
+  addition in revision 11 (#589, #618).
+
+### Changed
+- Virtual-command feedback prioritizes command outcomes within bounded output using
+  the shared truncation marker. Virtual edits remain invocation-local: subsequent
+  calls reimport source files. This avoids per-child physical workspace copies, not
+  durable Logs or artifacts. The Tool/Prompt Contract advances to `px8`/`pa5`,
+  intentionally restarting prompt-cache warming; no model-speed gain is claimed
+  (#631).
+- Session tree projection folds each selected Log once per query instead of repeating
+  whole-tree reads. Anthropic replay accumulates messages and items linearly while
+  preserving wire ordering; these improve local processing, not context size or
+  Provider token usage (#613, #614).
+- Monitor consumes the shared Core bounded Log reader, keeping prefix/tail evidence
+  within the existing 8 MiB and 20,000-event limits. Partial parents remain navigable;
+  partial child evidence does not invent attempts, complete usage, clean mutation
+  history or liveness. Exact omitted bytes and unknown omitted-event totals are the
+  explicitly accepted contract; genuinely unprojectable Logs remain named failures.
+  Normal replay and canonical Logs are unchanged (#549, #621, #623–#626).
+- Repository delegation Skills resolve and validate the caller's explicit/local/PATH
+  Pixir binary deterministically. Invalid explicit overrides fail rather than silently
+  selecting another installation; these Skills remain outside the Hex package (#616).
+
+### Fixed
+- WebSocket continuation recovery recognizes structured missing-response evidence
+  and permits only one clean full replay before observable progress. Tool declarations,
+  callbacks and other effects veto replay/fallback; failed recovery cannot retain a
+  failed response identity. Caller timeout or connection-process loss also vetoes
+  replay when reducer progress can no longer be recovered (#629, #633).
+- Invalid context-window overrides no longer discard valid siblings. Missing or
+  invalid usage is reported as unavailable rather than healthy zero usage; an actual
+  integer zero remains valid. OpenAI and Anthropic preserve this distinction before
+  accounting normalization and through durable usage summaries. Historical summaries
+  without provenance are not retroactively repaired; unknown model capacities are
+  not guessed (#630, #633).
+- Delegate forwards the selected transport into actual child Provider options,
+  including Workflow children, while preserving unrelated inherited options (#632).
+- Write/Edit replacement preserves ordinary rwx bits and uses exclusive temporary
+  files without overwriting unrelated temp paths. No ownership, ACL, xattr or special
+  privilege-bit preservation is promised (#619).
+- Session tree projection excludes recognized self-scoped metadata from descendant
+  edges. Benchmark cleanup synchronously stops scenario-owned Sessions while preserving
+  unrelated Sessions; queue and timeout tests use stronger lifecycle evidence (#619).
+- Present-invalid WorkspaceSet configuration fails explicitly across Monitor consumers
+  instead of deduplicating, truncating or silently falling back to single mode (#614).
+- ACP test response polling consumes captured frames incrementally; closed-port and
+  timed-out-child await tests no longer treat a 500 ms scheduler budget as correctness.
+  Home isolation is verified through behavior, and Monitor CI is isolated (#615, #627).
+- Public package installation docs no longer advertise the private development
+  repository, and package hygiene tests check the actual file allowlist (#614).
+- Bash process-group liveness checks support the BusyBox fallback without changing
+  the process-group termination contract (#607).
+- The CLI presenter idle watchdog now extends its wait while a silent in-flight bash
+  process is alive. Each extension is the smaller of the presenter interval and the
+  process's remaining effective timeout plus kill-escalation grace; closed, dead, and
+  over-cap entries cannot extend it, while genuinely idle sessions retain the existing
+  exit-124 recovery path (#575).
+- ExUnit now replaces any ambient `PIXIR_HOME` with a suite-local scratch home, preventing an operator `responses_backend` configuration from changing Provider and Turn test resolution (#586).
+- `pixir resume` now rejects a supplied `--write-policy` whose canonical hash differs
+  from the Session's pinned mandate, naming both hashes and directing the operator to
+  resume without the flag or start a fresh Session instead of silently enforcing the
+  original policy. A narrower differing file now refuses too rather than combining with
+  the pinned policy by intersection. Sessions with no pinned mandate retain the existing
+  documented one-Turn supplied-policy overlay, after which a flagless resume returns to
+  their durable unbounded posture (#574).
+
 ## [0.1.15] - 2026-08-24
 
 ### Added

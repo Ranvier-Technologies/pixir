@@ -45,6 +45,256 @@ defmodule PixirMonitor.ProjectionSourceTest do
     end)
   end
 
+  test "default event cap projects many-small-record parents both below and above the byte cap" do
+    workspace = Path.join(System.tmp_dir!(), "monitor-dual-bound-#{System.unique_integer([:positive, :monotonic])}")
+    sessions = Path.join([workspace, ".pixir", "sessions"])
+    File.mkdir_p!(sessions)
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    for padding <- [0, 150] do
+      id = "many-small-parent"
+
+      start =
+        workflow_event(id, 0, "2026-09-06T00:00:00Z", "workflow_started", %{
+          "workflow_id" => "many-small-workflow",
+          "workflow_name" => "Many small records",
+          "graph" => %{"steps" => [%{"id" => "work"}]}
+        })
+
+      finish = workflow_event(id, 40_000, "2026-09-06T00:00:02Z", "workflow_finished", %{"workflow_id" => "many-small-workflow", "status" => "completed"})
+
+      filler =
+        Enum.map(1..39_999, fn seq ->
+          %{"session_id" => id, "seq" => seq, "ts" => "2026-09-06T00:00:01Z", "type" => "user_message", "data" => %{"text" => String.duplicate("x", padding)}}
+        end)
+
+      path = write_log(sessions, id, [start] ++ filler ++ [finish])
+      before = File.read!(path)
+      byte_cap = 8 * 1024 * 1024
+      assert byte_size(before) > byte_cap == (padding == 150)
+
+      assert {:ok, %{"rows" => [row], "metadata" => metadata}} = PixirMonitor.Projection.Source.Filesystem.list_runs(workspace: workspace)
+      assert row["id"] == id
+      assert metadata["dropped_logs"] == 0
+      assert "partial_counts_lower_bounds" in row["source"]["limitations"]
+      assert {:ok, input} = PixirMonitor.Projection.Source.Filesystem.fetch_input(id, workspace: workspace)
+      selected = input["inputs"]["parent_log"]
+      selection = input["inputs"]["parent_log_selection"]
+      assert length(selected) == 20_000
+      assert selection["events_retained"] == 20_000
+      assert selection["tail_first_seq"] == 30_001
+      assert selection["partial"]
+      assert selection["events_omitted"] == "unknown"
+      assert selection["bytes_read"] == min(byte_size(before), byte_cap)
+      assert selection["bytes_omitted"] > 0
+      assert input["completeness"]["parent_log"] == "partial_prefix_tail"
+      assert input["inputs"]["runtime_diagnostics"] == nil
+      assert {:ok, projection} = PixirMonitor.Projection.project(input)
+      assert projection["execution"]["state"] == "completed"
+      refute projection["usage"]["complete"]
+      assert "partial_counts_lower_bounds" in projection["limitations"]
+      assert File.read!(path) == before
+    end
+  end
+
+  test "event-only child sampling keeps child selection metadata without hydrating full Logs" do
+    workspace = Path.join(System.tmp_dir!(), "monitor-event-child-#{System.unique_integer([:positive, :monotonic])}")
+    sessions = Path.join([workspace, ".pixir", "sessions"])
+    File.mkdir_p!(sessions)
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    parent_path =
+      write_log(sessions, "event-parent", [
+        event("event-parent", "event-child", 0, "2026-09-06T00:00:00Z", "started", "running", "event-sub"),
+        event("event-parent", "event-child", 1, "2026-09-06T00:00:02Z", "finished", "completed", "event-sub")
+      ])
+
+    child_path =
+      write_log(
+        sessions,
+        "event-child",
+        Enum.map(0..9, fn seq ->
+          %{"session_id" => "event-child", "seq" => seq, "ts" => "2026-09-06T00:00:01Z", "type" => "user_message", "data" => %{"text" => "small"}}
+        end)
+      )
+
+    before_parent = File.read!(parent_path)
+    before_child = File.read!(child_path)
+
+    assert {:ok, input} = PixirMonitor.Projection.Source.Filesystem.fetch_input("event-parent", workspace: workspace, max_events: 4)
+    assert input["completeness"]["parent_log"] == "complete_through_observed_at"
+    assert input["completeness"]["child_logs"] == "partial_prefix_tail"
+    assert input["inputs"]["child_logs"]["event-child"] |> Enum.map(& &1["seq"]) == [0, 1, 8, 9]
+    selection = input["inputs"]["child_log_selections"]["event-child"]
+    assert selection["partial"]
+    assert selection["tail_first_seq"] == 8
+    assert selection["events_retained"] == 4
+    assert selection["events_omitted"] == "unknown"
+    assert selection["bytes_read"] == byte_size(before_child)
+    assert input["inputs"]["runtime_diagnostics"] == nil
+    assert {:ok, projection} = PixirMonitor.Projection.project(input)
+    assert "child_log_partial" in projection["source"]["limitations"]
+    refute "child_log_missing" in projection["source"]["limitations"]
+    refute projection["usage"]["complete"]
+    assert projection["post_terminal_child_activity"]["state"] == "undetermined"
+    assert File.read!(parent_path) == before_parent
+    assert File.read!(child_path) == before_child
+  end
+
+  test "invalid and unrepresentable event caps retain event-limit errors without byte remedies" do
+    workspace = Path.join(System.tmp_dir!(), "monitor-invalid-event-cap-#{System.unique_integer([:positive, :monotonic])}")
+    sessions = Path.join([workspace, ".pixir", "sessions"])
+    File.mkdir_p!(sessions)
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    path =
+      write_log(sessions, "event-limit-parent", [
+        event("event-limit-parent", "event-limit-child", 0, "2026-09-06T00:00:00Z", "started", "running", "event-sub"),
+        event("event-limit-parent", "event-limit-child", 1, "2026-09-06T00:00:01Z", "finished", "completed", "event-sub")
+      ])
+
+    before = File.read!(path)
+
+    for cap <- [0, 1, -1, nil, "2", 2.5] do
+      opts = [workspace: workspace, max_events: cap]
+      assert {:error, %{kind: "run_event_limit"}} = PixirMonitor.Projection.Source.Filesystem.fetch_input("event-limit-parent", opts)
+      assert {:ok, %{"rows" => [], "metadata" => metadata}} = PixirMonitor.Projection.Source.Filesystem.list_runs(opts)
+      assert metadata["dropped_logs"] == 1
+      [limitation] = metadata["limitations"]
+      [drop] = limitation["details"]["dropped"]
+      assert drop["kind"] == "run_event_limit"
+      refute Map.has_key?(drop, "remedy")
+      refute Map.has_key?(drop, "max_log_bytes")
+    end
+
+    assert File.read!(path) == before
+  end
+
+  test "oversized parent stays discoverable with prefix-tail partiality and unknown middle outcome" do
+    workspace = Path.join(System.tmp_dir!(), "monitor-prefix-tail-#{System.unique_integer([:positive, :monotonic])}")
+    sessions = Path.join([workspace, ".pixir", "sessions"])
+    File.mkdir_p!(sessions)
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    start = event("large-parent", "visible-child", 0, "2026-07-10T00:00:00Z", "started", "running", "visible-sub")
+    finish = event("large-parent", "visible-child", 10002, "2026-07-10T00:00:03Z", "finished", "completed", "visible-sub")
+    failed = event("large-parent", "hidden-child", 5001, "2026-07-10T00:00:02Z", "failed", "failed", "hidden-sub")
+
+    filler = fn n ->
+      %{"id" => "filler-#{n}", "session_id" => "large-parent", "seq" => n, "ts" => "2026-07-10T00:00:01Z", "type" => "user_message", "data" => %{"text" => String.duplicate("x", 1000)}}
+    end
+
+    events = [start] ++ Enum.map(1..5000, filler) ++ [failed] ++ Enum.map(5002..10001, filler) ++ [finish]
+    write_log(sessions, "large-parent", events)
+
+    write_log(sessions, "visible-child", [
+      %{"session_id" => "visible-child", "seq" => 0, "ts" => "2026-07-10T00:00:00Z", "type" => "subagent_event", "data" => %{"event" => "permission_posture", "parent_session_id" => "large-parent"}}
+    ])
+
+    path = Path.join(sessions, "large-parent.ndjson")
+    before = File.read!(path)
+    assert byte_size(before) > 8 * 1024 * 1024
+
+    assert {:ok, %{"rows" => [row], "metadata" => metadata}} = PixirMonitor.Projection.Source.Filesystem.list_runs(workspace: workspace)
+    assert row["id"] == "large-parent"
+    assert metadata["dropped_logs"] == 0
+    assert row["execution"]["state"] == "unknown"
+    refute row["execution"]["terminal"]
+    refute row["temporal"]["ended_at"]["completeness"] == "complete"
+    refute row["temporal"]["duration"]["completeness"] == "complete"
+    assert Enum.any?(row["children"], &(&1["session_id"] == "visible-child"))
+    assert Enum.any?(row["source"]["limitations"], &String.starts_with?(&1, "parent_log_prefix_tail:"))
+    assert "partial_counts_lower_bounds" in row["source"]["limitations"]
+    assert {:ok, input} = PixirMonitor.Projection.Source.Filesystem.fetch_input("large-parent", workspace: workspace)
+    assert input["completeness"]["parent_log"] == "partial_prefix_tail"
+    assert input["inputs"]["runtime_diagnostics"] == nil
+    assert input["completeness"]["runtime_diagnostics"] == "unavailable"
+    assert {:ok, projection} = PixirMonitor.Projection.project(input)
+    assert projection["execution"]["state"] == "unknown"
+    assert projection["source"]["freshness"] == "unknown"
+    refute projection["usage"]["complete"]
+    assert "partial_counts_lower_bounds" in projection["limitations"]
+    assert {:error, %{kind: "run_not_found", details: details}} = PixirMonitor.Projection.Source.Filesystem.fetch_input("visible-child", workspace: workspace)
+    refute Map.has_key?(details, :parent_unprojected_reason)
+    assert File.read!(path) == before
+  end
+
+  test "oversized Workflow retains authoritative start and tail finish without claiming complete counts" do
+    workspace = Path.join(System.tmp_dir!(), "monitor-bounded-workflow-#{System.unique_integer([:positive, :monotonic])}")
+    sessions = Path.join([workspace, ".pixir", "sessions"])
+    File.mkdir_p!(sessions)
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    start =
+      workflow_event("bounded-workflow", 0, "2026-07-10T00:00:00Z", "workflow_started", %{
+        "workflow_id" => "bounded-wf",
+        "workflow_name" => "Bounded workflow",
+        "graph" => %{"steps" => [%{"id" => "only-step"}]}
+      })
+
+    finish = workflow_event("bounded-workflow", 101, "2026-07-10T00:00:03Z", "workflow_finished", %{"workflow_id" => "bounded-wf", "status" => "completed"})
+
+    filler =
+      Enum.map(1..100, fn seq -> %{"session_id" => "bounded-workflow", "seq" => seq, "ts" => "2026-07-10T00:00:01Z", "type" => "user_message", "data" => %{"text" => String.duplicate("é", 100)}} end)
+
+    write_log(sessions, "bounded-workflow", [start] ++ filler ++ [finish])
+    opts = [workspace: workspace, max_log_bytes: 2048]
+    assert {:ok, %{"rows" => [row]}} = PixirMonitor.Projection.Source.Filesystem.list_runs(opts)
+    assert row["title"] == "Bounded workflow"
+    assert row["execution"] == %{"state" => "completed", "terminal" => true}
+    assert {:ok, input} = PixirMonitor.Projection.Source.Filesystem.fetch_input("bounded-workflow", opts)
+    assert {:ok, projection} = PixirMonitor.Projection.project(input)
+    assert projection["execution"]["state"] == "completed"
+    assert projection["units"] |> hd() |> get_in(["execution", "state"]) == "unknown"
+    assert projection["counts"]["completed_units"] == 0
+    assert projection["post_terminal_child_activity"]["state"] == "undetermined"
+    assert projection["usage"]["complete"] == false
+
+    # A finish retained only in the prefix cannot certify the unread continuation.
+    selected = input["inputs"]["parent_log"]
+    early_finish = List.last(selected) |> Map.put("seq", 1)
+    early = [early_finish | Enum.reject(selected, &(&1["seq"] in [1, 101]))]
+    early_input = put_in(input, ["inputs", "parent_log"], early)
+    assert {:ok, early_projection} = PixirMonitor.Projection.project(early_input)
+    assert early_projection["execution"]["state"] == "unknown"
+    refute early_projection["execution"]["terminal"]
+  end
+
+  test "complete parent with incomplete child append never claims complete child evidence" do
+    workspace = Path.join(System.tmp_dir!(), "monitor-review-child-#{System.unique_integer([:positive, :monotonic])}")
+    sessions = Path.join([workspace, ".pixir", "sessions"])
+    File.mkdir_p!(sessions)
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    write_log(sessions, "review-parent", [
+      event("review-parent", "review-child", 0, "2026-09-05T00:00:00Z", "started", "running", "review-sub"),
+      event("review-parent", "review-child", 1, "2026-09-05T00:00:01Z", "finished", "completed", "review-sub")
+    ])
+
+    child_path = Path.join(sessions, "review-child.ndjson")
+    complete = Jason.encode!(%{"id" => "child-e0", "session_id" => "review-child", "seq" => 0, "ts" => "2026-09-05T00:00:00Z", "type" => "user_message", "data" => %{"text" => "hello"}}) <> "\n"
+    fragment = ~s({"type":)
+    File.write!(child_path, complete <> fragment)
+
+    assert {:ok, %{history: [_], selection: selection}} = Pixir.Log.fold_bounded("review-child", workspace: workspace)
+    refute selection["partial"]
+    assert selection["incomplete_trailing_bytes"] == byte_size(fragment)
+    assert {:ok, input} = PixirMonitor.Projection.Source.Filesystem.fetch_input("review-parent", workspace: workspace)
+    assert input["completeness"]["parent_log"] == "complete_through_observed_at"
+    assert input["completeness"]["child_logs"] == "partial_trailing_append"
+    assert [%{"seq" => 0, "type" => "user_message"}] = input["inputs"]["child_logs"]["review-child"]
+    assert input["inputs"]["child_log_selections"]["review-child"]["incomplete_trailing_bytes"] == byte_size(fragment)
+    assert input["inputs"]["runtime_diagnostics"] == nil
+    assert {:ok, projection} = PixirMonitor.Projection.project(input)
+    refute projection["usage"]["complete"]
+    assert "child_log_partial" in projection["source"]["limitations"]
+    refute "child_log_missing" in projection["source"]["limitations"]
+    assert hd(hd(projection["units"])["attempts"])["child_event_window"]["basis"] == "unknown"
+    assert projection["post_terminal_child_activity"]["state"] == "undetermined"
+    assert Enum.any?(projection["evidence"], &(&1["session_id"] == "review-child" and &1["seq"] == 0))
+    assert File.read!(child_path) == complete <> fragment
+  end
+
   test "returns the frozen list envelope and parent-derived row" do
     assert {:ok, %{"schema" => "pixir.monitor.runs", "schema_version" => 1, "runs" => [row]}} =
              PixirMonitor.Projection.Source.list_runs()
@@ -873,8 +1123,7 @@ defmodule PixirMonitor.ProjectionSourceTest do
              metadata["limitations"]
 
     assert details["error_kinds"] == %{
-             "run_log_limit" => 1,
-             "run_event_limit" => 1,
+             "run_event_limit" => 2,
              "run_graph_identity_invalid" => 1
            }
 
@@ -884,12 +1133,34 @@ defmodule PixirMonitor.ProjectionSourceTest do
     refute Map.has_key?(by_id, "child-only")
 
     cap = by_id["cap-parent"]
-    assert cap["kind"] == "run_log_limit"
+    # A one-event budget cannot represent either end of an oversized Log, so
+    # the event-limit refusal wins before inspecting unusable byte windows.
+    assert cap["kind"] == "run_event_limit"
     assert cap["bytes"] == cap_bytes
     assert cap["mtime"] == 1_776_400_000
     assert cap["newest_rank"] == 1
-    assert cap["max_log_bytes"] == 600
-    assert cap["remedy"] == "max_log_bytes"
+    refute Map.has_key?(cap, "max_log_bytes")
+    refute Map.has_key?(cap, "remedy")
+
+    # Once the event budget permits two ends, the independent byte-window
+    # failure remains named as such, with the original byte remedy.
+    assert {:ok, %{"metadata" => byte_metadata}} =
+             PixirMonitor.Projection.Source.Filesystem.list_runs(
+               workspace: workspace,
+               max_events: 2,
+               max_log_bytes: 600
+             )
+
+    assert_every_dropped_log_named(byte_metadata)
+    assert [%{"details" => byte_details}] = byte_metadata["limitations"]
+    assert byte_details["error_kinds"] == %{"run_log_limit" => 1, "run_graph_identity_invalid" => 1}
+    byte_cap = Enum.find(byte_details["dropped"], &(&1["id"] == "cap-parent"))
+    assert byte_cap["kind"] == "run_log_limit"
+    assert byte_cap["bytes"] == cap_bytes
+    assert byte_cap["mtime"] == 1_776_400_000
+    assert byte_cap["newest_rank"] == 1
+    assert byte_cap["max_log_bytes"] == 600
+    assert byte_cap["remedy"] == "max_log_bytes"
 
     event_drop = by_id["event-limit-parent"]
     assert event_drop["kind"] == "run_event_limit"

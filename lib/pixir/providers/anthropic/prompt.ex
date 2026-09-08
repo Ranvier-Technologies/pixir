@@ -1,14 +1,14 @@
 defmodule Pixir.Providers.Anthropic.Prompt do
   @moduledoc """
-  Provider-private pa4 prompt builder for Anthropic Messages requests.
+  Provider-private pa5 prompt builder for Anthropic Messages requests.
 
-  pa4 mirrors the px7 prompt contract in doctrine, not bytes. Layer 0 is a
+  pa5 mirrors the px8 prompt contract in doctrine, not bytes. Layer 0 is a
   byte-stable system text block selected by mode, Layer 1 is the deterministic
   Skills index when present, and volatile late context is inserted as the leading
   text content block of the latest user message because Anthropic has no developer
   role on the target model.
 
-  cache_control planning is fixed for pa4:
+  cache_control planning is fixed for pa5:
 
     * B1 is placed on the last system block.
     * B2 is placed on the content block at `prev_turn_boundary`, using a 1-based
@@ -24,19 +24,23 @@ defmodule Pixir.Providers.Anthropic.Prompt do
 
   Verified Anthropic prompt-caching documentation on 2026-07-08 says thinking,
   redacted_thinking, and empty text blocks cannot be marked directly with
-  cache_control; pa4 treats those blocks as non-cacheable.
+  cache_control; pa5 treats those blocks as non-cacheable.
 
-  pa4 never emits more than three breakpoints. The fourth Anthropic breakpoint is
-  reserved by ADR 0037 and adding a planned use for it requires a pa4 to pa5
-  prompt contract bump. Any future layout or fence-token change is also a pa4 to
-  pa5 bump. pa4 drops the code-style reviewability sentence after the N=3 A/B
-  verdict (refs #570), a pa3 to pa4 prompt contract bump. It continues to expose
-  the bash `timeout_ms` tool-schema field added in pa3 (refs #575).
+  pa5 never emits more than three breakpoints. The fourth Anthropic breakpoint is
+  reserved by ADR 0037; using it or changing layout/fence tokens requires a future
+  prompt-contract bump. pa4 dropped the code-style reviewability sentence after the
+  N=3 A/B verdict (refs #570); pa3 exposed bash `timeout_ms` (refs #575).
+
+  pa5 changes the virtual-overlay tool schema/description and lifetime context, not
+  Layer 0 bytes, fence tokens, or cache-control planning. The px8/pa5 migration is an
+  intentional cache restart: expect cold prefixes before the new contract warms.
+  Its PR and observability window must remain separate from independent WebSocket
+  fixes so cache movement is attributable; a release may include both verified changes.
   """
 
   alias Pixir.Tool
 
-  @prompt_contract_version "pa4"
+  @prompt_contract_version "pa5"
   @cache_control %{"type" => "ephemeral"}
   @hash_bytes 8
   @b3_threshold 15
@@ -94,11 +98,11 @@ defmodule Pixir.Providers.Anthropic.Prompt do
           required(:prev_turn_boundary) => non_neg_integer() | nil
         }
 
-  @doc "The pa4 prompt contract label, mirrored into neutral cache metadata (ADR 0037 D7)."
+  @doc "The pa5 prompt contract label, mirrored into neutral cache metadata (ADR 0037 D7)."
   @spec prompt_contract_version() :: String.t()
   def prompt_contract_version, do: @prompt_contract_version
 
-  @doc "Build Anthropic-native system and messages with the pa4 cache plan."
+  @doc "Build Anthropic-native system and messages with the pa5 cache plan."
   @spec build(input()) :: {:ok, map()} | {:error, map()}
   def build(input) when is_map(input) do
     with {:ok, mode} <- mode(Map.get(input, :mode) || Map.get(input, "mode")),

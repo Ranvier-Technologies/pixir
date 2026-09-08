@@ -173,6 +173,28 @@ defmodule Pixir.Delegate.DaemonClientTest do
     }
   end
 
+  test "daemon startup and live IPC status attribute the serving runtime", %{ws: ws} do
+    assert {:ok, pid} = DaemonServer.start_link(workspace: ws, async: FakeAsync)
+    on_exit(fn -> stop_daemon(pid) end)
+
+    assert {:ok, started} = DaemonServer.started_payload(pid)
+    assert {:ok, status} = DaemonClient.status(workspace: ws)
+
+    assert {:ok, delegated} =
+             DaemonClient.call("delegate_status", %{"handle" => "dlg1_fake"}, workspace: ws)
+
+    for payload <- [started, status] do
+      assert payload["build_info"]["os_pid"] == System.pid()
+      assert payload["build_info"]["version"] == Pixir.version()
+      assert payload["build_info"]["compile_otp"] == System.otp_release()
+    end
+
+    assert delegated["daemon"]["build_info"]["os_pid"] == System.pid()
+    assert delegated["daemon"]["build_info"]["version"] == Pixir.version()
+    assert status["build_info"] == started["build_info"]
+    refute Jason.encode!(status["build_info"]) =~ ws
+  end
+
   test "daemon client routes start status cancel through loopback IPC", %{ws: ws} do
     assert {:ok, pid} = DaemonServer.start_link(workspace: ws, async: FakeAsync)
 

@@ -1,0 +1,43 @@
+---
+import spec from "../../public/examples/first-worker.json";
+const specText = JSON.stringify(spec, null, 2);
+---
+
+<section class="section tone-mist" id="get-started" aria-labelledby="first-run-title">
+  <div class="section-inner">
+    <p class="section-kicker">First run · CLI or another coding agent</p>
+    <h2 id="first-run-title">One worker. One result.<br />A Log you can inspect.</h2>
+    <p class="section-lead">Start in a project that has a <code>README.md</code>. This example reads that file without editing it. The real run uses your configured provider and its account quota.</p>
+    <ol class="first-run-steps">
+      <li class="setup-step">
+        <div class="step-heading"><span class="step-number" aria-hidden="true">01</span><h3>Install the published runtime</h3></div>
+        <p>You need Elixir 1.20+ and OTP 29+. Add Mix's escript directory to your <code>PATH</code> if your shell cannot find <code>pixir</code>.</p>
+        <pre class="command-block"><code>mix escript.install hex pixir
+pixir --version</code></pre>
+        <p class="step-note">Hex installs the CLI/ACP runtime. Monitor and repository delegation Skills are separate source-checkout surfaces.</p>
+      </li>
+      <li class="setup-step">
+        <div class="step-heading"><span class="step-number" aria-hidden="true">02</span><h3>Choose a provider, then check readiness</h3></div>
+        <p>For the ChatGPT subscription route, run <code>pixir login</code>. For API keys or a compatible Open Responses endpoint, follow the <a href="https://pixir.hexdocs.pm/readme.html">provider setup in HexDocs</a>. Keep credentials in your own environment, never in this spec.</p>
+        <pre class="command-block"><code>pixir doctor --json</code></pre>
+        <p class="step-note">Read warnings and next actions before continuing. Missing auth is not ready; an absent local <code>./pixir</code> can be expected when using a Hex-installed binary outside a source checkout.</p>
+      </li>
+      <li class="setup-step">
+        <div class="step-heading"><span class="step-number" aria-hidden="true">03</span><h3>Inspect a small read-only plan</h3></div>
+        <p><a href="/examples/first-worker.json" download="first-worker.json">Download first-worker.json</a> and save it in your project. Inspect it before running: one explorer, one task, a 120-second child budget.</p>
+        <details class="spec-details"><summary>View the complete spec</summary><pre class="command-block"><code>{specText}</code></pre></details>
+        <pre class="command-block"><code>pixir delegate --spec first-worker.json --dry-run --json --timeout-ms 150000</code></pre>
+        <p class="step-note">Dry-run does not call the model. Continue only if the plan is accepted and <code>would_reject</code> is false. Read-only mode is not an OS sandbox.</p>
+      </li>
+      <li class="setup-step">
+        <div class="step-heading"><span class="step-number" aria-hidden="true">04</span><h3>Run, then inspect the evidence</h3></div>
+        <pre class="command-block"><code>pixir delegate --spec first-worker.json --json --timeout-ms 150000</code></pre>
+        <p>Read <code>command_ok</code>, <code>work_complete</code>, each child's status and its answer. A successful command is not proof that the requested work is complete.</p>
+        <p>Replace <code>PARENT_SESSION_ID</code> below with the <code>parent_session_id</code> returned by your run:</p>
+        <pre class="command-block"><code>pixir tree PARENT_SESSION_ID --json
+pixir diagnose session PARENT_SESSION_ID --json</code></pre>
+        <p class="step-note">A root agent can use the same commands. If a child fails or times out, inspect its evidence and suggested next actions before retrying; do not blindly repeat the whole batch.</p>
+      </li>
+    </ol>
+  </div>
+</section>

@@ -807,7 +807,58 @@ defmodule Pixir.WorkflowsTest do
 
     assert details["id"] == "bad_effort"
     assert details["field"] == "reasoning_effort"
-    assert details["allowed"] == ~w(low medium high xhigh)
+    assert details["allowed"] == ~w(low medium high xhigh max)
+  end
+
+  test "runtime admission ignores top-level model and effort opts just like child spawning", %{
+    sid: sid,
+    ws: ws
+  } do
+    spec = %{"steps" => [%{"id" => "effort", "task" => "inspect", "agent" => "explorer"}]}
+
+    assert {:ok, %{"status" => "completed"}} =
+             Workflows.run(sid, spec,
+               workspace: ws,
+               provider: EchoProvider,
+               model: "gpt-6-astra",
+               reasoning_effort: "max",
+               provider_opts: [test_pid: self(), model: "gpt-5.5", reasoning_effort: "high"]
+             )
+
+    assert_receive {:workflow_knobs, "gpt-5.5", "high"}
+  end
+
+  test "workflow capability errors identify the incompatible step", %{ws: ws} do
+    spec = %{
+      "steps" => [
+        %{
+          "id" => "wrong_model",
+          "task" => "inspect",
+          "agent" => "explorer",
+          "model" => "gpt-5.5",
+          "reasoning_effort" => "max"
+        }
+      ]
+    }
+
+    assert {:error, %{error: %{kind: :invalid_config, details: details}}} =
+             Workflows.dry_run(spec, workspace: ws)
+
+    assert details["id"] == "wrong_model"
+    assert details[:reason] == :unsupported_reasoning_effort
+  end
+
+  test "workflow default remains invalid rather than silently inheriting Config intent", %{ws: ws} do
+    spec = %{
+      "steps" => [
+        %{"id" => "invalid_default", "task" => "inspect", "reasoning_effort" => "default"}
+      ]
+    }
+
+    assert {:error, %{error: %{kind: :invalid_args, details: details}}} =
+             Workflows.dry_run(spec, workspace: ws)
+
+    assert details["field"] == "reasoning_effort"
   end
 
   test "dry_run rejects invalid workflow step attachments", %{ws: ws} do

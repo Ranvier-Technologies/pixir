@@ -178,6 +178,6 @@ defmodule PixirMonitor.PresenterUiSeamTest do
     # thrown as a PLAIN Error, which the shipped render guard launders into "The
     # fetched projection could not be displayed."; and the mirror-image lie, a
     # classifier that claims genuine upstream failures as Monitor defects.
-    assert result["red_proof_families"] == 18
+    assert result["red_proof_families"] == 19
   end
 end

@@ -7,7 +7,7 @@ defmodule PixirMonitor.Projection.Builder do
   bounded caller-supplied input map.
   """
 
-  alias PixirMonitor.Projection.{Advisory, AttemptStatus, Gate, Temporal, UnitIdentity, WorkflowGraph}
+  alias PixirMonitor.Projection.{Advisory, AttemptStatus, BoundedLog, Gate, PartialLifecycle, Temporal, UnitIdentity, WorkflowGraph}
 
   # Pinned names for the post-terminal child-activity dimension (#447 Phase 1).
   @post_terminal_basis "child_events_after_parent_terminal_boundary"
@@ -123,16 +123,51 @@ defmodule PixirMonitor.Projection.Builder do
     with {:ok, units0} <- units(ctx),
          {:ok, units1} <- enrich_units(units0, ctx, source, raw_limits) do
       graph = graph(ctx, units1)
-      root_usage = usage_for_units(units1)
+      root_usage = usage_for_units(units1, ctx)
+
+      root_usage =
+        if partial_parent?(ctx),
+          do: root_usage |> Map.put("complete", false) |> Map.put("source", "incomplete") |> Map.update!("limitations", &uniq(&1 ++ ["parent_log_missing_middle", "partial_counts_lower_bounds"])),
+          else: root_usage
+
+      child_limits = child_selection_limits(ctx, child_session_order(ctx))
+
+      root_usage =
+        if child_limits != [],
+          do: root_usage |> Map.put("complete", false) |> Map.put("source", "incomplete") |> Map.update!("limitations", &uniq(&1 ++ child_limits ++ ["usage_incomplete_partial_child_log"])),
+          else: root_usage
+
       root_mutation = root_mutation(units1)
+
+      root_mutation =
+        if child_limits != [] and root_mutation["observed_semantics"] == "exact" do
+          root_mutation
+          |> Map.put("status", "partial")
+          |> Map.put("observed_semantics", "at_least")
+          |> Map.put("observed_paths", units1 |> Enum.flat_map(& &1["mutation"]["observed_paths"]) |> uniq())
+          |> Map.put("evidence_refs", units1 |> Enum.flat_map(& &1["mutation"]["evidence_refs"]) |> uniq())
+          |> Map.update!("limitations", &uniq(&1 ++ child_limits ++ ["mutation_evidence_incomplete"]))
+        else
+          root_mutation
+        end
+
       root_actions = units1 |> Enum.flat_map(& &1["safe_actions"]) |> uniq_by(&{&1["scope"], &1["id"], &1["command"]})
       activity = post_terminal_child_activity(ctx, execution)
+
+      activity =
+        if partial_parent?(ctx),
+          do: activity |> Map.put("state", "undetermined") |> Map.put("basis", "child_evidence_unavailable") |> Map.put("event_count", nil) |> Map.put("latest_event_at", nil),
+          else: activity
 
       limitations =
         units1
         |> Enum.flat_map(& &1["limitations"])
         |> Kernel.++(source["limitations"])
         |> maybe_add(activity["state"] == "observed", @post_terminal_limitation)
+        |> maybe_add(
+          activity["state"] == "undetermined" and activity["evidence_refs"] != [] and child_limits != [],
+          "Partial child Log activity: retained canonical events occur after the parent terminal boundary; the full event count and latest activity are unavailable."
+        )
         |> uniq()
 
       units_with_advisory_source = Enum.map(units1, &put_attention/1)
@@ -320,6 +355,9 @@ defmodule PixirMonitor.Projection.Builder do
     subs = Enum.filter(ctx.parent, &recognized_subagent_lifecycle_event?/1)
 
     cond do
+      partial_parent?(ctx) and (is_nil(finish) or finish["seq"] < get_in(ctx.inputs, ["parent_log_selection", "tail_first_seq"])) ->
+        execution("unknown", "unknown", [])
+
       finish ->
         execution(get_in(finish, ["data", "status"]) || "unknown", "workflow_event_fold", [parent_ref(finish)])
 
@@ -359,7 +397,28 @@ defmodule PixirMonitor.Projection.Builder do
     end
   end
 
+  defp partial_parent?(ctx), do: get_in(ctx.inputs, ["parent_log_selection", "partial"]) == true
+
+  # Selection belongs to the surface that resolved the child. A primary list,
+  # even [], wins over a mirror; missing primary evidence may still resolve to
+  # the existing verified complete-copy fallback.
+  defp partial_child?(ctx, sid) do
+    is_list(get_in(ctx.inputs, ["child_logs", sid])) and
+      BoundedLog.incomplete?(get_in(ctx.inputs, ["child_log_selections", sid]))
+  end
+
+  defp child_selection_limits(ctx, sessions) do
+    sessions
+    |> Enum.filter(&partial_child?(ctx, &1))
+    |> Enum.flat_map(fn sid ->
+      {:ok, notes} = BoundedLog.child_limitations(sid, get_in(ctx.inputs, ["child_log_selections", sid]))
+      notes
+    end)
+    |> uniq()
+  end
+
   defp source(ctx, execution, raw_limits) do
+    {:ok, selection_limits} = PixirMonitor.Projection.BoundedLog.limitations(ctx.inputs["parent_log_selection"] || %{})
     has_durable = ctx.parent != [] or is_map(ctx.inputs["evidence_mirror"])
     owner = ctx.inputs["owner_state"] || %{}
     diagnostics = ctx.inputs["runtime_diagnostics"]
@@ -389,6 +448,7 @@ defmodule PixirMonitor.Projection.Builder do
 
     freshness =
       cond do
+        partial_parent?(ctx) -> "unknown"
         execution["terminal"] -> "terminal"
         has_durable and live in ~w(stale_handle owner_unavailable) -> "stale"
         # Externally owned with asserted advancement: the durable Log is the
@@ -400,7 +460,8 @@ defmodule PixirMonitor.Projection.Builder do
       end
 
     source_limits =
-      []
+      selection_limits
+      |> Kernel.++(child_selection_limits(ctx, child_session_order(ctx)))
       |> maybe_add(mirror_conflict?(ctx), "canonical_source_conflict")
       |> maybe_add(not has_durable, "durable_log_unavailable")
       |> maybe_add(child_logs_missing?(ctx), "child_log_missing")
@@ -680,8 +741,13 @@ defmodule PixirMonitor.Projection.Builder do
     )
     |> List.last()
     |> then(fn
-      nil -> projected
-      event -> raw_or_projected(event["data"] || %{}, "status", projected)
+      nil ->
+        projected
+
+      event ->
+        if partial_parent?(ctx) and event["seq"] < get_in(ctx.inputs, ["parent_log_selection", "tail_first_seq"]),
+          do: projected,
+          else: raw_or_projected(event["data"] || %{}, "status", projected)
     end)
   end
 
@@ -956,6 +1022,35 @@ defmodule PixirMonitor.Projection.Builder do
   end
 
   defp attempts(unit, events, ctx) do
+    if partial_parent?(ctx) do
+      with {:ok, segments} <- PartialLifecycle.fold(events, ctx.inputs["parent_log_selection"]),
+           {:ok, rows} <- complete_attempts(unit, segments.prefix, ctx) do
+        open_attempt_id = if segments.prefix_open, do: List.last(rows)["attempt_id"], else: nil
+
+        rows =
+          Enum.map(rows, fn row ->
+            row =
+              if row["attempt_id"] == open_attempt_id do
+                row
+                |> Map.put("status", "unknown")
+                |> Map.update!("limitations", &uniq(&1 ++ ["attempt_continuity_unknown"]))
+              else
+                row
+              end
+
+            row
+            |> Map.delete("usage")
+            |> Map.put("child_event_window", window(row["child_session_id"], nil, nil, "unknown", []))
+          end)
+
+        {:ok, rows}
+      end
+    else
+      complete_attempts(unit, events, ctx)
+    end
+  end
+
+  defp complete_attempts(unit, events, ctx) do
     result =
       Enum.reduce_while(events, {:ok, [], nil, nil}, fn event, {:ok, list, active, pending} ->
         d = event["data"] || %{}
@@ -1014,7 +1109,7 @@ defmodule PixirMonitor.Projection.Builder do
       end)
 
     case result do
-      {:ok, list, _active, _pending} -> {:ok, attach_attempt_evidence(list, ctx)}
+      {:ok, list, _active, _pending} -> {:ok, if(partial_parent?(ctx), do: list, else: attach_attempt_evidence(list, ctx))}
       {:error, _} = err -> err
     end
   end
@@ -1116,12 +1211,16 @@ defmodule PixirMonitor.Projection.Builder do
 
       {from, to, basis} =
         cond do
+          partial_child?(ctx, session) -> {nil, nil, "unknown"}
           length(siblings) == 1 -> {nil, nil, "whole_child_log_single_attempt"}
           length(anchors) == length(siblings) -> {Enum.at(anchors, index), Enum.at(anchors, index + 1), "child_user_message_epoch"}
           true -> {nil, nil, "unknown"}
         end
 
-      selected = Enum.filter(child, fn e -> (is_nil(from) or e["seq"] >= from) and (is_nil(to) or e["seq"] < to) end)
+      # Unknown windows are not whole-Session windows. Omitted user-message
+      # anchors can hide later epochs, so neither failure nor usage nor refs
+      # may be borrowed into this attempt. Session evidence stays inspectable.
+      selected = if basis == "unknown", do: [], else: Enum.filter(child, fn e -> (is_nil(from) or e["seq"] >= from) and (is_nil(to) or e["seq"] < to) end)
 
       window_refs =
         if basis == "child_user_message_epoch" do
@@ -1154,7 +1253,7 @@ defmodule PixirMonitor.Projection.Builder do
         |> add_refs(attempt_child_refs)
 
       include_empty_usage? =
-        explicitly_empty_child_log?(ctx, session) and
+        basis != "unknown" and explicitly_empty_child_log?(ctx, session) and
           ctx.completeness["child_logs"] in ~w(complete complete_through_observed_at)
 
       if usage["calls"] > 0 or include_empty_usage?,
@@ -1180,16 +1279,33 @@ defmodule PixirMonitor.Projection.Builder do
 
   defp enrich_unit(unit, events, attempts, ctx, source, raw_limits) do
     gate = gate(unit, ctx)
-    exec = unit_execution(unit, events, attempts, gate)
+    gate = if partial_parent?(ctx), do: Map.put(gate, "state", "unknown"), else: gate
+    exec = if partial_parent?(ctx), do: execution("unknown", "unknown", []), else: unit_execution(unit, events, attempts, gate)
     advisory = advisory(attempts, ctx)
     artifacts = artifacts(unit, ctx)
     mutation = unit_mutation(unit, ctx, artifacts)
     usage = usage_for_attempts(attempts, ctx)
+    child_limits = child_selection_limits(ctx, unit_child_sessions(unit, ctx))
+
+    usage =
+      if child_limits != [],
+        do:
+          usage
+          |> Map.put("complete", false)
+          |> Map.put("source", "incomplete")
+          |> Map.update!("limitations", &uniq(&1 ++ child_limits ++ ["usage_incomplete_partial_child_log", "usage_attribution_ambiguous"])),
+        else: usage
+
     unit_raw = unit_raw_limits(unit, ctx, raw_limits)
 
     limits =
       (unit["limitations"] || [])
       |> Kernel.++(unit_raw)
+      |> Kernel.++(child_selection_limits(ctx, unit_child_sessions(unit, ctx)))
+      |> maybe_add("usage_attribution_ambiguous" in usage["limitations"], "usage_attribution_ambiguous")
+      |> maybe_add("usage_incomplete_partial_child_log" in usage["limitations"], "usage_incomplete_partial_child_log")
+      |> maybe_add(partial_parent?(ctx), "attempt_lineage_unavailable")
+      |> maybe_add(partial_parent?(ctx), "parent_log_missing_middle")
       |> maybe_add(mirror_conflict?(ctx), "canonical_source_conflict")
       |> maybe_add(unit["materialization"] == "volatile_only", "durable_log_unavailable")
       |> maybe_add(unit["materialization"] == "volatile_only", "volatile_attempt_not_durable")
@@ -1207,6 +1323,8 @@ defmodule PixirMonitor.Projection.Builder do
 
         al =
           (attempt["limitations"] || [])
+          |> Kernel.++(child_selection_limits(ctx, [attempt["child_session_id"]]))
+          |> maybe_add(partial_child?(ctx, attempt["child_session_id"]), "usage_attribution_ambiguous")
           |> maybe_add(unit["materialization"] == "volatile_only", "volatile_attempt_not_durable")
           |> maybe_add("child_log_missing" in limits and child_events(ctx, attempt["child_session_id"]) == [], "child_log_missing")
           |> Kernel.++(Enum.filter(unit_raw, &(&1 in ~w(partial_repo_mutation subagent_close_failed subagent_may_still_be_running))))
@@ -1458,6 +1576,9 @@ defmodule PixirMonitor.Projection.Builder do
 
     state =
       cond do
+        partial_parent?(ctx) and owner["reachable"] != true ->
+          "unknown"
+
         execution["terminal"] and "subagent_may_still_be_running" not in limits ->
           "not_applicable"
 
@@ -1517,7 +1638,8 @@ defmodule PixirMonitor.Projection.Builder do
         }
 
       map_size(owner) > 0 ->
-        %{"state" => state, "reachable" => owner["reachable"] == true, "basis" => "delegate_owner", "observed_at" => ctx.observed_at, "evidence_refs" => compact([owner_ref(ctx)])}
+        basis = if owner["observation"] == "bounded_log_only", do: "durable_snapshot", else: "delegate_owner"
+        %{"state" => state, "reachable" => owner["reachable"] == true, "basis" => basis, "observed_at" => ctx.observed_at, "evidence_refs" => compact([owner_ref(ctx)])}
 
       true ->
         %{"state" => state, "reachable" => false, "basis" => "none", "observed_at" => nil, "evidence_refs" => []}
@@ -1527,20 +1649,57 @@ defmodule PixirMonitor.Projection.Builder do
   defp usage_for_attempts(attempts, ctx) do
     events = attempts |> Enum.flat_map(fn a -> usage_events_from_usage(a, ctx) end) |> uniq_by(fn {s, e} -> {s, e["seq"]} end)
     refs = Enum.map(events, fn {s, e} -> child_ref(s, e) end)
-    usage(Enum.map(events, &elem(&1, 1)), ctx, refs, attempts != [])
+
+    if partial_parent?(ctx) do
+      usage([], ctx, [], true)
+      |> Map.put("source", "incomplete")
+      |> Map.put("complete", false)
+      |> Map.update!("limitations", &uniq(&1 ++ ["parent_log_missing_middle", "attempt_lineage_unavailable"]))
+    else
+      result = usage(Enum.map(events, &elem(&1, 1)), ctx, refs, attempts != [])
+      sessions = attempts |> Enum.map(& &1["child_session_id"]) |> compact() |> uniq()
+      ambiguous? = Enum.any?(attempts, &(&1["materialization"] == "durable" and get_in(&1, ["child_event_window", "basis"]) == "unknown"))
+      partial? = Enum.any?(sessions, &partial_child?(ctx, &1))
+
+      limits =
+        result["limitations"]
+        |> Kernel.++(child_selection_limits(ctx, sessions))
+        |> maybe_add(partial?, "usage_incomplete_partial_child_log")
+        |> maybe_add(ambiguous?, "usage_attribution_ambiguous")
+        |> uniq()
+
+      if partial? or ambiguous?,
+        do: result |> Map.put("source", "incomplete") |> Map.put("complete", false) |> Map.put("limitations", limits),
+        else: result
+    end
   end
 
   defp usage_events_from_usage(attempt, ctx) do
     w = attempt["child_event_window"] || %{}
     session = w["session_id"]
+    {boundary, _basis} = terminal_boundary(ctx)
 
     child_events(ctx, session)
     |> Enum.filter(fn e -> e["type"] == "provider_usage" and (is_nil(w["from_seq"]) or e["seq"] >= w["from_seq"]) and (is_nil(w["to_seq_exclusive"]) or e["seq"] < w["to_seq_exclusive"]) end)
+    |> Enum.reject(&(partial_child?(ctx, session) and after_boundary?(&1["ts"], boundary)))
     |> Enum.map(&{session, &1})
   end
 
-  defp usage_for_units(units) do
-    groups = units |> Enum.flat_map(& &1["usage"]["groups"]) |> fold_groups()
+  defp usage_for_units(units, ctx) do
+    groups =
+      if Enum.any?(child_session_order(ctx), &partial_child?(ctx, &1)) and not partial_parent?(ctx) do
+        # A sampled Session can be referenced by more than one unit. Count each
+        # retained canonical identity once at run scope, not once per owner row.
+        units
+        |> Enum.flat_map(& &1["attempts"])
+        |> Enum.flat_map(&usage_events_from_usage(&1, ctx))
+        |> uniq_by(fn {sid, event} -> {sid, event["seq"]} end)
+        |> Enum.map(fn {_sid, event} -> usage_group(event) end)
+        |> fold_groups()
+      else
+        units |> Enum.flat_map(& &1["usage"]["groups"]) |> fold_groups()
+      end
+
     calls = Enum.sum(Enum.map(groups, & &1["calls"]))
     limits = units |> Enum.flat_map(& &1["usage"]["limitations"]) |> uniq()
     complete = Enum.all?(units, & &1["usage"]["complete"])
@@ -1720,6 +1879,7 @@ defmodule PixirMonitor.Projection.Builder do
     derived_paths = child_derived_write_paths(unit, ctx)
     denials = child_write_denials(unit, ctx)
     child_absent? = child_write_evidence_absent?(unit, ctx)
+    partial_child? = Enum.any?(unit_child_sessions(unit, ctx), &partial_child?(ctx, &1))
 
     {status, semantics, paths, basis} =
       cond do
@@ -1760,6 +1920,8 @@ defmodule PixirMonitor.Projection.Builder do
 
     mutation_limitations =
       []
+      |> Kernel.++(child_selection_limits(ctx, unit_child_sessions(unit, ctx)))
+      |> maybe_add(partial_child?, "mutation_evidence_incomplete")
       |> maybe_add(status in ~w(unknown indeterminate), "mutation_evidence_incomplete")
       |> maybe_add(basis == "no_child_evidence_available", "mutation_evidence_incomplete")
       |> maybe_add(basis == "no_child_evidence_available" and child_logs_missing?(ctx), "child_log_missing")
@@ -1804,24 +1966,24 @@ defmodule PixirMonitor.Projection.Builder do
   # correlated to an ok result by a binary call_id present on both sides.
   # Lower-bound evidence only.
   defp child_derived_write_paths(unit, ctx) do
-    events = unit_child_events(unit, ctx)
+    events = unit_child_event_pairs(unit, ctx)
 
     ok_calls =
-      for e <- events,
+      for {sid, e} <- events,
           e["type"] == "tool_result",
           get_in(e, ["data", "ok"]) == true,
           call_id = get_in(e, ["data", "call_id"]),
           is_binary(call_id),
           into: MapSet.new(),
-          do: call_id
+          do: {sid, child_segment(ctx, sid, e), call_id}
 
     paths =
-      for event <- events,
+      for {sid, event} <- events,
           event["type"] == "tool_call",
           get_in(event, ["data", "name"]) in @write_tools,
           call_id = get_in(event, ["data", "call_id"]),
           is_binary(call_id),
-          MapSet.member?(ok_calls, call_id),
+          MapSet.member?(ok_calls, {sid, child_segment(ctx, sid, event), call_id}),
           path = workspace_relative_path(get_in(event, ["data", "args", "path"])),
           path != nil,
           do: path
@@ -1829,17 +1991,27 @@ defmodule PixirMonitor.Projection.Builder do
     uniq(paths)
   end
 
+  # A repeated call id across the unread middle cannot correlate a prefix call
+  # to a tail result. Only pairs in the same retained contiguous segment prove
+  # a lower-bound write; both raw records remain independently inspectable.
+  defp child_segment(ctx, sid, event) do
+    selection = get_in(ctx.inputs, ["child_log_selections", sid]) || %{}
+    tail = selection["tail_first_seq"]
+
+    if selection["partial"] == true and is_integer(tail),
+      do: if(event["seq"] >= tail, do: :tail, else: :prefix),
+      else: :contiguous
+  end
+
   # Write-policy denials from the unit's child Log. A deny is not a mutation.
   defp child_write_denials(unit, ctx) do
-    child_session_id = matching_envelope_child(unit, ctx)["child_session_id"]
-
-    unit_child_events(unit, ctx)
-    |> Enum.filter(fn event ->
+    unit_child_event_pairs(unit, ctx)
+    |> Enum.filter(fn {_sid, event} ->
       event["type"] == "permission_decision" and
         get_in(event, ["data", "gate"]) == "write_policy" and
         get_in(event, ["data", "decision"]) == "deny"
     end)
-    |> Enum.map(fn event ->
+    |> Enum.map(fn {child_session_id, event} ->
       data = event["data"] || %{}
 
       %{
@@ -1861,17 +2033,55 @@ defmodule PixirMonitor.Projection.Builder do
     {denial["normalized_path"] || denial["requested_path"], denial["matched_rule"], denial["policy_id"], denial["policy_hash"]}
   end
 
-  # True when the unit could have child write evidence but none is readable.
+  # Missing and partially selected evidence both prohibit a no-writes claim,
+  # even when some retained records are readable. Positive correlated facts
+  # still contribute lower-bound paths above.
   defp child_write_evidence_absent?(unit, ctx) do
-    child_session_id = matching_envelope_child(unit, ctx)["child_session_id"]
-
-    child_session_id != nil and
-      unit_child_events(unit, ctx) == [] and
-      (ctx.completeness["child_logs"] in ~w(explicitly_missing unavailable minimized not_retained provider_usage_sampled) or
-         is_nil(get_in(ctx.inputs, ["child_logs", child_session_id])))
+    Enum.any?(unit_child_sessions(unit, ctx), fn sid ->
+      partial_child?(ctx, sid) or
+        (child_events(ctx, sid) == [] and
+           (ctx.completeness["child_logs"] in ~w(explicitly_missing unavailable minimized not_retained provider_usage_sampled) or
+              child_evidence_unavailable?(ctx, sid)))
+    end)
   end
 
-  defp unit_child_events(unit, ctx), do: child_events(ctx, matching_envelope_child(unit, ctx)["child_session_id"])
+  # Runtime Source has no terminal envelope. For newly retained partial child
+  # evidence, resolve the roster through validated canonical parent bindings.
+  # Leave the pre-existing complete/missing-child mutation projection untouched.
+  defp unit_child_sessions(unit, ctx) do
+    envelope_sessions = compact([matching_envelope_child(unit, ctx)["child_session_id"]])
+    key = List.last(String.split(unit["logical_id"], ":"))
+
+    partial_sessions = (ctx.inputs["child_log_selections"] || %{}) |> Map.keys() |> Enum.filter(&partial_child?(ctx, &1))
+
+    canonical_sessions =
+      if partial_sessions == [] do
+        []
+      else
+        ctx.parent
+        |> Enum.filter(&recognized_subagent_lifecycle_event?/1)
+        |> Enum.filter(fn event ->
+          data = event["data"] || %{}
+          if unit["unit_kind"] == "workflow_step", do: bound_step_id(data, ctx) == key, else: data["subagent_id"] == key
+        end)
+        |> Enum.map(&get_in(&1, ["data", "child_session_id"]))
+        |> compact()
+        |> uniq()
+      end
+
+    if Enum.any?(canonical_sessions, &partial_child?(ctx, &1)),
+      do: uniq(envelope_sessions ++ canonical_sessions),
+      else: envelope_sessions
+  end
+
+  defp unit_child_event_pairs(unit, ctx) do
+    {boundary, _basis} = terminal_boundary(ctx)
+
+    for sid <- unit_child_sessions(unit, ctx),
+        event <- child_events(ctx, sid),
+        not (partial_child?(ctx, sid) and after_boundary?(event["ts"], boundary)),
+        do: {sid, event}
+  end
 
   # A write is only an observed path when it lands inside the unit's workspace.
   # Absolute or escaping targets are rejected rather than normalized into the lane.
@@ -2317,7 +2527,7 @@ defmodule PixirMonitor.Projection.Builder do
     referenced_evidence =
       (envelope_evidence ++ durable_evidence ++ children ++ mirror_children ++ volatile_evidence)
       |> uniq_by(& &1["id"])
-      |> Enum.filter(&MapSet.member?(used, &1["id"]))
+      |> Enum.filter(&(MapSet.member?(used, &1["id"]) or (&1["source_kind"] == "child_log" and partial_child?(ctx, &1["session_id"]))))
 
     referenced_evidence ++ mirror_evidence
   end
@@ -2429,6 +2639,16 @@ defmodule PixirMonitor.Projection.Builder do
 
       Enum.any?(sessions, &child_evidence_unavailable?(ctx, &1)) ->
         activity_row("undetermined", "child_evidence_unavailable", boundary_at, boundary_basis, nil, nil, [], [])
+
+      Enum.any?(sessions, &partial_child?(ctx, &1)) ->
+        # The frozen activity dimension has no lower-bound/completeness field.
+        # Preserve provable positive refs, but never publish a sampled count as
+        # an exact total or a selected latest timestamp as the true latest.
+        observed_child_activity(ctx, sessions, boundary_at, boundary_basis)
+        |> Map.put("state", "undetermined")
+        |> Map.put("basis", "child_evidence_unavailable")
+        |> Map.put("event_count", nil)
+        |> Map.put("latest_event_at", nil)
 
       true ->
         observed_child_activity(ctx, sessions, boundary_at, boundary_basis)
@@ -2693,6 +2913,9 @@ defmodule PixirMonitor.Projection.Builder do
     resumed? = data["event"] == "input" or (ordinal > 0 and repeated_session?)
 
     cond do
+      partial_parent?(ctx) ->
+        "Durable Subagent #{data["event"]} observation (#{data["status"] || "unknown"}); partial parent history does not establish continuous attempt lineage."
+
       data["event"] == "started" and repeated_session? and ordinal == 0 ->
         "Initial child execution started."
 
@@ -2917,8 +3140,18 @@ defmodule PixirMonitor.Projection.Builder do
     child_ordinal = Enum.find_index(child_sessions, &(&1 == session_id)) || 0
     sampled? = ctx.completeness["child_logs"] in ~w(provider_usage_sampled minimized not_retained)
     write_activity? = Enum.any?(events, &(&1["type"] in ~w(tool_call tool_result)))
+    partial_parent? = partial_parent?(ctx)
+    partial_child? = partial_child?(ctx, session_id)
 
     case event["type"] do
+      type when partial_child? ->
+        error_kind = get_in(event, ["data", "error_kind"])
+        detail = if type == "turn_failed", do: " (error kind: #{if is_binary(error_kind), do: error_kind, else: "unknown"})", else: ""
+        "Retained canonical #{type}#{detail} observation from a partial child Log; attempt attribution and total event count are unavailable."
+
+      type when partial_parent? ->
+        "Canonical #{type} observation from the child Session; partial parent history does not establish attempt attribution."
+
       "provider_usage" when repeated_session? ->
         "#{ordinal_word(ordinal)} epoch provider usage."
 
@@ -2983,6 +3216,11 @@ defmodule PixirMonitor.Projection.Builder do
 
   defp owner_description(ctx, _authority) do
     cond do
+      (ctx.inputs["owner_state"] || %{})["observation"] == "bounded_log_only" ->
+        if durable_evidence_advanced?(ctx),
+          do: "Bounded durable Log evidence is advancing; live Owner reachability was not checked.",
+          else: "Only a bounded durable snapshot was inspected; live Owner reachability was not checked."
+
       (ctx.inputs["owner_state"] || %{})["reachable"] == true and ctx.parent == [] ->
         "Delegate owner is reachable in the current runtime."
 
@@ -3235,14 +3473,12 @@ defmodule PixirMonitor.Projection.Builder do
   end
 
   defp observed_write_refs(unit, ctx) do
-    child_session_id = matching_envelope_child(unit, ctx)["child_session_id"]
-
-    child_events(ctx, child_session_id)
-    |> Enum.filter(fn event ->
+    unit_child_event_pairs(unit, ctx)
+    |> Enum.filter(fn {_sid, event} ->
       (event["type"] == "tool_call" and get_in(event, ["data", "name"]) in @write_tools) or
         (event["type"] == "tool_result" and get_in(event, ["data", "ok"]) == true)
     end)
-    |> Enum.map(&child_ref(child_session_id, &1))
+    |> Enum.map(fn {sid, event} -> child_ref(sid, event) end)
   end
 
   defp paths_for(ms, status), do: ms |> Enum.filter(&(&1["status"] == status)) |> Enum.flat_map(& &1["observed_paths"])

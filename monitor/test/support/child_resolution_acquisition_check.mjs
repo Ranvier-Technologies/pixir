@@ -191,8 +191,8 @@ async function runNavigated(appSource, scenario) {
     history: {replaceState() {}},
     fetch: fetchStub,
     EventSource: function () { return {addEventListener() {}, close() {}}; },
-    setTimeout: (fn) => { void fn; return 0; },
-    clearTimeout() {}, setInterval: () => 0, clearInterval() {},
+    // No timer globals: production currently uses none on this route. A future
+    // timer must get an explicit execution model, not a callback-swallowing stub.
     queueMicrotask,
     URLSearchParams, URL, Set, Map, Object, Array, Number, String, JSON, Math, Date, RegExp, Error, TypeError, Promise, Boolean, Symbol, Intl,
     console: {log() {}, warn() {}, error() {}, debug() {}, info() {}}

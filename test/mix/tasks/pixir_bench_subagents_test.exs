@@ -13,7 +13,22 @@ defmodule Mix.Tasks.Pixir.Bench.SubagentsTest do
           Base.encode16(:crypto.strong_rand_bytes(6), case: :lower)
       )
 
-    on_exit(fn -> File.rm_rf!(output_dir) end)
+    on_exit(fn ->
+      # Never delete a live writer's files, even if the run/cleanup raised
+      # before runs.jsonl could be written. These ids come only from this
+      # fixture's Logs, not a global supervisor sweep.
+      output_dir
+      |> Path.join("**/.pixir/sessions/*.ndjson")
+      |> Path.wildcard(match_dot: true)
+      |> Enum.each(fn path ->
+        sid = Path.basename(path, ".ndjson")
+
+        assert Registry.lookup(Pixir.Sessions.Registry, sid) == [],
+               "benchmark Session #{sid} still owns files under #{output_dir}"
+      end)
+
+      File.rm_rf!(output_dir)
+    end)
 
     %{output_dir: output_dir}
   end
@@ -70,6 +85,19 @@ defmodule Mix.Tasks.Pixir.Bench.SubagentsTest do
   test "run emits reconciled records, summary, report, and completion audit", %{
     output_dir: output_dir
   } do
+    # A live Session outside the scenario must not be swept up by cleanup.
+    sentinel_workspace = Path.join(output_dir, "unrelated-session")
+    File.mkdir_p!(sentinel_workspace)
+
+    {:ok, sentinel_sid, sentinel_pid} =
+      Pixir.SessionSupervisor.start_session(workspace: sentinel_workspace)
+
+    on_exit(fn ->
+      monitor = Process.monitor(sentinel_pid)
+      assert {:ok, _} = Pixir.SessionSupervisor.stop_session(sentinel_sid)
+      assert_receive {:DOWN, ^monitor, :process, ^sentinel_pid, _}, 5_000
+    end)
+
     payload =
       capture_io(fn ->
         BenchTask.run(["--n", "1,2", "--repetitions", "1", "--json", "--output", output_dir])
@@ -92,6 +120,25 @@ defmodule Mix.Tasks.Pixir.Bench.SubagentsTest do
     assert File.exists?(audit_path)
 
     records = read_jsonl!(runs_path)
+
+    session_ids =
+      records
+      |> Enum.flat_map(fn record ->
+        [record["parent_session_id"] | Map.get(record, "child_session_ids", [])]
+      end)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+
+    surviving_sessions =
+      for sid <- session_ids,
+          {pid, _} <- Registry.lookup(Pixir.Sessions.Registry, sid),
+          Process.alive?(pid),
+          do: sid
+
+    assert surviving_sessions == []
+    assert Process.alive?(sentinel_pid)
+    assert [{^sentinel_pid, _}] = Registry.lookup(Pixir.Sessions.Registry, sentinel_sid)
+
     summary = summary_path |> File.read!() |> Jason.decode!()
     audit = audit_path |> File.read!() |> Jason.decode!()
     report = File.read!(report_path)

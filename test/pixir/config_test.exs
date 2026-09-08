@@ -94,6 +94,18 @@ defmodule Pixir.ConfigTest do
     %{home: home, config_path: config_path}
   end
 
+  test "max intent is retained with a compatibility warning instead of downgraded" do
+    loaded = Config.load(raw_config: %{"model" => "gpt-5.5", "reasoning" => %{"effort" => "max"}})
+    assert loaded["effective"]["reasoning"]["effort"] == "max"
+    assert Enum.any?(loaded["warnings"], &(&1["reason"] == "unsupported_reasoning_effort"))
+
+    loaded =
+      Config.load(raw_config: %{"model" => "gpt-6-astra", "reasoning" => %{"effort" => "max"}})
+
+    assert loaded["effective"]["reasoning"]["effort"] == "max"
+    assert loaded["warnings"] == []
+  end
+
   test "returns built-in defaults when config.json is missing", %{config_path: config_path} do
     result = Config.load(config_path: config_path)
 

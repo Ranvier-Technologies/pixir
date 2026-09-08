@@ -2986,6 +2986,15 @@
     if (typeof id !== "string" || !id) return null;
     return droppedLogsFromInventory(heldInventory(route)).find(function (row) { return row.id === id; }) || null;
   }
+  function boundedLogNote(projection) {
+    const limits = array(projection && projection.source && projection.source.limitations);
+    const record = limits.find(function (value) { return typeof value === "string" && value.startsWith("parent_log_prefix_tail:"); });
+    if (!record) return null;
+    const metrics = /^parent_log_prefix_tail:bytes_omitted=(\d+);events_omitted=unknown;events_retained=(\d+);bytes_read=(\d+)$/.exec(record);
+    const amount = metrics ? metrics[1] + " bytes omitted; omitted events unknown; " + metrics[2] + " events retained; " + metrics[3] + " bytes read. " : "Omitted bytes and events unknown. ";
+    return text("p", "Partial parent Log — prefix + tail only. " + amount + "Event, child, unit and usage counts describe selected evidence and are lower bounds, not complete totals. Missing middle work is not known complete.", "bounded-log-note provenance");
+  }
+
   function byteBoundLabel(bytes) {
     if (!Number.isSafeInteger(bytes) || bytes < 0) return "";
     if (bytes % (1024 * 1024) === 0) return (bytes / (1024 * 1024)) + " MB";
@@ -3311,7 +3320,10 @@
       const advisoryCell = el("td");
       const advisoryMarkers = distributionMarkers(row.advisory_counts, ADVISORY_BUCKET_ORDER, ADVISORY_DISPLAY_ALIASES, "advisory distribution", "parent_log_only");
       if (!advisoryMarkers.childNodes.length) advisoryCell.append(text("span", "—")); else advisoryCell.append(advisoryMarkers); tr.append(cellLabel(advisoryCell, "Advisory"));
-      const source = el("td"); source.append(marker(row.source && row.source.mode, "source")); tr.append(cellLabel(source, "Source"));
+      const source = el("td"); source.append(marker(row.source && row.source.mode, "source"));
+      const boundedNote = boundedLogNote(row);
+      if (boundedNote) source.append(boundedNote);
+      tr.append(cellLabel(source, "Source"));
       tr.append(cellLabel(text("td", scalar(row.counts && row.counts.completed_units, "0") + "/" + scalar(row.counts && row.counts.planned_units, "?")), "Units"));
       tr.append(cellLabel(text("td", titleCase(row.mutation && row.mutation.status)), "Mutation"));
       const duration = temporalField(row, "duration");
@@ -3720,6 +3732,8 @@
     const attentionCounts = runAttentionCounts(run);
     rail.append(distributionCard(route, "Attention (parent-observed)", "attention", attentionCounts, ATTENTION_BUCKET_ORDER, ATTENTION_DISPLAY_ALIASES, ATTENTION_FOLD_BASIS));
     rail.append(postTerminalCard(run.post_terminal_child_activity, route));
+    const boundedNote = boundedLogNote(run);
+    if (boundedNote) rail.append(boundedNote);
     return rail;
   }
   /**
@@ -3782,6 +3796,9 @@
     if (denials.length > LIMITS.evidence) region.append(text("p", "Showing " + LIMITS.evidence + " of " + denials.length + " observed denials.", "truncation"));
     return region;
   }
+  function incompleteAttemptLineage(unit) {
+    return array(unit.limitations).includes("attempt_lineage_unavailable");
+  }
   function unitSummary(run, unit, route, summaryFocusKey) {
     const article = el("article", "unit-card");
     article.dataset.unitId = unit.logical_id;
@@ -3795,7 +3812,8 @@
     if (unit.advisory && unit.advisory.present) header.append(labeledMarker(unitAdvisoryLabel(unit), unit.advisory.verdict, "advisory", "model_declared"));
     article.append(header);
     const meta = el("dl", "unit-meta");
-    meta.append(field("Agent", unit.agent)); meta.append(field("Workspace", unit.workspace_mode)); meta.append(field("Attempts", array(unit.attempts).length));
+    const attemptCount = array(unit.attempts).length;
+    meta.append(field("Agent", unit.agent)); meta.append(field("Workspace", unit.workspace_mode)); meta.append(field("Attempts", incompleteAttemptLineage(unit) ? attemptCount + " retained · total unknown" : attemptCount));
     article.append(meta);
     if (unit.attention && unit.attention.required) {
       const attention = el("div", "attention"); attention.append(text("strong", "Needs attention · parent-observed"));
@@ -4517,7 +4535,13 @@
     }
     facts.append(field("Started", attempt.started_at)); facts.append(field("Ended", attempt.ended_at)); facts.append(field("Error", attempt.error_kind)); facts.append(field("Materialization", attempt.materialization)); facts.append(field("Window basis", attempt.child_event_window && attempt.child_event_window.basis)); facts.append(field("From seq", attempt.child_event_window && attempt.child_event_window.from_seq)); facts.append(field("To seq exclusive", attempt.child_event_window && attempt.child_event_window.to_seq_exclusive)); card.append(facts);
     if (attempt.summary) projected(card, "p", attempt.summary, "attempt-summary");
-    card.append(usagePanel(attempt.usage || {source: "none", complete: true, calls: 0, groups: [], limitations: []}, "usage:attempt:" + attempt.attempt_id));
+    if (attempt.usage) card.append(usagePanel(attempt.usage, "usage:attempt:" + attempt.attempt_id));
+    else {
+      const unavailable = setDisclosureKey(el("details", "usage-panel"), "usage:attempt:" + attempt.attempt_id);
+      unavailable.append(text("summary", "Evidence-derived usage · unavailable"));
+      unavailable.append(text("p", "No attributable attempt usage is available; call and token totals are unknown.", "provenance"));
+      card.append(unavailable);
+    }
     const activity = setDisclosureKey(el("details", "activity-drawer"), "activity:" + attempt.attempt_id); activity.append(text("summary", "Attempt activity via evidence references (" + activityFor(run, attempt).length + ")"));
     const allActivity = activityFor(run, attempt); const activityPageKey = "activity:" + encodeURIComponent(run.run.id) + ":" + encodeURIComponent(unit.logical_id) + ":" + encodeURIComponent(attempt.attempt_id); const activityPage = state.pages[activityPageKey] || 1;
     const newestFirst = state.activityOrder[activityPageKey] === "newest";
@@ -4654,11 +4678,12 @@
     dimensions.append(truthCard(route, "Execution", "execution", unit.execution && unit.execution.state, unit.execution && unit.execution.basis)); dimensions.append(truthCard(route, "Liveness", "liveness", unit.liveness && unit.liveness.state, unit.liveness && unit.liveness.basis)); dimensions.append(labeledTruthCard(route, "Runtime gate", "gate", unitGateLabel(unit), unit.gate && unit.gate.state, unit.gate && unit.gate.basis)); dimensions.append(labeledTruthCard(route, "Model advisory", "advisory", unitAdvisoryLabel(unit), unit.advisory && unit.advisory.verdict, ADVISORY_FOLD_BASIS, "Declared gate: " + scalar(unit.advisory && unit.advisory.declared_gate, "none"))); root.append(dimensions);
     if (unit.advisory && unit.advisory.present) { const advisory = el("section", "advisory-panel"); advisory.append(heading(2, "Model-authored advisory")); advisory.append(text("p", "This content is advisory and cannot alter the runtime gate.", "provenance")); projected(advisory, "p", unit.advisory.summary || unit.advisory.raw_excerpt || "No summary"); root.append(advisory); }
     const lineage = el("section", "lineage"); lineage.append(heading(2, "Attempt lineage")); const attempts = array(unit.attempts); const attemptPageKey = "attempts:" + encodeURIComponent(run.run.id) + ":" + encodeURIComponent(unit.logical_id); const selectedAttemptIndex = attempts.findIndex(function (attempt) { return attempt.attempt_id === route.attemptId; }); const projectedAttemptId = selectedAttemptIndex >= 0 ? route.attemptId : null; const selectedAttemptPage = selectedAttemptIndex < 0 ? 1 : Math.floor(selectedAttemptIndex / LIMITS.attempts) + 1; const page = Math.max(state.pages[attemptPageKey] || 1, selectedAttemptPage); const shown = attempts.slice(0, page * LIMITS.attempts);
-    if (!shown.length) lineage.append(empty("This engine-only unit has no Subagent attempts."));
+    if (incompleteAttemptLineage(unit)) lineage.append(text("p", "Earlier attempt lineage is unavailable. Only provable retained attempts are shown; the total is unknown.", "limitation"));
+    if (!shown.length && !incompleteAttemptLineage(unit)) lineage.append(empty("This engine-only unit has no Subagent attempts."));
     shown.forEach(function (attempt) { lineage.append(attemptCard(run, unit, attempt, route.attemptId === attempt.attempt_id)); });
     if (shown.length < attempts.length) lineage.append(key(button("Show next 20 attempts", function () { state.pages[attemptPageKey] = page + 1; renderCurrentGuarded(); }, "continuation"), "continuation:" + attemptPageKey)); root.append(lineage);
     root.append(usagePanel(unit.usage, "usage:unit:" + unit.logical_id)); root.append(artifactPanel(unit.artifacts)); root.append(mutationPanel(unit.mutation)); root.append(actionsPanel(unit.safe_actions, "logical unit", unit.logical_id + (projectedAttemptId ? " · attempt " + projectedAttemptId : ""))); root.append(limitationsPanel(unit.limitations)); root.append(evidenceDrawer(run, unit.evidence_refs, "unit-evidence:" + unit.logical_id));
-    replaceContent(root, "Unit inspector updated. " + attempts.length + " attempts.");
+    replaceContent(root, "Unit inspector updated. " + attempts.length + (incompleteAttemptLineage(unit) ? " retained attempts; total unknown." : " attempts."));
     if (state.pendingAttemptScroll && state.pendingAttemptScroll === route.attemptId) {
       const pending = state.pendingAttemptScroll; state.pendingAttemptScroll = null;
       requestAnimationFrame(function () {
@@ -5568,7 +5593,7 @@
     location.hash = manualRoute(route, MANUAL_INDEX);
   });
 
-  window.PixirMonitorUI = Object.freeze({parseRoute: parseRoute, routeHash: routeHash, clientStateKey: clientStateKey, visible: visible, classifyCommand: classifyCommand, escapedEvidence: escapedEvidence, validInvalidation: validInvalidation, limits: LIMITS, sortVocabulary: SORT_VOCABULARY, defaultSort: DEFAULT_SORT, runsComparator: runsComparator, temporalField: temporalField, durationLabel: durationLabel, attentionRenderAllCap: ATTENTION_RENDER_ALL_CAP, attentionRowBudget: attentionRowBudget, resolveParentObservedChild: resolveParentObservedChild, glossaryEntries: glossaryEntries, glossaryBySlug: glossaryBySlug, glossaryConcerns: glossaryConcerns, manualField: manualField, manualRoute: manualRoute, manualUnderlyingKey: underlyingKey, manualIndexSlug: MANUAL_INDEX, manualRunValueSlugs: Object.freeze(Object.keys(MANUAL_RUN_READERS).sort()), manualNoRunValueSlugs: MANUAL_NO_RUN_VALUE_SLUGS, labelledTerms: LABELLED_TERMS, labelledTermSlug: labelledTermSlug, isMonitorDefect: isMonitorDefect, normalizeProjectionFailure: normalizeProjectionFailure});
+  window.PixirMonitorUI = Object.freeze({boundedLogNote: boundedLogNote, parseRoute: parseRoute, routeHash: routeHash, clientStateKey: clientStateKey, visible: visible, classifyCommand: classifyCommand, escapedEvidence: escapedEvidence, validInvalidation: validInvalidation, limits: LIMITS, sortVocabulary: SORT_VOCABULARY, defaultSort: DEFAULT_SORT, runsComparator: runsComparator, temporalField: temporalField, durationLabel: durationLabel, attentionRenderAllCap: ATTENTION_RENDER_ALL_CAP, attentionRowBudget: attentionRowBudget, resolveParentObservedChild: resolveParentObservedChild, glossaryEntries: glossaryEntries, glossaryBySlug: glossaryBySlug, glossaryConcerns: glossaryConcerns, manualField: manualField, manualRoute: manualRoute, manualUnderlyingKey: underlyingKey, manualIndexSlug: MANUAL_INDEX, manualRunValueSlugs: Object.freeze(Object.keys(MANUAL_RUN_READERS).sort()), manualNoRunValueSlugs: MANUAL_NO_RUN_VALUE_SLUGS, labelledTerms: LABELLED_TERMS, labelledTermSlug: labelledTermSlug, isMonitorDefect: isMonitorDefect, normalizeProjectionFailure: normalizeProjectionFailure});
   // Pre-load failure UX belongs solely to the shell bootstrap (PixirMonitor.Bootstrap):
   // this script loads only after the bootstrap promise fulfills, so rejection is unreachable here.
   window.__pixirBootstrap.then(function () {

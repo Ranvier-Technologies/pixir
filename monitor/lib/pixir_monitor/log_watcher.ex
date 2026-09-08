@@ -24,7 +24,7 @@ defmodule PixirMonitor.LogWatcher do
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
   @doc false
-  @spec refresh() :: {:ok, :refreshed}
+  @spec refresh() :: {:ok, :refreshed} | {:error, map()}
   def refresh, do: GenServer.call(__MODULE__, :refresh)
 
   @impl true
@@ -36,8 +36,10 @@ defmodule PixirMonitor.LogWatcher do
 
   @impl true
   def handle_call(:refresh, _from, state) do
-    state = refresh_state(state)
-    {:reply, {:ok, :refreshed}, state}
+    case PixirMonitor.WorkspaceSet.mode() do
+      {:ok, _} -> {:reply, {:ok, :refreshed}, refresh_state(state)}
+      {:error, _} = error -> {:reply, error, %{state | fingerprints: nil}}
+    end
   end
 
   @impl true
@@ -77,6 +79,9 @@ defmodule PixirMonitor.LogWatcher do
       {:ok, :single} ->
         opts = Application.get_env(:pixir_monitor, :projection_source, [])
         %{nil => snapshot(Keyword.get(opts, :workspace, File.cwd!()))}
+
+      {:error, _} ->
+        %{}
     end
   end
 

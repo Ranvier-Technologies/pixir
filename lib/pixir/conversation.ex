@@ -29,6 +29,9 @@ defmodule Pixir.Conversation do
 
   alias Pixir.{Event, Events, Log, Session, SessionId, SessionSupervisor, Subagents, Turn}
   alias Pixir.Permissions.WritePolicy
+  alias Pixir.Tools.CommandBoundary
+
+  @minimum_liveness_wait_ms 1
 
   @type session_id :: String.t()
 
@@ -177,149 +180,83 @@ defmodule Pixir.Conversation do
   safely send the next prompt without seeing a transient `:busy`.
 
   Options: `:on_event` (a 1-arity callback invoked per event, for in-process rendering),
-  `:idle_timeout` (ms, default 120_000), `:subagent_liveness?` (default `true`; an
-  internal red-proof seam), and `:cleanup_timeout` (ms, default 1_000). When a
-  positive idle deadline expires, an attached non-terminal Subagent with a live
-  timeout cap extends the deadline. Retry-queued children may instead rely on the
-  active `wait_agent` timer that is already bounding their parent wait.
+  `:idle_timeout` (ms, default 120_000), `:subagent_liveness?` and `:tool_liveness?`
+  (both default `true`; internal red-proof seams), and `:cleanup_timeout` (ms, default
+  1_000). When a positive idle deadline expires, bounded live presence extends the
+  deadline: either an attached non-terminal Subagent with a live timeout cap, or an
+  in-flight Tool whose spawned process is alive and still within that Tool's execution
+  cap plus cleanup grace. Tool-backed extensions wait for at most the smaller of the
+  presenter idle interval and that remaining Tool cap, with a 1ms floor for a live
+  boundary-edge observation. Retry-queued children may instead rely on the active
+  `wait_agent` timer that is already bounding their parent wait.
   """
   @spec await(session_id(), keyword()) :: :done | :error | :interrupted | :timeout
   def await(session_id, opts \\ []) do
     on_event = Keyword.get(opts, :on_event, fn _ -> :ok end)
     timeout = Keyword.get(opts, :idle_timeout, 120_000)
-    subagent_liveness? = Keyword.get(opts, :subagent_liveness?, true)
-    liveness_check = Keyword.get(opts, :subagent_liveness_check, &presenter_liveness?/1)
+
+    liveness = %{
+      subagent?: Keyword.get(opts, :subagent_liveness?, true),
+      subagent_check:
+        Keyword.get(opts, :subagent_liveness_check, &subagent_presenter_liveness?/1),
+      tool?: Keyword.get(opts, :tool_liveness?, true),
+      tool_check: Keyword.get(opts, :tool_liveness_check, &CommandBoundary.presenter_liveness/1)
+    }
+
     cleanup_timeout = Keyword.get(opts, :cleanup_timeout, 1_000)
 
-    case consume(session_id, on_event, timeout, subagent_liveness?, liveness_check) do
+    case consume(session_id, on_event, timeout, liveness) do
       :timeout -> :timeout
       outcome -> await_turn_cleanup(session_id, outcome, cleanup_timeout)
     end
   end
 
-  defp consume(session_id, on_event, timeout, subagent_liveness?, liveness_check) do
+  defp consume(session_id, on_event, timeout, liveness) do
     deadline = idle_deadline(timeout)
 
-    consume_until(
-      session_id,
-      on_event,
-      timeout,
-      deadline,
-      subagent_liveness?,
-      liveness_check
-    )
+    consume_until(session_id, on_event, timeout, deadline, liveness)
   end
 
-  defp consume_until(
-         session_id,
-         on_event,
-         timeout,
-         deadline,
-         subagent_liveness?,
-         liveness_check
-       ) do
+  defp consume_until(session_id, on_event, timeout, deadline, liveness) do
     receive do
       {:pixir_event, event} ->
-        handle_await_event(
-          event,
-          session_id,
-          on_event,
-          timeout,
-          subagent_liveness?,
-          liveness_check
-        )
+        handle_await_event(event, session_id, on_event, timeout, liveness)
     after
       remaining_timeout(deadline) ->
-        handle_idle_expiry(
-          session_id,
-          on_event,
-          timeout,
-          subagent_liveness?,
-          liveness_check
-        )
+        handle_idle_expiry(session_id, on_event, timeout, liveness)
     end
   end
 
-  defp handle_await_event(
-         event,
-         session_id,
-         on_event,
-         timeout,
-         subagent_liveness?,
-         liveness_check
-       ) do
+  defp handle_await_event(event, session_id, on_event, timeout, liveness) do
     on_event.(event)
 
     case terminal(event) do
       nil ->
-        consume_until(
-          session_id,
-          on_event,
-          timeout,
-          idle_deadline(timeout),
-          subagent_liveness?,
-          liveness_check
-        )
+        consume_until(session_id, on_event, timeout, idle_deadline(timeout), liveness)
 
       outcome ->
         outcome
     end
   end
 
-  defp handle_idle_expiry(
-         _session_id,
-         _on_event,
-         timeout,
-         _subagent_liveness?,
-         _liveness_check
-       )
+  defp handle_idle_expiry(_session_id, _on_event, timeout, _liveness)
        when timeout <= 0,
        do: :timeout
 
-  defp handle_idle_expiry(
-         session_id,
-         on_event,
-         timeout,
-         subagent_liveness?,
-         liveness_check
-       ) do
-    if subagent_liveness? and liveness_check.(session_id) do
-      consume_until(
-        session_id,
-        on_event,
-        timeout,
-        idle_deadline(timeout),
-        subagent_liveness?,
-        liveness_check
-      )
-    else
-      drain_after_presence_check(
-        session_id,
-        on_event,
-        timeout,
-        subagent_liveness?,
-        liveness_check
-      )
+  defp handle_idle_expiry(session_id, on_event, timeout, liveness) do
+    case presenter_extension_ms(session_id, liveness, timeout) do
+      extension_ms when is_integer(extension_ms) ->
+        consume_until(session_id, on_event, timeout, idle_deadline(extension_ms), liveness)
+
+      nil ->
+        drain_after_presence_check(session_id, on_event, timeout, liveness)
     end
   end
 
-  defp drain_after_presence_check(
-         session_id,
-         on_event,
-         timeout,
-         subagent_liveness?,
-         liveness_check
-       ) do
+  defp drain_after_presence_check(session_id, on_event, timeout, liveness) do
     receive do
       {:pixir_event, event} ->
-        handle_await_event(
-          event,
-          session_id,
-          on_event,
-          timeout,
-          subagent_liveness?,
-          liveness_check
-        )
+        handle_await_event(event, session_id, on_event, timeout, liveness)
     after
       0 -> :timeout
     end
@@ -330,7 +267,30 @@ defmodule Pixir.Conversation do
   defp remaining_timeout(deadline),
     do: max(deadline - System.monotonic_time(:millisecond), 0)
 
-  defp presenter_liveness?(session_id) do
+  defp presenter_extension_ms(session_id, liveness, idle_timeout) do
+    cond do
+      liveness.subagent? and liveness.subagent_check.(session_id) ->
+        idle_timeout
+
+      liveness.tool? ->
+        tool_extension_ms(liveness.tool_check.(session_id), idle_timeout)
+
+      true ->
+        nil
+    end
+  end
+
+  defp tool_extension_ms({:live, remaining_ms}, idle_timeout)
+       when is_integer(remaining_ms) and remaining_ms >= 0 do
+    min(idle_timeout, max(remaining_ms, @minimum_liveness_wait_ms))
+  end
+
+  # Boolean support keeps the internal injection seam backwards-compatible; the
+  # production CommandBoundary returns the remaining bounded cap.
+  defp tool_extension_ms(true, idle_timeout), do: idle_timeout
+  defp tool_extension_ms(_presence, _idle_timeout), do: nil
+
+  defp subagent_presenter_liveness?(session_id) do
     diagnostics_opts =
       case Session.info(session_id) do
         %{workspace: workspace} when is_binary(workspace) and workspace != "" ->

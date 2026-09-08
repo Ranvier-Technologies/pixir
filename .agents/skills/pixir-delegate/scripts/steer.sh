@@ -5,7 +5,8 @@
 #   steer.sh <session_id> "<next task>" [out.json]
 #
 # Environment:
-#   PIXIR_BIN      pixir binary (default: pixir on PATH)
+#   PIXIR_BIN      explicit executable override; otherwise caller ./pixir,
+#                  then PATH pixir only when no local candidate exists
 #   PIXIR_POSTURE  permission flag matching the session's original posture
 #                  (default: --read-only, correct for explorer children;
 #                  set empty for write-capable sessions)
@@ -17,7 +18,7 @@
 
 set -euo pipefail
 
-PIXIR_BIN="${PIXIR_BIN:-pixir}"
+source "$(dirname -- "${BASH_SOURCE[0]}")/resolve-binary.sh"
 PIXIR_POSTURE="${PIXIR_POSTURE---read-only}"
 
 if [[ $# -lt 2 ]]; then
@@ -29,8 +30,10 @@ sid="$1"
 task="$2"
 out="${3:-}"
 
-command -v "$PIXIR_BIN" >/dev/null || { echo "error: '$PIXIR_BIN' not found" >&2; exit 2; }
+PIXIR_BIN="$(pixir_resolve_binary)" || exit 2
 command -v jq >/dev/null || { echo "error: jq required" >&2; exit 2; }
+
+pixir_report_binary
 
 set +e
 if [[ -n "$PIXIR_POSTURE" ]]; then

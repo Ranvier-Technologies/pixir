@@ -1,17 +1,20 @@
-<div class="terminal" role="group" aria-label="Pixir terminal transcript">
+<div class="terminal" role="group" aria-label="Pixir delegation commands">
   <div class="terminal-head">
     <span class="window-dots" aria-hidden="true"><span></span><span></span><span></span></span>
-    <span>pixir · local runtime</span>
+    <span>pixir · one supervised worker</span>
   </div>
   <div class="terminal-body">
-    <div><span class="prompt">$</span> mix escript.install hex pixir</div>
-    <div class="dim">Resolving Hex dependencies...</div>
-    <div class="ok">Generated escript pixir with MIX_ENV=prod</div>
+    <div class="dim">After provider setup · run from your project</div>
     <br />
     <div><span class="prompt">$</span> pixir doctor --json</div>
-    <div class="json">{"{"}"ok":true,"status":"ready","version":"0.1.15"{"}"}</div>
+    <div class="dim">Inspect readiness and any warnings.</div>
     <br />
-    <div><span class="prompt">$</span> pixir tree &lt;session-id&gt; --json</div>
-    <div class="json">{"{"}"session":"...","children":[],"log":"append-only"{"}"}</div>
+    <pre class="terminal-command"><code>pixir delegate --spec first-worker.json --dry-run --json --timeout-ms 150000</code></pre>
+    <div class="dim">Check the plan before calling the model.</div>
+    <br />
+    <pre class="terminal-command"><code>pixir delegate --spec first-worker.json --json --timeout-ms 150000</code></pre>
+    <div class="dim">Inspect the result, child status and local Log.</div>
+    <br />
+    <a href="#get-started">Get the spec and complete setup →</a>
   </div>
 </div>

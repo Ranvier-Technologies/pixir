@@ -1440,7 +1440,13 @@ defmodule Pixir.CLI do
     turn_opts =
       turn_opts
       |> fold_web_search_flag()
-      |> Keyword.drop([:skip_auth?, :idle_timeout, :subagent_liveness?, :json?])
+      |> Keyword.drop([
+        :skip_auth?,
+        :idle_timeout,
+        :subagent_liveness?,
+        :tool_liveness?,
+        :json?
+      ])
       |> Keyword.merge(permission_mode: mode, asker: asker)
 
     {:ok, _ref} = Conversation.send(session_id, prompt, turn_opts)
@@ -1514,6 +1520,11 @@ defmodule Pixir.CLI do
     |> maybe_put_await_opt(
       :subagent_liveness?,
       Keyword.get(turn_opts, :subagent_liveness?),
+      &is_boolean/1
+    )
+    |> maybe_put_await_opt(
+      :tool_liveness?,
+      Keyword.get(turn_opts, :tool_liveness?),
       &is_boolean/1
     )
   end
@@ -1847,7 +1858,13 @@ defmodule Pixir.CLI do
          )}
 
       {:ok, durable_posture} ->
-        with {:ok, effective_posture} <-
+        with :ok <-
+               ensure_resume_policy_match(
+                 resume_opts.id,
+                 durable_posture.write_policy,
+                 requested_policy
+               ),
+             {:ok, effective_posture} <-
                Subagents.restrict_resume_posture(
                  durable_posture,
                  requested_mode,
@@ -1875,6 +1892,30 @@ defmodule Pixir.CLI do
         error
     end
   end
+
+  defp ensure_resume_policy_match(
+         session_id,
+         %{"hash" => pinned_hash},
+         %{"hash" => supplied_hash}
+       )
+       when pinned_hash != supplied_hash do
+    {:error,
+     Pixir.Tool.error(
+       :invalid_args,
+       "write policy mismatch: Session #{session_id} is pinned to #{pinned_hash}, but --write-policy supplied #{supplied_hash}; a Session's mandate is immutable. Resume without --write-policy to use the pinned mandate, or start a fresh Session with the new policy.",
+       %{
+         "session_id" => session_id,
+         "pinned_policy_hash" => pinned_hash,
+         "supplied_policy_hash" => supplied_hash,
+         "next_actions" => [
+           "resume_without_--write-policy_to_use_the_pinned_mandate",
+           "start_a_fresh_session_with_the_new_write_policy"
+         ]
+       }
+     )}
+  end
+
+  defp ensure_resume_policy_match(_session_id, _pinned_policy, _supplied_policy), do: :ok
 
   # `missing` is the ONE overrideable posture failure (a readable Log that
   # predates posture evidence). Lineage is unprovable from the Log alone — this

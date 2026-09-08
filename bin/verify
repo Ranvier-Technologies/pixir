@@ -1,0 +1,260 @@
+#!/usr/bin/env -S uv run python
+"""Run offline verification for named Pixir surfaces and keep a result manifest."""
+import argparse
+import datetime
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+
+SURFACES = {'core': ('', 'mix.exs'), 'monitor': ('monitor', 'mix.exs'),
+            'site': ('site', 'package.json')}
+
+
+# No browser installation or version discovery runs while constructing a plan.
+# Requiring an explicit executable avoids a release silently using a local-only
+# browser skip path. The real browser suites remain the launch/CDP authority.
+MONITOR_PREREQUISITES = """const fs = require('node:fs');
+const path = require('node:path');
+try {
+  if (Number(process.versions.node.split('.')[0]) < 22 || typeof WebSocket !== 'function')
+    throw new Error('Node >= 22 with global WebSocket is required');
+  const browser = process.env.PIXIR_MONITOR_BROWSER_BIN;
+  if (!browser || !path.isAbsolute(browser))
+    throw new Error('Set PIXIR_MONITOR_BROWSER_BIN to an absolute Chrome/Chromium executable path');
+  fs.accessSync(browser, fs.constants.X_OK);
+  if (!fs.statSync(browser).isFile()) throw new Error('Browser executable must be a file');
+  console.log('Monitor browser prerequisites available; real launch is verified by the test suite');
+} catch (error) {
+  console.error(JSON.stringify({kind: 'monitor_browser_prerequisite', message: error.message}));
+  process.exitCode = 1;
+}
+"""
+
+
+def plan_for(root, scopes, quick, release=False):
+    plan = []
+    for scope in scopes:
+        directory, _ = SURFACES[scope]
+        if scope in ('core', 'monitor'):
+            commands = [['mix', 'format', '--check-formatted'], ['mix', 'compile', '--warnings-as-errors'],
+                        ['mix', 'test', '--warnings-as-errors'] + (['--stale'] if quick else [])]
+            if release and scope == 'monitor':
+                commands.insert(0, ['node', '-e', MONITOR_PREREQUISITES])
+            if not quick:
+                commands.append(['mix', 'escript.build'])
+                if scope == 'monitor':
+                    commands.append(['./pixir-monitor', 'self-check', '--json'])
+            if release and scope == 'core':
+                commands.extend([['./pixir', 'doctor', '--json'],
+                                 ['mix', 'docs', '--warnings-as-errors'],
+                                 ['uv', 'run', 'python', '-m', 'unittest', 'discover',
+                                  '-s', 'test', '-p', 'verify_cli_test.py']])
+        elif scope == 'site':
+            commands = [['pnpm', 'check']] + ([] if quick else [['pnpm', 'build']])
+        if release and scope == 'site':
+            commands = [['node', '--version'], ['pnpm', '--version']] + commands
+        for command in commands:
+            environment = {'NO_COLOR': '1'}
+            required_env = []
+            version_requirement = None
+            if release and scope == 'site':
+                if command == ['node', '--version']:
+                    version_requirement = {'tool': 'node', 'major': 24}
+                elif command == ['pnpm', '--version']:
+                    version_requirement = {'tool': 'pnpm', 'exact': '11.5.0'}
+            if command[0] == 'pnpm':
+                command.insert(1, '--config.verifyDepsBeforeRun=error')
+            if release:
+                if command[0] == 'mix':
+                    environment['MIX_ENV'] = 'test' if command[1] == 'test' else 'dev'
+                    environment['HEX_OFFLINE'] = '1'
+                if command[0] == 'uv':
+                    environment['UV_OFFLINE'] = '1'
+                if scope == 'monitor' and (command[0] == 'node' or command[:2] == ['mix', 'test']):
+                    environment.update(CI='true', PIXIR_MONITOR_LIFECYCLE='1')
+                    required_env = ['PIXIR_MONITOR_BROWSER_BIN']
+                    for key in ('PIXIR_MONITOR_BROWSER_BIN', 'PIXIR_MONITOR_BROWSER_EXTRA_ARGS'):
+                        if key in os.environ:
+                            environment[key] = os.environ[key]
+            item = {'scope': scope, 'cwd': str(root / directory), 'command': command,
+                    'env': environment, 'required_env': required_env}
+            if version_requirement:
+                item['version_requirement'] = version_requirement
+            plan.append(item)
+    return plan
+
+
+def update_coverage(report, requested, present, dry_run=False):
+    checks = report['checks']
+    executed = [scope for scope in SURFACES if any(
+        row['scope'] == scope and row['status'] != 'not_run' for row in checks)]
+    completed = [scope for scope in report['scopes'] if
+                 sum(row['scope'] == scope and row['status'] == 'passed' for row in checks) ==
+                 sum(row['scope'] == scope for row in report['plan'])]
+    not_run = []
+    for scope in present:
+        if scope not in report['scopes']:
+            not_run.append({'scope': scope, 'reason': 'not_selected'})
+        elif dry_run:
+            not_run.append({'scope': scope, 'reason': 'dry_run'})
+        elif any(row['scope'] == scope and row['status'] == 'not_run' for row in checks):
+            not_run.append({'scope': scope, 'reason': 'earlier_scope_check_failed'})
+        elif scope not in executed:
+            not_run.append({'scope': scope, 'reason': 'pending'})
+    report['coverage'] = {'requested': requested, 'executed': executed, 'completed': completed,
+                          'not_run': not_run,
+                          'not_applicable': [scope for scope in SURFACES if scope not in present],
+                          'all_surfaces_completed': set(completed) == set(SURFACES)}
+    report['readiness'] = {
+        'label': 'offline_only',
+        'status': ('not_run' if not checks else 'failed' if not report['ok'] else
+                   'selected_scopes_passed' if completed == report['scopes'] else 'in_progress'),
+        'not_claimed': ['live_provider_calls', 'os_matrix', 'manual_publication_checks',
+                        'per_test_omission_accounting']}
+
+
+def git_value(root, *args):
+    try:
+        result = subprocess.run(['git', '-C', str(root), *args], capture_output=True, text=True, timeout=10,
+                                env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0'})
+        return result.stdout.strip() if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def run_check(item, output, index, timeout):
+    log = output / f'{index:02d}-{item["scope"]}.log'
+    row = {**item, 'log': str(log), 'exit_code': None, 'status': 'failed'}
+    start = time.monotonic()
+    with log.open('wb') as stream:
+        try:
+            process = subprocess.Popen(item['command'], cwd=item['cwd'], stdout=stream, stderr=subprocess.STDOUT,
+                                       env={**os.environ, **item['env']}, start_new_session=True)
+            try:
+                row['exit_code'] = process.wait(timeout=timeout)
+                row['status'] = 'passed' if row['exit_code'] == 0 else 'failed'
+            except subprocess.TimeoutExpired:
+                row['status'] = 'timed_out'
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                row['exit_code'] = process.returncode
+        except OSError as error:
+            row['error'] = {'kind': 'command_unavailable', 'message': str(error)}
+    if row['status'] == 'passed' and (requirement := item.get('version_requirement')):
+        with log.open('rb') as stream:
+            observed = stream.read(256).decode('utf-8', errors='replace').strip()
+        if 'major' in requirement:
+            expected = str(requirement['major']) + '.x'
+            matches = re.fullmatch(r'v' + str(requirement['major']) + r'\.\d+\.\d+', observed) is not None
+        else:
+            expected = requirement['exact']
+            matches = observed == expected
+        row['toolchain'] = {'tool': requirement['tool'], 'expected': expected, 'observed': observed}
+        if not matches:
+            row['status'] = 'failed'
+            row['error'] = {'kind': 'frontend_toolchain_mismatch',
+                            'message': f"Release verification requires {requirement['tool']} {expected}; select the documented frontend CI toolchain."}
+    row['seconds'] = round(time.monotonic() - start, 3)
+    return row
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument('--scope', action='append', choices=['all', *SURFACES], help='Repeat to select surfaces; default all present surfaces.')
+    parser.add_argument('--release', action='store_true', help='Offline release acceptance for selected surfaces, including Monitor lifecycle; incompatible with --quick.')
+    parser.add_argument('--quick', action='store_true', help='Use stale Elixir tests and omit builds; not full acceptance.')
+    parser.add_argument('--dry-run', action='store_true', help='Print the plan without running commands or creating files.')
+    parser.add_argument('--json', action='store_true', help='Emit one structured result on stdout; command output stays in logs.')
+    parser.add_argument('--show-failures', action='store_true', help='Also print a bounded tail of each failed command log to stderr.')
+    parser.add_argument('--output-dir', type=Path, help='New evidence directory; defaults to /tmp/codex-runs/verify-<unique-id>.')
+    parser.add_argument('--timeout', type=float, help='Maximum seconds per command (default 600; --release default 1800 for lifecycle plus normal tests).')
+    args = parser.parse_args()
+    if args.timeout is None:
+        args.timeout = 1800 if args.release else 600
+    root = args.root.resolve()
+
+    def emit(value):
+        if args.json or args.dry_run or 'error' in value:
+            print(json.dumps(value, indent=2))
+        else:
+            for check in value['checks']:
+                print(f'{check["scope"]}: {check["status"]} — {" ".join(check["command"])}')
+            print('Manifest: ' + value['manifest'])
+
+    if args.release and args.quick:
+        emit({'ok': False, 'error': {'kind': 'incompatible_modes', 'message': '--release and --quick cannot be combined.'}})
+        return 2
+    if args.timeout <= 0 or not args.timeout < float('inf'):
+        emit({'ok': False, 'error': {'kind': 'invalid_timeout', 'message': 'Timeout must be finite and positive.'}})
+        return 2
+    present = [scope for scope, (directory, marker) in SURFACES.items() if (root / directory / marker).is_file()]
+    requested = args.scope or ['all']
+    unavailable = [scope for scope in requested if scope != 'all' and scope not in present]
+    if unavailable or not present:
+        emit({'ok': False, 'error': {'kind': 'scope_unavailable', 'message': 'Requested surface is absent.', 'scopes': unavailable}})
+        return 2
+    scopes = list(dict.fromkeys(scope for selection in requested for scope in (present if selection == 'all' else [selection])))
+    requested_surfaces = list(dict.fromkeys(scope for selection in requested
+                                             for scope in (SURFACES if selection == 'all' else [selection])))
+    report = {'version': 1, 'ok': True, 'mode': 'release' if args.release else 'quick' if args.quick else 'full', 'root': str(root),
+              'commit': git_value(root, 'rev-parse', 'HEAD'), 'working_changes': git_value(root, 'status', '--porcelain'),
+              'scopes': scopes, 'absent_surfaces': [scope for scope in SURFACES if scope not in present],
+              'timeout_seconds': args.timeout,
+              'plan': plan_for(root, scopes, args.quick, args.release), 'checks': []}
+    update_coverage(report, requested_surfaces, present, dry_run=args.dry_run)
+    if args.dry_run:
+        emit({**report, 'dry_run': True})
+        return 0
+    if args.output_dir:
+        output = args.output_dir.resolve()
+        try:
+            output.mkdir(parents=True, mode=0o700, exist_ok=False)
+        except FileExistsError:
+            emit({'ok': False, 'error': {'kind': 'output_exists', 'message': 'Use a new output directory; previous evidence is not overwritten.'}})
+            return 2
+    else:
+        parent = Path('/tmp/codex-runs')
+        parent.mkdir(parents=True, exist_ok=True)
+        output = Path(tempfile.mkdtemp(prefix='verify-', dir=parent))
+    manifest = output / 'manifest.json'
+    report.update(manifest=str(manifest), state='running', started_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+    manifest.write_text(json.dumps(report, indent=2) + '\n')
+    failed_scopes = set()
+    for index, item in enumerate(report['plan'], 1):
+        if item['scope'] in failed_scopes:
+            row = {**item, 'status': 'not_run', 'reason': 'earlier_scope_check_failed'}
+        else:
+            row = run_check(item, output, index, args.timeout)
+            if row['status'] != 'passed':
+                failed_scopes.add(item['scope'])
+                report['ok'] = False
+                if args.show_failures:
+                    with Path(row['log']).open('rb') as stream:
+                        stream.seek(0, os.SEEK_END)
+                        stream.seek(max(0, stream.tell() - 16_384))
+                        tail = stream.read(16_384).decode('utf-8', errors='replace')
+                    print(f'{item["scope"]}: {row["status"]}; full log: {row["log"]}\n{tail}', file=sys.stderr)
+        report['checks'].append(row)
+        update_coverage(report, requested_surfaces, present)
+        manifest.write_text(json.dumps(report, indent=2) + '\n')
+    report['finished_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    report['state'] = 'passed' if report['ok'] else 'failed'
+    manifest.write_text(json.dumps(report, indent=2) + '\n')
+    emit(report)
+    return 0 if report['ok'] else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
