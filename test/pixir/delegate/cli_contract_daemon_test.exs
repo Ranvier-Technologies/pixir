@@ -5,6 +5,11 @@ defmodule Pixir.Delegate.CLIContractDaemonTest do
 
   alias Pixir.Delegate.{CLIContract, DaemonServer}
 
+  defmodule StubProvider do
+    def stream(_request, _opts),
+      do: raise("the current-runtime seam must not execute the Provider")
+  end
+
   defmodule UnavailableDaemonClient do
     def call(_action, _body, _opts) do
       {:error,

@@ -6,6 +6,15 @@ Pixir Harness is available as an early developer preview. This note records the 
 preview scope for source installs and the narrow Hex CLI/ACP distribution path. It does
 not define a stable Elixir library contract.
 
+## 0.1.17 Review Hardening Candidate
+
+The 0.1.17 candidate retains the improvements below and supersedes the source-tagged
+0.1.16 candidate, which was not published to Hex. It fixes configuration admission,
+landing-manifest byte limits, and independent parent/child completeness in Monitor.
+See the source-checkout note `docs/release-notes/review-hardening.md` for scope
+and regression evidence.
+Publication remains a separate maintainer action.
+
 ## 0.1.16 Runtime Efficiency And Release Evidence Update
 
 Pixir 0.1.16 retains the CLI/ACP-only Hex distribution contract and the

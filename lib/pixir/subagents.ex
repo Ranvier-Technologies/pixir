@@ -33,6 +33,7 @@ defmodule Pixir.Subagents do
 
   @landing_manifest_child_cap 8
   @landing_manifest_path_cap 20
+  @landing_manifest_max_bytes 16_000
   @shared_workspace_file_tools ~w(write edit)
 
   @cancellation_steps [
@@ -145,7 +146,11 @@ defmodule Pixir.Subagents do
         "Landing manifest:"
       end
 
-    heading <> "\n" <> Enum.map_join(shown, "\n", &render_landing_manifest_entry/1)
+    # Bound only this appended text, not the caller's summary/reverification
+    # directive or the structured projection. Entry/path counts alone do not
+    # bound long workspace paths or artifact references.
+    rendered = heading <> "\n" <> Enum.map_join(shown, "\n", &render_landing_manifest_entry/1)
+    Tool.truncate(rendered, {:total_bytes, @landing_manifest_max_bytes})
   end
 
   defp completed_item?(item) when is_map(item) do

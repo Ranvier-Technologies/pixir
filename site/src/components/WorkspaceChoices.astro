@@ -8,6 +8,6 @@
       <article class="proof"><code>isolated</code><h3>Keep a separate disk snapshot</h3><p>Useful when a child needs an independent physical workspace. Snapshot storage needs lifecycle management and cleanup as workers accumulate.</p></article>
       <article class="proof"><code>virtual_overlay · RAM</code><h3>Avoid a physical copy per child</h3><p>Useful for supported virtual commands across many workers. Edits live within one invocation; the next call reimports source files. Exported changes must be applied explicitly.</p></article>
     </div>
-    <p class="release-note">RAM mode is a storage and lifecycle choice, not a speed promise or a general-purpose VM. Canonical Logs and artifacts still persist on disk. In the 0.1.16 candidate, an explicit <code>deliverable</code> keeps a selected virtual result from being replaced by later unmarked reads.</p>
+    <p class="release-note">RAM mode is a storage and lifecycle choice, not a speed promise or a general-purpose VM. Canonical Logs and artifacts still persist on disk. In the 0.1.17 candidate, an explicit <code>deliverable</code> keeps a selected virtual result from being replaced by later unmarked reads.</p>
   </div>
 </section>

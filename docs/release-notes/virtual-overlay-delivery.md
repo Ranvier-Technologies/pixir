@@ -37,7 +37,8 @@ unchanged; old Log/fixture labels remain historical. An initial cache restart is
 intentional. Do not mix its performance/observability window with the independently
 verified WebSocket recovery change or claim a model-speed improvement.
 
-Both changes ship in 0.1.16 after separate PRs and staged live probes. ADR 0020
+Both changes entered the source-tagged 0.1.16 candidate after separate PRs and
+staged live probes and remain in the 0.1.17 candidate. ADR 0020
 requires attributable verification windows, not separate version numbers. The final
 combined candidate still requires full release acceptance; the individual probes do
 not establish a comparative cache-hit-rate or speed improvement.

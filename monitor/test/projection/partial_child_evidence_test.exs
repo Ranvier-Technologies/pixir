@@ -116,6 +116,7 @@ defmodule PixirMonitor.Projection.PartialChildEvidenceTest do
     assert {:ok, input} = Filesystem.fetch_input("parent", c.opts)
     assert input["inputs"]["parent_log_selection"]["partial"]
     assert input["inputs"]["child_log_selections"]["child"]["partial"]
+    assert input["completeness"]["child_logs"] == "partial_prefix_tail"
     assert {:ok, projection} = Projection.project(input)
     refute projection["usage"]["complete"]
     assert projection["execution"]["state"] == "unknown"

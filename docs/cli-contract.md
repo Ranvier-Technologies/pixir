@@ -215,6 +215,11 @@ durable child Log evidence. A Workflow `virtual_overlay` step executed in-proces
 child Session identity to resolve; it keeps the existing direct `virtual_diff`
 presentation and is intentionally outside landing-manifest scope.
 
+Each rendered manifest block fits within 16,000 bytes, including an explicit
+truncation marker when needed. This bounds the appended block only: the preceding
+summary and re-verification directive are unchanged, and the structured manifest
+retains its existing child/path caps and omission counts.
+
 The confession is a property of **terminal** envelopes: the delegate result and
 the workflow result, and the child or step entries inside them. It is
 deliberately **out of scope** for surfaces that report a run which has not
@@ -233,6 +238,13 @@ Non-`bounded_write` runs have no write policy and therefore no confession; the
 key is absent for them on every surface.
 
 ### Delegate spec-surface admission
+
+Provider configuration must resolve from the caller's Config snapshot before
+dispatch. A resolution failure without a known explicit unsupported effort is
+an `invalid_spec` with reason `provider_configuration_unresolved` and sanitized
+`configuration_error` field/reason details. Admission never rereads ambient
+configuration to guess effort after a failed snapshot. Valid source and explicit
+model/effort precedence remain unchanged.
 
 Delegate specs are admitted once, before dry-run planning, one-shot execution, or
 attached execution starts. Admission is fail-closed for the remaining tolerant nested

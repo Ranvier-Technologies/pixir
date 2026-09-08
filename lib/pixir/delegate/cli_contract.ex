@@ -1412,18 +1412,21 @@ defmodule Pixir.Delegate.CLIContract do
            do: invalid_delegate_effort(if(invalid_explicit?, do: explicit, else: effort), ids),
            else: :ok
 
-      {:error, _} ->
-        # Do not broaden old admission for unrelated config faults. If max
-        # intent is present, unresolved capability must fail closed.
-        effort =
-          explicit || Keyword.get(provider_opts, :reasoning_effort) ||
-            Pixir.Config.reasoning_effort()
+      {:error, error} ->
+        # Resolution owns the single Config snapshot. A second read (including
+        # the ambient home) cannot recover intent from that failed snapshot.
+        effort = explicit || Keyword.get(provider_opts, :reasoning_effort)
 
         if invalid_explicit? or ReasoningEffort.normalize(effort) == {:ok, "max"} do
           {:ok, ids} = ReasoningEffort.legacy_ids()
           invalid_delegate_effort(if(invalid_explicit?, do: explicit, else: effort), ids)
         else
-          :ok
+          {:error,
+           invalid_spec("delegate Provider configuration could not be resolved", %{
+             "reason" => "provider_configuration_unresolved",
+             "configuration_error" => Map.take(error_details(error), ["field", "reason"]),
+             "next_actions" => ["fix_provider_configuration_before_delegating"]
+           })}
         end
     end
   end

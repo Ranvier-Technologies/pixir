@@ -9,6 +9,21 @@ caveat that pre-1.0 minor versions may still change behavior.
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-09-08
+
+This candidate supersedes the source-tagged 0.1.16 candidate, which was not
+published to Hex. The existing 0.1.16 tag remains unchanged.
+
+### Fixed
+- Delegate admission rejects unresolvable Provider configuration before dispatch,
+  without rereading ambient configuration or invoking a snapshot loader twice.
+  Valid model/effort precedence and explicit unsupported-effort refusals remain intact.
+- Rendered landing-manifest blocks are bounded to 16,000 bytes, including the
+  truncation marker. Caller summaries and re-verification directives remain intact;
+  structured manifests retain their existing child/path caps and evidence.
+- Monitor reports child Log completeness independently of parent partiality.
+  Complete or bounded child evidence no longer masquerades as missing child Logs.
+
 ## [0.1.16] - 2026-09-06
 
 ### Added

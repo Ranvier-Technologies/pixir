@@ -138,7 +138,10 @@ defmodule PixirMonitor.Projection.PartialLifecycleTest do
         {path, bytes}
       end
 
-    {_input, projection} = success(ctx)
+    {input, projection} = success(ctx)
+    assert input["completeness"]["parent_log"] == "partial_prefix_tail"
+    assert input["completeness"]["child_logs"] == "complete_through_observed_at"
+    refute "child_log_missing" in projection["source"]["limitations"]
     assert {:ok, %{"rows" => [row]}} = Filesystem.list_runs(ctx.opts)
     assert Enum.sort(Enum.map(row["children"], & &1["session_id"])) == ["child-a", "child-b"]
     assert hd(projection["units"])["attempts"] == []

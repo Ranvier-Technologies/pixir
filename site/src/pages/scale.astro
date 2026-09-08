@@ -51,7 +51,7 @@ const tokenRows = [
             <div><dt>Comparison</dt><dd>One shared Pixir runtime vs. separate <code>codex exec</code> workers</dd></div>
             <div><dt>Measurements</dt><dd>July 5–6, 2026 · up to 64 workers</dd></div>
           </dl>
-          <p class="scope-note">Historical results, not benchmarks of the 0.1.16 candidate or Astra. The proc-pressure report identifies <code>gpt-5.5</code> / low effort and a pinned Pixir 0.1.5 benchmark binary; some older Codex version stamps are unavailable.</p>
+          <p class="scope-note">Historical results, not benchmarks of the 0.1.17 candidate or Astra. The proc-pressure report identifies <code>gpt-5.5</code> / low effort and a pinned Pixir 0.1.5 benchmark binary; some older Codex version stamps are unavailable.</p>
           <div class="proof-grid">
             <article class="proof"><code>audit64 · one run</code><h3>{ratio.toFixed(1)}× RSS ratio</h3><p>{number(memory[0].mib)} vs. {number(memory[1].mib)} MiB at 64 workers. This is sampled process-tree RSS, not unique physical-memory accounting.</p></article>
             <article class="proof"><code>Completion varied</code><h3>Failures are part of the result.</h3><p>The first audit64 run completed 64/64 on both arms. A later ladder completed 199/205 in Pixir and 205/205 in the baseline.</p></article>

@@ -277,7 +277,7 @@ defmodule PixirMonitor.Projection.Source.Filesystem do
          "completeness" => %{
            "parent_log" =>
              if(selection["partial"], do: "partial_prefix_tail", else: if(selection["incomplete_trailing_bytes"] > 0, do: "partial_trailing_append", else: "complete_through_observed_at")),
-           "child_logs" => child_completeness(child_selections, missing? or selection["partial"]),
+           "child_logs" => child_completeness(child_selections, missing?),
            "runtime_diagnostics" => if(diagnostics, do: "complete_snapshot", else: "unavailable")
          }
        }}
